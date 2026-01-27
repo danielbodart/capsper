@@ -55,12 +55,12 @@ check_dependencies() {
 # Start the SimulStreaming server
 start_server() {
     echo "Starting SimulStreaming server..."
-    (cd "$SIMUL_DIR" && mise exec -- python3 "$SIMUL_SERVER" --vac --warmup-file "$SCRIPT_DIR/jfk.wav") >> "$LOG_FILE" 2>&1 &
+    (cd "$SIMUL_DIR" && mise exec -- python3 "$SIMUL_SERVER" --vac --warmup-file "$SCRIPT_DIR/jfk.wav" --model_path ./large-v3-turbo.pt) >> "$LOG_FILE" 2>&1 &
     SERVER_PID=$!
 
     # Wait for server to be listening (up to 30 seconds for model loading)
     echo "Waiting for server to load model and start listening..."
-    local max_wait=30
+    local max_wait=300  # 5 minutes for first-time model download
     local waited=0
     while ! ss -tlnp 2>/dev/null | grep -q ":$SIMUL_PORT"; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
