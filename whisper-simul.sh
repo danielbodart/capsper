@@ -127,10 +127,15 @@ process_simul_output() {
             # Remove timing numbers at start (e.g., "0 3320  Hello" -> "Hello")
             # Pattern: one or more digits, space, one or more digits, then the text
             clean_line=$(echo "$line" | sed 's/^[0-9][0-9]* [0-9][0-9]* *//')
-            # Remove extra spaces
-            clean_line=$(echo "$clean_line" | sed 's/[[:space:]]\+/ /g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            # Remove extra spaces and spaces before punctuation
+            clean_line=$(echo "$clean_line" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*\([.,!?;:]\)/\1/g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             if [[ -n "$clean_line" ]]; then
-                xdotool type "$clean_line "
+                # Add leading space unless it's punctuation
+                local punct_re='^[.,!?;:]'
+                if [[ ! "$clean_line" =~ $punct_re ]]; then
+                    xdotool type " "
+                fi
+                xdotool type "$clean_line"
             fi
         fi
     done
