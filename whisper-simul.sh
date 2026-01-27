@@ -55,7 +55,7 @@ check_dependencies() {
 # Start the SimulStreaming server
 start_server() {
     echo "Starting SimulStreaming server..."
-    (cd "$SIMUL_DIR" && mise exec -- python3 "$SIMUL_SERVER") >> "$LOG_FILE" 2>&1 &
+    (cd "$SIMUL_DIR" && mise exec -- python3 "$SIMUL_SERVER" --vac --warmup-file "$SCRIPT_DIR/jfk.wav") >> "$LOG_FILE" 2>&1 &
     SERVER_PID=$!
 
     # Wait for server to be listening (up to 30 seconds for model loading)
