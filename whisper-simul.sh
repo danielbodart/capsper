@@ -135,7 +135,7 @@ process_simul_output() {
                 if [[ ! "$clean_line" =~ $punct_re ]]; then
                     xdotool type " "
                 fi
-                xdotool type "$clean_line"
+                xdotool type -- "$clean_line"
             fi
         fi
     done
