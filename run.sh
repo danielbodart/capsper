@@ -36,16 +36,15 @@ command -v nc      >/dev/null 2>&1 || missing+=("ncat")
 if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
     command -v evtest  >/dev/null 2>&1 || missing+=("evtest")
     command -v ydotool >/dev/null 2>&1 || missing+=("ydotool")
+    command -v keyd.rvaiya >/dev/null 2>&1 || command -v keyd >/dev/null 2>&1 || missing+=("keyd")
 else
     command -v xinput  >/dev/null 2>&1 || missing+=("xinput")
     command -v xdotool >/dev/null 2>&1 || missing+=("xdotool")
 fi
 
 if [[ ${#missing[@]} -gt 0 ]]; then
-    echo "Missing system packages: ${missing[*]}"
-    echo "Install them with your package manager, e.g.:"
-    echo "  sudo apt install ${missing[*]}"
-    exit 1
+    echo "Installing missing system packages: ${missing[*]}"
+    sudo apt install -y "${missing[@]}"
 fi
 
 # --- Whisper model ---
@@ -60,13 +59,12 @@ print('Model downloaded to $MODEL_FILE')
 "
 fi
 
-echo ""
-echo "Setup complete!"
-echo ""
+# --- Wayland: keyd + uinput setup ---
 if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
-    echo "To remap Caps Lock to F24 (push-to-talk key), run:"
-    echo "  sudo ./setup-keyd.sh"
-    echo ""
+    echo "Setting up keyd (Caps Lock → F24) and uinput permissions..."
+    sudo "$SCRIPT_DIR/setup-keyd.sh"
 fi
-echo "Start dictation with:"
+
+echo ""
+echo "Setup complete! Start dictation with:"
 echo "  ./whisper.sh"
