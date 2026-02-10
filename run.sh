@@ -20,6 +20,7 @@ if ! command -v mise >/dev/null 2>&1; then
 fi
 
 echo "Ensuring python is installed via mise..."
+mise trust "$SCRIPT_DIR"
 mise install
 
 # --- Python dependencies ---
@@ -28,15 +29,22 @@ mise exec -- pip install -q -r "$SIMUL_DIR/requirements_whisper.txt"
 
 # --- System dependencies ---
 missing=()
-command -v xinput  >/dev/null 2>&1 || missing+=("xinput (xinput)")
-command -v xdotool >/dev/null 2>&1 || missing+=("xdotool")
-command -v arecord >/dev/null 2>&1 || missing+=("arecord (alsa-utils)")
-command -v nc      >/dev/null 2>&1 || missing+=("nc (nmap-ncat or ncat)")
+command -v arecord >/dev/null 2>&1 || missing+=("alsa-utils")
+command -v nc      >/dev/null 2>&1 || missing+=("ncat")
+
+# Backend-specific deps (detect like whisper.sh does)
+if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+    command -v evtest  >/dev/null 2>&1 || missing+=("evtest")
+    command -v ydotool >/dev/null 2>&1 || missing+=("ydotool")
+else
+    command -v xinput  >/dev/null 2>&1 || missing+=("xinput")
+    command -v xdotool >/dev/null 2>&1 || missing+=("xdotool")
+fi
 
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Missing system packages: ${missing[*]}"
     echo "Install them with your package manager, e.g.:"
-    echo "  sudo apt install xinput xdotool alsa-utils ncat"
+    echo "  sudo apt install ${missing[*]}"
     exit 1
 fi
 
@@ -53,5 +61,12 @@ print('Model downloaded to $MODEL_FILE')
 fi
 
 echo ""
-echo "Setup complete. Run with:"
+echo "Setup complete!"
+echo ""
+if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+    echo "To remap Caps Lock to F24 (push-to-talk key), run:"
+    echo "  sudo ./setup-keyd.sh"
+    echo ""
+fi
+echo "Start dictation with:"
 echo "  ./whisper.sh"
