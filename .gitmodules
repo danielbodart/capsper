@@ -1,0 +1,3 @@
+[submodule "SimulStreaming"]
+	path = SimulStreaming
+	url = https://github.com/ufal/SimulStreaming.git

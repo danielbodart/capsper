@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration
-SIMUL_DIR="$SCRIPT_DIR/../SimulStreaming"
+SIMUL_DIR="$SCRIPT_DIR/SimulStreaming"
 SIMUL_SERVER="simulstreaming_whisper_server.py"
 SIMUL_HOST="localhost"
 SIMUL_PORT=43007
