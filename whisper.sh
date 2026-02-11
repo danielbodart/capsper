@@ -57,6 +57,12 @@ check_dependencies() {
     if [[ "$INPUT_BACKEND" == "wayland" ]]; then
         command -v evtest >/dev/null || missing_deps+=("evtest")
         command -v ydotool >/dev/null || missing_deps+=("ydotool")
+        if [[ ! -S /tmp/.ydotool_socket ]]; then
+            echo "ERROR: ydotoold socket not found at /tmp/.ydotool_socket" >&2
+            echo "Start it with: systemctl --user start ydotoold" >&2
+            echo "Or run ./run.sh to set it up automatically." >&2
+            exit 1
+        fi
     else
         command -v xinput >/dev/null || missing_deps+=("xinput")
         command -v xdotool >/dev/null || missing_deps+=("xdotool")
