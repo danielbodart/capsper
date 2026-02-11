@@ -33,7 +33,7 @@ if [[ "$INPUT_BACKEND" == "wayland" ]]; then
     KEYBOARD_DEVICE=""  # auto-detected
 else
     XINPUT_KEYCODE=202  # F24 in X11
-    KEYBOARD_DEVICE_ID="${WHISPER_KEYBOARD_ID:-12}"
+    KEYBOARD_DEVICE_ID="${WHISPER_KEYBOARD_ID:-}"  # auto-detected if empty
 fi
 
 # PIDs for cleanup
@@ -69,8 +69,7 @@ check_dependencies() {
     fi
     command -v arecord >/dev/null || missing_deps+=("arecord")
     command -v nc >/dev/null || missing_deps+=("nc")
-    command -v python3 >/dev/null || missing_deps+=("python3")
-    command -v mise >/dev/null || missing_deps+=("mise")
+    command -v uv >/dev/null || missing_deps+=("uv")
     [[ -f "$SIMUL_DIR/$SIMUL_SERVER" ]] || missing_deps+=("simulstreaming server script")
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
@@ -79,35 +78,52 @@ check_dependencies() {
     fi
 }
 
-# Auto-detect keyboard device for evtest
+# Auto-detect keyboard device
 detect_keyboard() {
-    # If keyd is running, monitor its virtual keyboard (it emits the remapped keys)
-    local keyd_event
-    keyd_event=$(grep -A 4 "keyd virtual keyboard" /proc/bus/input/devices 2>/dev/null | grep -o 'event[0-9]\+' || true)
-    if [[ -n "$keyd_event" ]]; then
-        KEYBOARD_DEVICE="/dev/input/$keyd_event"
-        echo "Detected keyd virtual keyboard: $KEYBOARD_DEVICE"
-        return
-    fi
+    if [[ "$INPUT_BACKEND" == "wayland" ]]; then
+        # If keyd is running, monitor its virtual keyboard (it emits the remapped keys)
+        local keyd_event
+        keyd_event=$(grep -A 4 "keyd virtual keyboard" /proc/bus/input/devices 2>/dev/null | grep -o 'event[0-9]\+' || true)
+        if [[ -n "$keyd_event" ]]; then
+            KEYBOARD_DEVICE="/dev/input/$keyd_event"
+            echo "Detected keyd virtual keyboard: $KEYBOARD_DEVICE"
+            return
+        fi
 
-    # Otherwise find the physical keyboard (EV=120013 = EV_SYN + EV_KEY + EV_MSC + EV_LED + EV_REP)
-    local phys_event
-    phys_event=$(grep -B 5 'EV=120013' /proc/bus/input/devices | grep -o 'event[0-9]\+' | head -1 || true)
-    if [[ -n "$phys_event" ]]; then
-        KEYBOARD_DEVICE="/dev/input/$phys_event"
-        echo "Detected keyboard: $KEYBOARD_DEVICE"
-        return
-    fi
+        # Otherwise find the physical keyboard (EV=120013 = EV_SYN + EV_KEY + EV_MSC + EV_LED + EV_REP)
+        local phys_event
+        phys_event=$(grep -B 5 'EV=120013' /proc/bus/input/devices | grep -o 'event[0-9]\+' | head -1 || true)
+        if [[ -n "$phys_event" ]]; then
+            KEYBOARD_DEVICE="/dev/input/$phys_event"
+            echo "Detected keyboard: $KEYBOARD_DEVICE"
+            return
+        fi
 
-    echo "ERROR: Could not auto-detect keyboard device" >&2
-    echo "Set KEYBOARD_DEVICE manually in the script" >&2
-    exit 1
+        echo "ERROR: Could not auto-detect keyboard device" >&2
+        echo "Set KEYBOARD_DEVICE manually in the script" >&2
+        exit 1
+    else
+        # X11: use override if set, otherwise listen on all keyboard devices
+        if [[ -n "$KEYBOARD_DEVICE_ID" ]]; then
+            echo "Using keyboard device ID: $KEYBOARD_DEVICE_ID (from WHISPER_KEYBOARD_ID)"
+            XINPUT_DEVICE_IDS=("$KEYBOARD_DEVICE_ID")
+            return
+        fi
+
+        # Collect all slave keyboard device IDs
+        mapfile -t XINPUT_DEVICE_IDS < <(xinput list | grep 'slave  keyboard' | grep -o 'id=[0-9]\+' | cut -d= -f2)
+        if [[ ${#XINPUT_DEVICE_IDS[@]} -eq 0 ]]; then
+            echo "ERROR: No X11 keyboard devices found" >&2
+            exit 1
+        fi
+        echo "Monitoring all ${#XINPUT_DEVICE_IDS[@]} keyboard devices for F24"
+    fi
 }
 
 # Start the SimulStreaming server
 start_server() {
     echo "Starting SimulStreaming server..."
-    (cd "$SIMUL_DIR" && mise exec -- python3 "$SIMUL_SERVER" --vac --out-txt --warmup-file "$SCRIPT_DIR/jfk.wav" --model_path ./large-v3-turbo.pt) >> "$LOG_FILE" 2>&1 &
+    (cd "$SIMUL_DIR" && uv run --project "$SCRIPT_DIR" python3 "$SIMUL_SERVER" --vac --out-txt --warmup-file "$SCRIPT_DIR/jfk.wav" --model_path ./large-v3-turbo.pt) >> "$LOG_FILE" 2>&1 &
     SERVER_PID=$!
 
     # Wait for server to be listening (up to 5 minutes for first-time model download)
@@ -159,11 +175,10 @@ monitor_key() {
             fi
         done
     else
-        local device_name
-        device_name=$(xinput list | grep "id=$KEYBOARD_DEVICE_ID" | sed 's/.*↳[[:space:]]*//' | sed 's/[[:space:]]*id=.*//')
-        echo "Monitoring key $XINPUT_KEYCODE on device: $device_name (ID: $KEYBOARD_DEVICE_ID)"
-
-        xinput test "$KEYBOARD_DEVICE_ID" | while read -r line; do
+        # Monitor all keyboard devices in parallel, merge into one stream
+        for dev_id in "${XINPUT_DEVICE_IDS[@]}"; do
+            xinput test "$dev_id" 2>/dev/null &
+        done | while read -r line; do
             if [[ "$line" =~ key\ press\ +$XINPUT_KEYCODE ]]; then
                 [[ -n "$debounce_pid" ]] && kill "$debounce_pid" 2>/dev/null || true
                 debounce_pid=""
@@ -220,10 +235,7 @@ main() {
     check_dependencies
     > "$LOG_FILE"
 
-    if [[ "$INPUT_BACKEND" == "wayland" ]]; then
-        detect_keyboard
-    fi
-
+    detect_keyboard
     start_server
 
     echo "Press and hold F24 to dictate..."

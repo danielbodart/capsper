@@ -12,20 +12,15 @@ if [[ ! -f "$SIMUL_DIR/simulstreaming_whisper_server.py" ]]; then
     git -C "$SCRIPT_DIR" submodule update --init --recursive
 fi
 
-# --- Python via mise ---
-if ! command -v mise >/dev/null 2>&1; then
-    echo "ERROR: mise is required but not installed." >&2
-    echo "Install from https://mise.jdx.dev" >&2
+# --- Python via uv ---
+if ! command -v uv >/dev/null 2>&1; then
+    echo "ERROR: uv is required but not installed." >&2
+    echo "Install with: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
     exit 1
 fi
 
-echo "Ensuring python is installed via mise..."
-mise trust "$SCRIPT_DIR"
-mise install
-
-# --- Python dependencies ---
-echo "Installing python dependencies..."
-mise exec -- pip install -q -r "$SIMUL_DIR/requirements_whisper.txt"
+echo "Syncing python and dependencies via uv..."
+uv sync --project "$SCRIPT_DIR"
 
 # --- System dependencies ---
 missing=()
@@ -51,7 +46,7 @@ fi
 # --- Whisper model ---
 if [[ ! -f "$MODEL_FILE" ]]; then
     echo "Downloading $MODEL_NAME model (~800 MB)..."
-    mise exec -- python3 -c "
+    uv run --project "$SCRIPT_DIR" python3 -c "
 import sys, os
 sys.path.insert(0, os.path.join('$SIMUL_DIR', 'simulstreaming', 'whisper', 'simul_whisper'))
 from whisper import load_model
@@ -94,9 +89,7 @@ fi
 echo "Installing whisper systemd user service..."
 mkdir -p "$HOME/.config/systemd/user"
 
-MISE_BIN="$(dirname "$(command -v mise)")"
-
-SERVICE_ENVS="Environment=PATH=$MISE_BIN:/usr/local/bin:/usr/bin:/bin"
+SERVICE_ENVS="Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
     SERVICE_AFTER="After=ydotoold.service"
