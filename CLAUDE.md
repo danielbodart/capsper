@@ -40,6 +40,8 @@ Unit tests live inline in `src/utils.zig` and `src/alignatt.zig` (pure Zig modul
 
 **When writing new code, add unit tests for any pure functions** (functions that don't depend on whisper.cpp C types). Keep testable logic in modules that don't import `whisper_c.zig` so tests run fast without requiring the GPU or model.
 
+**For functions with tricky invariants** (word matching, offset calculations, stability/delta logic), add property-based tests in `src/prop_tests.zig` using minish. Good candidates: functions that are idempotent, symmetric, have roundtrip relationships, or where edge cases around spaces/punctuation/empty strings matter. Property tests catch bugs that hand-written examples miss.
+
 ## Architecture
 
 Push-to-talk voice dictation for Linux. Audio flows: microphone -> `arecord | nc` -> Zig TCP server -> transcribed text -> `xdotool type` into focused window.

@@ -125,6 +125,11 @@ pub fn build(b: *std.Build) void {
                     .target = target,
                     .optimize = optimize,
                 }) },
+                .{ .name = "alignatt.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/alignatt.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
             },
         }),
     });
