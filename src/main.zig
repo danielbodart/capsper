@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("whisper_c.zig");
 const Vad = @import("vad.zig").Vad;
 const Pipeline = @import("pipeline.zig").Pipeline;
+const Server = @import("server.zig").Server;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -12,7 +13,9 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var model_path: [:0]const u8 = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
-    var audio_path: [:0]const u8 = "jfk.wav";
+    var vad_model_path: [:0]const u8 = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
+    var port: u16 = 43007;
+    var warmup_file: ?[:0]const u8 = "jfk.wav";
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -20,41 +23,25 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--model") or std.mem.eql(u8, arg, "-m")) {
             i += 1;
             if (i < args.len) model_path = args[i];
-        } else if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) {
+        } else if (std.mem.eql(u8, arg, "--vad-model")) {
             i += 1;
-            if (i < args.len) audio_path = args[i];
+            if (i < args.len) vad_model_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
+            i += 1;
+            if (i < args.len) port = std.fmt.parseInt(u16, args[i], 10) catch 43007;
+        } else if (std.mem.eql(u8, arg, "--warmup-file")) {
+            i += 1;
+            if (i < args.len) warmup_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--no-warmup")) {
+            warmup_file = null;
         } else {
-            std.debug.print("Usage: whisper-dictate [--model PATH] [--file PATH]\n", .{});
+            std.debug.print("Usage: whisper-dictate [--model PATH] [--vad-model PATH] [--port PORT] [--warmup-file PATH] [--no-warmup]\n", .{});
             return;
         }
     }
 
-    // Load audio
-    std.debug.print("Loading audio: {s}\n", .{audio_path});
-    const samples = try loadWav(allocator, audio_path);
-    defer allocator.free(samples);
-    std.debug.print("Loaded {d} samples ({d:.1}s)\n", .{ samples.len, @as(f64, @floatFromInt(samples.len)) / 16000.0 });
-
-    // VAD
-    std.debug.print("\n--- VAD ---\n", .{});
-    var vad = Vad.init("whisper.cpp/models/ggml-silero-v5.1.2.bin") catch |err| {
-        std.debug.print("Failed to init VAD: {}\n", .{err});
-        return;
-    };
-    defer vad.deinit();
-
-    const segments = vad.getSegments(samples) catch |err| {
-        std.debug.print("Failed to get VAD segments: {}\n", .{err});
-        return;
-    };
-    std.debug.print("Speech segments: {d}\n", .{segments.len});
-    for (segments, 0..) |seg, si| {
-        std.debug.print("  segment {d}: {d:.2}s - {d:.2}s\n", .{ si, seg.start_s, seg.end_s });
-    }
-
-    // Pipeline
-    std.debug.print("\n--- AlignAtt Pipeline ---\n", .{});
-
+    // Load whisper model
+    std.debug.print("Loading model: {s}\n", .{model_path});
     var cparams = c.whisper_context_default_params();
     cparams.use_gpu = true;
     cparams.flash_attn = false;
@@ -67,19 +54,39 @@ pub fn main() !void {
     };
     defer c.whisper_free(ctx);
 
-    var pipeline = try Pipeline.init(allocator, ctx, .{}, 4);
-    defer pipeline.deinit();
+    // Load VAD model
+    std.debug.print("Loading VAD model: {s}\n", .{vad_model_path});
+    var vad = Vad.init(vad_model_path) catch |err| {
+        std.debug.print("Failed to init VAD: {}\n", .{err});
+        return;
+    };
+    defer vad.deinit();
 
-    // Test: Full audio transcription
-    if (try pipeline.transcribe(samples, true)) |result| {
-        std.debug.print("Result: \"{s}\"\n", .{result.text});
-        allocator.free(result.text);
-    } else {
-        std.debug.print("No output\n", .{});
+    // Warmup
+    if (warmup_file) |wf| {
+        std.debug.print("Warming up with: {s}\n", .{wf});
+        const samples = loadWav(allocator, wf) catch |err| {
+            std.debug.print("Warning: warmup file load failed: {}\n", .{err});
+            return;
+        };
+        defer allocator.free(samples);
+
+        var pipeline = try Pipeline.init(allocator, ctx, .{}, 4);
+        defer pipeline.deinit();
+
+        if (try pipeline.transcribe(samples, true)) |result| {
+            std.debug.print("Warmup result: \"{s}\"\n", .{result.text});
+            allocator.free(result.text);
+        }
+        std.debug.print("Warmup complete\n", .{});
     }
+
+    // Start server
+    var server = Server.init(allocator, ctx, vad, port);
+    try server.run();
 }
 
-fn loadWav(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {
+pub fn loadWav(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 

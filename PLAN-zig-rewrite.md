@@ -293,18 +293,30 @@ VAD runs on CPU (~60ms for 11s audio), no GPU needed.
 - `whisper_n_len_from_state()` returns mel frames; divide by 2 for encoder frame space
 - Zig 0.15: `usingnamespace` removed, `ArrayListUnmanaged` replaces `ArrayList.init`
 
-### Phase 4: TCP Server
+### Phase 4: TCP Server ✅
 
-- Accept TCP connections on port 43007 (drop-in replacement for SimulStreaming)
-- Receive raw PCM audio (S16_LE, mono, 16kHz) from client (arecord | nc)
-- Feed audio through VAD → AlignAtt pipeline
-- Return text lines in same format as SimulStreaming: "start_ms end_ms text\n"
-- Handle client disconnect/reconnect gracefully
-- Model warmup on startup (transcribe jfk.wav)
-- Command-line args: model path, port, language, thresholds
+- ✅ Created `server.zig` — TCP server on port 43007 (configurable)
+- ✅ Accepts raw PCM audio (S16_LE, mono, 16kHz) via TCP
+- ✅ Feeds audio through VAD → AlignAtt pipeline
+- ✅ Returns plain text lines (no timestamps — simpler contract than SimulStreaming)
+- ✅ Delta output: each line contains only NEW text, not the full cumulative transcript
+- ✅ Handles client disconnect/reconnect gracefully (sequential connections)
+- ✅ Model warmup on startup (transcribes jfk.wav)
+- ✅ Command-line args: --model, --vad-model, --port, --warmup-file, --no-warmup
+- ✅ Updated `main.zig` as server entry point
 
-**Validation**: `whisper.sh` works with Zig server instead of Python server. Compare
-latency and accuracy against current Python system.
+**Test**: `tail -c +45 jfk.wav | nc -q 30 localhost 43007` produces:
+```
+And so, my fellow Americans, ask not what your country can do for
+you, ask what you can do
+for your country.
+```
+
+**Notes**:
+- Contract: raw PCM audio in → plain text lines out. No timestamps, no padding.
+- Each line is incremental (only new text since last output)
+- SO_REUSEADDR set for fast server restart
+- Re-transcribes accumulated audio each cycle (state recreated per call)
 
 ### Future Phases (not yet scheduled)
 
