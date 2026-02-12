@@ -1,0 +1,11 @@
+.{
+    .name = .whisper_dictate,
+    .version = "0.0.1",
+    .fingerprint = 0xe154d7029fa78d73,
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
