@@ -61,14 +61,27 @@ pub const Pipeline = struct {
         c.whisper_free_state(self.state);
         self.state = c.whisper_init_state(self.ctx) orelse return error.StateInitFailed;
 
+        // Whisper expects 30-second (480000 sample) input. Short audio gets
+        // immediate EOT from the decoder because the encoder output is too short.
+        // Pad with silence (zeros) like whisper_full does internally.
+        const whisper_n_samples: usize = 480000; // 30 seconds at 16kHz
+        const padded = if (samples.len < whisper_n_samples) blk: {
+            const buf = try self.allocator.alloc(f32, whisper_n_samples);
+            @memcpy(buf[0..samples.len], samples);
+            @memset(buf[samples.len..], 0);
+            break :blk buf;
+        } else null;
+        defer if (padded) |p| self.allocator.free(p);
+
+        const mel_samples = padded orelse samples;
+
         // Step 1: Mel spectrogram
-        if (c.whisper_pcm_to_mel_with_state(self.ctx, self.state, samples.ptr, @intCast(samples.len), self.n_threads) != 0) {
+        if (c.whisper_pcm_to_mel_with_state(self.ctx, self.state, mel_samples.ptr, @intCast(mel_samples.len), self.n_threads) != 0) {
             return error.MelFailed;
         }
 
-        // Content frames in encoder output space (50 frames/second)
-        const mel_len: usize = @intCast(c.whisper_n_len_from_state(self.state));
-        const content_frames: usize = mel_len / 2;
+        // Content frames from actual audio (not padding) in encoder output space (50 frames/second)
+        const content_frames: usize = samples.len / 320;
 
         // Step 2: Encode
         if (c.whisper_encode_with_state(self.ctx, self.state, 0, self.n_threads) != 0) {
@@ -78,9 +91,18 @@ pub const Pipeline = struct {
         // Step 3: Build prompt: [sot] [lang_en] [transcribe] [notimestamps]
         var prompt = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
 
-        // Decode prompt (n_past=0 clears KV cache automatically)
+        // Decode prompt in two parts: batch the first N-1 tokens, then decode the
+        // last token separately. whisper.cpp only populates logits for the last token
+        // in a batch, but whisper_get_logits_from_state always reads from offset 0.
+        // Decoding the last token alone ensures logits[0..n_vocab] is correct.
         if (c.whisper_decode_with_state_and_aheads(
-            self.ctx, self.state, &prompt, @intCast(prompt.len), 0, self.n_threads,
+            self.ctx, self.state, &prompt, @intCast(prompt.len - 1), 0, self.n_threads,
+        ) != 0) {
+            return error.PromptDecodeFailed;
+        }
+        var last_prompt = [_]c.whisper_token{prompt[prompt.len - 1]};
+        if (c.whisper_decode_with_state_and_aheads(
+            self.ctx, self.state, &last_prompt, 1, @intCast(prompt.len - 1), self.n_threads,
         ) != 0) {
             return error.PromptDecodeFailed;
         }

@@ -63,13 +63,20 @@ pub const Server = struct {
         var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4);
         defer pipeline.deinit();
 
+        const start_ns = std.time.nanoTimestamp();
+
         // Audio buffer (raw PCM S16_LE bytes)
         var pcm_buf = std.ArrayListUnmanaged(u8){};
         defer pcm_buf.deinit(self.allocator);
 
-        // Previously emitted text for delta computation
-        var emitted_text = std.ArrayListUnmanaged(u8){};
-        defer emitted_text.deinit(self.allocator);
+        // Previous transcription result — used to confirm stability
+        var prev_text = std.ArrayListUnmanaged(u8){};
+        defer prev_text.deinit(self.allocator);
+
+        // Word-level tracking: how many words have been sent to the client.
+        // Word-level (not byte-level) makes delta computation robust to
+        // Whisper changing punctuation between cycles ("so" vs "so,").
+        var emitted_words: usize = 0;
 
         var recv_buf: [32768]u8 = undefined;
         var state: State = .idle;
@@ -103,7 +110,7 @@ pub const Server = struct {
 
             bytes_since_last_cycle = 0;
 
-            // Final flush on disconnect
+            // Final flush on disconnect — emit everything, no stability wait
             if (client_closed) {
                 if (state == .speaking or state == .trailing_silence) {
                     if (pcm_buf.items.len >= min_transcribe_bytes) {
@@ -114,11 +121,9 @@ pub const Server = struct {
                             if (result.text.len > 0) {
                                 defer self.allocator.free(result.text);
                                 const text = std.mem.trim(u8, result.text, " ");
-                                const delta = computeDelta(emitted_text.items, text);
+                                const delta = wordDelta(text, emitted_words);
                                 if (delta.len > 0) {
-                                    _ = posix.write(conn, delta) catch {};
-                                    _ = posix.write(conn, "\n") catch {};
-                                    std.debug.print("  >> {s}\n", .{delta});
+                                    emitDelta(conn, start_ns, delta) catch {};
                                 }
                             }
                         }
@@ -142,10 +147,13 @@ pub const Server = struct {
             var should_transcribe = false;
             var should_flush = false;
 
+            var ts_buf: [32]u8 = undefined;
+
             switch (state) {
                 .idle => {
                     if (has_speech) {
-                        std.debug.print("[state] idle → speaking\n", .{});
+                        const ts = formatElapsed(&ts_buf, start_ns);
+                        std.debug.print("[{s}s] idle → speaking (buf={d})\n", .{ ts, pcm_buf.items.len });
                         state = .speaking;
                         should_transcribe = true;
                     } else {
@@ -155,7 +163,8 @@ pub const Server = struct {
                 },
                 .speaking => {
                     if (!has_speech) {
-                        std.debug.print("[state] speaking → trailing_silence\n", .{});
+                        const ts = formatElapsed(&ts_buf, start_ns);
+                        std.debug.print("[{s}s] speaking → trailing_silence (buf={d})\n", .{ ts, pcm_buf.items.len });
                         state = .trailing_silence;
                         silence_start_pos = pcm_buf.items.len;
                         continue;
@@ -164,7 +173,8 @@ pub const Server = struct {
                 },
                 .trailing_silence => {
                     if (has_speech) {
-                        std.debug.print("[state] trailing_silence → speaking\n", .{});
+                        const ts = formatElapsed(&ts_buf, start_ns);
+                        std.debug.print("[{s}s] trailing_silence → speaking (buf={d})\n", .{ ts, pcm_buf.items.len });
                         state = .speaking;
                         should_transcribe = true;
                     } else if (pcm_buf.items.len - silence_start_pos >= silence_timeout_bytes) {
@@ -177,39 +187,53 @@ pub const Server = struct {
 
             // Transcribe and emit delta
             if (should_transcribe or should_flush) {
-                const is_last = should_flush;
-
                 if (pcm_buf.items.len >= min_transcribe_bytes) {
                     const all_samples = try pcmToFloat(self.allocator, pcm_buf.items);
                     defer self.allocator.free(all_samples);
 
-                    if (try pipeline.transcribe(all_samples, is_last)) |result| {
+                    // Always pass is_last=true to pipeline: AlignAtt's frame_threshold=25
+                    // is too conservative for short buffers (null for <8s audio).
+                    // Stability check handles hallucination filtering instead.
+                    if (try pipeline.transcribe(all_samples, true)) |result| {
                         // result.text is "" (string literal) on rewind — only free if allocated
                         if (result.text.len > 0) {
                             defer self.allocator.free(result.text);
                             const text = std.mem.trim(u8, result.text, " ");
-                            const delta = computeDelta(emitted_text.items, text);
-                            if (delta.len > 0) {
-                                _ = posix.write(conn, delta) catch return;
-                                _ = posix.write(conn, "\n") catch return;
-                                std.debug.print("  >> {s}\n", .{delta});
-                                if (!is_last) {
-                                    try emitted_text.appendSlice(self.allocator, delta);
+
+                            if (should_flush) {
+                                // Utterance ended — emit everything remaining
+                                const delta = wordDelta(text, emitted_words);
+                                if (delta.len > 0) {
+                                    emitDelta(conn, start_ns, delta) catch return;
                                 }
-                            } else if (emitted_text.items.len > 0 and text.len > 0) {
-                                // Whisper rephrased earlier text — resync so we don't get stuck
-                                std.debug.print("  [resync] emitted={d} new={d}\n", .{ emitted_text.items.len, text.len });
-                                emitted_text.clearRetainingCapacity();
-                                try emitted_text.appendSlice(self.allocator, text);
+                            } else if (prev_text.items.len > 0) {
+                                // Require stability: only emit words present in both prev and current.
+                                // Word-level comparison tolerates punctuation changes ("so" vs "so,").
+                                const stable_words = stableWordCount(prev_text.items, text);
+                                if (stable_words > emitted_words) {
+                                    const start_byte = byteOffsetAfterWords(text, emitted_words);
+                                    const end_byte = byteOffsetAfterWords(text, stable_words);
+                                    if (end_byte > start_byte) {
+                                        emitDelta(conn, start_ns, text[start_byte..end_byte]) catch return;
+                                        emitted_words = stable_words;
+                                    }
+                                }
                             }
+                            // else: first cycle, no prev — just record, don't emit yet
+
+                            // Update prev for next stability check
+                            prev_text.clearRetainingCapacity();
+                            try prev_text.appendSlice(self.allocator, text);
                         }
                     }
                 }
 
                 if (should_flush) {
-                    std.debug.print("[state] flush → idle\n", .{});
+                    const flush_ts = formatElapsed(&ts_buf, start_ns);
+                    std.debug.print("[{s}s] flush → idle\n", .{flush_ts});
                     trimBuffer(&pcm_buf, vad_window_bytes);
-                    emitted_text.clearRetainingCapacity();
+                    emitted_words = 0;
+                    prev_text.clearRetainingCapacity();
                     state = .idle;
                 } else {
                     trimBuffer(&pcm_buf, max_buffer_bytes);
@@ -218,6 +242,24 @@ pub const Server = struct {
         }
     }
 };
+
+/// Format elapsed time since start_ns as "{s}.{tenths}" into buf.
+fn formatElapsed(buf: []u8, start_ns: i128) []u8 {
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ms: u64 = @intCast(@max(0, @divTrunc(elapsed_ns, 1_000_000)));
+    return std.fmt.bufPrint(buf, "{d}.{d}", .{ elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch buf[0..3];
+}
+
+/// Write a timestamped delta to the connection and log it.
+fn emitDelta(conn: posix.socket_t, start_ns: i128, delta: []const u8) error{BrokenPipe}!void {
+    var ts_buf: [32]u8 = undefined;
+    const ts = formatElapsed(&ts_buf, start_ns);
+    _ = posix.write(conn, ts) catch return error.BrokenPipe;
+    _ = posix.write(conn, "\t") catch return error.BrokenPipe;
+    _ = posix.write(conn, delta) catch return error.BrokenPipe;
+    _ = posix.write(conn, "\n") catch return error.BrokenPipe;
+    std.debug.print("  [{s}s] >> {s}\n", .{ ts, delta });
+}
 
 fn pcmToFloat(allocator: std.mem.Allocator, pcm_bytes: []const u8) ![]f32 {
     const n_samples = pcm_bytes.len / 2;
@@ -234,16 +276,78 @@ fn pcmToFloat(allocator: std.mem.Allocator, pcm_bytes: []const u8) ![]f32 {
     return result;
 }
 
-/// Find the new text that extends beyond what was already emitted.
-/// Returns "" if new_text diverges from emitted (Whisper rephrased).
-fn computeDelta(emitted: []const u8, new_text: []const u8) []const u8 {
-    const min_len = @min(emitted.len, new_text.len);
-    var common_len: usize = 0;
-    while (common_len < min_len) : (common_len += 1) {
-        if (emitted[common_len] != new_text[common_len]) break;
+/// Return byte offset in `text` just past the Nth word.
+/// If n >= total words, returns text.len.
+fn byteOffsetAfterWords(text: []const u8, n: usize) usize {
+    if (n == 0) return 0;
+    var words: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        // skip spaces
+        while (i < text.len and text[i] == ' ') : (i += 1) {}
+        if (i >= text.len) break;
+        // found a word
+        words += 1;
+        // skip word chars
+        while (i < text.len and text[i] != ' ') : (i += 1) {}
+        if (words == n) return i;
     }
-    if (common_len < emitted.len) return "";
-    return new_text[common_len..];
+    return text.len;
+}
+
+/// Get text from position after `skip_words` to end.
+fn wordDelta(text: []const u8, skip_words: usize) []const u8 {
+    return text[byteOffsetAfterWords(text, skip_words)..];
+}
+
+/// Strip trailing punctuation from a word for comparison purposes.
+fn stripTrailingPunct(word: []const u8) []const u8 {
+    var end = word.len;
+    while (end > 0) {
+        switch (word[end - 1]) {
+            '.', ',', '!', '?', ';', ':' => end -= 1,
+            else => break,
+        }
+    }
+    return word[0..end];
+}
+
+/// Case-insensitive byte comparison for ASCII text.
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
+}
+
+/// Count how many leading words are stable (present in both a and b).
+/// Words are compared case-insensitively after stripping trailing punctuation.
+fn stableWordCount(a: []const u8, b: []const u8) usize {
+    var ia: usize = 0;
+    var ib: usize = 0;
+    var stable: usize = 0;
+
+    while (ia < a.len and ib < b.len) {
+        // skip spaces
+        while (ia < a.len and a[ia] == ' ') : (ia += 1) {}
+        while (ib < b.len and b[ib] == ' ') : (ib += 1) {}
+        if (ia >= a.len or ib >= b.len) break;
+
+        // extract word
+        const wa_start = ia;
+        while (ia < a.len and a[ia] != ' ') : (ia += 1) {}
+        const wb_start = ib;
+        while (ib < b.len and b[ib] != ' ') : (ib += 1) {}
+
+        const wa = stripTrailingPunct(a[wa_start..ia]);
+        const wb = stripTrailingPunct(b[wb_start..ib]);
+
+        if (!eqlIgnoreCase(wa, wb)) break;
+        stable += 1;
+    }
+
+    return stable;
 }
 
 /// Trim buffer to keep only the last `keep_bytes`, aligned to sample boundary.

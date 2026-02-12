@@ -275,6 +275,8 @@ process_output() {
         arecord -f S16_LE -c1 -r 16000 -t raw -D default 2>>"$LOG_FILE" | \
             nc "$SERVER_HOST" "$SERVER_PORT" | while read -r line; do
             if is_key_pressed && [[ -n "$line" ]]; then
+                # Strip timestamp prefix (e.g. "2.3\ttext" → "text")
+                line="${line#*$'\t'}"
                 # Server sends clean text — just normalize whitespace and punctuation spacing
                 clean_line=$(echo "$line" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*\([.,!?;:]\)/\1/g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                 if [[ -n "$clean_line" ]]; then
