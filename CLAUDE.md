@@ -30,13 +30,16 @@ mise exec zig -- zig build test
 mise exec zig -- zig build prop-test
 
 # Short integration test: stream jfk.wav (~11s) at real-time rate
-./test-stream.sh jfk.wav 43007
+./test-stream.sh jfk.wav
 
 # Long integration test: loop jfk.wav 20x (~3.7 min) to verify sliding window stability
-./test-long-stream.sh 43007
+./test-long-stream.sh
+
+# Comparison test: stream long-recording.wav, compare against batch transcript (~1m42s)
+./test-compare.sh
 ```
 
-Unit tests live inline in `src/utils.zig` and `src/alignatt.zig` (pure Zig modules with no C deps). Property-based tests in `src/prop_tests.zig` use [minish](https://github.com/CogitatorTech/minish) for fuzz-like coverage of word-level delta/stability functions. Integration tests use `pv -qL 32000` to rate-limit raw PCM to 16kHz S16 mono and require a running server.
+Unit tests live inline in `src/utils.zig` and `src/alignatt.zig` (pure Zig modules with no C deps). Property-based tests in `src/prop_tests.zig` use [minish](https://github.com/CogitatorTech/minish) for fuzz-like coverage of word-level delta/stability functions. Integration tests are self-contained: each script starts its own server with `--port 0` (OS-assigned port), parses the port from the "Listening on port" log line, and cleans up on exit. They use `pv -qL 32000` to rate-limit raw PCM to 16kHz S16 mono.
 
 **When writing new code, add unit tests for any pure functions** (functions that don't depend on whisper.cpp C types). Keep testable logic in modules that don't import `whisper_c.zig` so tests run fast without requiring the GPU or model.
 
@@ -78,6 +81,10 @@ Static linking is intentionally avoided — Zig's bundled libc++ conflicts with 
 - **AlignAtt always `is_last=true`**: The frame_threshold=25 is too conservative for short streaming buffers. Server-side word stability checking handles hallucination filtering instead.
 - **Word-level delta tracking**: Stability is checked at word granularity (not byte), using case-insensitive comparison with trailing punctuation stripped. This handles Whisper changing "so" to "so," between cycles.
 - **Sliding window**: Audio buffer capped at 15s (`max_buffer_bytes=480000`). When trimmed, prev_text offset scanning (up to 6 words) realigns the emitted word count.
+
+## Workflow
+
+**Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test. Use `test-compare.sh` to get a baseline before and after changes — it gives concrete word coverage numbers to measure improvement.
 
 ## Conventions
 

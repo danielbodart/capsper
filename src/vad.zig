@@ -29,8 +29,22 @@ pub const Vad = struct {
     }
 
     /// Detect whether audio contains speech.
+    /// whisper_vad_detect_speech returns a success bool, not a speech indicator.
+    /// We must read the per-chunk probabilities it computes and check the threshold.
     pub fn hasSpeech(self: *Vad, samples: []const f32) bool {
-        return c.whisper_vad_detect_speech(self.vctx, samples.ptr, @intCast(samples.len));
+        const ok = c.whisper_vad_detect_speech(self.vctx, samples.ptr, @intCast(samples.len));
+        if (!ok) return false;
+
+        const n_probs = c.whisper_vad_n_probs(self.vctx);
+        if (n_probs <= 0) return false;
+
+        const probs: [*]const f32 = c.whisper_vad_probs(self.vctx) orelse return false;
+        const n: usize = @intCast(n_probs);
+        var max_prob: f32 = 0.0;
+        for (probs[0..n]) |p| {
+            if (p > max_prob) max_prob = p;
+        }
+        return max_prob >= self.params.threshold;
     }
 
     /// Get speech segments from audio samples.

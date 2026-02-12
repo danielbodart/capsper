@@ -16,6 +16,7 @@ pub const Timing = struct {
 
 pub const TranscribeResult = struct {
     text: []const u8,
+    words: []const utils.TimedWord,
     was_rewind: bool,
     timing: Timing,
 };
@@ -141,6 +142,10 @@ pub const Pipeline = struct {
         var generated = std.ArrayListUnmanaged(c.whisper_token){};
         defer generated.deinit(self.allocator);
 
+        // Parallel array: audio frame for each generated token (from cross-attention)
+        var token_frames = std.ArrayListUnmanaged(usize){};
+        defer token_frames.deinit(self.allocator);
+
         var n_past: c_int = @intCast(prompt.len);
         const max_tokens: usize = 224;
         var last_attend_frame: ?usize = null;
@@ -182,6 +187,8 @@ pub const Pipeline = struct {
             }
 
             try generated.append(self.allocator, best_token);
+            // Placeholder frame — updated below after attention analysis
+            try token_frames.append(self.allocator, last_attend_frame orelse 0);
 
             // Decode this token
             var next = [_]c.whisper_token{best_token};
@@ -209,6 +216,9 @@ pub const Pipeline = struct {
             const frame_limit = @min(content_frames, attention.len);
             const most_attended = alignatt.argmax(attention[0..frame_limit]);
 
+            // Update the frame for this token
+            token_frames.items[token_frames.items.len - 1] = most_attended;
+
             const decision = alignatt.checkStopping(
                 most_attended, content_frames, last_attend_frame, is_last, self.config,
             );
@@ -217,7 +227,10 @@ pub const Pipeline = struct {
             switch (decision) {
                 .stop_attention_at_end => {
                     // Strip the token that triggered the stop
-                    if (generated.items.len > 0) _ = generated.pop();
+                    if (generated.items.len > 0) {
+                        _ = generated.pop();
+                        _ = token_frames.pop();
+                    }
                     timing.stop_reason = "attn_end";
                     break;
                 },
@@ -225,9 +238,6 @@ pub const Pipeline = struct {
                     std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
                     was_rewind = true;
                     timing.stop_reason = "rewind";
-                    // Keep generated tokens — the server's word-level stability
-                    // check will filter out bad text. Discarding here causes long
-                    // gaps when the sliding window shifts audio context.
                     break;
                 },
                 .continue_decoding => {},
@@ -247,34 +257,77 @@ pub const Pipeline = struct {
         }
 
         // Step 5: Word boundary truncation (unless is_last)
-        var tokens_to_decode: []const c.whisper_token = generated.items;
-        if (!is_last and tokens_to_decode.len > 0) {
-            tokens_to_decode = truncateLastWord(self.ctx, tokens_to_decode);
+        var n_tokens_to_use = generated.items.len;
+        if (!is_last and n_tokens_to_use > 0) {
+            n_tokens_to_use = truncateLastWord(self.ctx, generated.items);
         }
-        if (tokens_to_decode.len == 0) return null;
+        if (n_tokens_to_use == 0) return null;
 
-        // Step 6: Decode tokens to text
+        const tokens_to_decode = generated.items[0..n_tokens_to_use];
+        const frames_to_use = token_frames.items[0..n_tokens_to_use];
+
+        // Step 6: Decode tokens to text and build TimedWord array
         var text_buf = std.ArrayListUnmanaged(u8){};
         defer text_buf.deinit(self.allocator);
 
-        for (tokens_to_decode) |token| {
+        var words = std.ArrayListUnmanaged(utils.TimedWord){};
+        defer words.deinit(self.allocator);
+
+        var word_start: ?usize = null;
+        var word_frame: usize = 0;
+
+        for (tokens_to_decode, 0..) |token, idx| {
             const str = c.whisper_token_to_str(self.ctx, token);
-            if (str != null) {
-                try text_buf.appendSlice(self.allocator, std.mem.span(str));
+            if (str == null) continue;
+            const slice = std.mem.span(str);
+
+            if (slice.len > 0 and slice[0] == ' ') {
+                // Close previous word if any
+                if (word_start) |ws| {
+                    if (text_buf.items.len > ws) {
+                        try words.append(self.allocator, .{
+                            .text_start = ws,
+                            .text_end = text_buf.items.len,
+                            .frame = word_frame,
+                        });
+                    }
+                }
+                // New word starts after the space
+                word_start = text_buf.items.len + 1;
+                word_frame = frames_to_use[idx];
+            } else if (word_start == null) {
+                // First token doesn't start with space
+                word_start = text_buf.items.len;
+                word_frame = frames_to_use[idx];
+            }
+
+            try text_buf.appendSlice(self.allocator, slice);
+        }
+
+        // Close last word
+        if (word_start) |ws| {
+            if (text_buf.items.len > ws) {
+                try words.append(self.allocator, .{
+                    .text_start = ws,
+                    .text_end = text_buf.items.len,
+                    .frame = word_frame,
+                });
             }
         }
 
         return .{
             .text = try self.allocator.dupe(u8, text_buf.items),
+            .words = try self.allocator.dupe(utils.TimedWord, words.items),
             .was_rewind = was_rewind,
             .timing = timing,
         };
     }
 };
 
-/// Truncate tokens to the last complete word boundary.
-fn truncateLastWord(ctx: *c.whisper_context, tokens: []const c.whisper_token) []const c.whisper_token {
-    if (tokens.len <= 1) return &.{};
+/// Count tokens up to the last complete word boundary.
+/// Returns the number of tokens to keep (0 if no complete word found).
+fn truncateLastWord(ctx: *c.whisper_context, tokens: []const c.whisper_token) usize {
+    if (tokens.len <= 1) return 0;
 
     var last_word_start: ?usize = null;
     for (0..tokens.len) |i| {
@@ -288,8 +341,8 @@ fn truncateLastWord(ctx: *c.whisper_context, tokens: []const c.whisper_token) []
     }
 
     if (last_word_start) |start| {
-        if (start == 0) return &.{};
-        return tokens[0..start];
+        if (start == 0) return 0;
+        return start;
     }
-    return &.{};
+    return 0;
 }

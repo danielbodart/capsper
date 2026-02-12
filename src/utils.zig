@@ -37,56 +37,6 @@ pub fn wordDelta(text: []const u8, skip_words: usize) []const u8 {
     return text[byteOffsetAfterWords(text, skip_words)..];
 }
 
-/// Strip trailing punctuation from a word for comparison purposes.
-pub fn stripTrailingPunct(word: []const u8) []const u8 {
-    var end = word.len;
-    while (end > 0) {
-        switch (word[end - 1]) {
-            '.', ',', '!', '?', ';', ':' => end -= 1,
-            else => break,
-        }
-    }
-    return word[0..end];
-}
-
-/// Case-insensitive byte comparison for ASCII text.
-pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-    }
-    return true;
-}
-
-/// Count how many leading words are stable (present in both a and b).
-/// Words are compared case-insensitively after stripping trailing punctuation.
-pub fn stableWordCount(a: []const u8, b: []const u8) usize {
-    var ia: usize = 0;
-    var ib: usize = 0;
-    var stable: usize = 0;
-
-    while (ia < a.len and ib < b.len) {
-        // skip spaces
-        while (ia < a.len and a[ia] == ' ') : (ia += 1) {}
-        while (ib < b.len and b[ib] == ' ') : (ib += 1) {}
-        if (ia >= a.len or ib >= b.len) break;
-
-        // extract word
-        const wa_start = ia;
-        while (ia < a.len and a[ia] != ' ') : (ia += 1) {}
-        const wb_start = ib;
-        while (ib < b.len and b[ib] != ' ') : (ib += 1) {}
-
-        const wa = stripTrailingPunct(a[wa_start..ia]);
-        const wb = stripTrailingPunct(b[wb_start..ib]);
-
-        if (!eqlIgnoreCase(wa, wb)) break;
-        stable += 1;
-    }
-
-    return stable;
-}
-
 /// Return a short preview of text for logging (first ~60 chars).
 pub fn textPreview(text: []const u8) []const u8 {
     return if (text.len <= 60) text else text[0..60];
@@ -131,34 +81,31 @@ pub fn isBlankOrPunct(text: []const u8) bool {
     return true;
 }
 
-/// Result of the flexible stability matching algorithm.
-pub const StabilityResult = struct {
-    stable_words: usize,
-    prev_skip: usize,
+/// A word with its audio frame position from cross-attention analysis.
+/// frame is in encoder frame units (50fps = 20ms/frame).
+pub const TimedWord = struct {
+    text_start: usize, // byte offset into result text (first char of word, after space)
+    text_end: usize, // byte offset one past last char of word
+    frame: usize, // audio frame (relative to PCM buffer start)
 };
 
-/// Find stable words between prev and current transcription, accounting for
-/// sliding window shifts. When the audio buffer is trimmed from the front,
-/// the new transcription loses leading words that prev still has. This tries
-/// small offsets (skip 1-6 words from prev) to find alignment.
-pub fn findStableWords(prev_text: []const u8, text: []const u8, emitted_words: usize) StabilityResult {
-    var stable_words = stableWordCount(prev_text, text);
-    var prev_skip: usize = 0;
-
-    if (stable_words <= emitted_words) {
-        for (1..7) |skip| {
-            const offset = byteOffsetAfterWords(prev_text, skip);
-            if (offset >= prev_text.len) break;
-            const shifted = stableWordCount(prev_text[offset..], text);
-            if (shifted >= 3) {
-                stable_words = shifted;
-                prev_skip = skip;
+/// Count how many words in the contiguous prefix of `curr` have a frame-matching
+/// word in `prev` (within ±tolerance frames). Stops at the first unmatched word.
+pub fn findTimedStableCount(prev: []const TimedWord, curr: []const TimedWord, tolerance: usize) usize {
+    var count: usize = 0;
+    for (curr) |cw| {
+        var matched = false;
+        for (prev) |pw| {
+            const diff = if (cw.frame >= pw.frame) cw.frame - pw.frame else pw.frame - cw.frame;
+            if (diff <= tolerance) {
+                matched = true;
                 break;
             }
         }
+        if (!matched) break;
+        count += 1;
     }
-
-    return .{ .stable_words = stable_words, .prev_skip = prev_skip };
+    return count;
 }
 
 /// Parse a WAV file header from raw bytes. Returns metadata needed to extract samples.
@@ -300,93 +247,6 @@ test "wordDelta: skip all returns empty" {
 
 test "wordDelta: skip more than total returns empty" {
     try std.testing.expectEqualStrings("", wordDelta("hello", 5));
-}
-
-test "stripTrailingPunct: no punctuation" {
-    try std.testing.expectEqualStrings("hello", stripTrailingPunct("hello"));
-}
-
-test "stripTrailingPunct: single comma" {
-    try std.testing.expectEqualStrings("hello", stripTrailingPunct("hello,"));
-}
-
-test "stripTrailingPunct: multiple punctuation" {
-    try std.testing.expectEqualStrings("hello", stripTrailingPunct("hello..."));
-}
-
-test "stripTrailingPunct: all punctuation" {
-    try std.testing.expectEqualStrings("", stripTrailingPunct("!?."));
-}
-
-test "stripTrailingPunct: empty string" {
-    try std.testing.expectEqualStrings("", stripTrailingPunct(""));
-}
-
-test "stripTrailingPunct: mixed ending" {
-    try std.testing.expectEqualStrings("ok", stripTrailingPunct("ok?!"));
-}
-
-test "eqlIgnoreCase: identical" {
-    try std.testing.expect(eqlIgnoreCase("hello", "hello"));
-}
-
-test "eqlIgnoreCase: different case" {
-    try std.testing.expect(eqlIgnoreCase("Hello", "hello"));
-    try std.testing.expect(eqlIgnoreCase("HELLO", "hello"));
-}
-
-test "eqlIgnoreCase: different strings" {
-    try std.testing.expect(!eqlIgnoreCase("hello", "world"));
-}
-
-test "eqlIgnoreCase: different lengths" {
-    try std.testing.expect(!eqlIgnoreCase("hello", "hell"));
-}
-
-test "eqlIgnoreCase: empty strings" {
-    try std.testing.expect(eqlIgnoreCase("", ""));
-}
-
-test "stableWordCount: identical texts" {
-    try std.testing.expectEqual(@as(usize, 3), stableWordCount("one two three", "one two three"));
-}
-
-test "stableWordCount: same words different punctuation" {
-    try std.testing.expectEqual(@as(usize, 2), stableWordCount("hello, world.", "hello world"));
-}
-
-test "stableWordCount: same words different case" {
-    try std.testing.expectEqual(@as(usize, 2), stableWordCount("Ask not", "ask not"));
-}
-
-test "stableWordCount: diverge at word 2" {
-    try std.testing.expectEqual(@as(usize, 2), stableWordCount("one two three", "one two four"));
-}
-
-test "stableWordCount: first word differs" {
-    try std.testing.expectEqual(@as(usize, 0), stableWordCount("hello world", "goodbye world"));
-}
-
-test "stableWordCount: empty strings" {
-    try std.testing.expectEqual(@as(usize, 0), stableWordCount("", ""));
-}
-
-test "stableWordCount: one empty" {
-    try std.testing.expectEqual(@as(usize, 0), stableWordCount("hello", ""));
-    try std.testing.expectEqual(@as(usize, 0), stableWordCount("", "hello"));
-}
-
-test "stableWordCount: b longer than a" {
-    try std.testing.expectEqual(@as(usize, 2), stableWordCount("one two", "one two three four"));
-}
-
-test "stableWordCount: a longer than b" {
-    try std.testing.expectEqual(@as(usize, 2), stableWordCount("one two three four", "one two"));
-}
-
-test "stableWordCount: punctuation on different words" {
-    // "so" vs "so," — trailing punct stripped
-    try std.testing.expectEqual(@as(usize, 3), stableWordCount("and so it", "and so, it"));
 }
 
 test "textPreview: short text unchanged" {
@@ -534,51 +394,95 @@ test "isBlankOrPunct: word starting with space" {
     try std.testing.expect(!isBlankOrPunct(" the"));
 }
 
-// --- findStableWords tests ---
+// --- findTimedStableCount tests ---
 
-test "findStableWords: identical, no prior emission" {
-    const r = findStableWords("one two three", "one two three", 0);
-    try std.testing.expectEqual(@as(usize, 3), r.stable_words);
-    try std.testing.expectEqual(@as(usize, 0), r.prev_skip);
+test "findTimedStableCount: identical words" {
+    const words = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+        .{ .text_start = 4, .text_end = 7, .frame = 20 },
+        .{ .text_start = 8, .text_end = 11, .frame = 30 },
+    };
+    try std.testing.expectEqual(@as(usize, 3), findTimedStableCount(&words, &words, 0));
 }
 
-test "findStableWords: stable exceeds emitted, no offset needed" {
-    const r = findStableWords("one two three", "one two three four", 1);
-    try std.testing.expectEqual(@as(usize, 3), r.stable_words);
-    try std.testing.expectEqual(@as(usize, 0), r.prev_skip);
+test "findTimedStableCount: within tolerance" {
+    const prev = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+        .{ .text_start = 4, .text_end = 7, .frame = 20 },
+    };
+    const curr = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 12 },
+        .{ .text_start = 4, .text_end = 7, .frame = 24 },
+    };
+    try std.testing.expectEqual(@as(usize, 2), findTimedStableCount(&prev, &curr, 5));
 }
 
-test "findStableWords: sliding window shift needs offset" {
-    // prev had "alpha one two three", new text lost "alpha" due to trim.
-    // emitted_words=4, direct stableWordCount("alpha one two three", "one two three")=0
-    // With skip=1: stableWordCount("one two three", "one two three")=3 (>=3) → found
-    const r = findStableWords("alpha one two three", "one two three", 4);
-    try std.testing.expectEqual(@as(usize, 3), r.stable_words);
-    try std.testing.expectEqual(@as(usize, 1), r.prev_skip);
+test "findTimedStableCount: outside tolerance" {
+    const prev = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+    };
+    const curr = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 20 },
+    };
+    try std.testing.expectEqual(@as(usize, 0), findTimedStableCount(&prev, &curr, 5));
 }
 
-test "findStableWords: larger offset" {
-    // prev had "a b c one two three", new lost "a b c" (3 words trimmed).
-    // emitted=6, direct stable=0. skip=3: "one two three" vs "one two three" = 3 → found
-    const r = findStableWords("a b c one two three", "one two three", 6);
-    try std.testing.expectEqual(@as(usize, 3), r.stable_words);
-    try std.testing.expectEqual(@as(usize, 3), r.prev_skip);
+test "findTimedStableCount: stops at first unstable" {
+    const prev = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+        .{ .text_start = 4, .text_end = 7, .frame = 100 },
+        .{ .text_start = 8, .text_end = 11, .frame = 30 },
+    };
+    const curr = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+        .{ .text_start = 4, .text_end = 7, .frame = 20 },
+        .{ .text_start = 8, .text_end = 11, .frame = 30 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), findTimedStableCount(&prev, &curr, 5));
 }
 
-test "findStableWords: no alignment possible" {
-    // Completely different text — no offset will help
-    const r = findStableWords("hello world foo bar", "something completely different xyz", 4);
-    try std.testing.expectEqual(@as(usize, 0), r.stable_words);
-    try std.testing.expectEqual(@as(usize, 0), r.prev_skip);
+test "findTimedStableCount: empty prev" {
+    const curr = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+    };
+    try std.testing.expectEqual(@as(usize, 0), findTimedStableCount(&.{}, &curr, 5));
 }
 
-test "findStableWords: offset needed but fewer than 3 stable" {
-    // After skip, only 2 stable words — below the threshold of 3
-    const r = findStableWords("alpha one two xyz", "one two abc", 3);
-    // Direct: stable=0. skip=1: "one two xyz" vs "one two abc" = 2 (<3, skip).
-    // No offset produces >=3 stable, so falls through with original values.
-    try std.testing.expectEqual(@as(usize, 0), r.stable_words);
-    try std.testing.expectEqual(@as(usize, 0), r.prev_skip);
+test "findTimedStableCount: empty curr" {
+    const prev = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+    };
+    try std.testing.expectEqual(@as(usize, 0), findTimedStableCount(&prev, &.{}, 5));
+}
+
+test "findTimedStableCount: tolerance zero requires exact match" {
+    const prev = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+    };
+    const curr_exact = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+    };
+    const curr_off = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 11 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), findTimedStableCount(&prev, &curr_exact, 0));
+    try std.testing.expectEqual(@as(usize, 0), findTimedStableCount(&prev, &curr_off, 0));
+}
+
+test "findTimedStableCount: matches any prev word not just positional" {
+    // curr[0] at frame 50 matches prev[2] at frame 50 (not positional)
+    const prev = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 10 },
+        .{ .text_start = 4, .text_end = 7, .frame = 30 },
+        .{ .text_start = 8, .text_end = 11, .frame = 50 },
+    };
+    const curr = [_]TimedWord{
+        .{ .text_start = 0, .text_end = 3, .frame = 50 },
+        .{ .text_start = 4, .text_end = 7, .frame = 60 },
+    };
+    // curr[0] frame=50 matches prev[2] frame=50 → stable
+    // curr[1] frame=60 no match (closest is 50, diff=10 > 5) → unstable
+    try std.testing.expectEqual(@as(usize, 1), findTimedStableCount(&prev, &curr, 5));
 }
 
 // --- parseWavHeader tests ---

@@ -27,7 +27,6 @@ const punct_text_gen = mgen.string(.{
 
 // Pairs of text for two-argument properties
 const text_pair_gen = mgen.tuple2([]const u8, []const u8, word_text_gen, word_text_gen);
-const punct_pair_gen = mgen.tuple2([]const u8, []const u8, punct_text_gen, punct_text_gen);
 
 // Numeric generators for alignatt
 const frame_gen = mgen.intRange(usize, 0, 1500); // audio frame indices
@@ -109,108 +108,6 @@ fn prop_wordDelta_reduces_count(text: []const u8) !void {
 }
 
 // ============================================================================
-// stripTrailingPunct properties
-// ============================================================================
-
-// stripTrailingPunct is idempotent: strip(strip(x)) == strip(x)
-fn prop_stripPunct_idempotent(text: []const u8) !void {
-    const once = utils.stripTrailingPunct(text);
-    const twice = utils.stripTrailingPunct(once);
-    try std.testing.expectEqualStrings(once, twice);
-}
-
-// stripTrailingPunct result is a prefix of the input
-fn prop_stripPunct_is_prefix(text: []const u8) !void {
-    const stripped = utils.stripTrailingPunct(text);
-    try std.testing.expect(stripped.len <= text.len);
-    if (stripped.len > 0) {
-        try std.testing.expectEqualStrings(stripped, text[0..stripped.len]);
-    }
-}
-
-// ============================================================================
-// eqlIgnoreCase properties
-// ============================================================================
-
-// eqlIgnoreCase is reflexive: eqlIgnoreCase(a, a) is always true
-fn prop_eqlIgnoreCase_reflexive(text: []const u8) !void {
-    try std.testing.expect(utils.eqlIgnoreCase(text, text));
-}
-
-// eqlIgnoreCase is symmetric: eqlIgnoreCase(a, b) == eqlIgnoreCase(b, a)
-fn prop_eqlIgnoreCase_symmetric(pair: struct { []const u8, []const u8 }) !void {
-    try std.testing.expectEqual(
-        utils.eqlIgnoreCase(pair[0], pair[1]),
-        utils.eqlIgnoreCase(pair[1], pair[0]),
-    );
-}
-
-// ============================================================================
-// stableWordCount properties
-// ============================================================================
-
-// stableWordCount is reflexive: stableWordCount(a, a) == countWords(a)
-fn prop_stable_reflexive(text: []const u8) !void {
-    const trimmed = std.mem.trim(u8, text, " ");
-    try std.testing.expectEqual(utils.countWords(trimmed), utils.stableWordCount(trimmed, trimmed));
-}
-
-// stableWordCount is bounded: stableWordCount(a, b) <= min(countWords(a), countWords(b))
-fn prop_stable_bounded(pair: struct { []const u8, []const u8 }) !void {
-    const stable = utils.stableWordCount(pair[0], pair[1]);
-    const min_words = @min(utils.countWords(pair[0]), utils.countWords(pair[1]));
-    try std.testing.expect(stable <= min_words);
-}
-
-// stableWordCount is symmetric under case: stableWordCount(lower(a), a) == stableWordCount(a, a)
-// (Because eqlIgnoreCase is used internally)
-fn prop_stable_case_insensitive(text: []const u8) !void {
-    const trimmed = std.mem.trim(u8, text, " ");
-    // Our word_text_gen only produces lowercase, but still good to test
-    const baseline = utils.stableWordCount(trimmed, trimmed);
-    try std.testing.expectEqual(baseline, utils.stableWordCount(trimmed, trimmed));
-}
-
-// ============================================================================
-// findStableWords properties
-// ============================================================================
-
-// findStableWords result is bounded
-fn prop_findStable_bounded(pair: struct { []const u8, []const u8 }) !void {
-    const r = utils.findStableWords(pair[0], pair[1], 0);
-    const words_b = utils.countWords(pair[1]);
-    try std.testing.expect(r.stable_words <= words_b);
-    try std.testing.expect(r.prev_skip <= 6); // max offset tried is 6
-}
-
-// findStableWords with emitted=0 should match stableWordCount when no offset needed
-fn prop_findStable_matches_basic(pair: struct { []const u8, []const u8 }) !void {
-    const r = utils.findStableWords(pair[0], pair[1], 0);
-    const direct = utils.stableWordCount(pair[0], pair[1]);
-    // When emitted=0 and direct > 0, no offset search is triggered
-    if (direct > 0) {
-        try std.testing.expectEqual(direct, r.stable_words);
-        try std.testing.expectEqual(@as(usize, 0), r.prev_skip);
-    }
-}
-
-// findStableWords: consistency — if stable_words > 0 and prev_skip > 0,
-// then the offset-shifted prev must actually share those words with text
-fn prop_findStable_offset_consistent(pair: struct { []const u8, []const u8 }) !void {
-    // Use a large emitted_words to force offset search
-    const emitted = utils.countWords(pair[0]);
-    const r = utils.findStableWords(pair[0], pair[1], emitted);
-    if (r.prev_skip > 0 and r.stable_words >= 3) {
-        // Verify the offset actually works
-        const offset = utils.byteOffsetAfterWords(pair[0], r.prev_skip);
-        if (offset < pair[0].len) {
-            const shifted_stable = utils.stableWordCount(pair[0][offset..], pair[1]);
-            try std.testing.expectEqual(r.stable_words, shifted_stable);
-        }
-    }
-}
-
-// ============================================================================
 // pcmToFloat roundtrip property
 // ============================================================================
 
@@ -281,7 +178,7 @@ fn prop_trimBuffer_preserves_tail(text: []const u8) !void {
 }
 
 // ============================================================================
-// Deeper cross-function properties (most likely to find bugs)
+// Cross-function properties
 // ============================================================================
 
 // byteOffsetAfterWords roundtrip: countWords(text[0..offset(text, n)]) == n
@@ -299,80 +196,6 @@ fn prop_byteOffset_countWords_roundtrip(text: []const u8) !void {
     }
 }
 
-// stableWordCount agreement: if stableWordCount(a, b) = n, then the first n
-// words of a and b match (case-insensitive, punct-stripped)
-fn prop_stable_prefix_agreement(pair: struct { []const u8, []const u8 }) !void {
-    const n = utils.stableWordCount(pair[0], pair[1]);
-    if (n == 0) return;
-
-    // Extract the first n words from each
-    var ia: usize = 0;
-    var ib: usize = 0;
-    for (0..n) |_| {
-        while (ia < pair[0].len and pair[0][ia] == ' ') : (ia += 1) {}
-        while (ib < pair[1].len and pair[1][ib] == ' ') : (ib += 1) {}
-        const wa_start = ia;
-        while (ia < pair[0].len and pair[0][ia] != ' ') : (ia += 1) {}
-        const wb_start = ib;
-        while (ib < pair[1].len and pair[1][ib] != ' ') : (ib += 1) {}
-        const wa = utils.stripTrailingPunct(pair[0][wa_start..ia]);
-        const wb = utils.stripTrailingPunct(pair[1][wb_start..ib]);
-        try std.testing.expect(utils.eqlIgnoreCase(wa, wb));
-    }
-}
-
-// Streaming simulation: construct prev and current like the server would.
-// Take text, split at some word boundary, verify findStableWords + wordDelta
-// reconstructs a valid emission.
-fn prop_streaming_simulation(text: []const u8) !void {
-    const trimmed = std.mem.trim(u8, text, " ");
-    const total = utils.countWords(trimmed);
-    if (total < 4) return;
-
-    // Simulate: prev transcription = first (total-1) words
-    // Current transcription = all words (Whisper added one more word)
-    const prev_end = utils.byteOffsetAfterWords(trimmed, total - 1);
-    const prev = trimmed[0..prev_end];
-
-    // emitted_words = total - 3 (we've already emitted most words)
-    const emitted: usize = if (total > 3) total - 3 else 0;
-    const r = utils.findStableWords(prev, trimmed, emitted);
-
-    // Stable words should be at least the overlap (total - 1 words match)
-    try std.testing.expect(r.stable_words >= 1);
-
-    // The delta from stable_words should be valid text
-    if (r.stable_words > emitted) {
-        const start_byte = utils.byteOffsetAfterWords(trimmed, emitted);
-        const end_byte = utils.byteOffsetAfterWords(trimmed, r.stable_words);
-        try std.testing.expect(end_byte >= start_byte);
-        try std.testing.expect(end_byte <= trimmed.len);
-    }
-}
-
-// Sliding window simulation: prev has extra leading words that current lost.
-// Verifies findStableWords finds the alignment via offset search.
-fn prop_sliding_window_shift(text: []const u8) !void {
-    const trimmed = std.mem.trim(u8, text, " ");
-    const total = utils.countWords(trimmed);
-    if (total < 5) return;
-
-    // prev = all words, current = last (total-2) words (lost 2 from front)
-    const shift = 2;
-    const current_start = utils.byteOffsetAfterWords(trimmed, shift);
-    const current = std.mem.trimLeft(u8, trimmed[current_start..], " ");
-    const current_words = utils.countWords(current);
-
-    // emitted = total (force offset search since direct match gives <= emitted)
-    const r = utils.findStableWords(trimmed, current, total);
-
-    // Should find alignment at skip=2 with stable_words = current_words
-    if (current_words >= 3) {
-        try std.testing.expect(r.stable_words >= 3);
-        try std.testing.expectEqual(@as(usize, shift), r.prev_skip);
-    }
-}
-
 // wordDelta + countWords: emitting wordDelta(text, n) should give us
 // exactly countWords(text) - n words (for well-formed trimmed text)
 fn prop_wordDelta_word_count(text: []const u8) !void {
@@ -385,6 +208,106 @@ fn prop_wordDelta_word_count(text: []const u8) !void {
         const delta_trimmed = std.mem.trimLeft(u8, delta, " ");
         try std.testing.expectEqual(total - n, utils.countWords(delta_trimmed));
     }
+}
+
+// ============================================================================
+// findTimedStableCount properties
+// ============================================================================
+
+// Reflexive: same words always match themselves (tolerance >= 0)
+fn prop_timedStable_reflexive(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const word_count = 1 + (n % 10); // 1..10 words
+    const words = try allocator.alloc(utils.TimedWord, word_count);
+    defer allocator.free(words);
+
+    var frame: usize = 0;
+    for (words) |*w| {
+        frame += prng.random().intRangeAtMost(usize, 1, 50);
+        w.* = .{ .text_start = 0, .text_end = 1, .frame = frame };
+    }
+
+    // Same words should always fully match with tolerance 0
+    try std.testing.expectEqual(word_count, utils.findTimedStableCount(words, words, 0));
+}
+
+// Larger tolerance never decreases the stable count
+fn prop_timedStable_tolerance_monotonic(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const count = 1 + (n % 8);
+
+    const prev = try allocator.alloc(utils.TimedWord, count);
+    defer allocator.free(prev);
+    const curr = try allocator.alloc(utils.TimedWord, count);
+    defer allocator.free(curr);
+
+    var frame: usize = 0;
+    for (prev) |*w| {
+        frame += prng.random().intRangeAtMost(usize, 1, 50);
+        w.* = .{ .text_start = 0, .text_end = 1, .frame = frame };
+    }
+    frame = 0;
+    for (curr) |*w| {
+        frame += prng.random().intRangeAtMost(usize, 1, 50);
+        w.* = .{ .text_start = 0, .text_end = 1, .frame = frame };
+    }
+
+    const stable_0 = utils.findTimedStableCount(prev, curr, 0);
+    const stable_5 = utils.findTimedStableCount(prev, curr, 5);
+    const stable_50 = utils.findTimedStableCount(prev, curr, 50);
+
+    try std.testing.expect(stable_0 <= stable_5);
+    try std.testing.expect(stable_5 <= stable_50);
+}
+
+// Empty prev always returns 0
+fn prop_timedStable_empty_prev(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const count = 1 + (n % 10);
+    const curr = try allocator.alloc(utils.TimedWord, count);
+    defer allocator.free(curr);
+    for (curr, 0..) |*w, i| {
+        w.* = .{ .text_start = 0, .text_end = 1, .frame = i * 10 };
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), utils.findTimedStableCount(&.{}, curr, 100));
+}
+
+// Result is bounded by min(prev.len, curr.len)
+fn prop_timedStable_bounded(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const prev_count = 1 + (n % 8);
+    const curr_count = 1 + ((n / 8) % 8);
+
+    const prev = try allocator.alloc(utils.TimedWord, prev_count);
+    defer allocator.free(prev);
+    const curr = try allocator.alloc(utils.TimedWord, curr_count);
+    defer allocator.free(curr);
+
+    for (prev) |*w| {
+        w.* = .{ .text_start = 0, .text_end = 1, .frame = prng.random().intRangeAtMost(usize, 0, 500) };
+    }
+    for (curr) |*w| {
+        w.* = .{ .text_start = 0, .text_end = 1, .frame = prng.random().intRangeAtMost(usize, 0, 500) };
+    }
+
+    const stable = utils.findTimedStableCount(prev, curr, 5);
+    try std.testing.expect(stable <= curr_count);
 }
 
 // ============================================================================
@@ -698,34 +621,6 @@ pub fn main() !void {
     std.debug.print("prop: wordDelta reduces count... ", .{});
     try minish.check(allocator, word_text_gen, prop_wordDelta_reduces_count, .{ .num_runs = runs });
 
-    // stripTrailingPunct
-    std.debug.print("prop: stripPunct idempotent... ", .{});
-    try minish.check(allocator, punct_text_gen, prop_stripPunct_idempotent, .{ .num_runs = runs });
-    std.debug.print("prop: stripPunct is prefix... ", .{});
-    try minish.check(allocator, punct_text_gen, prop_stripPunct_is_prefix, .{ .num_runs = runs });
-
-    // eqlIgnoreCase
-    std.debug.print("prop: eqlIgnoreCase reflexive... ", .{});
-    try minish.check(allocator, word_text_gen, prop_eqlIgnoreCase_reflexive, .{ .num_runs = runs });
-    std.debug.print("prop: eqlIgnoreCase symmetric... ", .{});
-    try minish.check(allocator, text_pair_gen, prop_eqlIgnoreCase_symmetric, .{ .num_runs = runs });
-
-    // stableWordCount
-    std.debug.print("prop: stableWordCount reflexive... ", .{});
-    try minish.check(allocator, word_text_gen, prop_stable_reflexive, .{ .num_runs = runs });
-    std.debug.print("prop: stableWordCount bounded... ", .{});
-    try minish.check(allocator, text_pair_gen, prop_stable_bounded, .{ .num_runs = runs });
-    std.debug.print("prop: stableWordCount case insensitive... ", .{});
-    try minish.check(allocator, word_text_gen, prop_stable_case_insensitive, .{ .num_runs = runs });
-
-    // findStableWords
-    std.debug.print("prop: findStableWords bounded... ", .{});
-    try minish.check(allocator, text_pair_gen, prop_findStable_bounded, .{ .num_runs = runs });
-    std.debug.print("prop: findStableWords matches basic... ", .{});
-    try minish.check(allocator, text_pair_gen, prop_findStable_matches_basic, .{ .num_runs = runs });
-    std.debug.print("prop: findStableWords offset consistent... ", .{});
-    try minish.check(allocator, text_pair_gen, prop_findStable_offset_consistent, .{ .num_runs = runs });
-
     // pcmToFloat
     std.debug.print("prop: pcmToFloat range... ", .{});
     try minish.check(allocator, text_pair_gen, prop_pcmToFloat_range, .{ .num_runs = runs });
@@ -743,14 +638,18 @@ pub fn main() !void {
     // Deep cross-function properties
     std.debug.print("prop: byteOffset/countWords roundtrip... ", .{});
     try minish.check(allocator, word_text_gen, prop_byteOffset_countWords_roundtrip, .{ .num_runs = runs });
-    std.debug.print("prop: stableWordCount prefix agreement... ", .{});
-    try minish.check(allocator, punct_pair_gen, prop_stable_prefix_agreement, .{ .num_runs = runs });
-    std.debug.print("prop: streaming simulation... ", .{});
-    try minish.check(allocator, word_text_gen, prop_streaming_simulation, .{ .num_runs = runs });
-    std.debug.print("prop: sliding window shift... ", .{});
-    try minish.check(allocator, word_text_gen, prop_sliding_window_shift, .{ .num_runs = runs });
     std.debug.print("prop: wordDelta word count... ", .{});
     try minish.check(allocator, word_text_gen, prop_wordDelta_word_count, .{ .num_runs = runs });
+
+    // findTimedStableCount
+    std.debug.print("prop: timedStable reflexive... ", .{});
+    try minish.check(allocator, frame_gen, prop_timedStable_reflexive, .{ .num_runs = runs });
+    std.debug.print("prop: timedStable tolerance monotonic... ", .{});
+    try minish.check(allocator, frame_gen, prop_timedStable_tolerance_monotonic, .{ .num_runs = runs });
+    std.debug.print("prop: timedStable empty prev... ", .{});
+    try minish.check(allocator, frame_gen, prop_timedStable_empty_prev, .{ .num_runs = runs });
+    std.debug.print("prop: timedStable bounded... ", .{});
+    try minish.check(allocator, frame_gen, prop_timedStable_bounded, .{ .num_runs = runs });
 
     // textPreview
     std.debug.print("prop: textPreview bounded... ", .{});
@@ -788,5 +687,5 @@ pub fn main() !void {
     std.debug.print("prop: analyzeAttention peak preserved... ", .{});
     try minish.check(allocator, small_frame_gen, prop_analyzeAttention_peak_preserved, .{ .num_runs = runs });
 
-    std.debug.print("\nAll 39 property tests passed!\n", .{});
+    std.debug.print("\nAll 31 property tests passed!\n", .{});
 }
