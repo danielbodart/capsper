@@ -125,7 +125,7 @@ pub const Server = struct {
                                 const text = std.mem.trim(u8, result.text, " ");
                                 const delta = utils.wordDelta(text, emitted_words);
                                 if (delta.len > 0) {
-                                    emitDelta(conn, start_ns, delta) catch {};
+                                    emitDelta(conn, start_ns, delta) catch {}; // client may have disconnected; main loop handles it
                                 }
                             }
                         }

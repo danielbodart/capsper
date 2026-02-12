@@ -32,7 +32,6 @@ const punct_pair_gen = mgen.tuple2([]const u8, []const u8, punct_text_gen, punct
 // Numeric generators for alignatt
 const frame_gen = mgen.intRange(usize, 0, 1500); // audio frame indices
 const small_frame_gen = mgen.intRange(usize, 1, 200); // small frame counts for attention arrays
-const bool_gen = mgen.boolean();
 
 // ============================================================================
 // countWords properties

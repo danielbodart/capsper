@@ -30,7 +30,10 @@ pub fn main() !void {
             if (i < args.len) vad_model_path = args[i];
         } else if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
             i += 1;
-            if (i < args.len) port = std.fmt.parseInt(u16, args[i], 10) catch 43007;
+            if (i < args.len) port = std.fmt.parseInt(u16, args[i], 10) catch |err| blk: {
+                std.log.warn("invalid --port value '{s}': {}, using default {d}", .{ args[i], err, 43007 });
+                break :blk 43007;
+            };
         } else if (std.mem.eql(u8, arg, "--warmup-file")) {
             i += 1;
             if (i < args.len) warmup_file = args[i];
