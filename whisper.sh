@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# SimulStreaming Push-to-Talk Dictation Tool
-# Uses SimulStreaming server for speech recognition
+# Whisper Push-to-Talk Dictation Tool
+# Uses whisper-dictate server for speech recognition
 
 set -uo pipefail
 
@@ -9,10 +9,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration
-SIMUL_DIR="$SCRIPT_DIR/../SimulStreaming"
-SIMUL_SERVER="simulstreaming_whisper_server.py"
-SIMUL_HOST="localhost"
-SIMUL_PORT=43007
+SERVER_BIN="$SCRIPT_DIR/zig-out/bin/whisper-dictate"
+SERVER_HOST="localhost"
+SERVER_PORT=43007
 LOG_FILE="/tmp/whisper-dictation.log"
 KEY_STATE_FILE="/tmp/key_state"
 
@@ -47,7 +46,7 @@ cleanup() {
     kill -- -$$ 2>/dev/null || true
     # Wait for server to release the port before exiting
     local i=0
-    while ss -tlnp 2>/dev/null | grep -q ":$SIMUL_PORT" && [[ $i -lt 10 ]]; do
+    while ss -tlnp 2>/dev/null | grep -q ":$SERVER_PORT" && [[ $i -lt 10 ]]; do
         sleep 0.5
         i=$((i + 1))
     done
@@ -76,8 +75,7 @@ check_dependencies() {
     fi
     command -v arecord >/dev/null || missing_deps+=("arecord")
     command -v nc >/dev/null || missing_deps+=("nc")
-    command -v mise >/dev/null || missing_deps+=("mise")
-    [[ -f "$SIMUL_DIR/$SIMUL_SERVER" ]] || missing_deps+=("simulstreaming server script")
+    [[ -f "$SERVER_BIN" ]] || missing_deps+=("whisper-dictate binary (run: zig build)")
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         echo "ERROR: Missing dependencies: ${missing_deps[*]}" >&2
@@ -162,30 +160,30 @@ detect_keyboard() {
     fi
 }
 
-# Start the SimulStreaming server
+# Start the whisper-dictate server
 start_server() {
     # Kill any stale server from a previous crash
-    if ss -tlnp 2>/dev/null | grep -q ":$SIMUL_PORT"; then
-        echo "Killing stale server on port $SIMUL_PORT..."
+    if ss -tlnp 2>/dev/null | grep -q ":$SERVER_PORT"; then
+        echo "Killing stale server on port $SERVER_PORT..."
         if command -v fuser >/dev/null; then
-            fuser -k "$SIMUL_PORT/tcp" 2>/dev/null || true
+            fuser -k "$SERVER_PORT/tcp" 2>/dev/null || true
         else
-            ss -tlnp 2>/dev/null | grep ":$SIMUL_PORT" | grep -o 'pid=[0-9]\+' | cut -d= -f2 | xargs -r kill 2>/dev/null || true
+            ss -tlnp 2>/dev/null | grep ":$SERVER_PORT" | grep -o 'pid=[0-9]\+' | cut -d= -f2 | xargs -r kill 2>/dev/null || true
         fi
         sleep 1
     fi
 
-    echo "Starting SimulStreaming server..."
-    (cd "$SIMUL_DIR" && mise exec -- python3 "$SIMUL_SERVER" --vac --warmup-file "$SCRIPT_DIR/jfk.wav" --model_path ./large-v3-turbo.pt) >> "$LOG_FILE" 2>&1 &
+    echo "Starting whisper-dictate server..."
+    "$SERVER_BIN" --port "$SERVER_PORT" >> "$LOG_FILE" 2>&1 &
     SERVER_PID=$!
 
-    # Wait for server to be listening (up to 5 minutes for first-time model download)
+    # Wait for server to be listening (model load + warmup)
     echo "Waiting for server to load model and start listening..."
-    local max_wait=300
+    local max_wait=60
     local waited=0
-    while ! ss -tlnp 2>/dev/null | grep -q ":$SIMUL_PORT"; do
+    while ! ss -tlnp 2>/dev/null | grep -q ":$SERVER_PORT"; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            echo "ERROR: SimulStreaming server failed to start. Check $LOG_FILE" >&2
+            echo "ERROR: whisper-dictate server failed to start. Check $LOG_FILE" >&2
             exit 1
         fi
         sleep 1
@@ -265,8 +263,8 @@ type_text() {
     fi
 }
 
-# Process SimulStreaming output
-process_simul_output() {
+# Process server output
+process_output() {
     while true; do
         # Restart server if it died
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -275,12 +273,10 @@ process_simul_output() {
         fi
 
         arecord -f S16_LE -c1 -r 16000 -t raw -D default 2>>"$LOG_FILE" | \
-            nc "$SIMUL_HOST" "$SIMUL_PORT" | while read -r line; do
+            nc "$SERVER_HOST" "$SERVER_PORT" | while read -r line; do
             if is_key_pressed && [[ -n "$line" ]]; then
-                # Remove timing numbers at start (e.g., "0 3320  Hello" -> "Hello")
-                clean_line=$(echo "$line" | sed 's/^[0-9][0-9]* [0-9][0-9]* *//')
-                # Remove extra spaces and spaces before punctuation
-                clean_line=$(echo "$clean_line" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*\([.,!?;:]\)/\1/g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                # Server sends clean text — just normalize whitespace and punctuation spacing
+                clean_line=$(echo "$line" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*\([.,!?;:]\)/\1/g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                 if [[ -n "$clean_line" ]]; then
                     local punct_re='^[.,!?;:]'
                     if [[ ! "$clean_line" =~ $punct_re ]]; then
@@ -297,7 +293,7 @@ process_simul_output() {
 
 # Main function
 main() {
-    echo "Starting SimulStreaming Push-to-Talk Dictation Tool ($INPUT_BACKEND backend)..."
+    echo "Starting Whisper Push-to-Talk Dictation ($INPUT_BACKEND backend)..."
     check_dependencies
     > "$LOG_FILE"
 
@@ -307,7 +303,7 @@ main() {
     echo "Press and hold F24 to dictate..."
 
     monitor_key &
-    process_simul_output
+    process_output
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

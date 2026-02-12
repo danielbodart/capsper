@@ -2,21 +2,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIMUL_DIR="$SCRIPT_DIR/../SimulStreaming"
 
-# --- Check external SimulStreaming ---
-if [[ ! -f "$SIMUL_DIR/simulstreaming_whisper_server.py" ]]; then
-    echo "ERROR: SimulStreaming not found at $SIMUL_DIR" >&2
-    echo "Clone it alongside this project:" >&2
-    echo "  cd $(dirname "$SCRIPT_DIR") && git clone <SimulStreaming repo>" >&2
-    exit 1
-fi
-
-# --- Python via mise ---
-if ! command -v mise >/dev/null 2>&1; then
-    echo "ERROR: mise is required but not installed." >&2
-    echo "Install with: curl https://mise.run | sh" >&2
-    exit 1
+# --- Build whisper-dictate if needed ---
+if [[ ! -f "$SCRIPT_DIR/zig-out/bin/whisper-dictate" ]]; then
+    echo "Building whisper-dictate..."
+    if ! command -v zig >/dev/null 2>&1; then
+        # Try mise-managed zig
+        if command -v mise >/dev/null 2>&1; then
+            eval "$(mise env)"
+        fi
+    fi
+    if ! command -v zig >/dev/null 2>&1; then
+        echo "ERROR: zig is required but not installed." >&2
+        echo "Install with: mise use zig@0.15" >&2
+        exit 1
+    fi
+    (cd "$SCRIPT_DIR" && zig build)
 fi
 
 # --- System dependencies ---
