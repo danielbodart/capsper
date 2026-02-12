@@ -10,14 +10,14 @@ const net = std.net;
 // Streaming constants (byte counts for S16_LE at 16kHz = 32000 bytes/sec)
 const transcribe_interval_bytes: usize = 32000; // 1s — re-transcribe cadence during speech
 const vad_window_bytes: usize = 16000; // 0.5s — VAD lookback window
-const idle_keep_bytes: usize = 64000; // 2s — audio retained while idle (gives first transcription more context)
+const idle_keep_bytes: usize = 128000; // 4s — audio retained while idle (gives first transcription more context)
 const silence_timeout_bytes: usize = 16000; // 0.5s — silence before utterance flush
 const max_buffer_bytes: usize = 480000; // 15s — sliding window cap
 const min_transcribe_bytes: usize = 16000; // 0.5s — minimum audio worth transcribing
 
 // Frame-based stability: word is stable if prev_words has a word within ±tolerance frames.
-// 5 frames = 100ms at 50fps encoder output.
-const frame_tolerance: usize = 5;
+// 10 frames = 200ms at 50fps encoder output.
+const frame_tolerance: usize = 10;
 // Bytes per encoder frame: 320 samples × 2 bytes/sample = 640
 const bytes_per_frame: usize = 640;
 
@@ -96,19 +96,39 @@ pub const Server = struct {
         var bytes_since_last_cycle: usize = 0;
         var silence_start_pos: usize = 0;
         var cycle_count: usize = 0;
+        var cycles_without_emit: usize = 0; // force-emit after too many dry cycles
 
         while (true) {
-            const n = posix.read(conn, &recv_buf) catch |err| switch (err) {
-                error.ConnectionResetByPeer => return,
-                else => return err,
+            // Use poll for timeout support during active speech
+            var fds = [_]posix.pollfd{.{
+                .fd = conn,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const poll_timeout: i32 = switch (state) {
+                .speaking, .trailing_silence => 2000, // 2s timeout for end-of-stream detection
+                .idle => -1, // block forever in idle
             };
+            const poll_ready = try posix.poll(&fds, poll_timeout);
+
+            var n: usize = 0;
+            var timed_out = false;
+            if (poll_ready == 0) {
+                // Poll timeout — no data arrived
+                timed_out = true;
+            } else {
+                n = posix.read(conn, &recv_buf) catch |err| switch (err) {
+                    error.ConnectionResetByPeer => return,
+                    else => return err,
+                };
+            }
 
             if (n > 0) {
                 try pcm_buf.appendSlice(self.allocator, recv_buf[0..n]);
                 bytes_since_last_cycle += n;
             }
 
-            const client_closed = (n == 0);
+            const client_closed = (!timed_out and n == 0);
 
             // Throttle: wait for enough new audio before processing
             const min_bytes: usize = switch (state) {
@@ -116,7 +136,7 @@ pub const Server = struct {
                 .trailing_silence => vad_window_bytes,
             };
 
-            if (!client_closed and bytes_since_last_cycle < min_bytes) continue;
+            if (!client_closed and !timed_out and bytes_since_last_cycle < min_bytes) continue;
             if (pcm_buf.items.len == 0) {
                 if (client_closed) return;
                 continue;
@@ -124,8 +144,8 @@ pub const Server = struct {
 
             bytes_since_last_cycle = 0;
 
-            // Final flush on disconnect — emit everything, no stability wait
-            if (client_closed) {
+            // Final flush on disconnect or read timeout — emit everything
+            if (client_closed or timed_out) {
                 if (state == .speaking or state == .trailing_silence) {
                     if (pcm_buf.items.len >= min_transcribe_bytes) {
                         const samples = try utils.pcmToFloat(self.allocator, pcm_buf.items);
@@ -134,14 +154,26 @@ pub const Server = struct {
                         if (try pipeline.transcribe(samples, true)) |result| {
                             defer self.allocator.free(result.text);
                             defer self.allocator.free(result.words);
+                            defer self.allocator.free(result.tokens);
                             if (result.words.len > 0) {
                                 const frame_offset = pcm_trim_total / bytes_per_frame;
+                                var flush_ts_buf: [32]u8 = undefined;
+                                const ts = formatElapsed(&flush_ts_buf, start_ns);
+                                std.debug.print("    [{s}s] FINAL FLUSH words={d} timed_out={} closed={}\n", .{ ts, result.words.len, timed_out, client_closed });
                                 _ = emitNewWords(conn, start_ns, result.text, result.words, frame_offset, result.words.len, &last_emitted_frame, &emitted_in_utterance) catch {};
                             }
                         }
                     }
                 }
-                return;
+                if (client_closed) return;
+                // After timeout flush, go idle. Keep prev_words for stability bridging.
+                const old_len = pcm_buf.items.len;
+                utils.trimBuffer(&pcm_buf, idle_keep_bytes);
+                pcm_trim_total += old_len - pcm_buf.items.len;
+                emitted_in_utterance = false;
+                state = .idle;
+                cycle_count = 0;
+                continue;
             }
 
             // VAD check on last 0.5s
@@ -183,9 +215,11 @@ pub const Server = struct {
                         std.debug.print("[{s}s] speaking → trailing_silence (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .trailing_silence;
                         silence_start_pos = pcm_buf.items.len;
-                        continue;
+                        // Transcribe before entering silence to capture trailing words
+                        should_transcribe = true;
+                    } else {
+                        should_transcribe = true;
                     }
-                    should_transcribe = true;
                 },
                 .trailing_silence => {
                     if (has_speech) {
@@ -217,6 +251,7 @@ pub const Server = struct {
                     if (try pipeline.transcribe(all_samples, true)) |result| {
                         defer self.allocator.free(result.text);
                         defer self.allocator.free(result.words);
+                        defer self.allocator.free(result.tokens);
 
                         if (result.words.len > 0) {
                             const frame_offset = pcm_trim_total / bytes_per_frame;
@@ -234,14 +269,24 @@ pub const Server = struct {
                                 };
                             }
 
-                            const emit_count = if (should_flush)
-                                abs_words.len
-                            else if (prev_words.items.len > 0)
+                            const stable_count = if (prev_words.items.len > 0)
                                 utils.findTimedStableCount(prev_words.items, abs_words, frame_tolerance)
                             else
                                 0; // First cycle: store for next stability check
 
+                            const emit_count = if (should_flush)
+                                abs_words.len
+                            else if (cycles_without_emit >= 4)
+                                abs_words.len // Force-emit after 4+ dry cycles (~4s) to prevent stalls
+                            else
+                                stable_count;
+
                             const did_emit = emitNewWords(conn, start_ns, result.text, result.words, frame_offset, emit_count, &last_emitted_frame, &emitted_in_utterance) catch return;
+                            if (did_emit) {
+                                cycles_without_emit = 0;
+                            } else {
+                                cycles_without_emit += 1;
+                            }
 
                             // Debug logging
                             const ts = formatElapsed(&ts_buf, start_ns);
@@ -267,6 +312,7 @@ pub const Server = struct {
                             // Update prev_words with absolute frames
                             prev_words.clearRetainingCapacity();
                             try prev_words.appendSlice(self.allocator, abs_words);
+
                         }
                     } else {
                         // Pipeline returned null — log it
@@ -281,19 +327,23 @@ pub const Server = struct {
                 if (should_flush) {
                     const flush_ts = formatElapsed(&ts_buf, start_ns);
                     std.debug.print("[{s}s] flush → idle\n", .{flush_ts});
-                    // Reset for new utterance — keep pcm_trim_total and last_emitted_frame
-                    // so retained audio words at frames ≤ last_emitted_frame are auto-skipped
+                    // Keep prev_words from flush transcription — allows the first post-flush
+                    // cycle to use stability checking against the flush result, capturing words
+                    // like "How it works" that appear in both the flush and first new cycle.
+                    // last_emitted_frame prevents re-emitting already-flushed words.
                     const old_len = pcm_buf.items.len;
                     utils.trimBuffer(&pcm_buf, idle_keep_bytes);
                     pcm_trim_total += old_len - pcm_buf.items.len;
-                    prev_words.clearRetainingCapacity();
                     emitted_in_utterance = false;
                     state = .idle;
                     cycle_count = 0;
                 } else {
                     const old_len = pcm_buf.items.len;
                     utils.trimBuffer(&pcm_buf, max_buffer_bytes);
-                    pcm_trim_total += old_len - pcm_buf.items.len;
+                    const trimmed = old_len - pcm_buf.items.len;
+                    pcm_trim_total += trimmed;
+                    // Keep silence_start_pos valid after trim
+                    silence_start_pos -|= trimmed;
                 }
             }
         }

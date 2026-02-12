@@ -17,6 +17,7 @@ pub const Timing = struct {
 pub const TranscribeResult = struct {
     text: []const u8,
     words: []const utils.TimedWord,
+    tokens: []const c.whisper_token,
     was_rewind: bool,
     timing: Timing,
 };
@@ -71,10 +72,20 @@ pub const Pipeline = struct {
     /// Transcribe audio samples using AlignAtt streaming policy.
     /// Each call is a fresh decode — no state persists between calls.
     /// is_last=true uses a tighter stopping threshold and skips word truncation.
+    /// context_tokens: previously decoded tokens to use as prompt (improves consistency).
     pub fn transcribe(
         self: *Pipeline,
         samples: []const f32,
         is_last: bool,
+    ) !?TranscribeResult {
+        return self.transcribeWithContext(samples, is_last, &.{});
+    }
+
+    pub fn transcribeWithContext(
+        self: *Pipeline,
+        samples: []const f32,
+        is_last: bool,
+        context_tokens: []const c.whisper_token,
     ) !?TranscribeResult {
         const t_total = std.time.nanoTimestamp();
         var timing = Timing{};
@@ -116,22 +127,34 @@ pub const Pipeline = struct {
         }
         timing.encode_ms = msFromNs(t_encode);
 
-        // Step 3: Build prompt: [sot] [lang_en] [transcribe] [notimestamps]
-        var prompt = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
+        // Step 3: Build prompt: [sot] [lang_en] [transcribe] [notimestamps] [context...]
+        // Context tokens give the model memory of previously decoded text,
+        // improving consistency between consecutive transcription cycles.
+        const base_prompt = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
+        const max_context: usize = 100; // Limit context to avoid exceeding model capacity
+        const ctx_len = @min(context_tokens.len, max_context);
+        const full_prompt = try self.allocator.alloc(c.whisper_token, base_prompt.len + ctx_len);
+        defer self.allocator.free(full_prompt);
+        @memcpy(full_prompt[0..base_prompt.len], &base_prompt);
+        if (ctx_len > 0) {
+            @memcpy(full_prompt[base_prompt.len..], context_tokens[context_tokens.len - ctx_len ..]);
+        }
 
         // Decode prompt in two parts: batch the first N-1 tokens, then decode the
         // last token separately. whisper.cpp only populates logits for the last token
         // in a batch, but whisper_get_logits_from_state always reads from offset 0.
         // Decoding the last token alone ensures logits[0..n_vocab] is correct.
         const t_prompt = std.time.nanoTimestamp();
-        if (c.whisper_decode_with_state_and_aheads(
-            self.ctx, self.state, &prompt, @intCast(prompt.len - 1), 0, self.n_threads,
-        ) != 0) {
-            return error.PromptDecodeFailed;
+        if (full_prompt.len > 1) {
+            if (c.whisper_decode_with_state_and_aheads(
+                self.ctx, self.state, full_prompt.ptr, @intCast(full_prompt.len - 1), 0, self.n_threads,
+            ) != 0) {
+                return error.PromptDecodeFailed;
+            }
         }
-        var last_prompt = [_]c.whisper_token{prompt[prompt.len - 1]};
+        var last_prompt = [_]c.whisper_token{full_prompt[full_prompt.len - 1]};
         if (c.whisper_decode_with_state_and_aheads(
-            self.ctx, self.state, &last_prompt, 1, @intCast(prompt.len - 1), self.n_threads,
+            self.ctx, self.state, &last_prompt, 1, @intCast(full_prompt.len - 1), self.n_threads,
         ) != 0) {
             return error.PromptDecodeFailed;
         }
@@ -146,7 +169,7 @@ pub const Pipeline = struct {
         var token_frames = std.ArrayListUnmanaged(usize){};
         defer token_frames.deinit(self.allocator);
 
-        var n_past: c_int = @intCast(prompt.len);
+        var n_past: c_int = @intCast(full_prompt.len);
         const max_tokens: usize = 224;
         var last_attend_frame: ?usize = null;
         var was_rewind = false;
@@ -318,6 +341,7 @@ pub const Pipeline = struct {
         return .{
             .text = try self.allocator.dupe(u8, text_buf.items),
             .words = try self.allocator.dupe(utils.TimedWord, words.items),
+            .tokens = try self.allocator.dupe(c.whisper_token, tokens_to_decode),
             .was_rewind = was_rewind,
             .timing = timing,
         };

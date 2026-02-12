@@ -2,15 +2,17 @@
 # Stream a WAV file and compare streaming output against a reference transcript.
 # Reports word coverage, missed words, and timing.
 #
-# Usage: ./test-compare.sh
+# Usage: ./test-compare.sh [name]
 #
-# Requires: testdata/long-recording.wav and testdata/long-recording.txt
+# name defaults to "long-recording". Files must exist:
+#   testdata/<name>.wav and testdata/<name>.txt
 
 set -euo pipefail
 
 BINARY="./zig-out/bin/whisper-dictate"
-WAV="testdata/long-recording.wav"
-REF="testdata/long-recording.txt"
+NAME="${1:-long-recording}"
+WAV="testdata/${NAME}.wav"
+REF="testdata/${NAME}.txt"
 
 if [ ! -x "$BINARY" ]; then
     echo "Binary not found: $BINARY (run: mise exec zig -- zig build)" >&2
@@ -34,7 +36,10 @@ SERVER_LOG=$(mktemp /tmp/whisper-server-XXXXXX.log)
 SERVER_PID=$!
 
 cleanup() {
-    kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+    kill "$SERVER_PID" 2>/dev/null
+    sleep 0.5
+    kill -9 "$SERVER_PID" 2>/dev/null
+    wait "$SERVER_PID" 2>/dev/null || true
     rm -f "$STREAM_OUTPUT" "$SERVER_LOG"
 }
 trap cleanup EXIT
@@ -70,7 +75,7 @@ echo "" >&2
 STREAM_OUTPUT=$(mktemp /tmp/whisper-compare-XXXXXX.txt)
 
 echo "Streaming at real-time rate..." >&2
-tail -c +45 "$WAV" | pv -qL 32000 | nc -q 5 localhost "$PORT" > "$STREAM_OUTPUT"
+tail -c +45 "$WAV" | pv -qL 32000 | nc -q 1 localhost "$PORT" > "$STREAM_OUTPUT"
 
 echo "" >&2
 echo "=== Raw Streaming Output ===" >&2
