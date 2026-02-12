@@ -1,7 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("whisper.h");
-});
+const c = @import("whisper_c.zig");
 
 pub const Segment = struct {
     start_s: f32,

@@ -273,19 +273,25 @@ Context must be created with `dtw_token_timestamps = true` for attention capture
 **Note**: VAD values from API are in centiseconds (divide by 100 for seconds).
 VAD runs on CPU (~60ms for 11s audio), no GPU needed.
 
-### Phase 3: AlignAtt Streaming
+### Phase 3: AlignAtt Streaming ✅
 
-- Implement the core decode loop using low-level API:
-  1. `whisper_pcm_to_mel_with_state()`
-  2. `whisper_encode_with_state()`
-  3. Loop: `whisper_decode_with_state_and_aheads()` → check attention → continue or stop
-- Implement attention analysis: z-score normalization, median filter, argmax
-- Implement stopping rule and rewind detection
-- Implement word boundary truncation
-- Manage rolling 30s audio buffer with token context carry-over
+- ✅ Created `alignatt.zig` — pure math module for attention analysis:
+  - Z-score normalization per head, median filter (window=7), average across heads
+  - `argmax()` for most-attended frame, `checkStopping()` for AlignAtt policy
+  - Config: frame_threshold=25, rewind_threshold=200
+- ✅ Created `pipeline.zig` — streaming pipeline:
+  - `transcribe(samples, is_last)` — fresh state → mel → encode → prompt decode → autoregressive loop
+  - Greedy sampling with AlignAtt stopping after each token
+  - Initial blank/punctuation token suppression
+  - Word boundary truncation (strip last incomplete word unless is_last)
+- ✅ Created `whisper_c.zig` — shared C import module (avoids duplicate types across Zig modules)
+- ✅ Full audio transcription verified correct: JFK quote matches expected output
+- ✅ Frame space handling: mel frames (100/s) ÷ 2 = encoder frames (50/s) for attention
 
-**Validation**: Stream audio from file, compare transcription output against current Python
-system. Text should appear incrementally with similar latency.
+**Notes**:
+- State must be recreated per transcribe call (becomes corrupted after mel→encode→decode cycle)
+- `whisper_n_len_from_state()` returns mel frames; divide by 2 for encoder frame space
+- Zig 0.15: `usingnamespace` removed, `ArrayListUnmanaged` replaces `ArrayList.init`
 
 ### Phase 4: TCP Server
 

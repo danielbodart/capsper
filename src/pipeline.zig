@@ -1,0 +1,236 @@
+const std = @import("std");
+const c = @import("whisper_c.zig");
+const alignatt = @import("alignatt.zig");
+
+pub const TranscribeResult = struct {
+    text: []const u8,
+    was_rewind: bool,
+};
+
+pub const Pipeline = struct {
+    allocator: std.mem.Allocator,
+    ctx: *c.whisper_context,
+    state: *c.whisper_state,
+    config: alignatt.Config,
+    n_threads: c_int,
+
+    // Special tokens
+    sot: c.whisper_token,
+    lang_en: c.whisper_token,
+    tok_transcribe: c.whisper_token,
+    notimestamps: c.whisper_token,
+    eot: c.whisper_token,
+    n_vocab: usize,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ctx: *c.whisper_context,
+        config: alignatt.Config,
+        n_threads: c_int,
+    ) !Pipeline {
+        const state = c.whisper_init_state(ctx) orelse return error.StateInitFailed;
+
+        return .{
+            .allocator = allocator,
+            .ctx = ctx,
+            .state = state,
+            .config = config,
+            .n_threads = n_threads,
+            .sot = c.whisper_token_sot(ctx),
+            .lang_en = c.whisper_token_lang(ctx, c.whisper_lang_id("en")),
+            .tok_transcribe = c.whisper_token_transcribe(ctx),
+            .notimestamps = c.whisper_token_not(ctx),
+            .eot = c.whisper_token_eot(ctx),
+            .n_vocab = @intCast(c.whisper_n_vocab(ctx)),
+        };
+    }
+
+    pub fn deinit(self: *Pipeline) void {
+        c.whisper_free_state(self.state);
+    }
+
+    /// Transcribe audio samples using AlignAtt streaming policy.
+    /// Each call is a fresh decode — no state persists between calls.
+    /// is_last=true uses a tighter stopping threshold and skips word truncation.
+    pub fn transcribe(
+        self: *Pipeline,
+        samples: []const f32,
+        is_last: bool,
+    ) !?TranscribeResult {
+        // Fresh state for each transcription
+        c.whisper_free_state(self.state);
+        self.state = c.whisper_init_state(self.ctx) orelse return error.StateInitFailed;
+
+        // Step 1: Mel spectrogram
+        if (c.whisper_pcm_to_mel_with_state(self.ctx, self.state, samples.ptr, @intCast(samples.len), self.n_threads) != 0) {
+            return error.MelFailed;
+        }
+
+        // Content frames in encoder output space (50 frames/second)
+        const mel_len: usize = @intCast(c.whisper_n_len_from_state(self.state));
+        const content_frames: usize = mel_len / 2;
+
+        // Step 2: Encode
+        if (c.whisper_encode_with_state(self.ctx, self.state, 0, self.n_threads) != 0) {
+            return error.EncodeFailed;
+        }
+
+        // Step 3: Build prompt: [sot] [lang_en] [transcribe] [notimestamps]
+        var prompt = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
+
+        // Decode prompt (n_past=0 clears KV cache automatically)
+        if (c.whisper_decode_with_state_and_aheads(
+            self.ctx, self.state, &prompt, @intCast(prompt.len), 0, self.n_threads,
+        ) != 0) {
+            return error.PromptDecodeFailed;
+        }
+
+        // Step 4: Autoregressive decode loop with AlignAtt
+        var generated = std.ArrayListUnmanaged(c.whisper_token){};
+        defer generated.deinit(self.allocator);
+
+        var n_past: c_int = @intCast(prompt.len);
+        const max_tokens: usize = 224;
+        var last_attend_frame: ?usize = null;
+        var was_rewind = false;
+
+        for (0..max_tokens) |step| {
+            const logits = c.whisper_get_logits_from_state(self.state);
+            if (logits == null) break;
+
+            // Greedy sample
+            var best_token: c.whisper_token = 0;
+            var best_logit: f32 = -std.math.inf(f32);
+            for (0..self.n_vocab) |vi| {
+                if (logits[vi] > best_logit) {
+                    best_logit = logits[vi];
+                    best_token = @intCast(vi);
+                }
+            }
+
+            if (best_token == self.eot) break;
+
+            // Skip initial blank/punctuation-only tokens
+            if (generated.items.len == 0) {
+                const str = c.whisper_token_to_str(self.ctx, best_token);
+                if (str != null) {
+                    const slice = std.mem.span(str);
+                    const is_blank = blk: {
+                        for (slice) |ch| {
+                            switch (ch) {
+                                ' ', '!', '.', ',' => {},
+                                else => break :blk false,
+                            }
+                        }
+                        break :blk true;
+                    };
+                    if (is_blank and slice.len <= 1) {
+                        var skip = [_]c.whisper_token{best_token};
+                        if (c.whisper_decode_with_state_and_aheads(
+                            self.ctx, self.state, &skip, 1, n_past, self.n_threads,
+                        ) != 0) break;
+                        n_past += 1;
+                        continue;
+                    }
+                }
+            }
+
+            try generated.append(self.allocator, best_token);
+
+            // Decode this token
+            var next = [_]c.whisper_token{best_token};
+            if (c.whisper_decode_with_state_and_aheads(
+                self.ctx, self.state, &next, 1, n_past, self.n_threads,
+            ) != 0) break;
+            n_past += 1;
+
+            // Analyze attention
+            var n_tok: c_int = 0;
+            var n_actx: c_int = 0;
+            var n_hd: c_int = 0;
+            const attn_data = c.whisper_state_get_aheads_cross_qks(
+                self.state, &n_tok, &n_actx, &n_hd,
+            );
+            if (attn_data == null) continue;
+
+            const attention = try alignatt.analyzeAttention(
+                self.allocator, attn_data,
+                @intCast(n_tok), @intCast(n_actx), @intCast(n_hd),
+                self.config,
+            );
+            defer self.allocator.free(attention);
+
+            const frame_limit = @min(content_frames, attention.len);
+            const most_attended = alignatt.argmax(attention[0..frame_limit]);
+
+            const decision = alignatt.checkStopping(
+                most_attended, content_frames, last_attend_frame, is_last, self.config,
+            );
+            last_attend_frame = most_attended;
+
+            switch (decision) {
+                .stop_attention_at_end => {
+                    // Strip the token that triggered the stop
+                    if (generated.items.len > 0) _ = generated.pop();
+                    break;
+                },
+                .rewind_detected => {
+                    std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
+                    was_rewind = true;
+                    generated.clearRetainingCapacity();
+                    break;
+                },
+                .continue_decoding => {},
+            }
+        }
+
+        if (was_rewind or generated.items.len == 0) {
+            return if (was_rewind) TranscribeResult{ .text = "", .was_rewind = true } else null;
+        }
+
+        // Step 5: Word boundary truncation (unless is_last)
+        var tokens_to_decode: []const c.whisper_token = generated.items;
+        if (!is_last and tokens_to_decode.len > 0) {
+            tokens_to_decode = truncateLastWord(self.ctx, tokens_to_decode);
+        }
+        if (tokens_to_decode.len == 0) return null;
+
+        // Step 6: Decode tokens to text
+        var text_buf = std.ArrayListUnmanaged(u8){};
+        defer text_buf.deinit(self.allocator);
+
+        for (tokens_to_decode) |token| {
+            const str = c.whisper_token_to_str(self.ctx, token);
+            if (str != null) {
+                try text_buf.appendSlice(self.allocator, std.mem.span(str));
+            }
+        }
+
+        return .{
+            .text = try self.allocator.dupe(u8, text_buf.items),
+            .was_rewind = false,
+        };
+    }
+};
+
+/// Truncate tokens to the last complete word boundary.
+fn truncateLastWord(ctx: *c.whisper_context, tokens: []const c.whisper_token) []const c.whisper_token {
+    if (tokens.len <= 1) return &.{};
+
+    var last_word_start: ?usize = null;
+    for (0..tokens.len) |i| {
+        const str = c.whisper_token_to_str(ctx, tokens[i]);
+        if (str != null) {
+            const slice = std.mem.span(str);
+            if (slice.len > 0 and slice[0] == ' ') {
+                last_word_start = i;
+            }
+        }
+    }
+
+    if (last_word_start) |start| {
+        if (start == 0) return &.{};
+        return tokens[0..start];
+    }
+    return &.{};
+}
