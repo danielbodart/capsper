@@ -199,16 +199,16 @@ pub const Pipeline = struct {
                 .rewind_detected => {
                     std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
                     was_rewind = true;
-                    generated.clearRetainingCapacity();
+                    // Keep generated tokens — the server's word-level stability
+                    // check will filter out bad text. Discarding here causes long
+                    // gaps when the sliding window shifts audio context.
                     break;
                 },
                 .continue_decoding => {},
             }
         }
 
-        if (was_rewind or generated.items.len == 0) {
-            return if (was_rewind) TranscribeResult{ .text = "", .was_rewind = true } else null;
-        }
+        if (generated.items.len == 0) return null;
 
         // Step 5: Word boundary truncation (unless is_last)
         var tokens_to_decode: []const c.whisper_token = generated.items;

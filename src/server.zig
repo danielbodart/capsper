@@ -207,9 +207,37 @@ pub const Server = struct {
                                     emitDelta(conn, start_ns, delta) catch return;
                                 }
                             } else if (prev_text.items.len > 0) {
-                                // Require stability: only emit words present in both prev and current.
-                                // Word-level comparison tolerates punctuation changes ("so" vs "so,").
-                                const stable_words = stableWordCount(prev_text.items, text);
+                                // Stability check: only emit words present in both prev and current.
+                                // Uses flexible matching to handle sliding window shifts —
+                                // when the buffer trims audio from the front, the transcription
+                                // shifts by a few words. Try small offsets to find alignment.
+                                var stable_words = stableWordCount(prev_text.items, text);
+                                var prev_skip: usize = 0;
+
+                                if (stable_words <= emitted_words) {
+                                    // Direct match failed or didn't advance — try offsets.
+                                    // The buffer trim removed audio (and words) from the front,
+                                    // so prev_text has extra leading words the new text lacks.
+                                    for (1..7) |skip| {
+                                        const offset = byteOffsetAfterWords(prev_text.items, skip);
+                                        if (offset >= prev_text.items.len) break;
+                                        const shifted = stableWordCount(prev_text.items[offset..], text);
+                                        if (shifted >= 3) {
+                                            stable_words = shifted;
+                                            prev_skip = skip;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // Adjust emitted_words for the offset
+                                if (prev_skip > 0) {
+                                    emitted_words = if (emitted_words > prev_skip)
+                                        emitted_words - prev_skip
+                                    else
+                                        0;
+                                }
+
                                 if (stable_words > emitted_words) {
                                     const start_byte = byteOffsetAfterWords(text, emitted_words);
                                     const end_byte = byteOffsetAfterWords(text, stable_words);
