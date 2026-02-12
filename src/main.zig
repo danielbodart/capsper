@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @cImport({
     @cInclude("whisper.h");
 });
+const Vad = @import("vad.zig").Vad;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -36,9 +37,30 @@ pub fn main() !void {
     defer allocator.free(samples);
     std.debug.print("Loaded {d} samples ({d:.1}s)\n", .{ samples.len, @as(f64, @floatFromInt(samples.len)) / 16000.0 });
 
+    // --- VAD test ---
+    std.debug.print("\n--- VAD Test ---\n", .{});
+    var vad = Vad.init("whisper.cpp/models/ggml-silero-v5.1.2.bin") catch |err| {
+        std.debug.print("Failed to init VAD: {}\n", .{err});
+        return;
+    };
+    defer vad.deinit();
+
+    const has_speech = vad.hasSpeech(samples);
+    std.debug.print("Has speech: {}\n", .{has_speech});
+
+    const segments = vad.getSegments(samples) catch |err| {
+        std.debug.print("Failed to get VAD segments: {}\n", .{err});
+        return;
+    };
+    std.debug.print("Speech segments: {d}\n", .{segments.len});
+    for (segments, 0..) |seg, si| {
+        std.debug.print("  segment {d}: {d:.2}s - {d:.2}s\n", .{ si, seg.start_s, seg.end_s });
+    }
+
+    // --- Whisper test ---
     // Initialize whisper with DTW enabled (required for cross-attention capture)
     // flash_attn must be false — incompatible with DTW
-    std.debug.print("Loading model: {s}\n", .{model_path});
+    std.debug.print("\nLoading model: {s}\n", .{model_path});
     var cparams = c.whisper_context_default_params();
     cparams.use_gpu = true;
     cparams.flash_attn = false;

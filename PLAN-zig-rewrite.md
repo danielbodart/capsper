@@ -261,14 +261,17 @@ GCC's libstdc++ at link time. RPaths embedded so binary finds .so files.
 **Note**: DTW requires `flash_attn = false` and `dtw_aheads_preset = WHISPER_AHEADS_LARGE_V3_TURBO`.
 Context must be created with `dtw_token_timestamps = true` for attention capture to work.
 
-### Phase 2: VAD
+### Phase 2: VAD ✅
 
-- Integrate whisper.cpp built-in VAD
-- Implement state machine: `silence → voice_detected → speaking → silence_detected → silence`
-- Buffer audio during silence, forward to pipeline during speech
-- Detect utterance boundaries (500ms silence)
+- ✅ Created `vad.zig` module wrapping whisper.cpp VAD API
+- ✅ Loads Silero VAD model (ggml-silero-v5.1.2.bin, 0.88 MB)
+- ✅ `hasSpeech()` — boolean speech detection
+- ✅ `getSegments()` — returns speech segment boundaries in seconds
+- ✅ Tested with jfk.wav: detects 5 speech segments matching whisper.cpp output
+- ✅ Fixed centisecond→second conversion (API returns centiseconds as int64→float)
 
-**Validation**: Print "speech start" / "speech end" events while speaking into mic.
+**Note**: VAD values from API are in centiseconds (divide by 100 for seconds).
+VAD runs on CPU (~60ms for 11s audio), no GPU needed.
 
 ### Phase 3: AlignAtt Streaming
 
