@@ -238,34 +238,30 @@ Only switch to Option B if quality regresses.
 
 ## Phases
 
-### Phase 0: Project Setup
+### Phase 0: Project Setup ✅ (commit 18de52a)
 
-- Create Zig project with `zig init`
-- Set up build.zig to compile and link whisper.cpp as a C library
-- Verify we can call `whisper_init_from_file_with_params()` from Zig
-- Verify we can load and run inference on a test audio file (e.g., jfk.wav)
+- ✅ Created Zig project with build.zig, build.zig.zon, src/main.zig
+- ✅ whisper.cpp added as git submodule (pinned to 0a4d85cf)
+- ✅ build.zig invokes CMake to build whisper.cpp as shared libs with CUDA
+- ✅ main.zig loads model, reads WAV, calls whisper_full(), prints text
+- ✅ jfk.wav transcription verified correct on GPU (85ms encode, 1.4s total)
 
-**Validation**: Zig binary loads model, transcribes jfk.wav, prints text to stdout.
+**Note**: Uses shared libs (not static) because Zig's bundled libc++ conflicts with
+GCC's libstdc++ at link time. RPaths embedded so binary finds .so files.
 
-### Phase 1: whisper.cpp Modifications
+### Phase 1: whisper.cpp Modifications ✅
 
-- Add `whisper_decode_with_state_and_aheads()` function
-- Add `whisper_state_get_aheads_cross_qks()` accessor
-- Add to `whisper.h` header
-- Test: call from Zig, verify attention tensor shape and values are sensible
+- ✅ Added `whisper_decode_with_state_and_aheads()` — decode with cross-attention capture
+- ✅ Added `whisper_state_get_aheads_cross_qks()` — accessor for attention tensor
+- ✅ Both functions added to `whisper.h` and `whisper.cpp` (53 lines total)
+- ✅ Tested from Zig: low-level API (mel → encode → decode loop) with greedy sampling
+- ✅ Cross-attention shape: [1 tokens x 1500 audio_ctx x 6 heads]
+- ✅ Attention frames advance monotonically through audio (frame 5 → 540 for 11s clip)
 
-**Validation**: After decoding a few tokens, we can read cross-attention weights from Zig.
+**Note**: DTW requires `flash_attn = false` and `dtw_aheads_preset = WHISPER_AHEADS_LARGE_V3_TURBO`.
+Context must be created with `dtw_token_timestamps = true` for attention capture to work.
 
-### Phase 2: Audio Capture
-
-- Integrate ALSA via `@cImport`
-- Open default capture device: S16_LE, mono, 16000 Hz
-- Stream audio into a ring buffer
-- Chunk into configurable intervals (e.g., 40ms chunks matching current vac-chunk-size)
-
-**Validation**: Record audio to a file, play it back, confirm it sounds correct.
-
-### Phase 3: VAD
+### Phase 2: VAD
 
 - Integrate whisper.cpp built-in VAD
 - Implement state machine: `silence → voice_detected → speaking → silence_detected → silence`
@@ -274,7 +270,7 @@ Only switch to Option B if quality regresses.
 
 **Validation**: Print "speech start" / "speech end" events while speaking into mic.
 
-### Phase 4: AlignAtt Streaming
+### Phase 3: AlignAtt Streaming
 
 - Implement the core decode loop using low-level API:
   1. `whisper_pcm_to_mel_with_state()`
@@ -288,34 +284,47 @@ Only switch to Option B if quality regresses.
 **Validation**: Stream audio from file, compare transcription output against current Python
 system. Text should appear incrementally with similar latency.
 
-### Phase 5: Push-to-Talk
+### Phase 4: TCP Server
 
-- Monitor keyboard via libevdev (read `/dev/input/eventN`)
-- Detect KEY_F24 press/release (evdev code 194, matching current keyd config)
-- Implement 1-second debounce on release (matching current behavior)
-- Gate text output on key state
+- Accept TCP connections on port 43007 (drop-in replacement for SimulStreaming)
+- Receive raw PCM audio (S16_LE, mono, 16kHz) from client (arecord | nc)
+- Feed audio through VAD → AlignAtt pipeline
+- Return text lines in same format as SimulStreaming: "start_ms end_ms text\n"
+- Handle client disconnect/reconnect gracefully
+- Model warmup on startup (transcribe jfk.wav)
+- Command-line args: model path, port, language, thresholds
 
-**Validation**: Press F24, speak, release — text only output during key hold.
-
-### Phase 6: Text Input Simulation
-
-- Implement ydotool socket protocol (write to `/tmp/.ydotool_socket`)
-  OR use libevdev/uinput to create a virtual keyboard
-- Apply text cleanup: collapse whitespace, remove spaces before punctuation
-- Handle smart spacing (no space before punctuation, space between words)
-
-**Validation**: Text appears in focused window when speaking with key held.
-
-### Phase 7: Integration & Polish
-
-- Wire all phases together into the main event loop
-- Implement signal handling (SIGINT, SIGTERM) for clean shutdown
-- Model warmup on startup (transcribe jfk.wav to warm caches)
-- Error handling: device not found, model not found, permission errors
-- Command-line args: model path, device, language, key code, thresholds
-
-**Validation**: Full end-to-end: start binary, hold key, speak, see text typed. Compare
+**Validation**: `whisper.sh` works with Zig server instead of Python server. Compare
 latency and accuracy against current Python system.
+
+### Future Phases (not yet scheduled)
+
+- **Audio Capture**: Integrate ALSA via `@cImport`, ring buffer, direct mic input
+- **Push-to-Talk**: Monitor keyboard via libevdev, F24 key, debounce
+- **Text Input Simulation**: ydotool/uinput for typing text into focused window
+- **CIF End-of-Word Detection**: Port CIF model for smarter word boundary truncation
+- **Single Binary**: Combine all phases into one binary (no more whisper.sh)
+
+---
+
+## Testing Strategy
+
+Tests should be added alongside each phase. The jfk.wav file serves as the primary test fixture.
+
+### Phase-level tests:
+- **Phase 0**: `zig build run` transcribes jfk.wav correctly via whisper_full()
+- **Phase 1**: Low-level decode loop produces correct transcription with cross-attention data
+- **Phase 4 (TCP)**: Pipe raw PCM via netcat as integration test:
+  ```bash
+  # Extract raw PCM from WAV (skip 44-byte header) and pipe to TCP server
+  tail -c +45 jfk.wav | nc localhost 43007
+  ```
+  This validates the full pipeline: PCM receive → VAD → encode → AlignAtt decode → text output
+
+### Principles:
+- Each phase should have a validation step that can be re-run
+- Prefer integration tests over unit tests (the system is small and I/O-heavy)
+- jfk.wav is the canonical test fixture — known-good output to compare against
 
 ---
 
