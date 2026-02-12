@@ -103,4 +103,35 @@ pub fn build(b: *std.Build) void {
     });
     const run_alignatt_tests = b.addRunArtifact(alignatt_tests);
     test_step.dependOn(&run_alignatt_tests.step);
+
+    // --- Property tests (minish-based, runs as executable) ---
+    const prop_step = b.step("prop-test", "Run property-based tests (minish)");
+
+    const minish_dep = b.dependency("minish", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const prop_exe = b.addExecutable(.{
+        .name = "prop-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/prop_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "minish", .module = minish_dep.module("minish") },
+                .{ .name = "utils.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/utils.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+            },
+        }),
+    });
+
+    const run_prop = b.addRunArtifact(prop_exe);
+    prop_step.dependOn(&run_prop.step);
+
+    // Also include prop tests in the main test step
+    test_step.dependOn(&run_prop.step);
 }

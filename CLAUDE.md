@@ -23,8 +23,11 @@ mise exec zig -- zig build
 ### Testing
 
 ```bash
-# Unit tests (pure Zig, no GPU/model required)
+# Unit tests + property tests (pure Zig, no GPU/model required)
 mise exec zig -- zig build test
+
+# Property tests only (minish, 500 random inputs × 27 properties)
+mise exec zig -- zig build prop-test
 
 # Short integration test: stream jfk.wav (~11s) at real-time rate
 ./test-stream.sh jfk.wav 43007
@@ -33,7 +36,7 @@ mise exec zig -- zig build test
 ./test-long-stream.sh 43007
 ```
 
-Unit tests live inline in `src/utils.zig` and `src/alignatt.zig` (pure Zig modules with no C deps). Integration tests use `pv -qL 32000` to rate-limit raw PCM to 16kHz S16 mono and require a running server.
+Unit tests live inline in `src/utils.zig` and `src/alignatt.zig` (pure Zig modules with no C deps). Property-based tests in `src/prop_tests.zig` use [minish](https://github.com/CogitatorTech/minish) for fuzz-like coverage of word-level delta/stability functions. Integration tests use `pv -qL 32000` to rate-limit raw PCM to 16kHz S16 mono and require a running server.
 
 **When writing new code, add unit tests for any pure functions** (functions that don't depend on whisper.cpp C types). Keep testable logic in modules that don't import `whisper_c.zig` so tests run fast without requiring the GPU or model.
 
