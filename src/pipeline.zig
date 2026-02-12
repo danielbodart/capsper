@@ -2,9 +2,21 @@ const std = @import("std");
 const c = @import("whisper_c.zig");
 const alignatt = @import("alignatt.zig");
 
+pub const Timing = struct {
+    state_init_ms: f64 = 0,
+    mel_ms: f64 = 0,
+    encode_ms: f64 = 0,
+    prompt_decode_ms: f64 = 0,
+    decode_ms: f64 = 0,
+    total_ms: f64 = 0,
+    tokens_generated: usize = 0,
+    stop_reason: []const u8 = "none",
+};
+
 pub const TranscribeResult = struct {
     text: []const u8,
     was_rewind: bool,
+    timing: Timing,
 };
 
 pub const Pipeline = struct {
@@ -49,6 +61,11 @@ pub const Pipeline = struct {
         c.whisper_free_state(self.state);
     }
 
+    fn msFromNs(start: i128) f64 {
+        const elapsed: i128 = std.time.nanoTimestamp() - start;
+        return @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    }
+
     /// Transcribe audio samples using AlignAtt streaming policy.
     /// Each call is a fresh decode — no state persists between calls.
     /// is_last=true uses a tighter stopping threshold and skips word truncation.
@@ -57,9 +74,14 @@ pub const Pipeline = struct {
         samples: []const f32,
         is_last: bool,
     ) !?TranscribeResult {
+        const t_total = std.time.nanoTimestamp();
+        var timing = Timing{};
+
         // Fresh state for each transcription
+        const t_state = std.time.nanoTimestamp();
         c.whisper_free_state(self.state);
         self.state = c.whisper_init_state(self.ctx) orelse return error.StateInitFailed;
+        timing.state_init_ms = msFromNs(t_state);
 
         // Whisper expects 30-second (480000 sample) input. Short audio gets
         // immediate EOT from the decoder because the encoder output is too short.
@@ -76,17 +98,21 @@ pub const Pipeline = struct {
         const mel_samples = padded orelse samples;
 
         // Step 1: Mel spectrogram
+        const t_mel = std.time.nanoTimestamp();
         if (c.whisper_pcm_to_mel_with_state(self.ctx, self.state, mel_samples.ptr, @intCast(mel_samples.len), self.n_threads) != 0) {
             return error.MelFailed;
         }
+        timing.mel_ms = msFromNs(t_mel);
 
         // Content frames from actual audio (not padding) in encoder output space (50 frames/second)
         const content_frames: usize = samples.len / 320;
 
         // Step 2: Encode
+        const t_encode = std.time.nanoTimestamp();
         if (c.whisper_encode_with_state(self.ctx, self.state, 0, self.n_threads) != 0) {
             return error.EncodeFailed;
         }
+        timing.encode_ms = msFromNs(t_encode);
 
         // Step 3: Build prompt: [sot] [lang_en] [transcribe] [notimestamps]
         var prompt = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
@@ -95,6 +121,7 @@ pub const Pipeline = struct {
         // last token separately. whisper.cpp only populates logits for the last token
         // in a batch, but whisper_get_logits_from_state always reads from offset 0.
         // Decoding the last token alone ensures logits[0..n_vocab] is correct.
+        const t_prompt = std.time.nanoTimestamp();
         if (c.whisper_decode_with_state_and_aheads(
             self.ctx, self.state, &prompt, @intCast(prompt.len - 1), 0, self.n_threads,
         ) != 0) {
@@ -106,8 +133,10 @@ pub const Pipeline = struct {
         ) != 0) {
             return error.PromptDecodeFailed;
         }
+        timing.prompt_decode_ms = msFromNs(t_prompt);
 
         // Step 4: Autoregressive decode loop with AlignAtt
+        const t_decode = std.time.nanoTimestamp();
         var generated = std.ArrayListUnmanaged(c.whisper_token){};
         defer generated.deinit(self.allocator);
 
@@ -130,7 +159,10 @@ pub const Pipeline = struct {
                 }
             }
 
-            if (best_token == self.eot) break;
+            if (best_token == self.eot) {
+                timing.stop_reason = "eot";
+                break;
+            }
 
             // Skip initial blank/punctuation-only tokens
             if (generated.items.len == 0) {
@@ -194,11 +226,13 @@ pub const Pipeline = struct {
                 .stop_attention_at_end => {
                     // Strip the token that triggered the stop
                     if (generated.items.len > 0) _ = generated.pop();
+                    timing.stop_reason = "attn_end";
                     break;
                 },
                 .rewind_detected => {
                     std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
                     was_rewind = true;
+                    timing.stop_reason = "rewind";
                     // Keep generated tokens — the server's word-level stability
                     // check will filter out bad text. Discarding here causes long
                     // gaps when the sliding window shifts audio context.
@@ -208,7 +242,17 @@ pub const Pipeline = struct {
             }
         }
 
-        if (generated.items.len == 0) return null;
+        timing.decode_ms = msFromNs(t_decode);
+        timing.tokens_generated = generated.items.len;
+        timing.total_ms = msFromNs(t_total);
+
+        if (generated.items.len == 0) {
+            timing.stop_reason = if (std.mem.eql(u8, timing.stop_reason, "none")) "empty" else timing.stop_reason;
+            std.debug.print("    [pipeline] null result ({s}) | state={d:.0}ms mel={d:.0}ms enc={d:.0}ms dec={d:.0}ms total={d:.0}ms\n", .{
+                timing.stop_reason, timing.state_init_ms, timing.mel_ms, timing.encode_ms, timing.decode_ms, timing.total_ms,
+            });
+            return null;
+        }
 
         // Step 5: Word boundary truncation (unless is_last)
         var tokens_to_decode: []const c.whisper_token = generated.items;
@@ -230,7 +274,8 @@ pub const Pipeline = struct {
 
         return .{
             .text = try self.allocator.dupe(u8, text_buf.items),
-            .was_rewind = false,
+            .was_rewind = was_rewind,
+            .timing = timing,
         };
     }
 };
