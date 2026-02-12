@@ -2,25 +2,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIMUL_DIR="$SCRIPT_DIR/SimulStreaming"
-MODEL_NAME="large-v3-turbo"
-MODEL_FILE="$SIMUL_DIR/$MODEL_NAME.pt"
+SIMUL_DIR="$SCRIPT_DIR/../SimulStreaming"
 
-# --- Git submodule ---
+# --- Check external SimulStreaming ---
 if [[ ! -f "$SIMUL_DIR/simulstreaming_whisper_server.py" ]]; then
-    echo "Initialising SimulStreaming submodule..."
-    git -C "$SCRIPT_DIR" submodule update --init --recursive
-fi
-
-# --- Python via uv ---
-if ! command -v uv >/dev/null 2>&1; then
-    echo "ERROR: uv is required but not installed." >&2
-    echo "Install with: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
+    echo "ERROR: SimulStreaming not found at $SIMUL_DIR" >&2
+    echo "Clone it alongside this project:" >&2
+    echo "  cd $(dirname "$SCRIPT_DIR") && git clone <SimulStreaming repo>" >&2
     exit 1
 fi
 
-echo "Syncing python and dependencies via uv..."
-uv sync --project "$SCRIPT_DIR"
+# --- Python via mise ---
+if ! command -v mise >/dev/null 2>&1; then
+    echo "ERROR: mise is required but not installed." >&2
+    echo "Install with: curl https://mise.run | sh" >&2
+    exit 1
+fi
 
 # --- System dependencies ---
 missing=()
@@ -41,18 +38,6 @@ fi
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Installing missing system packages: ${missing[*]}"
     sudo apt install -y "${missing[@]}"
-fi
-
-# --- Whisper model ---
-if [[ ! -f "$MODEL_FILE" ]]; then
-    echo "Downloading $MODEL_NAME model (~800 MB)..."
-    uv run --project "$SCRIPT_DIR" python3 -c "
-import sys, os
-sys.path.insert(0, os.path.join('$SIMUL_DIR', 'simulstreaming', 'whisper', 'simul_whisper'))
-from whisper import load_model
-load_model('$MODEL_NAME', download_root='$SIMUL_DIR')
-print('Model downloaded to $MODEL_FILE')
-"
 fi
 
 # --- Wayland: keyd + uinput setup ---

@@ -3,13 +3,13 @@
 # SimulStreaming Push-to-Talk Dictation Tool
 # Uses SimulStreaming server for speech recognition
 
-set -euo pipefail
+set -uo pipefail
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration
-SIMUL_DIR="$SCRIPT_DIR/SimulStreaming"
+SIMUL_DIR="$SCRIPT_DIR/../SimulStreaming"
 SIMUL_SERVER="simulstreaming_whisper_server.py"
 SIMUL_HOST="localhost"
 SIMUL_PORT=43007
@@ -42,13 +42,20 @@ SERVER_PID=""
 # Cleanup function
 cleanup() {
     echo "Cleaning up..."
-    jobs -p | xargs -r kill 2>/dev/null || true
-    [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
-    [[ -f "$KEY_STATE_FILE" ]] && rm -f "$KEY_STATE_FILE"
+    trap '' SIGINT SIGTERM  # ignore signals so we can finish cleanup
+    # Kill our entire process group (server, arecord, nc, xinput, etc.)
+    kill -- -$$ 2>/dev/null || true
+    # Wait for server to release the port before exiting
+    local i=0
+    while ss -tlnp 2>/dev/null | grep -q ":$SIMUL_PORT" && [[ $i -lt 10 ]]; do
+        sleep 0.5
+        i=$((i + 1))
+    done
+    rm -f "$KEY_STATE_FILE"
     exit 0
 }
 
-trap cleanup SIGINT SIGTERM EXIT
+trap cleanup SIGINT SIGTERM
 
 # Check dependencies
 check_dependencies() {
@@ -69,7 +76,7 @@ check_dependencies() {
     fi
     command -v arecord >/dev/null || missing_deps+=("arecord")
     command -v nc >/dev/null || missing_deps+=("nc")
-    command -v uv >/dev/null || missing_deps+=("uv")
+    command -v mise >/dev/null || missing_deps+=("mise")
     [[ -f "$SIMUL_DIR/$SIMUL_SERVER" ]] || missing_deps+=("simulstreaming server script")
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
@@ -103,27 +110,73 @@ detect_keyboard() {
         echo "Set KEYBOARD_DEVICE manually in the script" >&2
         exit 1
     else
-        # X11: use override if set, otherwise listen on all keyboard devices
+        # X11: use override if set, otherwise auto-detect
         if [[ -n "$KEYBOARD_DEVICE_ID" ]]; then
             echo "Using keyboard device ID: $KEYBOARD_DEVICE_ID (from WHISPER_KEYBOARD_ID)"
-            XINPUT_DEVICE_IDS=("$KEYBOARD_DEVICE_ID")
             return
         fi
 
-        # Collect all slave keyboard device IDs
-        mapfile -t XINPUT_DEVICE_IDS < <(xinput list | grep 'slave  keyboard' | grep -o 'id=[0-9]\+' | cut -d= -f2)
-        if [[ ${#XINPUT_DEVICE_IDS[@]} -eq 0 ]]; then
+        # Auto-detect: find the keyboard name from /proc/bus/input/devices,
+        # then match it to an xinput device ID.
+        # Check keyd virtual keyboard first, then physical keyboard (EV=120013)
+        local kb_name=""
+        local block=""
+        while IFS= read -r line || [[ -n "$block" ]]; do
+            if [[ -z "$line" ]]; then
+                if [[ -n "$kb_name" ]]; then
+                    break
+                fi
+                if [[ "$block" == *"keyd virtual keyboard"* ]]; then
+                    kb_name=$(echo "$block" | grep -o 'N: Name="[^"]*"' | sed 's/N: Name="//;s/"//')
+                elif [[ "$block" == *"EV=120013"* ]] && [[ -z "$kb_name" ]]; then
+                    kb_name=$(echo "$block" | grep -o 'N: Name="[^"]*"' | sed 's/N: Name="//;s/"//')
+                fi
+                block=""
+            else
+                block="$block"$'\n'"$line"
+            fi
+        done < /proc/bus/input/devices
+
+        if [[ -n "$kb_name" ]]; then
+            # Match the kernel device name to an xinput device ID
+            while read -r dev_line; do
+                local dev_name dev_id
+                dev_name=$(echo "$dev_line" | sed 's/.*↳[[:space:]]*//' | sed 's/[[:space:]]*id=.*//')
+                dev_id=$(echo "$dev_line" | grep -o 'id=[0-9]\+' | cut -d= -f2)
+                if [[ "$dev_name" == "$kb_name" ]]; then
+                    KEYBOARD_DEVICE_ID="$dev_id"
+                    echo "Detected keyboard: $kb_name (xinput id=$dev_id)"
+                    return
+                fi
+            done < <(xinput list | grep 'slave  keyboard')
+        fi
+
+        # Fallback: monitor all slave keyboard devices
+        mapfile -t _ALL_KEYBOARD_IDS < <(xinput list | grep 'slave  keyboard' | grep -o 'id=[0-9]\+' | cut -d= -f2)
+        if [[ ${#_ALL_KEYBOARD_IDS[@]} -eq 0 ]]; then
             echo "ERROR: No X11 keyboard devices found" >&2
             exit 1
         fi
-        echo "Monitoring all ${#XINPUT_DEVICE_IDS[@]} keyboard devices for F24"
+        KEYBOARD_DEVICE_ID="${_ALL_KEYBOARD_IDS[0]}"
+        echo "WARNING: Could not auto-detect keyboard, using first device (id=$KEYBOARD_DEVICE_ID)" >&2
     fi
 }
 
 # Start the SimulStreaming server
 start_server() {
+    # Kill any stale server from a previous crash
+    if ss -tlnp 2>/dev/null | grep -q ":$SIMUL_PORT"; then
+        echo "Killing stale server on port $SIMUL_PORT..."
+        if command -v fuser >/dev/null; then
+            fuser -k "$SIMUL_PORT/tcp" 2>/dev/null || true
+        else
+            ss -tlnp 2>/dev/null | grep ":$SIMUL_PORT" | grep -o 'pid=[0-9]\+' | cut -d= -f2 | xargs -r kill 2>/dev/null || true
+        fi
+        sleep 1
+    fi
+
     echo "Starting SimulStreaming server..."
-    (cd "$SIMUL_DIR" && uv run --project "$SCRIPT_DIR" python3 "$SIMUL_SERVER" --vac --out-txt --warmup-file "$SCRIPT_DIR/jfk.wav" --model_path ./large-v3-turbo.pt) >> "$LOG_FILE" 2>&1 &
+    (cd "$SIMUL_DIR" && mise exec -- python3 "$SIMUL_SERVER" --vac --warmup-file "$SCRIPT_DIR/jfk.wav" --model_path ./large-v3-turbo.pt) >> "$LOG_FILE" 2>&1 &
     SERVER_PID=$!
 
     # Wait for server to be listening (up to 5 minutes for first-time model download)
@@ -160,7 +213,7 @@ monitor_key() {
         echo "Monitoring KEY_F24 (evdev $EVDEV_KEYCODE) on $KEYBOARD_DEVICE"
 
         # evtest output: "Event: time ..., type 1 (EV_KEY), code 194 (KEY_F24), value 1"
-        evtest "$KEYBOARD_DEVICE" 2>/dev/null | grep --line-buffered "code $EVDEV_KEYCODE" | while read -r line; do
+        while read -r line; do
             if [[ "$line" =~ value\ 1$ ]]; then
                 [[ -n "$debounce_pid" ]] && kill "$debounce_pid" 2>/dev/null || true
                 debounce_pid=""
@@ -173,24 +226,27 @@ monitor_key() {
                 delayed_release &
                 debounce_pid=$!
             fi
-        done
+        done < <(evtest "$KEYBOARD_DEVICE" 2>/dev/null | grep --line-buffered "code $EVDEV_KEYCODE")
     else
-        # Monitor all keyboard devices in parallel, merge into one stream
-        for dev_id in "${XINPUT_DEVICE_IDS[@]}"; do
-            xinput test "$dev_id" 2>/dev/null &
-        done | while read -r line; do
-            if [[ "$line" =~ key\ press\ +$XINPUT_KEYCODE ]]; then
-                [[ -n "$debounce_pid" ]] && kill "$debounce_pid" 2>/dev/null || true
-                debounce_pid=""
-                if [[ "$(cat "$KEY_STATE_FILE" 2>/dev/null)" == "0" ]]; then
-                    echo "1" > "$KEY_STATE_FILE"
-                    echo "Key pressed"
+        echo "Monitoring F24 (keycode $XINPUT_KEYCODE) on xinput device $KEYBOARD_DEVICE_ID"
+
+        while true; do
+            while read -r line; do
+                if [[ "$line" =~ key\ press\ +$XINPUT_KEYCODE ]]; then
+                    [[ -n "$debounce_pid" ]] && kill "$debounce_pid" 2>/dev/null || true
+                    debounce_pid=""
+                    if [[ "$(cat "$KEY_STATE_FILE" 2>/dev/null)" == "0" ]]; then
+                        echo "1" > "$KEY_STATE_FILE"
+                        echo "Key pressed"
+                    fi
+                elif [[ "$line" =~ key\ release\ +$XINPUT_KEYCODE ]]; then
+                    [[ -n "$debounce_pid" ]] && kill "$debounce_pid" 2>/dev/null || true
+                    delayed_release &
+                    debounce_pid=$!
                 fi
-            elif [[ "$line" =~ key\ release\ +$XINPUT_KEYCODE ]]; then
-                [[ -n "$debounce_pid" ]] && kill "$debounce_pid" 2>/dev/null || true
-                delayed_release &
-                debounce_pid=$!
-            fi
+            done < <(xinput test "$KEYBOARD_DEVICE_ID" 2>/dev/null)
+            echo "Key monitor disconnected, reconnecting in 2s..."
+            sleep 2
         done
     fi
 }
@@ -211,21 +267,31 @@ type_text() {
 
 # Process SimulStreaming output
 process_simul_output() {
-    arecord -f S16_LE -c1 -r 16000 -t raw -D default 2>>"$LOG_FILE" | \
-        nc "$SIMUL_HOST" "$SIMUL_PORT" | while read -r line; do
-        if is_key_pressed && [[ -n "$line" ]]; then
-            # Remove timing numbers at start (e.g., "0 3320  Hello" -> "Hello")
-            clean_line=$(echo "$line" | sed 's/^[0-9][0-9]* [0-9][0-9]* *//')
-            # Remove extra spaces and spaces before punctuation
-            clean_line=$(echo "$clean_line" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*\([.,!?;:]\)/\1/g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            if [[ -n "$clean_line" ]]; then
-                local punct_re='^[.,!?;:]'
-                if [[ ! "$clean_line" =~ $punct_re ]]; then
-                    type_text " "
-                fi
-                type_text "$clean_line"
-            fi
+    while true; do
+        # Restart server if it died
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "Server died, restarting..."
+            start_server
         fi
+
+        arecord -f S16_LE -c1 -r 16000 -t raw -D default 2>>"$LOG_FILE" | \
+            nc "$SIMUL_HOST" "$SIMUL_PORT" | while read -r line; do
+            if is_key_pressed && [[ -n "$line" ]]; then
+                # Remove timing numbers at start (e.g., "0 3320  Hello" -> "Hello")
+                clean_line=$(echo "$line" | sed 's/^[0-9][0-9]* [0-9][0-9]* *//')
+                # Remove extra spaces and spaces before punctuation
+                clean_line=$(echo "$clean_line" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*\([.,!?;:]\)/\1/g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ -n "$clean_line" ]]; then
+                    local punct_re='^[.,!?;:]'
+                    if [[ ! "$clean_line" =~ $punct_re ]]; then
+                        type_text " "
+                    fi
+                    type_text "$clean_line"
+                fi
+            fi
+        done
+        echo "Audio pipeline disconnected, reconnecting in 2s..."
+        sleep 2
     done
 }
 
