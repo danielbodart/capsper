@@ -22,17 +22,20 @@ mise exec zig -- zig build
 
 ### Testing
 
-No unit test suite. Testing is done with shell scripts that stream audio at real-time rate:
-
 ```bash
-# Short test: stream jfk.wav (~11s) at real-time rate
+# Unit tests (pure Zig, no GPU/model required)
+mise exec zig -- zig build test
+
+# Short integration test: stream jfk.wav (~11s) at real-time rate
 ./test-stream.sh jfk.wav 43007
 
-# Long test: loop jfk.wav 20x (~3.7 min) to verify sliding window stability
+# Long integration test: loop jfk.wav 20x (~3.7 min) to verify sliding window stability
 ./test-long-stream.sh 43007
 ```
 
-Both use `pv -qL 32000` to rate-limit raw PCM to 16kHz S16 mono. The server must be running first.
+Unit tests live inline in `src/utils.zig` and `src/alignatt.zig` (pure Zig modules with no C deps). Integration tests use `pv -qL 32000` to rate-limit raw PCM to 16kHz S16 mono and require a running server.
+
+**When writing new code, add unit tests for any pure functions** (functions that don't depend on whisper.cpp C types). Keep testable logic in modules that don't import `whisper_c.zig` so tests run fast without requiring the GPU or model.
 
 ## Architecture
 
@@ -46,6 +49,7 @@ The Zig binary replaces a Python SimulStreaming server. It links whisper.cpp as 
 - **`server.zig`** — TCP server with streaming state machine (`idle` -> `speaking` -> `trailing_silence`). Accepts raw S16_LE PCM over socket. Uses VAD to detect speech boundaries. Runs transcription on accumulated audio buffer, emits word-level deltas with stability checking (word must appear in 2 consecutive cycles before being emitted). Wire protocol: `{elapsed}.{tenths}\t{text}\n`.
 - **`pipeline.zig`** — Low-level whisper.cpp integration. Manually drives mel spectrogram, encode, and autoregressive decode loop (no `whisper_full`). Implements AlignAtt streaming policy via cross-attention analysis to decide when to stop decoding.
 - **`alignatt.zig`** — AlignAtt attention analysis: z-score normalization, median filtering, head averaging, stopping/rewind detection.
+- **`utils.zig`** — Pure utility functions (no C deps): word counting, byte offsets, word-level delta/stability tracking, PCM-to-float conversion, buffer trimming. Independently unit-tested.
 - **`vad.zig`** — Thin wrapper around whisper.cpp's Silero VAD.
 - **`whisper_c.zig`** — C import bridge. Re-exports whisper.cpp types/functions for use in Zig code.
 

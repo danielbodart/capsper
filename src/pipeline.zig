@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("whisper_c.zig");
 const alignatt = @import("alignatt.zig");
+const utils = @import("utils.zig");
 
 pub const Timing = struct {
     state_init_ms: f64 = 0,
@@ -169,16 +170,7 @@ pub const Pipeline = struct {
                 const str = c.whisper_token_to_str(self.ctx, best_token);
                 if (str != null) {
                     const slice = std.mem.span(str);
-                    const is_blank = blk: {
-                        for (slice) |ch| {
-                            switch (ch) {
-                                ' ', '!', '.', ',' => {},
-                                else => break :blk false,
-                            }
-                        }
-                        break :blk true;
-                    };
-                    if (is_blank and slice.len <= 1) {
+                    if (utils.isBlankOrPunct(slice)) {
                         var skip = [_]c.whisper_token{best_token};
                         if (c.whisper_decode_with_state_and_aheads(
                             self.ctx, self.state, &skip, 1, n_past, self.n_threads,

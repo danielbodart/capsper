@@ -3,11 +3,13 @@ const c = @import("whisper_c.zig");
 const Vad = @import("vad.zig").Vad;
 const Pipeline = @import("pipeline.zig").Pipeline;
 const Server = @import("server.zig").Server;
+const utils = @import("utils.zig");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    std.debug.print("GPA memory tracking enabled\n", .{});
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -93,55 +95,6 @@ pub fn loadWav(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {
     const data = try file.readToEndAlloc(allocator, 100 * 1024 * 1024);
     defer allocator.free(data);
 
-    if (data.len < 44) return error.InvalidWavFile;
-    if (!std.mem.eql(u8, data[0..4], "RIFF")) return error.InvalidWavFile;
-    if (!std.mem.eql(u8, data[8..12], "WAVE")) return error.InvalidWavFile;
-
-    var pos: usize = 12;
-    var channels: u16 = 0;
-    var bits_per_sample: u16 = 0;
-    var data_start: usize = 0;
-    var data_size: u32 = 0;
-    var found_fmt = false;
-    var found_data = false;
-
-    while (pos + 8 <= data.len and !found_data) {
-        const chunk_id = data[pos..][0..4];
-        const chunk_size = std.mem.readInt(u32, data[pos + 4 ..][0..4], .little);
-        pos += 8;
-
-        if (std.mem.eql(u8, chunk_id, "fmt ")) {
-            if (pos + 16 > data.len) return error.InvalidWavFile;
-            const audio_format = std.mem.readInt(u16, data[pos..][0..2], .little);
-            if (audio_format != 1) return error.UnsupportedWavFormat;
-            channels = std.mem.readInt(u16, data[pos + 2 ..][0..2], .little);
-            bits_per_sample = std.mem.readInt(u16, data[pos + 14 ..][0..2], .little);
-            found_fmt = true;
-            pos += chunk_size;
-        } else if (std.mem.eql(u8, chunk_id, "data")) {
-            data_start = pos;
-            data_size = chunk_size;
-            found_data = true;
-        } else {
-            pos += chunk_size;
-        }
-    }
-
-    if (!found_fmt or !found_data) return error.InvalidWavFile;
-    if (bits_per_sample != 16 or channels == 0) return error.UnsupportedWavFormat;
-
-    const bytes_per_sample = channels * (bits_per_sample / 8);
-    const n_samples = data_size / bytes_per_sample;
-    const result = try allocator.alloc(f32, n_samples);
-    errdefer allocator.free(result);
-
-    const pcm_data = data[data_start..];
-    for (result, 0..) |*sample, idx| {
-        const byte_offset = idx * bytes_per_sample;
-        if (byte_offset + 2 > pcm_data.len) break;
-        const raw = std.mem.readInt(i16, pcm_data[byte_offset..][0..2], .little);
-        sample.* = @as(f32, @floatFromInt(raw)) / 32768.0;
-    }
-
-    return result;
+    const header = try utils.parseWavHeader(data);
+    return utils.wavToFloat(allocator, data, header);
 }

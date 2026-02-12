@@ -154,3 +154,119 @@ pub fn checkStopping(
 
     return .continue_decoding;
 }
+
+// ============================================================
+// Tests
+// ============================================================
+
+test "argmax: basic" {
+    const data = [_]f32{ 0.1, 0.5, 0.3, 0.2 };
+    try std.testing.expectEqual(@as(usize, 1), argmax(&data));
+}
+
+test "argmax: single element" {
+    const data = [_]f32{42.0};
+    try std.testing.expectEqual(@as(usize, 0), argmax(&data));
+}
+
+test "argmax: last element is max" {
+    const data = [_]f32{ 0.1, 0.2, 0.3, 0.9 };
+    try std.testing.expectEqual(@as(usize, 3), argmax(&data));
+}
+
+test "argmax: negative values" {
+    const data = [_]f32{ -5.0, -1.0, -3.0 };
+    try std.testing.expectEqual(@as(usize, 1), argmax(&data));
+}
+
+test "checkStopping: continue when attention far from end" {
+    const result = checkStopping(10, 100, null, false, .{});
+    try std.testing.expectEqual(Decision.continue_decoding, result);
+}
+
+test "checkStopping: stop when attention near end (not is_last)" {
+    // content_frames=100, most_attended=80, threshold=25 → 100-80=20 <= 25 → stop
+    const result = checkStopping(80, 100, null, false, .{});
+    try std.testing.expectEqual(Decision.stop_attention_at_end, result);
+}
+
+test "checkStopping: is_last uses threshold=4" {
+    // content_frames=100, most_attended=80, threshold=4 → 100-80=20 > 4 → continue
+    const result = checkStopping(80, 100, null, true, .{});
+    try std.testing.expectEqual(Decision.continue_decoding, result);
+}
+
+test "checkStopping: is_last stops when very close to end" {
+    // content_frames=100, most_attended=97, threshold=4 → 100-97=3 <= 4 → stop
+    const result = checkStopping(97, 100, null, true, .{});
+    try std.testing.expectEqual(Decision.stop_attention_at_end, result);
+}
+
+test "checkStopping: rewind detected" {
+    // last=500, most_attended=100, diff=400 > rewind_threshold=200
+    const result = checkStopping(100, 1000, 500, false, .{});
+    try std.testing.expectEqual(Decision.rewind_detected, result);
+}
+
+test "checkStopping: small backward jump is not rewind" {
+    // last=110, most_attended=100, diff=10 < rewind_threshold=200
+    const result = checkStopping(100, 1000, 110, false, .{});
+    try std.testing.expectEqual(Decision.continue_decoding, result);
+}
+
+test "checkStopping: forward movement is not rewind" {
+    const result = checkStopping(200, 1000, 100, false, .{});
+    try std.testing.expectEqual(Decision.continue_decoding, result);
+}
+
+test "analyzeAttention: single head identity peak" {
+    const allocator = std.testing.allocator;
+    const n_tokens: usize = 3;
+    const n_audio_ctx: usize = 5;
+    const n_heads: usize = 1;
+
+    // Layout: [n_heads][n_audio_ctx][n_tokens]
+    // We want the last token (idx=2) to have a strong peak at frame 2
+    var attn_data: [n_heads * n_audio_ctx * n_tokens]f32 = undefined;
+    @memset(&attn_data, 0);
+    // Set last token attention: peak at frame 2
+    attn_data[0 * n_audio_ctx * n_tokens + 0 * n_tokens + 2] = 0.0; // frame 0, token 2
+    attn_data[0 * n_audio_ctx * n_tokens + 1 * n_tokens + 2] = 0.1; // frame 1, token 2
+    attn_data[0 * n_audio_ctx * n_tokens + 2 * n_tokens + 2] = 1.0; // frame 2, token 2 (peak)
+    attn_data[0 * n_audio_ctx * n_tokens + 3 * n_tokens + 2] = 0.1; // frame 3, token 2
+    attn_data[0 * n_audio_ctx * n_tokens + 4 * n_tokens + 2] = 0.0; // frame 4, token 2
+
+    const result = try analyzeAttention(
+        allocator, &attn_data, n_tokens, n_audio_ctx, n_heads,
+        .{ .median_filter_width = 1 }, // disable median filter for clarity
+    );
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, n_audio_ctx), result.len);
+    // After z-score normalization, frame 2 should still be the argmax
+    try std.testing.expectEqual(@as(usize, 2), argmax(result));
+}
+
+test "analyzeAttention: two heads averaged" {
+    const allocator = std.testing.allocator;
+    const n_tokens: usize = 2;
+    const n_audio_ctx: usize = 4;
+    const n_heads: usize = 2;
+
+    var attn_data: [n_heads * n_audio_ctx * n_tokens]f32 = undefined;
+    @memset(&attn_data, 0);
+
+    // Head 0: last token peaks at frame 1
+    attn_data[0 * n_audio_ctx * n_tokens + 1 * n_tokens + 1] = 1.0;
+
+    // Head 1: last token peaks at frame 1 (same)
+    attn_data[1 * n_audio_ctx * n_tokens + 1 * n_tokens + 1] = 1.0;
+
+    const result = try analyzeAttention(
+        allocator, &attn_data, n_tokens, n_audio_ctx, n_heads,
+        .{ .median_filter_width = 1 },
+    );
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 1), argmax(result));
+}

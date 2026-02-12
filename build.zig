@@ -80,4 +80,27 @@ pub fn build(b: *std.Build) void {
     }
     const run_step = b.step("run", "Run whisper-dictate");
     run_step.dependOn(&run_cmd.step);
+
+    // --- Test step (pure Zig modules only, no C deps) ---
+    const test_step = b.step("test", "Run unit tests");
+
+    const utils_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/utils.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_utils_tests = b.addRunArtifact(utils_tests);
+    test_step.dependOn(&run_utils_tests.step);
+
+    const alignatt_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/alignatt.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_alignatt_tests = b.addRunArtifact(alignatt_tests);
+    test_step.dependOn(&run_alignatt_tests.step);
 }

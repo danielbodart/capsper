@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("whisper_c.zig");
 const Vad = @import("vad.zig").Vad;
 const Pipeline = @import("pipeline.zig").Pipeline;
+const utils = @import("utils.zig");
 
 const posix = std.posix;
 const net = std.net;
@@ -82,6 +83,7 @@ pub const Server = struct {
         var state: State = .idle;
         var bytes_since_last_cycle: usize = 0;
         var silence_start_pos: usize = 0;
+        var cycle_count: usize = 0;
 
         while (true) {
             const n = posix.read(conn, &recv_buf) catch |err| switch (err) {
@@ -114,14 +116,14 @@ pub const Server = struct {
             if (client_closed) {
                 if (state == .speaking or state == .trailing_silence) {
                     if (pcm_buf.items.len >= min_transcribe_bytes) {
-                        const samples = try pcmToFloat(self.allocator, pcm_buf.items);
+                        const samples = try utils.pcmToFloat(self.allocator, pcm_buf.items);
                         defer self.allocator.free(samples);
 
                         if (try pipeline.transcribe(samples, true)) |result| {
                             if (result.text.len > 0) {
                                 defer self.allocator.free(result.text);
                                 const text = std.mem.trim(u8, result.text, " ");
-                                const delta = wordDelta(text, emitted_words);
+                                const delta = utils.wordDelta(text, emitted_words);
                                 if (delta.len > 0) {
                                     emitDelta(conn, start_ns, delta) catch {};
                                 }
@@ -133,15 +135,17 @@ pub const Server = struct {
             }
 
             // VAD check on last 0.5s
+            const t_vad = std.time.nanoTimestamp();
             const has_speech = blk: {
                 const vad_start = if (pcm_buf.items.len > vad_window_bytes)
                     (pcm_buf.items.len - vad_window_bytes) & ~@as(usize, 1)
                 else
                     0;
-                const vad_samples = try pcmToFloat(self.allocator, pcm_buf.items[vad_start..]);
+                const vad_samples = try utils.pcmToFloat(self.allocator, pcm_buf.items[vad_start..]);
                 defer self.allocator.free(vad_samples);
                 break :blk self.vad.hasSpeech(vad_samples);
             };
+            const vad_ms = msFromNs(t_vad);
 
             // State machine
             var should_transcribe = false;
@@ -153,18 +157,18 @@ pub const Server = struct {
                 .idle => {
                     if (has_speech) {
                         const ts = formatElapsed(&ts_buf, start_ns);
-                        std.debug.print("[{s}s] idle → speaking (buf={d})\n", .{ ts, pcm_buf.items.len });
+                        std.debug.print("[{s}s] idle → speaking (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .speaking;
                         should_transcribe = true;
                     } else {
-                        trimBuffer(&pcm_buf, vad_window_bytes);
+                        utils.trimBuffer(&pcm_buf, vad_window_bytes);
                         continue;
                     }
                 },
                 .speaking => {
                     if (!has_speech) {
                         const ts = formatElapsed(&ts_buf, start_ns);
-                        std.debug.print("[{s}s] speaking → trailing_silence (buf={d})\n", .{ ts, pcm_buf.items.len });
+                        std.debug.print("[{s}s] speaking → trailing_silence (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .trailing_silence;
                         silence_start_pos = pcm_buf.items.len;
                         continue;
@@ -174,7 +178,7 @@ pub const Server = struct {
                 .trailing_silence => {
                     if (has_speech) {
                         const ts = formatElapsed(&ts_buf, start_ns);
-                        std.debug.print("[{s}s] trailing_silence → speaking (buf={d})\n", .{ ts, pcm_buf.items.len });
+                        std.debug.print("[{s}s] trailing_silence → speaking (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .speaking;
                         should_transcribe = true;
                     } else if (pcm_buf.items.len - silence_start_pos >= silence_timeout_bytes) {
@@ -188,7 +192,11 @@ pub const Server = struct {
             // Transcribe and emit delta
             if (should_transcribe or should_flush) {
                 if (pcm_buf.items.len >= min_transcribe_bytes) {
-                    const all_samples = try pcmToFloat(self.allocator, pcm_buf.items);
+                    cycle_count += 1;
+                    const t_cycle = std.time.nanoTimestamp();
+                    const buf_duration_ms = pcm_buf.items.len * 1000 / 32000;
+
+                    const all_samples = try utils.pcmToFloat(self.allocator, pcm_buf.items);
                     defer self.allocator.free(all_samples);
 
                     // Always pass is_last=true to pipeline: AlignAtt's frame_threshold=25
@@ -199,38 +207,26 @@ pub const Server = struct {
                         if (result.text.len > 0) {
                             defer self.allocator.free(result.text);
                             const text = std.mem.trim(u8, result.text, " ");
+                            const text_words = utils.countWords(text);
+                            const t = result.timing;
 
                             if (should_flush) {
                                 // Utterance ended — emit everything remaining
-                                const delta = wordDelta(text, emitted_words);
+                                const delta = utils.wordDelta(text, emitted_words);
                                 if (delta.len > 0) {
                                     emitDelta(conn, start_ns, delta) catch return;
                                 }
+                                const ts = formatElapsed(&ts_buf, start_ns);
+                                std.debug.print("    [{s}s] cycle={d} FLUSH words={d} emitted={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms\n", .{
+                                    ts, cycle_count, text_words, emitted_words, buf_duration_ms,
+                                    utils.textPreview(text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
+                                });
                             } else if (prev_text.items.len > 0) {
-                                // Stability check: only emit words present in both prev and current.
-                                // Uses flexible matching to handle sliding window shifts —
-                                // when the buffer trims audio from the front, the transcription
-                                // shifts by a few words. Try small offsets to find alignment.
-                                var stable_words = stableWordCount(prev_text.items, text);
-                                var prev_skip: usize = 0;
+                                // Stability check with flexible offset matching for sliding window shifts
+                                const stability = utils.findStableWords(prev_text.items, text, emitted_words);
+                                const stable_words = stability.stable_words;
+                                const prev_skip = stability.prev_skip;
 
-                                if (stable_words <= emitted_words) {
-                                    // Direct match failed or didn't advance — try offsets.
-                                    // The buffer trim removed audio (and words) from the front,
-                                    // so prev_text has extra leading words the new text lacks.
-                                    for (1..7) |skip| {
-                                        const offset = byteOffsetAfterWords(prev_text.items, skip);
-                                        if (offset >= prev_text.items.len) break;
-                                        const shifted = stableWordCount(prev_text.items[offset..], text);
-                                        if (shifted >= 3) {
-                                            stable_words = shifted;
-                                            prev_skip = skip;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // Adjust emitted_words for the offset
                                 if (prev_skip > 0) {
                                     emitted_words = if (emitted_words > prev_skip)
                                         emitted_words - prev_skip
@@ -238,38 +234,67 @@ pub const Server = struct {
                                         0;
                                 }
 
-                                if (stable_words > emitted_words) {
-                                    const start_byte = byteOffsetAfterWords(text, emitted_words);
-                                    const end_byte = byteOffsetAfterWords(text, stable_words);
+                                const did_emit = stable_words > emitted_words;
+                                if (did_emit) {
+                                    const start_byte = utils.byteOffsetAfterWords(text, emitted_words);
+                                    const end_byte = utils.byteOffsetAfterWords(text, stable_words);
                                     if (end_byte > start_byte) {
                                         emitDelta(conn, start_ns, text[start_byte..end_byte]) catch return;
                                         emitted_words = stable_words;
                                     }
                                 }
+
+                                // Debug: log every cycle's stability result
+                                const ts = formatElapsed(&ts_buf, start_ns);
+                                const cycle_ms = msFromNs(t_cycle);
+                                std.debug.print("    [{s}s] cycle={d} stable={d} emitted={d} skip={d} words={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) cycle={d:.0}ms{s}\n", .{
+                                    ts,           cycle_count,  stable_words, emitted_words, prev_skip, text_words, buf_duration_ms,
+                                    utils.textPreview(text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, cycle_ms,
+                                    if (did_emit) " EMIT" else "",
+                                });
+                            } else {
+                                // First cycle, no prev — just record, don't emit yet
+                                const ts = formatElapsed(&ts_buf, start_ns);
+                                std.debug.print("    [{s}s] cycle={d} FIRST words={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms\n", .{
+                                    ts, cycle_count, text_words, buf_duration_ms,
+                                    utils.textPreview(text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
+                                });
                             }
-                            // else: first cycle, no prev — just record, don't emit yet
 
                             // Update prev for next stability check
                             prev_text.clearRetainingCapacity();
                             try prev_text.appendSlice(self.allocator, text);
                         }
+                    } else {
+                        // Pipeline returned null — log it
+                        const ts = formatElapsed(&ts_buf, start_ns);
+                        const cycle_ms = msFromNs(t_cycle);
+                        std.debug.print("    [{s}s] cycle={d} NULL buf={d}ms cycle={d:.0}ms\n", .{
+                            ts, cycle_count, buf_duration_ms, cycle_ms,
+                        });
                     }
                 }
 
                 if (should_flush) {
                     const flush_ts = formatElapsed(&ts_buf, start_ns);
                     std.debug.print("[{s}s] flush → idle\n", .{flush_ts});
-                    trimBuffer(&pcm_buf, vad_window_bytes);
+                    utils.trimBuffer(&pcm_buf, vad_window_bytes);
                     emitted_words = 0;
                     prev_text.clearRetainingCapacity();
                     state = .idle;
+                    cycle_count = 0;
                 } else {
-                    trimBuffer(&pcm_buf, max_buffer_bytes);
+                    utils.trimBuffer(&pcm_buf, max_buffer_bytes);
                 }
             }
         }
     }
 };
+
+fn msFromNs(start: i128) f64 {
+    const elapsed: i128 = std.time.nanoTimestamp() - start;
+    return @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+}
 
 /// Format elapsed time since start_ns as "{s}.{tenths}" into buf.
 fn formatElapsed(buf: []u8, start_ns: i128) []u8 {
@@ -287,103 +312,4 @@ fn emitDelta(conn: posix.socket_t, start_ns: i128, delta: []const u8) error{Brok
     _ = posix.write(conn, delta) catch return error.BrokenPipe;
     _ = posix.write(conn, "\n") catch return error.BrokenPipe;
     std.debug.print("  [{s}s] >> {s}\n", .{ ts, delta });
-}
-
-fn pcmToFloat(allocator: std.mem.Allocator, pcm_bytes: []const u8) ![]f32 {
-    const n_samples = pcm_bytes.len / 2;
-    const result = try allocator.alloc(f32, n_samples);
-    errdefer allocator.free(result);
-
-    for (result, 0..) |*sample, i| {
-        const offset = i * 2;
-        if (offset + 2 > pcm_bytes.len) break;
-        const raw = std.mem.readInt(i16, pcm_bytes[offset..][0..2], .little);
-        sample.* = @as(f32, @floatFromInt(raw)) / 32768.0;
-    }
-
-    return result;
-}
-
-/// Return byte offset in `text` just past the Nth word.
-/// If n >= total words, returns text.len.
-fn byteOffsetAfterWords(text: []const u8, n: usize) usize {
-    if (n == 0) return 0;
-    var words: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        // skip spaces
-        while (i < text.len and text[i] == ' ') : (i += 1) {}
-        if (i >= text.len) break;
-        // found a word
-        words += 1;
-        // skip word chars
-        while (i < text.len and text[i] != ' ') : (i += 1) {}
-        if (words == n) return i;
-    }
-    return text.len;
-}
-
-/// Get text from position after `skip_words` to end.
-fn wordDelta(text: []const u8, skip_words: usize) []const u8 {
-    return text[byteOffsetAfterWords(text, skip_words)..];
-}
-
-/// Strip trailing punctuation from a word for comparison purposes.
-fn stripTrailingPunct(word: []const u8) []const u8 {
-    var end = word.len;
-    while (end > 0) {
-        switch (word[end - 1]) {
-            '.', ',', '!', '?', ';', ':' => end -= 1,
-            else => break,
-        }
-    }
-    return word[0..end];
-}
-
-/// Case-insensitive byte comparison for ASCII text.
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-    }
-    return true;
-}
-
-/// Count how many leading words are stable (present in both a and b).
-/// Words are compared case-insensitively after stripping trailing punctuation.
-fn stableWordCount(a: []const u8, b: []const u8) usize {
-    var ia: usize = 0;
-    var ib: usize = 0;
-    var stable: usize = 0;
-
-    while (ia < a.len and ib < b.len) {
-        // skip spaces
-        while (ia < a.len and a[ia] == ' ') : (ia += 1) {}
-        while (ib < b.len and b[ib] == ' ') : (ib += 1) {}
-        if (ia >= a.len or ib >= b.len) break;
-
-        // extract word
-        const wa_start = ia;
-        while (ia < a.len and a[ia] != ' ') : (ia += 1) {}
-        const wb_start = ib;
-        while (ib < b.len and b[ib] != ' ') : (ib += 1) {}
-
-        const wa = stripTrailingPunct(a[wa_start..ia]);
-        const wb = stripTrailingPunct(b[wb_start..ib]);
-
-        if (!eqlIgnoreCase(wa, wb)) break;
-        stable += 1;
-    }
-
-    return stable;
-}
-
-/// Trim buffer to keep only the last `keep_bytes`, aligned to sample boundary.
-fn trimBuffer(buf: *std.ArrayListUnmanaged(u8), keep_bytes: usize) void {
-    if (buf.items.len <= keep_bytes) return;
-    const trim = (buf.items.len - keep_bytes) & ~@as(usize, 1);
-    if (trim == 0) return;
-    const remaining = buf.items.len - trim;
-    std.mem.copyForwards(u8, buf.items[0..remaining], buf.items[trim..]);
-    buf.items.len = remaining;
 }
