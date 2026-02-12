@@ -10,7 +10,7 @@ const net = std.net;
 const transcribe_interval_bytes: usize = 32000; // 1s — re-transcribe cadence during speech
 const vad_window_bytes: usize = 16000; // 0.5s — VAD lookback window
 const silence_timeout_bytes: usize = 16000; // 0.5s — silence before utterance flush
-const max_buffer_bytes: usize = 960000; // 30s — sliding window cap
+const max_buffer_bytes: usize = 480000; // 15s — sliding window cap
 const min_transcribe_bytes: usize = 16000; // 0.5s — minimum audio worth transcribing
 
 const State = enum { idle, speaking, trailing_silence };
@@ -196,6 +196,11 @@ pub const Server = struct {
                                 if (!is_last) {
                                     try emitted_text.appendSlice(self.allocator, delta);
                                 }
+                            } else if (emitted_text.items.len > 0 and text.len > 0) {
+                                // Whisper rephrased earlier text — resync so we don't get stuck
+                                std.debug.print("  [resync] emitted={d} new={d}\n", .{ emitted_text.items.len, text.len });
+                                emitted_text.clearRetainingCapacity();
+                                try emitted_text.appendSlice(self.allocator, text);
                             }
                         }
                     }
