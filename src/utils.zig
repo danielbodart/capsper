@@ -180,6 +180,32 @@ pub fn wavToFloat(allocator: std.mem.Allocator, data: []const u8, header: WavHea
     return result;
 }
 
+/// Normalize audio gain to a target RMS level.
+/// Boosts quiet audio (e.g. from multichannel interfaces where mic is only on one channel).
+/// - If RMS < target: applies gain = target/rms, capped at max_gain (default 10x = 20dB)
+/// - If RMS >= target: no-op (never attenuates)
+/// - Clamps output to [-1.0, 1.0]
+pub fn normalizeGain(samples: []f32, target_rms: f32) void {
+    if (samples.len == 0) return;
+
+    // Compute RMS
+    var sum_sq: f64 = 0;
+    for (samples) |s| {
+        const d: f64 = @floatCast(s);
+        sum_sq += d * d;
+    }
+    const rms: f32 = @floatCast(@sqrt(sum_sq / @as(f64, @floatFromInt(samples.len))));
+
+    // Don't boost if already loud enough or silent
+    if (rms >= target_rms or rms < 1e-10) return;
+
+    const gain = @min(target_rms / rms, 10.0); // cap at 10x (20dB)
+
+    for (samples) |*s| {
+        s.* = std.math.clamp(s.* * gain, -1.0, 1.0);
+    }
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -592,4 +618,64 @@ test "wavToFloat: stereo reads first channel" {
     try std.testing.expectEqual(@as(usize, 2), samples.len);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), samples[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), samples[1], 1e-6);
+}
+
+// --- normalizeGain tests ---
+
+fn computeRms(samples: []const f32) f32 {
+    if (samples.len == 0) return 0;
+    var sum_sq: f64 = 0;
+    for (samples) |s| {
+        const d: f64 = @floatCast(s);
+        sum_sq += d * d;
+    }
+    return @floatCast(@sqrt(sum_sq / @as(f64, @floatFromInt(samples.len))));
+}
+
+test "normalizeGain: boosts quiet signal to target" {
+    var samples = [_]f32{ 0.01, -0.01, 0.01, -0.01 };
+    // RMS = 0.01, target = 0.1, gain = 10x
+    normalizeGain(&samples, 0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), computeRms(&samples), 0.01);
+}
+
+test "normalizeGain: no-op when already loud" {
+    var samples = [_]f32{ 0.5, -0.5, 0.5, -0.5 };
+    const original = [_]f32{ 0.5, -0.5, 0.5, -0.5 };
+    normalizeGain(&samples, 0.1);
+    for (samples, original) |s, o| {
+        try std.testing.expectApproxEqAbs(o, s, 1e-6);
+    }
+}
+
+test "normalizeGain: caps gain at 10x" {
+    // RMS = 0.001, target = 0.1 → uncapped gain = 100x, but capped at 10x
+    var samples = [_]f32{ 0.001, -0.001, 0.001, -0.001 };
+    normalizeGain(&samples, 0.1);
+    // With 10x gain: 0.001 * 10 = 0.01
+    try std.testing.expectApproxEqAbs(@as(f32, 0.01), samples[0], 1e-6);
+}
+
+test "normalizeGain: clamps to [-1, 1]" {
+    // 0.2 * 5x gain = 1.0 (clamped), -0.2 * 5x = -1.0 (clamped)
+    var samples = [_]f32{ 0.2, -0.2, 0.3, -0.3 };
+    // RMS ≈ 0.26, target = 1.0 → gain ≈ 3.8x
+    // 0.3 * 3.8 = 1.14 → clamp to 1.0
+    normalizeGain(&samples, 1.0);
+    for (samples) |s| {
+        try std.testing.expect(s >= -1.0 and s <= 1.0);
+    }
+}
+
+test "normalizeGain: empty slice is no-op" {
+    var samples = [_]f32{};
+    normalizeGain(&samples, 0.1);
+}
+
+test "normalizeGain: silence is no-op" {
+    var samples = [_]f32{ 0.0, 0.0, 0.0 };
+    normalizeGain(&samples, 0.1);
+    for (samples) |s| {
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), s, 1e-10);
+    }
 }

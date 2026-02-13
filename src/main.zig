@@ -23,6 +23,7 @@ pub fn main() !void {
     var input_mode: InputMode = .tcp;
     var pw_target: ?[:0]const u8 = null;
     var pw_channel: u32 = pw.SPA_AUDIO_CHANNEL_AUX2;
+    var gain_normalize: bool = true;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -68,9 +69,11 @@ pub fn main() !void {
                     return;
                 };
             }
+        } else if (std.mem.eql(u8, arg, "--no-gain")) {
+            gain_normalize = false;
         } else {
             std.debug.print("Usage: whisper-dictate [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
-            std.debug.print("       [--warmup-file PATH] [--no-warmup]\n", .{});
+            std.debug.print("       [--warmup-file PATH] [--no-warmup] [--no-gain]\n", .{});
             std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
             return;
         }
@@ -118,7 +121,7 @@ pub fn main() !void {
     }
 
     // Start server
-    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel);
+    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, gain_normalize);
     try server.run();
 }
 

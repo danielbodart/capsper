@@ -34,6 +34,7 @@ pub const Server = struct {
     input_mode: InputMode,
     pw_target: ?[:0]const u8,
     pw_channel: u32,
+    gain_normalize: bool,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -43,6 +44,7 @@ pub const Server = struct {
         input_mode: InputMode,
         pw_target: ?[:0]const u8,
         pw_channel: u32,
+        gain_normalize: bool,
     ) Server {
         return .{
             .allocator = allocator,
@@ -52,6 +54,7 @@ pub const Server = struct {
             .input_mode = input_mode,
             .pw_target = pw_target,
             .pw_channel = pw_channel,
+            .gain_normalize = gain_normalize,
         };
     }
 
@@ -187,6 +190,7 @@ pub const Server = struct {
                     if (pcm_buf.items.len >= min_transcribe_bytes) {
                         const samples = try utils.pcmToFloat(self.allocator, pcm_buf.items);
                         defer self.allocator.free(samples);
+                        if (self.gain_normalize) utils.normalizeGain(samples, 0.1);
 
                         if (try pipeline.transcribe(samples, true)) |result| {
                             defer self.allocator.free(result.text);
@@ -222,6 +226,7 @@ pub const Server = struct {
                     0;
                 const vad_samples = try utils.pcmToFloat(self.allocator, pcm_buf.items[vad_start..]);
                 defer self.allocator.free(vad_samples);
+                if (self.gain_normalize) utils.normalizeGain(vad_samples, 0.1);
 
                 break :blk self.vad.hasSpeech(vad_samples);
             };
@@ -282,6 +287,7 @@ pub const Server = struct {
 
                     const all_samples = try utils.pcmToFloat(self.allocator, pcm_buf.items);
                     defer self.allocator.free(all_samples);
+                    if (self.gain_normalize) utils.normalizeGain(all_samples, 0.1);
 
                     // Always pass is_last=true to pipeline: AlignAtt's frame_threshold=25
                     // is too conservative for short buffers (null for <8s audio).

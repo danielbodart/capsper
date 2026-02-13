@@ -55,14 +55,14 @@ check_dependencies() {
         if [[ ! -S /tmp/.ydotool_socket ]]; then
             echo "ERROR: ydotoold socket not found at /tmp/.ydotool_socket" >&2
             echo "Start it with: systemctl --user start ydotoold" >&2
-            echo "Or run ./run.sh to set it up automatically." >&2
+            echo "Or run ./run.ts setup to set it up automatically." >&2
             exit 1
         fi
     else
         command -v xinput >/dev/null || missing_deps+=("xinput")
         command -v xdotool >/dev/null || missing_deps+=("xdotool")
     fi
-    [[ -f "$SERVER_BIN" ]] || missing_deps+=("whisper-dictate binary (run: zig build)")
+    [[ -f "$SERVER_BIN" ]] || missing_deps+=("whisper-dictate binary (run: ./run.ts)")
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         echo "ERROR: Missing dependencies: ${missing_deps[*]}" >&2
@@ -220,6 +220,7 @@ process_output() {
         "$SERVER_BIN" --input local \
             --pw-channel "${WHISPER_PW_CHANNEL:-AUX2}" \
             ${WHISPER_PW_TARGET:+--pw-target "$WHISPER_PW_TARGET"} \
+            ${WHISPER_NO_GAIN:+--no-gain} \
             2>>"$LOG_FILE" | while read -r line; do
             if is_key_pressed && [[ -n "$line" ]]; then
                 # Strip timestamp prefix (e.g. "2.3\ttext" → "text")

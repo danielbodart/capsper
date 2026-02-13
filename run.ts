@@ -484,6 +484,189 @@ export async function testCompare(name = "long-recording") {
     }
 }
 
+export async function pwDetect(targetDevice?: string) {
+    if (!await which("pw-record")) {
+        console.error("ERROR: pw-record not found. Install PipeWire.");
+        process.exit(1);
+    }
+
+    const RECORD_SECS = 2;
+    const SAMPLE_RATE = 48000;
+    const FORMAT = "s32"; // pw-record default for multichannel devices
+
+    // Step 1: Discover target device info
+    const targetArgs = targetDevice ? ["--target", targetDevice] : [];
+    console.log(targetDevice
+        ? `Probing device: ${targetDevice}`
+        : "Probing default audio source...");
+    console.log("");
+
+    // Step 2: Record silence baseline (2 seconds)
+    console.log(`Recording ${RECORD_SECS}s of SILENCE (don't speak)...`);
+    const silenceFile = tmpFile("pw-detect-silence", ".wav");
+    await $`pw-record --rate=${SAMPLE_RATE} --format=${FORMAT} ${targetArgs} ${silenceFile} &
+            PID=$!; sleep ${RECORD_SECS}; kill $PID 2>/dev/null; wait $PID 2>/dev/null; true`.quiet().nothrow();
+
+    // Parse WAV to get channel count
+    const silenceData = await file(silenceFile).arrayBuffer();
+    const silenceView = new DataView(silenceData);
+
+    if (silenceData.byteLength < 44) {
+        console.error("ERROR: Recording too short. Is PipeWire running?");
+        process.exit(1);
+    }
+
+    const numChannels = silenceView.getUint16(22, true);
+    const bitsPerSample = silenceView.getUint16(34, true);
+    const bytesPerSample = bitsPerSample / 8;
+
+    // Find data chunk
+    let dataOffset = 12;
+    let dataSize = 0;
+    while (dataOffset + 8 < silenceData.byteLength) {
+        const chunkId = String.fromCharCode(
+            silenceView.getUint8(dataOffset),
+            silenceView.getUint8(dataOffset + 1),
+            silenceView.getUint8(dataOffset + 2),
+            silenceView.getUint8(dataOffset + 3),
+        );
+        const chunkSize = silenceView.getUint32(dataOffset + 4, true);
+        dataOffset += 8;
+        if (chunkId === "data") {
+            dataSize = chunkSize;
+            break;
+        }
+        dataOffset += chunkSize;
+    }
+
+    const samplesPerChannel = Math.floor(dataSize / (numChannels * bytesPerSample));
+
+    console.log(`  Channels: ${numChannels}, Format: S${bitsPerSample}LE, Rate: ${SAMPLE_RATE}Hz`);
+    console.log(`  Samples per channel: ${samplesPerChannel}`);
+    console.log("");
+
+    // Compute per-channel RMS for silence
+    function channelRms(view: DataView, offset: number, nChannels: number, nSamples: number, bps: number, channel: number): number {
+        let sumSq = 0;
+        const scale = bps === 4 ? 2147483648 : (bps === 2 ? 32768 : 128);
+        for (let i = 0; i < nSamples; i++) {
+            const byteOff = offset + (i * nChannels + channel) * bps;
+            if (byteOff + bps > view.byteLength) break;
+            let sample: number;
+            if (bps === 4) sample = view.getInt32(byteOff, true);
+            else if (bps === 2) sample = view.getInt16(byteOff, true);
+            else sample = view.getInt8(byteOff);
+            const norm = sample / scale;
+            sumSq += norm * norm;
+        }
+        return Math.sqrt(sumSq / nSamples);
+    }
+
+    function rmsToDb(rms: number): number {
+        return rms > 1e-10 ? 20 * Math.log10(rms) : -100;
+    }
+
+    const silenceRms: number[] = [];
+    for (let ch = 0; ch < numChannels; ch++) {
+        silenceRms.push(channelRms(silenceView, dataOffset, numChannels, samplesPerChannel, bytesPerSample, ch));
+    }
+
+    // Step 3: Record with speech (2 seconds)
+    console.log(`Now SPEAK for ${RECORD_SECS}s...`);
+    await Bun.sleep(500); // brief pause so user sees the prompt
+    const speechFile = tmpFile("pw-detect-speech", ".wav");
+    await $`pw-record --rate=${SAMPLE_RATE} --format=${FORMAT} ${targetArgs} ${speechFile} &
+            PID=$!; sleep ${RECORD_SECS}; kill $PID 2>/dev/null; wait $PID 2>/dev/null; true`.quiet().nothrow();
+
+    const speechData = await file(speechFile).arrayBuffer();
+    const speechView = new DataView(speechData);
+
+    // Find data chunk in speech file
+    let speechDataOffset = 12;
+    let speechDataSize = 0;
+    while (speechDataOffset + 8 < speechData.byteLength) {
+        const chunkId = String.fromCharCode(
+            speechView.getUint8(speechDataOffset),
+            speechView.getUint8(speechDataOffset + 1),
+            speechView.getUint8(speechDataOffset + 2),
+            speechView.getUint8(speechDataOffset + 3),
+        );
+        const chunkSize = speechView.getUint32(speechDataOffset + 4, true);
+        speechDataOffset += 8;
+        if (chunkId === "data") {
+            speechDataSize = chunkSize;
+            break;
+        }
+        speechDataOffset += chunkSize;
+    }
+
+    const speechSamplesPerChannel = Math.floor(speechDataSize / (numChannels * bytesPerSample));
+
+    const speechRms: number[] = [];
+    for (let ch = 0; ch < numChannels; ch++) {
+        speechRms.push(channelRms(speechView, speechDataOffset, numChannels, speechSamplesPerChannel, bytesPerSample, ch));
+    }
+
+    // Step 4: Show results table
+    console.log("");
+    console.log("=== Channel Analysis ===");
+    console.log("");
+
+    const channelNames = (n: number): string => {
+        if (n <= 2) return n === 0 ? "FL" : "FR";
+        return `AUX${n - 2}`;  // PipeWire maps ch2+ to AUX0, AUX1, ...
+    };
+
+    // For multi-channel devices, PipeWire typically uses AUX0..AUXN
+    const getName = (ch: number): string => {
+        if (numChannels <= 2) return ch === 0 ? "FL" : "FR";
+        return `AUX${ch}`;
+    };
+
+    let bestChannel = -1;
+    let bestDelta = -Infinity;
+
+    console.log("  Channel   | Silence (dB) | Speech (dB)  | Delta (dB)");
+    console.log("  ----------|--------------|--------------|----------");
+
+    for (let ch = 0; ch < numChannels; ch++) {
+        const silDb = rmsToDb(silenceRms[ch]);
+        const spDb = rmsToDb(speechRms[ch]);
+        const delta = spDb - silDb;
+        const name = getName(ch);
+        const marker = delta > 3 ? " <--" : "";
+
+        console.log(`  ${name.padEnd(10)}| ${silDb.toFixed(1).padStart(12)} | ${spDb.toFixed(1).padStart(12)} | ${delta.toFixed(1).padStart(8)}${marker}`);
+
+        if (delta > bestDelta) {
+            bestDelta = delta;
+            bestChannel = ch;
+        }
+    }
+
+    console.log("");
+
+    // Step 5: Recommendation
+    if (bestDelta < 3) {
+        console.log("WARNING: No channel showed significant speech activity (delta < 3dB).");
+        console.log("Make sure you spoke during the speech recording phase.");
+        console.log("Try again, or specify a device: ./run.ts pw-detect <device-name>");
+    } else {
+        const bestName = getName(bestChannel);
+        const speechDb = rmsToDb(speechRms[bestChannel]);
+        console.log(`Recommended channel: ${bestName} (speech: ${speechDb.toFixed(1)} dB, delta: ${bestDelta.toFixed(1)} dB)`);
+        console.log("");
+        console.log(`  --pw-channel ${bestName}`);
+        console.log("");
+        if (speechDb < -30) {
+            console.log(`Note: Signal is quiet (${speechDb.toFixed(1)} dB). Gain normalization (on by default) will boost it.`);
+        }
+    }
+
+    // Cleanup
+    await $`rm -f ${silenceFile} ${speechFile}`.nothrow();
+}
+
 // ─── Command dispatch ──────────────────────────────────────────────────────
 
 const commands: Record<string, Function> = {
@@ -492,6 +675,7 @@ const commands: Record<string, Function> = {
     "test-pw-stream": testPwStream,
     "test-long-stream": testLongStream,
     "test-compare": testCompare,
+    "pw-detect": pwDetect,
 };
 
 const command = process.argv[2] || "build";
