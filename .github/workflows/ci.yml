@@ -8,13 +8,18 @@ jobs:
     container:
       image: nvidia/cuda:13.0.0-devel-ubuntu22.04
     steps:
-      - name: Install git
-        run: apt-get update && apt-get install -y git
+      - name: Install system deps
+        run: |
+          apt-get update
+          apt-get install -y git curl ca-certificates cmake pkg-config patchelf pv ncat libpipewire-0.3-dev
+          git config --global safe.directory '*'
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - name: CI
         run: ./run ci
+        env:
+          CI: "true"
       # TODO: re-enable once CI is green
       # - uses: actions/upload-artifact@v4
       #   with:
