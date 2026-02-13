@@ -47,6 +47,15 @@ pub extern fn pw_build_audio_format(
     channel_position: u32,
 ) ?*anyopaque;
 
+// C helper to connect a capture stream with proper SPA format negotiation.
+// Passing spa_pod** through Zig FFI breaks format negotiation (ports get generic
+// names like input_1, auto-connect fails). Doing it in C works correctly.
+pub extern fn pw_connect_capture(
+    stream: *pw_stream,
+    rate: u32,
+    channel_position: u32,
+) c_int;
+
 // SPA audio channel positions (u32 constants)
 pub const SPA_AUDIO_CHANNEL_AUX0: u32 = pw.SPA_AUDIO_CHANNEL_AUX0;
 pub const SPA_AUDIO_CHANNEL_AUX1: u32 = pw.SPA_AUDIO_CHANNEL_AUX1;

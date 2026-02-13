@@ -22,3 +22,29 @@ pw_build_audio_format(uint8_t *buf, uint32_t buf_size,
     );
     return spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &info);
 }
+
+/* Connect a PipeWire capture stream with the given audio format.
+   Done in C because passing the spa_pod** params array through Zig FFI
+   causes format negotiation to fail (ports get generic names like input_1
+   instead of input_MONO, and auto-connect doesn't work). */
+int
+pw_connect_capture(struct pw_stream *stream,
+                   uint32_t rate, uint32_t channel_position)
+{
+    uint8_t buf[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    struct spa_audio_info_raw info = SPA_AUDIO_INFO_RAW_INIT(
+        .format = SPA_AUDIO_FORMAT_S16_LE,
+        .rate = rate,
+        .channels = 1,
+        .position = { channel_position }
+    );
+    const struct spa_pod *pod = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &info);
+    if (!pod) return -1;
+
+    return pw_stream_connect(stream,
+        PW_DIRECTION_INPUT,
+        PW_ID_ANY,
+        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
+        &pod, 1);
+}

@@ -96,25 +96,9 @@ pub const AudioCapture = struct {
         // Store stream pointer so the callback can access it
         stream_data.stream = stream;
 
-        // Build SPA format pod via C helper: S16_LE, 16000Hz, 1 channel
-        // Buffer must stay alive until pw_stream_connect returns (stack-allocated is fine)
-        var pod_buf: [1024]u8 = undefined;
-        const pod = pw.pw_build_audio_format(&pod_buf, pod_buf.len, 16000, channel_position) orelse {
-            log.err("Failed to build SPA audio format pod", .{});
-            return error.PipeWireInitFailed;
-        };
-
-        var params = [_]*anyopaque{pod};
-
-        const connect_result = pw.pw_stream_connect(
-            stream,
-            pw.PW_DIRECTION_INPUT,
-            pw.PW_ID_ANY,
-            pw.PW_STREAM_FLAG_AUTOCONNECT | pw.PW_STREAM_FLAG_MAP_BUFFERS | pw.PW_STREAM_FLAG_RT_PROCESS,
-            @ptrCast(&params),
-            params.len,
-        );
-
+        // Connect stream with SPA format negotiation via C helper.
+        // (Passing spa_pod** through Zig FFI breaks format negotiation.)
+        const connect_result = pw.pw_connect_capture(stream, 16000, channel_position);
         if (connect_result < 0) {
             log.err("Failed to connect PipeWire stream: {d}", .{connect_result});
             return error.PipeWireConnectFailed;
