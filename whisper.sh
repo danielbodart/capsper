@@ -220,7 +220,6 @@ process_output() {
         "$SERVER_BIN" --input local \
             --pw-channel "${WHISPER_PW_CHANNEL:-AUX2}" \
             ${WHISPER_PW_TARGET:+--pw-target "$WHISPER_PW_TARGET"} \
-            ${WHISPER_NO_GAIN:+--no-gain} \
             2>>"$LOG_FILE" | while read -r line; do
             if is_key_pressed && [[ -n "$line" ]]; then
                 # Strip timestamp prefix (e.g. "2.3\ttext" → "text")
