@@ -18,6 +18,11 @@ async function which(cmd: string): Promise<boolean> {
     return exitCode === 0;
 }
 
+async function hasGpu(): Promise<boolean> {
+    const { exitCode } = await $`nvidia-smi`.quiet().nothrow();
+    return exitCode === 0;
+}
+
 function tmpFile(prefix: string, ext: string): string {
     return join(tmpdir(), `${prefix}-${Date.now()}${ext}`);
 }
@@ -137,6 +142,9 @@ async function ensureDeps() {
     }
     if (!await which("nvcc")) missing.push("nvidia-cuda-toolkit");
 
+    // Packaging
+    if (!await which("patchelf")) missing.push("patchelf");
+
     // Streaming test deps
     if (!await which("pv")) missing.push("pv");
     if (!await which("nc") && !await which("ncat")) missing.push("ncat");
@@ -209,27 +217,17 @@ function ensureFile(path: string, label?: string) {
     }
 }
 
-/** Write content to path only if it differs from existing file. Returns true if written. */
-async function writeIfChanged(path: string, content: string): Promise<boolean> {
-    const existing = await file(path).text().catch(() => "");
-    if (existing === content) return false;
-    await Bun.write(path, content);
-    return true;
-}
-
 function wavDuration(path: string): string {
     const rawSize = statSync(path).size - 44;
     return (rawSize / 32000).toFixed(1);
 }
-
-type PwDetectResult = { channel: string; target?: string };
 
 // ─── Commands ──────────────────────────────────────────────────────────────
 
 export async function build() {
     await ensureDeps();
     await ensureSubmodule();
-    await ensureModels();
+    if (!process.env.CI) await ensureModels();
     console.log("Building...");
     await $`zig build`;
 }
@@ -247,107 +245,18 @@ export async function clean() {
     console.log("Cleaned.");
 }
 
-async function updateServiceFile(pw: PwDetectResult) {
-    const home = process.env.HOME!;
-    const serviceDir = `${home}/.config/systemd/user`;
-    await $`mkdir -p ${serviceDir}`;
-
-    const envLines = [`Environment=PATH=${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`];
-
-    // evdev mode: binary handles everything directly, no display server dependency
-    let execStart = `${SCRIPT_DIR}/zig-out/bin/whisper-dictate --trigger capslock --pw-channel ${pw.channel}`;
-    if (pw.target) {
-        execStart += ` --pw-target ${pw.target}`;
-    }
-
-    const serviceContent = `[Unit]
-Description=Whisper push-to-talk dictation
-
-[Service]
-Type=simple
-WorkingDirectory=${SCRIPT_DIR}
-ExecStart=${execStart}
-Restart=always
-RestartSec=5
-${envLines.join("\n")}
-
-[Install]
-WantedBy=default.target
-`;
-
-    const servicePath = `${serviceDir}/whisper.service`;
-    if (await writeIfChanged(servicePath, serviceContent)) {
-        await $`systemctl --user daemon-reload`;
-        console.log("whisper.service updated");
-    }
-    await $`systemctl --user enable whisper.service`.quiet().nothrow();
-}
-
 export async function setup() {
     await build();
 
-    // Ensure user is in 'input' group for evdev/uinput access
-    const { exitCode: inInputGroup } = await $`id -nG | grep -qw input`.quiet().nothrow();
-    if (inInputGroup !== 0) {
-        console.log("\n=== Permissions Setup ===");
-        console.log("The 'input' group is needed for keyboard grab and text injection.");
-        if (await confirm("Add current user to 'input' group? (requires sudo)")) {
-            await $`sudo usermod -aG input ${process.env.USER}`;
-            console.log("Added to 'input' group. You may need to log out and back in.");
-        }
-    }
-
-    // Ensure uinput device is accessible
-    const uinputRule = '/etc/udev/rules.d/99-uinput.rules';
-    const { exitCode: uinputExists } = await $`test -f ${uinputRule}`.quiet().nothrow();
-    if (uinputExists !== 0) {
-        console.log("\nSetting up /dev/uinput access...");
-        if (await confirm("Install udev rule for /dev/uinput? (requires sudo)")) {
-            await $`echo 'KERNEL=="uinput", MODE="0660", GROUP="input"' | sudo tee ${uinputRule}`;
-            await $`sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput`.nothrow();
-            console.log("udev rule installed.");
-        }
-    }
-
-    // Audio configuration — optionally run pwDetect to find the best mic channel
-    let pwResult: PwDetectResult = { channel: "FL" };
-
-    console.log("\n=== Audio Configuration ===");
-    if (await confirm("Run microphone channel detection? (No = use default FL)")) {
-        let audioConfigured = false;
-        while (!audioConfigured) {
-            try {
-                pwResult = await pwDetect();
-                audioConfigured = true;
-            } catch (e: any) {
-                console.error(`\nAudio detection failed: ${e.message}`);
-                if (await confirm("Skip and use default channel FL?")) {
-                    audioConfigured = true;
-                } else if (!await confirm("Retry?")) {
-                    process.exit(1);
-                }
-            }
-        }
-    } else {
-        console.log("Using default channel: FL");
-    }
-
-    await updateServiceFile(pwResult);
-    console.log("\nwhisper.service ready");
-
-    if (await confirm("Start the dictation service now?")) {
-        await $`systemctl --user restart whisper.service`;
-        console.log("Service started. Check status with:");
-        console.log("  systemctl --user status whisper.service");
-    } else {
-        console.log("\nStart manually with:");
-        console.log("  systemctl --user start whisper.service");
-    }
+    // Delegate permissions, audio detection, and service setup to install.sh
+    const installSh = join(SCRIPT_DIR, "install.sh");
+    await $`bash ${installSh} setup-dev ${SCRIPT_DIR}`;
 }
 
 export async function testStream(wavFile = "jfk.wav") {
     ensureBinary();
     ensureFile(wavFile);
+    if (!await hasGpu()) { console.log("Skipping: no CUDA-capable GPU detected"); return; }
 
     const duration = wavDuration(wavFile);
     const timeoutMs = (parseFloat(duration) + 30) * 1000; // audio duration + 30s for startup/flush
@@ -368,6 +277,7 @@ export async function testStream(wavFile = "jfk.wav") {
 export async function testPwStream(wavFile = "jfk.wav") {
     ensureBinary();
     ensureFile(wavFile);
+    if (!await hasGpu()) { console.log("Skipping: no CUDA-capable GPU detected"); return; }
 
     const duration = wavDuration(wavFile);
     const LOOPBACK_SINK = "test-whisper-loopback-sink";
@@ -434,6 +344,7 @@ export async function testPwStream(wavFile = "jfk.wav") {
 export async function testLongStream() {
     ensureBinary();
     ensureFile("jfk.wav");
+    if (!await hasGpu()) { console.log("Skipping: no CUDA-capable GPU detected"); return; }
 
     const rawPcm = tmpFile("whisper-test", ".raw");
     const LOOPS = 20;
@@ -465,6 +376,7 @@ export async function testLongStream() {
 
 export async function testCompare(name = "long-recording") {
     ensureBinary();
+    if (!await hasGpu()) { console.log("Skipping: no CUDA-capable GPU detected"); return; }
     const wav = `testdata/${name}.wav`;
     const ref = `testdata/${name}.txt`;
     ensureFile(wav);
@@ -544,257 +456,54 @@ export async function testCompare(name = "long-recording") {
     }
 }
 
-export async function pwDetect(targetDevice?: string, durationArg?: string): Promise<PwDetectResult> {
-    if (!await which("pw-record")) {
-        console.error("ERROR: pw-record not found. Install PipeWire.");
-        process.exit(1);
-    }
+export async function test() {
+    await $`zig build test`;
+}
 
-    const RECORD_SECS = durationArg ? parseInt(durationArg, 10) : 5;
-    if (isNaN(RECORD_SECS) || RECORD_SECS < 1) {
-        console.error("ERROR: Duration must be a positive integer (seconds).");
-        process.exit(1);
-    }
-    const SAMPLE_RATE = 48000;
-    const FORMAT = "s32"; // pw-record default for multichannel devices
+export async function dist() {
+    ensureBinary();
+    await $`rm -rf dist && mkdir -p dist/models`;
 
-    // Step 1: Discover target device info
-    const targetArgs = targetDevice ? ["--target", targetDevice] : [];
-    console.log(targetDevice
-        ? `Probing device: ${targetDevice}`
-        : "Probing default audio source...");
-    console.log(`Recording duration: ${RECORD_SECS}s per phase`);
-    console.log("");
+    // Copy binary
+    await $`cp zig-out/bin/whisper-dictate dist/`;
 
-    // Wait for Enter keypress
-    async function waitForEnter(prompt: string) {
-        process.stdout.write(prompt);
-        return new Promise<void>(resolve => {
-            const onData = () => {
-                process.stdin.removeListener("data", onData);
-                process.stdin.pause();
-                if (wasTTYRaw) process.stdin.setRawMode(false);
-                resolve();
-            };
-            const wasTTYRaw = process.stdin.isTTY;
-            if (wasTTYRaw) process.stdin.setRawMode(true);
-            process.stdin.resume();
-            process.stdin.on("data", onData);
-        });
-    }
+    // Fix RPATH so binary finds shared libs relative to itself
+    await $`patchelf --set-rpath '$ORIGIN' dist/whisper-dictate`;
 
-    function startRecording(outFile: string) {
-        const args = ["pw-record", `--rate=${SAMPLE_RATE}`, `--format=${FORMAT}`, ...targetArgs, outFile];
-        return Bun.spawn(args, { stdout: "ignore", stderr: "ignore" });
-    }
+    // Copy shared libs (with symlinks preserved)
+    await $`bash -c "cp -a whisper.cpp/build-zig/*/lib*.so* dist/"`;
 
-    async function stopRecording(proc: ReturnType<typeof Bun.spawn>) {
-        proc.kill();
-        await proc.exited;
-    }
+    // Copy install script
+    await $`cp install.sh dist/`;
 
-    // Step 2: Record silence baseline
-    await waitForEnter("Press ENTER to start recording SILENCE (stay quiet)...");
-    console.log(`Recording ${RECORD_SECS}s of silence...`);
-    const silenceFile = tmpFile("pw-detect-silence", ".wav");
-    const silenceProc = startRecording(silenceFile);
-    await Bun.sleep(RECORD_SECS * 1000);
-    await stopRecording(silenceProc);
-    console.log("Done.\n");
+    // Summary
+    const { stdout: fileCount } = await $`ls -1 dist/ | wc -l`.quiet();
+    const { stdout: totalSize } = await $`du -sh dist/`.quiet();
+    console.log(`dist/ ready: ${fileCount.toString().trim()} files, ${totalSize.toString().trim().split("\t")[0]}`);
+}
 
-    // Parse WAV to get channel count
-    const silenceData = await file(silenceFile).arrayBuffer();
-    const silenceView = new DataView(silenceData);
-
-    if (silenceData.byteLength < 44) {
-        console.error("ERROR: Recording too short. Is PipeWire running?");
-        process.exit(1);
-    }
-
-    const numChannels = silenceView.getUint16(22, true);
-    const bitsPerSample = silenceView.getUint16(34, true);
-    const bytesPerSample = bitsPerSample / 8;
-
-    // Find data chunk
-    let dataOffset = 12;
-    let dataSize = 0;
-    while (dataOffset + 8 < silenceData.byteLength) {
-        const chunkId = String.fromCharCode(
-            silenceView.getUint8(dataOffset),
-            silenceView.getUint8(dataOffset + 1),
-            silenceView.getUint8(dataOffset + 2),
-            silenceView.getUint8(dataOffset + 3),
-        );
-        const chunkSize = silenceView.getUint32(dataOffset + 4, true);
-        dataOffset += 8;
-        if (chunkId === "data") {
-            dataSize = chunkSize;
-            break;
-        }
-        dataOffset += chunkSize;
-    }
-
-    const samplesPerChannel = Math.floor(dataSize / (numChannels * bytesPerSample));
-
-    console.log(`  Channels: ${numChannels}, Format: S${bitsPerSample}LE, Rate: ${SAMPLE_RATE}Hz`);
-    console.log(`  Samples per channel: ${samplesPerChannel}`);
-    console.log("");
-
-    // Compute per-channel RMS
-    function channelRms(view: DataView, offset: number, nChannels: number, nSamples: number, bps: number, channel: number): number {
-        let sumSq = 0;
-        const scale = bps === 4 ? 2147483648 : (bps === 2 ? 32768 : 128);
-        for (let i = 0; i < nSamples; i++) {
-            const byteOff = offset + (i * nChannels + channel) * bps;
-            if (byteOff + bps > view.byteLength) break;
-            let sample: number;
-            if (bps === 4) sample = view.getInt32(byteOff, true);
-            else if (bps === 2) sample = view.getInt16(byteOff, true);
-            else sample = view.getInt8(byteOff);
-            const norm = sample / scale;
-            sumSq += norm * norm;
-        }
-        return Math.sqrt(sumSq / nSamples);
-    }
-
-    function rmsToDb(rms: number): number {
-        return rms > 1e-10 ? 20 * Math.log10(rms) : -100;
-    }
-
-    const silenceRms: number[] = [];
-    for (let ch = 0; ch < numChannels; ch++) {
-        silenceRms.push(channelRms(silenceView, dataOffset, numChannels, samplesPerChannel, bytesPerSample, ch));
-    }
-
-    // Step 3: Record with speech
-    await waitForEnter("Press ENTER to start recording SPEECH (talk normally)...");
-    console.log(`Recording ${RECORD_SECS}s of speech...`);
-    const speechFile = tmpFile("pw-detect-speech", ".wav");
-    const speechProc = startRecording(speechFile);
-    await Bun.sleep(RECORD_SECS * 1000);
-    await stopRecording(speechProc);
-    console.log("Done.\n");
-
-    const speechData = await file(speechFile).arrayBuffer();
-    const speechView = new DataView(speechData);
-
-    // Find data chunk in speech file
-    let speechDataOffset = 12;
-    let speechDataSize = 0;
-    while (speechDataOffset + 8 < speechData.byteLength) {
-        const chunkId = String.fromCharCode(
-            speechView.getUint8(speechDataOffset),
-            speechView.getUint8(speechDataOffset + 1),
-            speechView.getUint8(speechDataOffset + 2),
-            speechView.getUint8(speechDataOffset + 3),
-        );
-        const chunkSize = speechView.getUint32(speechDataOffset + 4, true);
-        speechDataOffset += 8;
-        if (chunkId === "data") {
-            speechDataSize = chunkSize;
-            break;
-        }
-        speechDataOffset += chunkSize;
-    }
-
-    const speechSamplesPerChannel = Math.floor(speechDataSize / (numChannels * bytesPerSample));
-
-    const speechRms: number[] = [];
-    for (let ch = 0; ch < numChannels; ch++) {
-        speechRms.push(channelRms(speechView, speechDataOffset, numChannels, speechSamplesPerChannel, bytesPerSample, ch));
-    }
-
-    // Step 4: Show results table
-    console.log("=== Channel Analysis ===");
-    console.log("");
-
-    // For multi-channel devices, PipeWire typically uses AUX0..AUXN
-    const getName = (ch: number): string => {
-        if (numChannels <= 2) return ch === 0 ? "FL" : "FR";
-        return `AUX${ch}`;
-    };
-
-    let bestChannel = -1;
-    let bestDelta = -Infinity;
-
-    console.log("  Channel   | Silence (dB) | Speech (dB)  | Delta (dB)");
-    console.log("  ----------|--------------|--------------|----------");
-
-    for (let ch = 0; ch < numChannels; ch++) {
-        const silDb = rmsToDb(silenceRms[ch]);
-        const spDb = rmsToDb(speechRms[ch]);
-        const delta = spDb - silDb;
-        const name = getName(ch);
-        const marker = delta > 3 ? " <--" : "";
-
-        console.log(`  ${name.padEnd(10)}| ${silDb.toFixed(1).padStart(12)} | ${spDb.toFixed(1).padStart(12)} | ${delta.toFixed(1).padStart(8)}${marker}`);
-
-        if (delta > bestDelta) {
-            bestDelta = delta;
-            bestChannel = ch;
-        }
-    }
-
-    console.log("");
-
-    // Step 5: Recommendation
-    const bestName = getName(bestChannel);
-    const speechDb = rmsToDb(speechRms[bestChannel]);
-
-    // Cleanup
-    await $`rm -f ${silenceFile} ${speechFile}`.nothrow();
-
-    if (bestDelta < 3) {
-        console.log("WARNING: No channel showed significant speech activity (delta < 3dB).");
-        console.log("Make sure you spoke during the speech recording phase.");
-        console.log("Falling back to AUX2.");
-        return { channel: "AUX2", target: targetDevice };
-    }
-
-    console.log(`Recommended channel: ${bestName} (speech: ${speechDb.toFixed(1)} dB, delta: ${bestDelta.toFixed(1)} dB)`);
-    console.log("");
-    console.log(`  --pw-channel ${bestName}`);
-    console.log("");
-    if (speechDb < -30) {
-        console.log(`Note: Signal is quiet (${speechDb.toFixed(1)} dB). Check your hardware gain settings.`);
-    }
-
-    return { channel: bestName, target: targetDevice };
+export async function ci() {
+    await ensureDeps();
+    await ensureSubmodule();
+    console.log("Building...");
+    await $`zig build`;
+    console.log("Running tests...");
+    await $`zig build test`;
+    console.log("Packaging...");
+    await dist();
 }
 
 // ─── Command dispatch ──────────────────────────────────────────────────────
 
-async function pwDetectCli(...cliArgs: string[]) {
-    let targetDevice: string | undefined;
-    let duration: string | undefined;
-    let doUpdateService = false;
-
-    for (let i = 0; i < cliArgs.length; i++) {
-        if (cliArgs[i] === "--update-service") {
-            doUpdateService = true;
-        } else if (!targetDevice) {
-            targetDevice = cliArgs[i];
-        } else {
-            duration = cliArgs[i];
-        }
-    }
-    const result = await pwDetect(targetDevice, duration);
-    if (doUpdateService) {
-        await updateServiceFile(result);
-        console.log("\nService file updated. Restart with: systemctl --user restart whisper.service");
-    }
-}
-
 const commands: Record<string, Function> = {
-    build, rebuild, clean, setup,
+    build, rebuild, clean, setup, test, dist, ci,
     "test-stream": testStream,
     "test-pw-stream": testPwStream,
     "test-long-stream": testLongStream,
     "test-compare": testCompare,
-    "pw-detect": pwDetectCli,
 };
 
-const command = process.argv[2] || "setup";
+const command = process.argv[2] || "build";
 const args = process.argv.slice(3);
 
 const fn = commands[command];

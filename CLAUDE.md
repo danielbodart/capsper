@@ -63,7 +63,8 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 
 ### Scripts & Task Runner
 
-- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `build`, `clean`, `setup`, `test-stream`, `test-pw-stream`, `test-long-stream`, `test-compare`, `pw-detect`.
+- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `build`, `rebuild`, `clean`, `setup`, `test`, `dist`, `ci`, `test-stream`, `test-pw-stream`, `test-long-stream`, `test-compare`.
+- **`install.sh`** — Self-contained bash installer. Ships in dist tarball. Subcommands: `install` (default), `pw-detect`, `setup-dev` (called by `run.ts setup`).
 
 ### Build System
 

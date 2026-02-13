@@ -1,0 +1,20 @@
+name: CI
+on:
+  push:
+    branches: [trunk]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:13.0.0-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: CI
+        run: ./run ci
+      # TODO: re-enable once CI is green
+      # - uses: actions/upload-artifact@v4
+      #   with:
+      #     name: whisper-dictate-linux-x86_64
+      #     path: dist/
