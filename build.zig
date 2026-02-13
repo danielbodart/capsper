@@ -34,14 +34,19 @@ pub fn build(b: *std.Build) void {
     const mkdir_nvcc_tmp = b.addSystemCommand(&.{ "mkdir", "-p", nvcc_tmp });
     mkdir_nvcc_tmp.step.dependOn(&cmake_configure.step);
 
-    const cmake_build = b.addSystemCommand(&.{
+    const cmake_jobs = b.option([]const u8, "cmake-jobs", "Limit CMake build parallelism (e.g. '2')");
+    const cmake_build_args = .{
         "cmake",
         "--build",
         cmake_build_dir,
         "--config",
         "Release",
         "-j",
-    });
+    };
+    const cmake_build = if (cmake_jobs) |jobs|
+        b.addSystemCommand(&cmake_build_args ++ .{jobs})
+    else
+        b.addSystemCommand(&cmake_build_args);
     cmake_build.setEnvironmentVariable("TMPDIR", nvcc_tmp);
     cmake_build.step.dependOn(&mkdir_nvcc_tmp.step);
 
