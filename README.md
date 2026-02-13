@@ -6,10 +6,10 @@ Uses a custom streaming speech recognition server written in Zig, linking [whisp
 
 ## How it works
 
-1. The Zig server loads the Whisper model and captures audio directly via PipeWire
-2. The server runs incremental transcription with VAD (Silero) and emits stable words as they're recognised
-3. `xdotool` (X11) or `ydotool` (Wayland) types the text into the focused window
-4. A shell script monitors the push-to-talk key (F24) to gate audio capture
+1. A single Zig binary grabs your keyboard via evdev, intercepts CapsLock as push-to-talk
+2. Audio is captured directly via PipeWire while the trigger key is held
+3. Incremental transcription runs on the GPU with VAD (Silero) and word-level stability checking
+4. Transcribed text is injected as keystrokes via uinput into the focused window
 
 ## Requirements
 
@@ -17,7 +17,7 @@ Uses a custom streaming speech recognition server written in Zig, linking [whisp
 - NVIDIA GPU with ~4 GB VRAM
 - CUDA toolkit
 - PipeWire (default audio server on modern Ubuntu/Fedora)
-- An F24 key — either hardware-mapped (e.g. a programmable keyboard) or software-mapped via keyd (set up automatically on Wayland)
+- User in the `input` group (for evdev keyboard grab and uinput text injection)
 
 ## Setup
 
@@ -29,12 +29,12 @@ cd whisper
 
 This auto-detects and handles everything:
 - Installs toolchain (mise, Zig 0.15.2, Bun) on first run via `bootstrap.sh`
-- Installs system packages (`xinput`/`xdotool` or `evtest`/`ydotool`, `pv`, `ncat`, `cmake`)
+- Installs system packages (`pv`, `ncat`, `cmake`)
 - Initialises the whisper.cpp submodule if needed
 - Downloads models (~574 MB Whisper model + VAD model) if missing
 - Builds whisper.cpp shared libs via CMake with CUDA
-- Compiles the Zig server binary
-- On Wayland: configures keyd (Caps Lock to F24) and uinput permissions
+- Compiles the Zig binary
+- Configures uinput permissions (for text injection via virtual keyboard)
 - Creates and enables a systemd user service
 
 Every step is incremental — re-running `./run` is fast if everything is already set up.
@@ -45,7 +45,7 @@ Every step is incremental — re-running `./run` is fast if everything is alread
 systemctl --user start whisper.service
 ```
 
-Hold F24 (or Caps Lock if keyd is configured) and speak. Release to stop. Text appears in the focused window.
+Hold CapsLock and speak. Release to stop. Text appears in the focused window.
 
 ### PipeWire channel selection
 
@@ -58,25 +58,26 @@ For multi-channel audio interfaces, use `pw-detect` to find which channel carrie
 This records silence and speech, then shows per-channel signal levels and recommends the correct `--pw-channel` flag. Set it via environment variable:
 
 ```bash
-WHISPER_PW_CHANNEL=AUX2 ./whisper.sh
+WHISPER_PW_CHANNEL=AUX2 systemctl --user restart whisper.service
 ```
 
 ## Architecture
 
 ```
-Microphone → [PipeWire] → [Zig Server] → transcribed text → xdotool/ydotool → focused window
-                               ↓
-                       whisper.cpp (GPU)
-                       Silero VAD
-                       AlignAtt streaming
-                       Word-level stability
+Physical Keyboard ──evdev──→ whisper-dictate ──uinput──→ Virtual Keyboard → Apps
+                              │
+                              ├─ Trigger key held → PipeWire audio capture
+                              ├─ whisper.cpp (GPU) + Silero VAD
+                              ├─ AlignAtt streaming + word-level stability
+                              └─ All other keys → forwarded transparently
 ```
 
-The Zig server (`src/`) handles the heavy lifting:
+A single self-contained binary (`src/`):
 
 | File | Purpose |
 |---|---|
 | `main.zig` | Entry point, argument parsing, model loading, warmup |
+| `input.zig` | evdev keyboard grab, uinput virtual keyboard, trigger key + text injection |
 | `server.zig` | Streaming state machine, word-level delta emission |
 | `pipeline.zig` | Low-level whisper.cpp integration, mel/encode/decode loop |
 | `alignatt.zig` | Cross-attention analysis for streaming stop/rewind decisions |
@@ -95,27 +96,13 @@ whisper-dictate [OPTIONS]
   --port, -p PORT         TCP port (default: 43007, use 0 for OS-assigned)
   --warmup-file PATH      WAV file for GPU warmup (default: jfk.wav)
   --no-warmup             Skip warmup inference
-  --input tcp|local       Input mode: tcp (socket) or local (PipeWire capture, default in whisper.sh)
+  --input tcp|local       Input mode: tcp (socket) or local (PipeWire capture)
+  --trigger KEY           Trigger key for push-to-talk (default: capslock)
+  --trigger-passthrough   Forward trigger key to OS after interception
+  --type-delay MS         Delay between injected keystrokes in ms (default: 12)
   --pw-target NODE        PipeWire capture target node name
   --pw-channel CHANNEL    PipeWire channel: MONO, FL, AUX0-AUX7 (default: AUX2)
-```
-
-## Display server support
-
-Auto-detects Wayland vs X11 and uses the appropriate tools:
-
-| | Wayland | X11 |
-|---|---|---|
-| **Key monitoring** | evtest | xinput |
-| **Text typing** | ydotool | xdotool |
-| **Key remapping** | keyd (Caps Lock to F24) | Hardware or xmodmap |
-| **Keyboard detection** | Auto (via /proc/bus/input/devices) | Auto (via xinput + /proc/bus/input/devices) |
-
-Override auto-detection:
-
-```bash
-WHISPER_BACKEND=x11 ./whisper.sh
-WHISPER_BACKEND=wayland ./whisper.sh
+  --verbose               Enable verbose logging
 ```
 
 ## Building & testing
@@ -154,8 +141,6 @@ mise exec zig -- zig build test
 |---|---|---|
 | `WHISPER_PW_CHANNEL` | `AUX2` | PipeWire channel to capture |
 | `WHISPER_PW_TARGET` | *(unset)* | PipeWire node to capture from |
-| `WHISPER_BACKEND` | *(auto)* | Force `x11` or `wayland` backend |
-| `WHISPER_KEYBOARD_ID` | *(auto)* | X11 xinput device ID override |
 
 ## Performance
 
@@ -175,11 +160,11 @@ On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
 cd whisper.cpp/models && ./download-ggml-model.sh large-v3-turbo-q5_0
 ```
 
-**No key events detected on Wayland** — ensure your user is in the `input` group (`groups` to check, `sudo usermod -aG input $USER` then log out/in).
+**Cannot open /dev/input** — ensure your user is in the `input` group (`groups` to check, `sudo usermod -aG input $USER` then log out/in).
 
-**ydotool fails to type** — ensure `/dev/uinput` is accessible. Run `sudo ./setup-keyd.sh` to fix permissions.
+**Text not being typed** — ensure `/dev/uinput` is accessible. The udev rule should be set up by `./run setup`, or manually: `echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uinput.rules && sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput`.
 
-**Wrong keyboard detected** — check `cat /proc/bus/input/devices` to see available devices.
+**Keyboard locked up** — press Enter+Backspace+Escape simultaneously to trigger the panic sequence and ungrab all keyboards.
 
 **Build fails with CMake errors** — ensure the whisper.cpp submodule is initialised:
 ```bash

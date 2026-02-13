@@ -8,6 +8,24 @@ const utils = @import("utils.zig");
 const posix = std.posix;
 const net = std.net;
 
+// Global pause state (module-level so input handler can access it via setPaused).
+// Default unpaused; main.zig sets to paused when --trigger is used.
+pub var is_paused = std.atomic.Value(bool).init(false);
+
+pub fn setPaused(paused: bool) void {
+    is_paused.store(paused, .monotonic);
+}
+
+/// Type-erased callback for injecting text (used by evdev/uinput mode).
+pub const TypeCallback = struct {
+    context: *anyopaque,
+    func: *const fn (*anyopaque, []const u8) void,
+
+    pub fn call(self: TypeCallback, text: []const u8) void {
+        self.func(self.context, text);
+    }
+};
+
 // Streaming constants (byte counts for S16_LE at 16kHz = 32000 bytes/sec)
 const transcribe_interval_bytes: usize = 32000; // 1s — re-transcribe cadence during speech
 const vad_window_bytes: usize = 16000; // 0.5s — VAD lookback window
@@ -34,6 +52,8 @@ pub const Server = struct {
     input_mode: InputMode,
     pw_target: ?[:0]const u8,
     pw_channel: u32,
+    verbose: bool,
+    type_callback: ?TypeCallback,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -43,6 +63,8 @@ pub const Server = struct {
         input_mode: InputMode,
         pw_target: ?[:0]const u8,
         pw_channel: u32,
+        verbose: bool,
+        type_callback: ?TypeCallback,
     ) Server {
         return .{
             .allocator = allocator,
@@ -52,6 +74,8 @@ pub const Server = struct {
             .input_mode = input_mode,
             .pw_target = pw_target,
             .pw_channel = pw_channel,
+            .verbose = verbose,
+            .type_callback = type_callback,
         };
     }
 
@@ -85,7 +109,7 @@ pub const Server = struct {
             defer posix.close(conn);
 
             std.debug.print("Client connected\n", .{});
-            self.handleConnection(conn, conn) catch |err| {
+            self.handleConnection(conn, conn, self.type_callback) catch |err| {
                 std.debug.print("Connection error: {}\n", .{err});
             };
             std.debug.print("Client disconnected\n", .{});
@@ -102,16 +126,20 @@ pub const Server = struct {
         defer capture.deinit();
 
         const stdout_fd: posix.fd_t = 1; // STDOUT_FILENO
-        std.debug.print("Capturing audio, transcribing to stdout\n", .{});
+        if (self.type_callback != null) {
+            std.debug.print("Capturing audio, injecting text via uinput\n", .{});
+        } else {
+            std.debug.print("Capturing audio, transcribing to stdout\n", .{});
+        }
 
-        self.handleConnection(capture.getFd(), stdout_fd) catch |err| {
+        self.handleConnection(capture.getFd(), stdout_fd, self.type_callback) catch |err| {
             std.debug.print("Local capture error: {}\n", .{err});
             return err;
         };
     }
 
-    fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t) !void {
-        var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4);
+    fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
+        var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4, self.verbose);
         defer pipeline.deinit();
 
         const start_ns = std.time.nanoTimestamp();
@@ -134,6 +162,7 @@ pub const Server = struct {
         var silence_start_pos: usize = 0;
         var cycle_count: usize = 0;
         var cycles_without_emit: usize = 0; // force-emit after too many dry cycles
+        var was_paused: bool = is_paused.load(.monotonic); // track previous pause state for transition detection
 
         while (true) {
             // Use poll for timeout support during active speech
@@ -181,6 +210,28 @@ pub const Server = struct {
 
             bytes_since_last_cycle = 0;
 
+            // Pause logic: when paused, drain audio and skip all processing
+            const paused = is_paused.load(.monotonic);
+            if (paused) {
+                const old_len = pcm_buf.items.len;
+                utils.trimBuffer(&pcm_buf, idle_keep_bytes);
+                pcm_trim_total += old_len - pcm_buf.items.len;
+                was_paused = true;
+                continue;
+            }
+
+            // Unpause transition: reset state for clean first transcription
+            if (was_paused) {
+                var ts_buf2: [32]u8 = undefined;
+                const ts2 = formatElapsed(&ts_buf2, start_ns);
+                std.debug.print("[{s}s] UNPAUSED\n", .{ts2});
+                state = .idle;
+                cycle_count = 0;
+                cycles_without_emit = 0;
+                emitted_in_utterance = false;
+                was_paused = false;
+            }
+
             // Final flush on disconnect or read timeout — emit everything
             if (client_closed or timed_out) {
                 if (state == .speaking or state == .trailing_silence) {
@@ -194,10 +245,12 @@ pub const Server = struct {
                             defer self.allocator.free(result.tokens);
                             if (result.words.len > 0) {
                                 const frame_offset = pcm_trim_total / bytes_per_frame;
-                                var flush_ts_buf: [32]u8 = undefined;
-                                const ts = formatElapsed(&flush_ts_buf, start_ns);
-                                std.debug.print("    [{s}s] FINAL FLUSH words={d} timed_out={} closed={}\n", .{ ts, result.words.len, timed_out, client_closed });
-                                _ = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, result.words.len, &last_emitted_frame, &emitted_in_utterance) catch {};
+                                if (self.verbose) {
+                                    var flush_ts_buf: [32]u8 = undefined;
+                                    const ts = formatElapsed(&flush_ts_buf, start_ns);
+                                    std.debug.print("    [{s}s] FINAL FLUSH words={d} timed_out={} closed={}\n", .{ ts, result.words.len, timed_out, client_closed });
+                                }
+                                _ = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, result.words.len, &last_emitted_frame, &emitted_in_utterance, type_cb) catch {};
                             }
                         }
                     }
@@ -318,32 +371,34 @@ pub const Server = struct {
                             else
                                 stable_count;
 
-                            const did_emit = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, emit_count, &last_emitted_frame, &emitted_in_utterance) catch return;
+                            const did_emit = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, emit_count, &last_emitted_frame, &emitted_in_utterance, type_cb) catch return;
                             if (did_emit) {
                                 cycles_without_emit = 0;
                             } else {
                                 cycles_without_emit += 1;
                             }
 
-                            // Debug logging
-                            const ts = formatElapsed(&ts_buf, start_ns);
-                            const cycle_ms = msFromNs(t_cycle);
-                            if (should_flush) {
-                                std.debug.print("    [{s}s] cycle={d} FLUSH words={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms\n", .{
-                                    ts, cycle_count, text_words, buf_duration_ms,
-                                    utils.textPreview(result.text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
-                                });
-                            } else if (prev_words.items.len > 0) {
-                                std.debug.print("    [{s}s] cycle={d} stable={d} last_frame={d} words={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) cycle={d:.0}ms{s}\n", .{
-                                    ts,           cycle_count,  emit_count, last_emitted_frame, text_words, buf_duration_ms,
-                                    utils.textPreview(result.text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, cycle_ms,
-                                    if (did_emit) " EMIT" else "",
-                                });
-                            } else {
-                                std.debug.print("    [{s}s] cycle={d} FIRST words={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms\n", .{
-                                    ts, cycle_count, text_words, buf_duration_ms,
-                                    utils.textPreview(result.text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
-                                });
+                            // Debug logging (verbose only — per-cycle timing)
+                            if (self.verbose) {
+                                const ts = formatElapsed(&ts_buf, start_ns);
+                                const cycle_ms = msFromNs(t_cycle);
+                                if (should_flush) {
+                                    std.debug.print("    [{s}s] cycle={d} FLUSH words={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms\n", .{
+                                        ts, cycle_count, text_words, buf_duration_ms,
+                                        utils.textPreview(result.text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
+                                    });
+                                } else if (prev_words.items.len > 0) {
+                                    std.debug.print("    [{s}s] cycle={d} stable={d} last_frame={d} words={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) cycle={d:.0}ms{s}\n", .{
+                                        ts,           cycle_count,  emit_count, last_emitted_frame, text_words, buf_duration_ms,
+                                        utils.textPreview(result.text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, cycle_ms,
+                                        if (did_emit) " EMIT" else "",
+                                    });
+                                } else {
+                                    std.debug.print("    [{s}s] cycle={d} FIRST words={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms\n", .{
+                                        ts, cycle_count, text_words, buf_duration_ms,
+                                        utils.textPreview(result.text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
+                                    });
+                                }
                             }
 
                             // Update prev_words with absolute frames
@@ -351,7 +406,7 @@ pub const Server = struct {
                             try prev_words.appendSlice(self.allocator, abs_words);
 
                         }
-                    } else {
+                    } else if (self.verbose) {
                         // Pipeline returned null — log it
                         const ts = formatElapsed(&ts_buf, start_ns);
                         const cycle_ms = msFromNs(t_cycle);
@@ -399,14 +454,21 @@ fn formatElapsed(buf: []u8, start_ns: i128) []u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}", .{ elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch buf[0..3];
 }
 
-/// Write a timestamped delta to the output fd and log it.
-fn emitDelta(output_fd: posix.fd_t, start_ns: i128, delta: []const u8) error{BrokenPipe}!void {
+/// Write a timestamped delta to the output fd (or type callback) and log it.
+fn emitDelta(output_fd: posix.fd_t, start_ns: i128, delta: []const u8, type_cb: ?TypeCallback) error{BrokenPipe}!void {
     var ts_buf: [32]u8 = undefined;
     const ts = formatElapsed(&ts_buf, start_ns);
-    _ = posix.write(output_fd, ts) catch return error.BrokenPipe;
-    _ = posix.write(output_fd, "\t") catch return error.BrokenPipe;
-    _ = posix.write(output_fd, delta) catch return error.BrokenPipe;
-    _ = posix.write(output_fd, "\n") catch return error.BrokenPipe;
+
+    if (type_cb) |cb| {
+        // Inject text as keystrokes (evdev mode)
+        cb.call(delta);
+    } else {
+        // Write wire protocol to fd
+        _ = posix.write(output_fd, ts) catch return error.BrokenPipe;
+        _ = posix.write(output_fd, "\t") catch return error.BrokenPipe;
+        _ = posix.write(output_fd, delta) catch return error.BrokenPipe;
+        _ = posix.write(output_fd, "\n") catch return error.BrokenPipe;
+    }
     std.debug.print("  [{s}s] >> {s}\n", .{ ts, delta });
 }
 
@@ -422,6 +484,7 @@ fn emitNewWords(
     count: usize,
     last_emitted_frame: *usize,
     emitted_in_utterance: *bool,
+    type_cb: ?TypeCallback,
 ) error{BrokenPipe}!bool {
     if (count == 0 or words.len == 0) return false;
 
@@ -445,7 +508,7 @@ fn emitNewWords(
         const emit_start = if (emitted_in_utterance.* and raw_start > 0) raw_start - 1 else raw_start;
         const emit_end = words[li].text_end;
         if (emit_end > emit_start and emit_end <= text.len) {
-            try emitDelta(output_fd, start_ns, text[emit_start..emit_end]);
+            try emitDelta(output_fd, start_ns, text[emit_start..emit_end], type_cb);
             last_emitted_frame.* = words[li].frame + frame_offset;
             emitted_in_utterance.* = true;
             return true;

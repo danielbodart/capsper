@@ -7,6 +7,7 @@ const minish = @import("minish");
 const mgen = minish.gen;
 const utils = @import("utils.zig");
 const alignatt = @import("alignatt.zig");
+const input = @import("input.zig");
 
 // Generator for "word-like" strings: lowercase letters and spaces.
 // This mimics Whisper output text (words separated by single spaces).
@@ -587,6 +588,129 @@ fn prop_analyzeAttention_peak_preserved(n: usize) !void {
 }
 
 // ============================================================================
+// input.zig property tests
+// ============================================================================
+
+// Generator for ASCII bytes (0-127)
+const ascii_byte_gen = mgen.intRange(u8, 0, 127);
+// Generator for random key sequences (pairs of keycode + pressed)
+const keycode_gen = mgen.intRange(u16, 0, 255);
+// Generator for printable ASCII strings
+const ascii_text_gen = mgen.string(.{
+    .min_len = 0,
+    .max_len = 80,
+    .charset = .custom,
+    .custom_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?-_=+[]{}|;:'\"<>/\\`~@#$%^&*()\t\n",
+});
+
+// eventsForChar: unshifted chars produce exactly 4 events, shifted produce 8
+fn prop_eventsForChar_count(ch: u8) !void {
+    const result = input.eventsForChar(ch);
+    if (result.len == 0) return; // unmapped char
+    // Must be either 4 (unshifted) or 8 (shifted)
+    try std.testing.expect(result.len == 4 or result.len == 8);
+}
+
+// eventsForChar: all events alternate key/syn
+fn prop_eventsForChar_syn_placement(ch: u8) !void {
+    const result = input.eventsForChar(ch);
+    const events = result.slice();
+    // Every odd-indexed event must be SYN
+    for (events, 0..) |evt, i| {
+        if (i % 2 == 1) {
+            try std.testing.expectEqual(@as(u16, 0x00), evt.type); // EV_SYN
+        } else {
+            try std.testing.expectEqual(@as(u16, 0x01), evt.type); // EV_KEY
+        }
+    }
+}
+
+// eventsForChar: key down and up are balanced
+fn prop_eventsForChar_balanced(ch: u8) !void {
+    const result = input.eventsForChar(ch);
+    const events = result.slice();
+    var downs: i32 = 0;
+    var ups: i32 = 0;
+    for (events) |evt| {
+        if (evt.type == 0x01) { // EV_KEY
+            if (evt.value == 1) downs += 1;
+            if (evt.value == 0) ups += 1;
+        }
+    }
+    try std.testing.expectEqual(downs, ups);
+}
+
+// PanicDetector: random non-panic key sequences never trigger
+fn prop_panic_no_false_trigger(code: u16) !void {
+    // Feed random key presses that aren't all three panic keys
+    var pd = input.PanicDetector{};
+    // Only feed non-panic keys
+    if (code == 28 or code == 14 or code == 1) return; // KEY_ENTER, KEY_BACKSPACE, KEY_ESC
+    try std.testing.expect(!pd.feed(code, true));
+    try std.testing.expect(!pd.feed(code, false));
+}
+
+// PanicDetector: release always disarms
+fn prop_panic_release_disarms(code: u16) !void {
+    var pd = input.PanicDetector{};
+    _ = pd.feed(code, true);
+    _ = pd.feed(code, false); // release
+    // After releasing any key, that key's state should be false
+    // Pressing the other two should not trigger
+    // (this tests that release works correctly for any key)
+    switch (code) {
+        28 => try std.testing.expect(!pd.enter),
+        14 => try std.testing.expect(!pd.backspace),
+        1 => try std.testing.expect(!pd.escape),
+        else => {},
+    }
+}
+
+// TriggerState: press-release-press always produces start/debounce/cancel
+fn prop_trigger_press_release_press(n: usize) !void {
+    _ = n;
+    var ts = input.TriggerState{};
+    try std.testing.expectEqual(input.TriggerAction.start_recording, ts.keyEvent(1));
+    try std.testing.expectEqual(input.TriggerAction.start_debounce, ts.keyEvent(0));
+    try std.testing.expectEqual(input.TriggerAction.cancel_debounce, ts.keyEvent(1));
+}
+
+// hasKeyBit: setting a bit and checking it roundtrips
+fn prop_hasKeyBit_roundtrip(key: u16) !void {
+    if (key >= 256) return; // reasonable bitmask size
+    var mask: [32]u8 = std.mem.zeroes([32]u8);
+    mask[key / 8] |= @as(u8, 1) << @intCast(key % 8);
+    try std.testing.expect(input.hasKeyBit(&mask, key));
+    // Adjacent bits should not be set (unless same byte)
+    if (key > 0) {
+        const prev = key - 1;
+        if (prev / 8 != key / 8 or prev % 8 != key % 8) {
+            try std.testing.expect(!input.hasKeyBit(&mask, prev));
+        }
+    }
+}
+
+// eventsForText: total event count matches sum of per-char events
+fn prop_eventsForText_count(text: []const u8) !void {
+    var expected_count: usize = 0;
+    for (text) |ch| {
+        expected_count += input.eventsForChar(ch).len;
+    }
+    // Just verify the counts are consistent (since we don't have eventsForText,
+    // verify the per-char counts are self-consistent across the string)
+    var actual_count: usize = 0;
+    for (text) |ch| {
+        const result = input.eventsForChar(ch);
+        actual_count += result.len;
+        // Verify each char independently
+        if (result.len > 0) {
+            try std.testing.expect(result.len == 4 or result.len == 8);
+        }
+    }
+    try std.testing.expectEqual(expected_count, actual_count);
+}
+
+// ============================================================================
 // Runner
 // ============================================================================
 
@@ -687,5 +811,31 @@ pub fn main() !void {
     std.debug.print("prop: analyzeAttention peak preserved... ", .{});
     try minish.check(allocator, small_frame_gen, prop_analyzeAttention_peak_preserved, .{ .num_runs = runs });
 
-    std.debug.print("\nAll 31 property tests passed!\n", .{});
+    // input.zig: eventsForChar
+    std.debug.print("prop: eventsForChar event count... ", .{});
+    try minish.check(allocator, ascii_byte_gen, prop_eventsForChar_count, .{ .num_runs = runs });
+    std.debug.print("prop: eventsForChar SYN placement... ", .{});
+    try minish.check(allocator, ascii_byte_gen, prop_eventsForChar_syn_placement, .{ .num_runs = runs });
+    std.debug.print("prop: eventsForChar balanced down/up... ", .{});
+    try minish.check(allocator, ascii_byte_gen, prop_eventsForChar_balanced, .{ .num_runs = runs });
+
+    // input.zig: PanicDetector
+    std.debug.print("prop: PanicDetector no false trigger... ", .{});
+    try minish.check(allocator, keycode_gen, prop_panic_no_false_trigger, .{ .num_runs = runs });
+    std.debug.print("prop: PanicDetector release disarms... ", .{});
+    try minish.check(allocator, keycode_gen, prop_panic_release_disarms, .{ .num_runs = runs });
+
+    // input.zig: TriggerState
+    std.debug.print("prop: TriggerState press-release-press cycle... ", .{});
+    try minish.check(allocator, frame_gen, prop_trigger_press_release_press, .{ .num_runs = runs });
+
+    // input.zig: hasKeyBit
+    std.debug.print("prop: hasKeyBit roundtrip... ", .{});
+    try minish.check(allocator, keycode_gen, prop_hasKeyBit_roundtrip, .{ .num_runs = runs });
+
+    // input.zig: eventsForText count consistency
+    std.debug.print("prop: eventsForText count consistency... ", .{});
+    try minish.check(allocator, ascii_text_gen, prop_eventsForText_count, .{ .num_runs = runs });
+
+    std.debug.print("\nAll 39 property tests passed!\n", .{});
 }

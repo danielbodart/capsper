@@ -132,6 +132,18 @@ pub fn build(b: *std.Build) void {
     const run_alignatt_tests = b.addRunArtifact(alignatt_tests);
     test_step.dependOn(&run_alignatt_tests.step);
 
+    // input.zig tests need libc for @cImport of linux/input-event-codes.h
+    const input_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/input.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    input_tests.linkLibC();
+    const run_input_tests = b.addRunArtifact(input_tests);
+    test_step.dependOn(&run_input_tests.step);
+
     // --- Property tests (minish-based, runs as executable) ---
     const prop_step = b.step("prop-test", "Run property-based tests (minish)");
 
@@ -157,6 +169,12 @@ pub fn build(b: *std.Build) void {
                     .root_source_file = b.path("src/alignatt.zig"),
                     .target = target,
                     .optimize = optimize,
+                }) },
+                .{ .name = "input.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/input.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
                 }) },
             },
         }),

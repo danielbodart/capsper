@@ -18,10 +18,6 @@ async function which(cmd: string): Promise<boolean> {
     return exitCode === 0;
 }
 
-function isWayland(): boolean {
-    return process.env.XDG_SESSION_TYPE === "wayland";
-}
-
 function tmpFile(prefix: string, ext: string): string {
     return join(tmpdir(), `${prefix}-${Date.now()}${ext}`);
 }
@@ -141,15 +137,6 @@ async function ensureDeps() {
     }
     if (!await which("nvcc")) missing.push("nvidia-cuda-toolkit");
 
-    // Runtime deps (X11 vs Wayland)
-    if (isWayland()) {
-        if (!await which("evtest")) missing.push("evtest");
-        if (!await which("ydotool")) missing.push("ydotool");
-    } else {
-        if (!await which("xinput")) missing.push("xinput");
-        if (!await which("xdotool")) missing.push("xdotool");
-    }
-
     // Streaming test deps
     if (!await which("pv")) missing.push("pv");
     if (!await which("nc") && !await which("ncat")) missing.push("ncat");
@@ -235,13 +222,6 @@ function wavDuration(path: string): string {
     return (rawSize / 32000).toFixed(1);
 }
 
-async function isKeydConfigured(): Promise<boolean> {
-    const { exitCode: active } = await $`systemctl is-active --quiet keyd`.quiet().nothrow();
-    if (active !== 0) return false;
-    const { exitCode: hasMapping } = await $`grep -qi 'capslock.*=.*f24' /etc/keyd/default.conf`.quiet().nothrow();
-    return hasMapping === 0;
-}
-
 type PwDetectResult = { channel: string; target?: string };
 
 // ─── Commands ──────────────────────────────────────────────────────────────
@@ -273,28 +253,15 @@ async function updateServiceFile(pw: PwDetectResult) {
     await $`mkdir -p ${serviceDir}`;
 
     const envLines = [`Environment=PATH=${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`];
-    let afterLine = "";
-    let requiresLine = "";
 
-    if (isWayland()) {
-        afterLine = "After=ydotoold.service";
-        requiresLine = "Requires=ydotoold.service";
-        envLines.push(`Environment=XDG_SESSION_TYPE=wayland`);
-        envLines.push(`Environment=WAYLAND_DISPLAY=${process.env.WAYLAND_DISPLAY || "wayland-0"}`);
-    } else {
-        envLines.push(`Environment=XDG_SESSION_TYPE=x11`);
-        envLines.push(`Environment=DISPLAY=${process.env.DISPLAY || ":0"}`);
-    }
-
-    let execStart = `${SCRIPT_DIR}/whisper.sh --pw-channel ${pw.channel}`;
+    // evdev mode: binary handles everything directly, no display server dependency
+    let execStart = `${SCRIPT_DIR}/zig-out/bin/whisper-dictate --trigger capslock --pw-channel ${pw.channel}`;
     if (pw.target) {
         execStart += ` --pw-target ${pw.target}`;
     }
 
     const serviceContent = `[Unit]
 Description=Whisper push-to-talk dictation
-${afterLine}
-${requiresLine}
 
 [Service]
 Type=simple
@@ -319,40 +286,26 @@ WantedBy=default.target
 export async function setup() {
     await build();
 
-    // Wayland: keyd + ydotoold
-    if (isWayland()) {
-        const serviceDir = `${process.env.HOME!}/.config/systemd/user`;
-        await $`mkdir -p ${serviceDir}`;
-        if (await isKeydConfigured()) {
-            console.log("keyd already configured (Caps Lock → F24) — skipping.");
-        } else {
-            console.log("Whisper dictation on Wayland needs keyd to remap Caps Lock to F24 (the push-to-talk key).");
-            console.log("This requires sudo to write /etc/keyd/default.conf.");
-            if (await confirm("Install keyd configuration?")) {
-                await $`sudo ${SCRIPT_DIR}/setup-keyd.sh`;
-            } else {
-                console.log("Skipping keyd setup. You'll need to configure F24 manually.");
-            }
+    // Ensure user is in 'input' group for evdev/uinput access
+    const { exitCode: inInputGroup } = await $`id -nG | grep -qw input`.quiet().nothrow();
+    if (inInputGroup !== 0) {
+        console.log("\n=== Permissions Setup ===");
+        console.log("The 'input' group is needed for keyboard grab and text injection.");
+        if (await confirm("Add current user to 'input' group? (requires sudo)")) {
+            await $`sudo usermod -aG input ${process.env.USER}`;
+            console.log("Added to 'input' group. You may need to log out and back in.");
         }
+    }
 
-        const ydotooldActive = await $`systemctl --user is-active ydotoold`.quiet().nothrow();
-        if (ydotooldActive.exitCode !== 0) {
-            console.log("Setting up ydotoold user service...");
-            await writeIfChanged(`${serviceDir}/ydotoold.service`, `[Unit]
-Description=ydotool daemon
-Documentation=https://github.com/ReimuNotMoe/ydotool
-
-[Service]
-ExecStart=/usr/bin/ydotoold
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-`);
-            await $`systemctl --user daemon-reload`;
-            await $`systemctl --user enable --now ydotoold`;
-            console.log("ydotoold service started");
+    // Ensure uinput device is accessible
+    const uinputRule = '/etc/udev/rules.d/99-uinput.rules';
+    const { exitCode: uinputExists } = await $`test -f ${uinputRule}`.quiet().nothrow();
+    if (uinputExists !== 0) {
+        console.log("\nSetting up /dev/uinput access...");
+        if (await confirm("Install udev rule for /dev/uinput? (requires sudo)")) {
+            await $`echo 'KERNEL=="uinput", MODE="0660", GROUP="input"' | sudo tee ${uinputRule}`;
+            await $`sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput`.nothrow();
+            console.log("udev rule installed.");
         }
     }
 
@@ -396,11 +349,17 @@ export async function testStream(wavFile = "jfk.wav") {
     ensureBinary();
     ensureFile(wavFile);
 
-    const server = await startServer(["--port", "0"]);
+    const duration = wavDuration(wavFile);
+    const timeoutMs = (parseFloat(duration) + 30) * 1000; // audio duration + 30s for startup/flush
+
+    const server = await startServer(["--port", "0", "--verbose"]);
     try {
-        console.error(`Streaming ${wavFile} to localhost:${server.port} at real-time rate...`);
+        console.error(`Streaming ${wavFile} (${duration}s, timeout ${(timeoutMs / 1000).toFixed(0)}s) to localhost:${server.port}...`);
         // Skip 44-byte WAV header, send at 32000 bytes/sec (16kHz S16 mono)
-        await $`tail -c +45 ${wavFile} | pv -qL 32000 | nc -q 5 localhost ${server.port}`;
+        await Promise.race([
+            $`tail -c +45 ${wavFile} | pv -qL 32000 | nc -q 5 localhost ${server.port}`.nothrow(),
+            Bun.sleep(timeoutMs).then(() => { throw new Error(`Test timed out after ${timeoutMs / 1000}s`); }),
+        ]);
     } finally {
         server.kill();
     }
@@ -436,6 +395,7 @@ export async function testPwStream(wavFile = "jfk.wav") {
         "--input", "local",
         "--pw-target", LOOPBACK_SOURCE,
         "--pw-channel", "MONO",
+        "--verbose",
     ]);
 
     try {
@@ -484,7 +444,7 @@ export async function testLongStream() {
     const durationPerLoop = (rawSize / 32000).toFixed(1);
     const totalDuration = (rawSize * LOOPS / 32000).toFixed(1);
 
-    const server = await startServer(["--port", "0"]);
+    const server = await startServer(["--port", "0", "--verbose"]);
 
     try {
         console.error(`Raw PCM: ${rawSize} bytes per loop (${durationPerLoop}s)`);
@@ -513,7 +473,7 @@ export async function testCompare(name = "long-recording") {
     const duration = wavDuration(wav);
     const streamOutput = tmpFile("whisper-compare", ".txt");
 
-    const server = await startServer(["--port", "0"]);
+    const server = await startServer(["--port", "0", "--verbose"]);
 
     try {
         console.error("=== Streaming Comparison Test ===");

@@ -13,13 +13,10 @@ Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `b
 # Clean build artifacts
 ./run.ts clean
 
-# Run the server directly (loads model + VAD, warms up, listens on TCP)
-./zig-out/bin/whisper-dictate --port 43007
+# Run directly (loads model, grabs keyboard, CapsLock = push-to-talk)
+./zig-out/bin/whisper-dictate --trigger capslock --pw-channel AUX2
 
-# Run the full dictation system (server + key monitoring + audio piping)
-./whisper.sh
-
-# First-time setup (builds, installs systemd service, Wayland keyd/ydotoold)
+# First-time setup (builds, configures evdev permissions, installs systemd service)
 ./run.ts setup
 ```
 
@@ -47,24 +44,26 @@ Unit tests and property tests run automatically as part of `./run.ts` (via `zig 
 
 ## Architecture
 
-Push-to-talk voice dictation for Linux. Audio flows: microphone -> `arecord | nc` -> Zig TCP server -> transcribed text -> `xdotool type` into focused window.
+Push-to-talk voice dictation for Linux. Self-contained binary: grabs keyboards via evdev, intercepts CapsLock as trigger, captures audio via PipeWire, transcribes with whisper.cpp, injects text as keystrokes via uinput. No external tools needed (no xdotool, ydotool, keyd, xinput). Works on both X11 and Wayland.
 
-### Zig Server (`src/`)
+### Zig Binary (`src/`)
 
-The Zig binary replaces a Python SimulStreaming server. It links whisper.cpp as shared libraries built via CMake.
+Single binary handles everything: keyboard grab, audio capture, transcription, text injection.
 
-- **`main.zig`** — Entry point. Loads whisper model + VAD model, runs warmup inference on `jfk.wav`, starts TCP server.
-- **`server.zig`** — TCP server with streaming state machine (`idle` -> `speaking` -> `trailing_silence`). Accepts raw S16_LE PCM over socket. Uses VAD to detect speech boundaries. Runs transcription on accumulated audio buffer, emits word-level deltas with stability checking (word must appear in 2 consecutive cycles before being emitted). Wire protocol: `{elapsed}.{tenths}\t{text}\n`.
+- **`main.zig`** — Entry point. Loads whisper + VAD models, warmup, wires input handler to server.
+- **`server.zig`** — Streaming state machine (`idle` -> `speaking` -> `trailing_silence`). Accepts PCM from PipeWire (local mode) or TCP socket. Uses VAD for speech boundaries. Emits word-level deltas with stability checking. Supports `TypeCallback` for uinput text injection.
+- **`input.zig`** — evdev/uinput input handling. Grabs physical keyboards, forwards all keys through virtual uinput keyboard, intercepts trigger key for push-to-talk, injects transcribed text as keystrokes. Includes hotplug (inotify) and panic sequence (Enter+Backspace+Escape = ungrab).
 - **`pipeline.zig`** — Low-level whisper.cpp integration. Manually drives mel spectrogram, encode, and autoregressive decode loop (no `whisper_full`). Implements AlignAtt streaming policy via cross-attention analysis to decide when to stop decoding.
 - **`alignatt.zig`** — AlignAtt attention analysis: z-score normalization, median filtering, head averaging, stopping/rewind detection.
 - **`utils.zig`** — Pure utility functions (no C deps): word counting, byte offsets, word-level delta/stability tracking, PCM-to-float conversion, buffer trimming. Independently unit-tested.
+- **`audio_capture.zig`** — PipeWire audio capture via `pw_thread_loop` + `pw_stream`.
 - **`vad.zig`** — Thin wrapper around whisper.cpp's Silero VAD.
-- **`whisper_c.zig`** — C import bridge. Re-exports whisper.cpp types/functions for use in Zig code.
+- **`whisper_c.zig`** / **`pipewire_c.zig`** — C import bridges for whisper.cpp and PipeWire.
+- **`pw_helpers.c`** — C helpers for PipeWire SPA pod building and `pw_stream_connect` (variadic C calls that Zig can't handle).
 
 ### Scripts & Task Runner
 
-- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `build`, `clean`, `setup`, `test-stream`, `test-pw-stream`, `test-long-stream`, `test-compare`.
-- **`whisper.sh`** — Main user-facing script. Starts the Zig server, monitors F24 key (xinput on X11, evtest on Wayland), pipes audio to server, types transcribed text via xdotool/ydotool.
+- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `build`, `clean`, `setup`, `test-stream`, `test-pw-stream`, `test-long-stream`, `test-compare`, `pw-detect`.
 
 ### Build System
 

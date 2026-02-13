@@ -3,15 +3,18 @@ const c = @import("whisper_c.zig");
 const pw = @import("pipewire_c.zig");
 const Vad = @import("vad.zig").Vad;
 const Pipeline = @import("pipeline.zig").Pipeline;
-const Server = @import("server.zig").Server;
-const InputMode = @import("server.zig").InputMode;
+const server_mod = @import("server.zig");
+const Server = server_mod.Server;
+const InputMode = server_mod.InputMode;
+const TypeCallback = server_mod.TypeCallback;
+const InputHandler = @import("input.zig").InputHandler;
+const input_mod = @import("input.zig");
 const utils = @import("utils.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    std.debug.print("GPA memory tracking enabled\n", .{});
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -23,11 +26,17 @@ pub fn main() !void {
     var input_mode: InputMode = .tcp;
     var pw_target: ?[:0]const u8 = null;
     var pw_channel: u32 = pw.SPA_AUDIO_CHANNEL_AUX2;
+    var verbose: bool = false;
+    var trigger_key: ?u16 = null;
+    var trigger_passthrough: bool = false;
+    var type_delay_us: u64 = 12_000; // 12ms
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--model") or std.mem.eql(u8, arg, "-m")) {
+        if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+            verbose = true;
+        } else if (std.mem.eql(u8, arg, "--model") or std.mem.eql(u8, arg, "-m")) {
             i += 1;
             if (i < args.len) model_path = args[i];
         } else if (std.mem.eql(u8, arg, "--vad-model")) {
@@ -68,12 +77,32 @@ pub fn main() !void {
                     return;
                 };
             }
+        } else if (std.mem.eql(u8, arg, "--trigger")) {
+            i += 1;
+            if (i < args.len) {
+                trigger_key = input_mod.parseTriggerKey(args[i]) orelse {
+                    std.debug.print("Unknown trigger key '{s}'\n", .{args[i]});
+                    std.debug.print("Supported: capslock, f24, scrolllock, numlock, pause, f13-f20\n", .{});
+                    return;
+                };
+            }
+        } else if (std.mem.eql(u8, arg, "--trigger-passthrough")) {
+            trigger_passthrough = true;
+        } else if (std.mem.eql(u8, arg, "--type-delay")) {
+            i += 1;
+            if (i < args.len) type_delay_us = std.fmt.parseInt(u64, args[i], 10) catch 12_000;
         } else {
             std.debug.print("Usage: whisper-dictate [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
-            std.debug.print("       [--warmup-file PATH] [--no-warmup]\n", .{});
+            std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
             std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
+            std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
             return;
         }
+    }
+
+    // --trigger implies --input local (PipeWire capture) and starts paused (trigger key controls recording)
+    if (trigger_key != null) {
+        input_mode = .local;
     }
 
     // Load whisper model
@@ -98,6 +127,36 @@ pub fn main() !void {
     };
     defer vad.deinit();
 
+    // Initialize evdev input handler (if --trigger specified)
+    var input_handler: ?InputHandler = null;
+    var type_callback: ?TypeCallback = null;
+
+    if (trigger_key) |tkey| {
+        std.debug.print("Initializing evdev input handler (trigger=keycode {d})\n", .{tkey});
+        input_handler = InputHandler.init(.{
+            .trigger_key = tkey,
+            .trigger_passthrough = trigger_passthrough,
+            .type_delay_us = type_delay_us,
+            .pause_fn = &server_mod.setPaused,
+        }) catch |err| {
+            std.debug.print("Failed to init input handler: {}\n", .{err});
+            std.debug.print("Check: is user in 'input' group? Is /dev/uinput accessible?\n", .{});
+            return;
+        };
+        type_callback = .{
+            .context = @ptrCast(&input_handler.?),
+            .func = &InputHandler.typeTextCallback,
+        };
+    }
+    defer {
+        if (input_handler != null) input_handler.?.deinit();
+    }
+
+    // Start paused when using trigger key (evdev controls pause directly)
+    if (trigger_key != null) {
+        server_mod.setPaused(true);
+    }
+
     // Warmup
     if (warmup_file) |wf| {
         std.debug.print("Warming up with: {s}\n", .{wf});
@@ -107,7 +166,7 @@ pub fn main() !void {
         };
         defer allocator.free(samples);
 
-        var pipeline = try Pipeline.init(allocator, ctx, .{}, 4);
+        var pipeline = try Pipeline.init(allocator, ctx, .{}, 4, verbose);
         defer pipeline.deinit();
 
         if (try pipeline.transcribe(samples, true)) |result| {
@@ -117,8 +176,13 @@ pub fn main() !void {
         std.debug.print("Warmup complete\n", .{});
     }
 
+    // Start input handler thread (after warmup, before server)
+    if (input_handler != null) {
+        try input_handler.?.start();
+    }
+
     // Start server
-    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel);
+    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, type_callback);
     try server.run();
 }
 

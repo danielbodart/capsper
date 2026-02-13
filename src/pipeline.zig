@@ -28,6 +28,7 @@ pub const Pipeline = struct {
     state: *c.whisper_state,
     config: alignatt.Config,
     n_threads: c_int,
+    verbose: bool,
 
     // Special tokens
     sot: c.whisper_token,
@@ -42,6 +43,7 @@ pub const Pipeline = struct {
         ctx: *c.whisper_context,
         config: alignatt.Config,
         n_threads: c_int,
+        verbose: bool,
     ) !Pipeline {
         const state = c.whisper_init_state(ctx) orelse return error.StateInitFailed;
 
@@ -51,6 +53,7 @@ pub const Pipeline = struct {
             .state = state,
             .config = config,
             .n_threads = n_threads,
+            .verbose = verbose,
             .sot = c.whisper_token_sot(ctx),
             .lang_en = c.whisper_token_lang(ctx, c.whisper_lang_id("en")),
             .tok_transcribe = c.whisper_token_transcribe(ctx),
@@ -273,9 +276,11 @@ pub const Pipeline = struct {
 
         if (generated.items.len == 0) {
             timing.stop_reason = if (std.mem.eql(u8, timing.stop_reason, "none")) "empty" else timing.stop_reason;
-            std.debug.print("    [pipeline] null result ({s}) | state={d:.0}ms mel={d:.0}ms enc={d:.0}ms dec={d:.0}ms total={d:.0}ms\n", .{
-                timing.stop_reason, timing.state_init_ms, timing.mel_ms, timing.encode_ms, timing.decode_ms, timing.total_ms,
-            });
+            if (self.verbose) {
+                std.debug.print("    [pipeline] null result ({s}) | state={d:.0}ms mel={d:.0}ms enc={d:.0}ms dec={d:.0}ms total={d:.0}ms\n", .{
+                    timing.stop_reason, timing.state_init_ms, timing.mel_ms, timing.encode_ms, timing.decode_ms, timing.total_ms,
+                });
+            }
             return null;
         }
 
