@@ -782,7 +782,7 @@ fn createUinput() !posix.fd_t {
 
     // Device metadata
     var setup: UinputSetup = std.mem.zeroes(UinputSetup);
-    const name = "whisper-dictate";
+    const name = "zigsper";
     @memcpy(setup.name[0..name.len], name);
     setup.id.bustype = BUS_VIRTUAL;
     setup.id.vendor = VIRTUAL_VENDOR;

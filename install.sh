@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Self-contained installer for whisper-dictate.
+# Self-contained installer for zigsper.
 # Ships in the dist tarball alongside the binary and shared libs.
 #
 # Usage:
@@ -259,9 +259,9 @@ install_service() {
     local exec_start="$binary --trigger capslock --pw-channel $channel"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
 
-    cat > "$service_dir/whisper.service" <<EOF
+    cat > "$service_dir/zigsper.service" <<EOF
 [Unit]
-Description=Whisper push-to-talk dictation
+Description=Zigsper push-to-talk dictation
 
 [Service]
 Type=simple
@@ -276,18 +276,18 @@ WantedBy=default.target
 EOF
 
     systemctl --user daemon-reload
-    systemctl --user enable whisper.service 2>/dev/null || true
-    echo "whisper.service installed."
+    systemctl --user enable zigsper.service 2>/dev/null || true
+    echo "zigsper.service installed."
 }
 
 # ─── Subcommands ──────────────────────────────────────────────────────────────
 
 cmd_install() {
-    echo "=== Whisper Dictate Installer ==="
+    echo "=== Zigsper Installer ==="
     echo ""
 
     # Verify we're in a dist directory with the binary
-    [ -f "$SCRIPT_DIR/whisper-dictate" ] || die "whisper-dictate binary not found in $SCRIPT_DIR"
+    [ -f "$SCRIPT_DIR/zigsper" ] || die "zigsper binary not found in $SCRIPT_DIR"
 
     # Check runtime deps
     require_cmd nvidia-smi "NVIDIA driver required for CUDA inference."
@@ -314,17 +314,17 @@ cmd_install() {
     fi
 
     # Systemd service
-    install_service "$SCRIPT_DIR" "$SCRIPT_DIR/whisper-dictate" "$channel"
+    install_service "$SCRIPT_DIR" "$SCRIPT_DIR/zigsper" "$channel"
 
     echo ""
     if confirm "Start the dictation service now?"; then
-        systemctl --user restart whisper.service
+        systemctl --user restart zigsper.service
         echo "Service started. Check status with:"
-        echo "  systemctl --user status whisper.service"
+        echo "  systemctl --user status zigsper.service"
     else
         echo ""
         echo "Start manually with:"
-        echo "  systemctl --user start whisper.service"
+        echo "  systemctl --user start zigsper.service"
     fi
 }
 
@@ -347,18 +347,18 @@ cmd_setup_dev() {
         echo "Using default channel: FL"
     fi
 
-    install_service "$project_dir" "$project_dir/zig-out/bin/whisper-dictate" "$channel"
+    install_service "$project_dir" "$project_dir/zig-out/bin/zigsper" "$channel"
 
     echo ""
-    echo "whisper.service ready"
+    echo "zigsper.service ready"
     if confirm "Start the dictation service now?"; then
-        systemctl --user restart whisper.service
+        systemctl --user restart zigsper.service
         echo "Service started. Check status with:"
-        echo "  systemctl --user status whisper.service"
+        echo "  systemctl --user status zigsper.service"
     else
         echo ""
         echo "Start manually with:"
-        echo "  systemctl --user start whisper.service"
+        echo "  systemctl --user start zigsper.service"
     fi
 }
 

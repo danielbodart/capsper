@@ -1,4 +1,4 @@
-# Whisper Dictation
+# Zigsper
 
 Push-to-talk voice dictation for Linux. Hold a key, speak, release — text is typed into whatever window is focused.
 
@@ -22,8 +22,8 @@ Uses a custom streaming speech recognition server written in Zig, linking [whisp
 ## Setup
 
 ```bash
-git clone --recurse-submodules https://github.com/danielbodart/whisper.git
-cd whisper
+git clone --recurse-submodules https://github.com/danielbodart/zigsper.git
+cd zigsper
 ./run
 ```
 
@@ -42,7 +42,7 @@ Every step is incremental — re-running `./run` is fast if everything is alread
 ## Usage
 
 ```bash
-systemctl --user start whisper.service
+systemctl --user start zigsper.service
 ```
 
 Hold CapsLock and speak. Release to stop. Text appears in the focused window.
@@ -58,13 +58,13 @@ For multi-channel audio interfaces, use `pw-detect` to find which channel carrie
 This records silence and speech, then shows per-channel signal levels and recommends the correct `--pw-channel` flag. Set it via environment variable:
 
 ```bash
-WHISPER_PW_CHANNEL=AUX2 systemctl --user restart whisper.service
+ZIGSPER_PW_CHANNEL=AUX2 systemctl --user restart zigsper.service
 ```
 
 ## Architecture
 
 ```
-Physical Keyboard ──evdev──→ whisper-dictate ──uinput──→ Virtual Keyboard → Apps
+Physical Keyboard ──evdev──→ zigsper ──uinput──→ Virtual Keyboard → Apps
                               │
                               ├─ Trigger key held → PipeWire audio capture
                               ├─ whisper.cpp (GPU) + Silero VAD
@@ -89,7 +89,7 @@ A single self-contained binary (`src/`):
 ## Server options
 
 ```
-whisper-dictate [OPTIONS]
+zigsper [OPTIONS]
 
   --model, -m PATH        Whisper model path (default: whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin)
   --vad-model PATH        VAD model path (default: whisper.cpp/models/ggml-silero-v5.1.2.bin)
@@ -139,8 +139,8 @@ mise exec zig -- zig build test
 
 | Variable | Default | Description |
 |---|---|---|
-| `WHISPER_PW_CHANNEL` | `AUX2` | PipeWire channel to capture |
-| `WHISPER_PW_TARGET` | *(unset)* | PipeWire node to capture from |
+| `ZIGSPER_PW_CHANNEL` | `AUX2` | PipeWire channel to capture |
+| `ZIGSPER_PW_TARGET` | *(unset)* | PipeWire node to capture from |
 
 ## Performance
 
@@ -153,7 +153,7 @@ On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
 
 ## Troubleshooting
 
-**Server fails to start** — check `/tmp/whisper-dictation.log`. Ensure CUDA is installed and GPU has sufficient VRAM.
+**Server fails to start** — check `/tmp/zigsper.log`. Ensure CUDA is installed and GPU has sufficient VRAM.
 
 **"Failed to load model"** — model file not found. Download it:
 ```bash
@@ -173,4 +173,4 @@ git submodule update --init --recursive
 
 **PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). For multi-channel devices, run `./run pw-detect` to find the correct channel.
 
-**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `./run pw-detect` and set `WHISPER_PW_CHANNEL` accordingly.
+**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `./run pw-detect` and set `ZIGSPER_PW_CHANNEL` accordingly.

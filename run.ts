@@ -6,7 +6,7 @@ import { join } from "path";
 
 process.env.FORCE_COLOR = "1";
 
-const BINARY = "./zig-out/bin/whisper-dictate";
+const BINARY = "./zig-out/bin/zigsper";
 const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
 const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
 const SCRIPT_DIR = import.meta.dir;
@@ -44,7 +44,7 @@ async function waitForLog(logFile: string, pattern: RegExp, proc: ReturnType<typ
     throw new Error(`Timed out waiting for ${pattern} after ${timeoutSec}s. Log:\n${log.slice(-2000)}`);
 }
 
-/** Start the whisper-dictate server with given args, wait for ready, return handle. */
+/** Start the zigsper server with given args, wait for ready, return handle. */
 async function startServer(args: string[]): Promise<{ proc: ReturnType<typeof spawn>; port: number; logFile: string; kill: () => void }> {
     const logFile = tmpFile("whisper-server", ".log");
 
@@ -465,10 +465,10 @@ export async function dist() {
     await $`rm -rf dist && mkdir -p dist/models`;
 
     // Copy binary
-    await $`cp zig-out/bin/whisper-dictate dist/`;
+    await $`cp zig-out/bin/zigsper dist/`;
 
     // Fix RPATH so binary finds shared libs relative to itself
-    await $`patchelf --set-rpath '$ORIGIN' dist/whisper-dictate`;
+    await $`patchelf --set-rpath '$ORIGIN' dist/zigsper`;
 
     // Copy shared libs (with symlinks preserved)
     await $`bash -c "cp -a whisper.cpp/build-zig/*/lib*.so* dist/"`;

@@ -92,7 +92,7 @@ pub fn main() !void {
             i += 1;
             if (i < args.len) type_delay_us = std.fmt.parseInt(u64, args[i], 10) catch 12_000;
         } else {
-            std.debug.print("Usage: whisper-dictate [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
+            std.debug.print("Usage: zigsper [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
             std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
             std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
             std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});

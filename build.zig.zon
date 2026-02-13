@@ -1,5 +1,5 @@
 .{
-    .name = .whisper_dictate,
+    .name = .zigsper,
     .version = "0.0.1",
     .dependencies = .{
         .minish = .{
@@ -7,7 +7,7 @@
             .hash = "minish-0.1.0-SQtSTWHkAQACfz3xGuWHU8zbx320vK_47r2yto3Pq0Rf",
         },
     },
-    .fingerprint = 0xe154d7029fa78d73,
+    .fingerprint = 0x5a674d0431704524,
     .minimum_zig_version = "0.15.2",
     .paths = .{
         "build.zig",

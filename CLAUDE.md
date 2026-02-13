@@ -14,7 +14,7 @@ Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `b
 ./run.ts clean
 
 # Run directly (loads model, grabs keyboard, CapsLock = push-to-talk)
-./zig-out/bin/whisper-dictate --trigger capslock --pw-channel AUX2
+./zig-out/bin/zigsper --trigger capslock --pw-channel AUX2
 
 # First-time setup (builds, configures evdev permissions, installs systemd service)
 ./run.ts setup
