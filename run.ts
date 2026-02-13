@@ -486,14 +486,10 @@ export async function ci() {
     await ensureSubmodule();
     console.log("Running tests...");
     await $`zig build test`;
-    if (await hasGpu()) {
-        console.log("Building...");
-        await $`zig build -Dcmake-jobs=3`;
-        console.log("Packaging...");
-        await dist();
-    } else {
-        console.log("No GPU detected — skipping full build and packaging.");
-    }
+    console.log("Building...");
+    await $`zig build -Dcmake-jobs=3`;
+    console.log("Packaging...");
+    await dist();
 }
 
 // ─── Command dispatch ──────────────────────────────────────────────────────
