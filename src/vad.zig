@@ -18,9 +18,11 @@ pub const Vad = struct {
         const vctx = c.whisper_vad_init_from_file_with_params(model_path.ptr, ctx_params);
         if (vctx == null) return error.VadInitFailed;
 
+        var params = c.whisper_vad_default_params();
+        params.threshold = 0.2; // Default 0.5 is too aggressive for quiet mics
         return .{
             .vctx = vctx.?,
-            .params = c.whisper_vad_default_params(),
+            .params = params,
         };
     }
 

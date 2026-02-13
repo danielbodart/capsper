@@ -1,8 +1,10 @@
 const std = @import("std");
 const c = @import("whisper_c.zig");
+const pw = @import("pipewire_c.zig");
 const Vad = @import("vad.zig").Vad;
 const Pipeline = @import("pipeline.zig").Pipeline;
 const Server = @import("server.zig").Server;
+const InputMode = @import("server.zig").InputMode;
 const utils = @import("utils.zig");
 
 pub fn main() !void {
@@ -18,6 +20,9 @@ pub fn main() !void {
     var vad_model_path: [:0]const u8 = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
     var port: u16 = 43007;
     var warmup_file: ?[:0]const u8 = "jfk.wav";
+    var input_mode: InputMode = .tcp;
+    var pw_target: ?[:0]const u8 = null;
+    var pw_channel: u32 = pw.SPA_AUDIO_CHANNEL_AUX2;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -39,8 +44,34 @@ pub fn main() !void {
             if (i < args.len) warmup_file = args[i];
         } else if (std.mem.eql(u8, arg, "--no-warmup")) {
             warmup_file = null;
+        } else if (std.mem.eql(u8, arg, "--input")) {
+            i += 1;
+            if (i < args.len) {
+                if (std.mem.eql(u8, args[i], "tcp")) {
+                    input_mode = .tcp;
+                } else if (std.mem.eql(u8, args[i], "local")) {
+                    input_mode = .local;
+                } else {
+                    std.debug.print("Invalid --input value '{s}', expected 'tcp' or 'local'\n", .{args[i]});
+                    return;
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--pw-target")) {
+            i += 1;
+            if (i < args.len) pw_target = args[i];
+        } else if (std.mem.eql(u8, arg, "--pw-channel")) {
+            i += 1;
+            if (i < args.len) {
+                pw_channel = parseChannelName(args[i]) orelse {
+                    std.debug.print("Invalid --pw-channel value '{s}'\n", .{args[i]});
+                    std.debug.print("Expected: MONO, FL, AUX0-AUX7\n", .{});
+                    return;
+                };
+            }
         } else {
-            std.debug.print("Usage: whisper-dictate [--model PATH] [--vad-model PATH] [--port PORT] [--warmup-file PATH] [--no-warmup]\n", .{});
+            std.debug.print("Usage: whisper-dictate [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
+            std.debug.print("       [--warmup-file PATH] [--no-warmup]\n", .{});
+            std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
             return;
         }
     }
@@ -87,8 +118,23 @@ pub fn main() !void {
     }
 
     // Start server
-    var server = Server.init(allocator, ctx, vad, port);
+    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel);
     try server.run();
+}
+
+/// Parse a channel name string to a SPA audio channel position constant.
+fn parseChannelName(name: []const u8) ?u32 {
+    if (std.ascii.eqlIgnoreCase(name, "MONO")) return pw.SPA_AUDIO_CHANNEL_MONO;
+    if (std.ascii.eqlIgnoreCase(name, "FL")) return pw.SPA_AUDIO_CHANNEL_FL;
+    if (std.ascii.eqlIgnoreCase(name, "AUX0")) return pw.SPA_AUDIO_CHANNEL_AUX0;
+    if (std.ascii.eqlIgnoreCase(name, "AUX1")) return pw.SPA_AUDIO_CHANNEL_AUX1;
+    if (std.ascii.eqlIgnoreCase(name, "AUX2")) return pw.SPA_AUDIO_CHANNEL_AUX2;
+    if (std.ascii.eqlIgnoreCase(name, "AUX3")) return pw.SPA_AUDIO_CHANNEL_AUX3;
+    if (std.ascii.eqlIgnoreCase(name, "AUX4")) return pw.SPA_AUDIO_CHANNEL_AUX4;
+    if (std.ascii.eqlIgnoreCase(name, "AUX5")) return pw.SPA_AUDIO_CHANNEL_AUX5;
+    if (std.ascii.eqlIgnoreCase(name, "AUX6")) return pw.SPA_AUDIO_CHANNEL_AUX6;
+    if (std.ascii.eqlIgnoreCase(name, "AUX7")) return pw.SPA_AUDIO_CHANNEL_AUX7;
+    return null;
 }
 
 pub fn loadWav(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {

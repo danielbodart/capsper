@@ -10,8 +10,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration
 SERVER_BIN="$SCRIPT_DIR/zig-out/bin/whisper-dictate"
-SERVER_HOST="localhost"
-SERVER_PORT=43007
 LOG_FILE="/tmp/whisper-dictation.log"
 KEY_STATE_FILE="/tmp/key_state"
 
@@ -35,21 +33,12 @@ else
     KEYBOARD_DEVICE_ID="${WHISPER_KEYBOARD_ID:-}"  # auto-detected if empty
 fi
 
-# PIDs for cleanup
-SERVER_PID=""
-
 # Cleanup function
 cleanup() {
     echo "Cleaning up..."
     trap '' SIGINT SIGTERM  # ignore signals so we can finish cleanup
-    # Kill our entire process group (server, arecord, nc, xinput, etc.)
+    # Kill our entire process group (server, xinput, etc.)
     kill -- -$$ 2>/dev/null || true
-    # Wait for server to release the port before exiting
-    local i=0
-    while ss -tlnp 2>/dev/null | grep -q ":$SERVER_PORT" && [[ $i -lt 10 ]]; do
-        sleep 0.5
-        i=$((i + 1))
-    done
     rm -f "$KEY_STATE_FILE"
     exit 0
 }
@@ -73,8 +62,6 @@ check_dependencies() {
         command -v xinput >/dev/null || missing_deps+=("xinput")
         command -v xdotool >/dev/null || missing_deps+=("xdotool")
     fi
-    command -v arecord >/dev/null || missing_deps+=("arecord")
-    command -v nc >/dev/null || missing_deps+=("nc")
     [[ -f "$SERVER_BIN" ]] || missing_deps+=("whisper-dictate binary (run: zig build)")
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
@@ -160,42 +147,6 @@ detect_keyboard() {
     fi
 }
 
-# Start the whisper-dictate server
-start_server() {
-    # Kill any stale server from a previous crash
-    if ss -tlnp 2>/dev/null | grep -q ":$SERVER_PORT"; then
-        echo "Killing stale server on port $SERVER_PORT..."
-        if command -v fuser >/dev/null; then
-            fuser -k "$SERVER_PORT/tcp" 2>/dev/null || true
-        else
-            ss -tlnp 2>/dev/null | grep ":$SERVER_PORT" | grep -o 'pid=[0-9]\+' | cut -d= -f2 | xargs -r kill 2>/dev/null || true
-        fi
-        sleep 1
-    fi
-
-    echo "Starting whisper-dictate server..."
-    "$SERVER_BIN" --port "$SERVER_PORT" >> "$LOG_FILE" 2>&1 &
-    SERVER_PID=$!
-
-    # Wait for server to be listening (model load + warmup)
-    echo "Waiting for server to load model and start listening..."
-    local max_wait=60
-    local waited=0
-    while ! ss -tlnp 2>/dev/null | grep -q ":$SERVER_PORT"; do
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            echo "ERROR: whisper-dictate server failed to start. Check $LOG_FILE" >&2
-            exit 1
-        fi
-        sleep 1
-        waited=$((waited + 1))
-        if [[ $waited -ge $max_wait ]]; then
-            echo "ERROR: Server did not start listening within $max_wait seconds" >&2
-            exit 1
-        fi
-    done
-    echo "Server started (PID: $SERVER_PID)"
-}
-
 # Monitor key state with debounce
 monitor_key() {
     echo "0" > "$KEY_STATE_FILE"
@@ -263,17 +214,13 @@ type_text() {
     fi
 }
 
-# Process server output
+# Process server output (local PipeWire capture mode)
 process_output() {
     while true; do
-        # Restart server if it died
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            echo "Server died, restarting..."
-            start_server
-        fi
-
-        arecord -f S16_LE -c1 -r 16000 -t raw -D default 2>>"$LOG_FILE" | \
-            nc "$SERVER_HOST" "$SERVER_PORT" | while read -r line; do
+        "$SERVER_BIN" --input local \
+            --pw-channel "${WHISPER_PW_CHANNEL:-AUX2}" \
+            ${WHISPER_PW_TARGET:+--pw-target "$WHISPER_PW_TARGET"} \
+            2>>"$LOG_FILE" | while read -r line; do
             if is_key_pressed && [[ -n "$line" ]]; then
                 # Strip timestamp prefix (e.g. "2.3\ttext" → "text")
                 line="${line#*$'\t'}"
@@ -288,7 +235,7 @@ process_output() {
                 fi
             fi
         done
-        echo "Audio pipeline disconnected, reconnecting in 2s..."
+        echo "Server exited, restarting in 2s..."
         sleep 2
     done
 }
@@ -300,9 +247,9 @@ main() {
     > "$LOG_FILE"
 
     detect_keyboard
-    start_server
 
     echo "Press and hold F24 to dictate..."
+    echo "Audio: PipeWire local capture (channel=${WHISPER_PW_CHANNEL:-AUX2})"
 
     monitor_key &
     process_output

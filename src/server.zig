@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("whisper_c.zig");
 const Vad = @import("vad.zig").Vad;
 const Pipeline = @import("pipeline.zig").Pipeline;
+const AudioCapture = @import("audio_capture.zig").AudioCapture;
 const utils = @import("utils.zig");
 
 const posix = std.posix;
@@ -11,7 +12,7 @@ const net = std.net;
 const transcribe_interval_bytes: usize = 32000; // 1s — re-transcribe cadence during speech
 const vad_window_bytes: usize = 16000; // 0.5s — VAD lookback window
 const idle_keep_bytes: usize = 128000; // 4s — audio retained while idle (gives first transcription more context)
-const silence_timeout_bytes: usize = 16000; // 0.5s — silence before utterance flush
+const silence_timeout_bytes: usize = 64000; // 2s — silence before utterance flush
 const max_buffer_bytes: usize = 480000; // 15s — sliding window cap
 const min_transcribe_bytes: usize = 16000; // 0.5s — minimum audio worth transcribing
 
@@ -23,27 +24,45 @@ const bytes_per_frame: usize = 640;
 
 const State = enum { idle, speaking, trailing_silence };
 
+pub const InputMode = enum { tcp, local };
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     ctx: *c.whisper_context,
     vad: Vad,
     port: u16,
+    input_mode: InputMode,
+    pw_target: ?[:0]const u8,
+    pw_channel: u32,
 
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: *c.whisper_context,
         vad: Vad,
         port: u16,
+        input_mode: InputMode,
+        pw_target: ?[:0]const u8,
+        pw_channel: u32,
     ) Server {
         return .{
             .allocator = allocator,
             .ctx = ctx,
             .vad = vad,
             .port = port,
+            .input_mode = input_mode,
+            .pw_target = pw_target,
+            .pw_channel = pw_channel,
         };
     }
 
     pub fn run(self: *Server) !void {
+        switch (self.input_mode) {
+            .tcp => try self.runTcp(),
+            .local => try self.runLocal(),
+        }
+    }
+
+    fn runTcp(self: *Server) !void {
         const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.port);
         const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
         defer posix.close(listener);
@@ -66,14 +85,32 @@ pub const Server = struct {
             defer posix.close(conn);
 
             std.debug.print("Client connected\n", .{});
-            self.handleConnection(conn) catch |err| {
+            self.handleConnection(conn, conn) catch |err| {
                 std.debug.print("Connection error: {}\n", .{err});
             };
             std.debug.print("Client disconnected\n", .{});
         }
     }
 
-    fn handleConnection(self: *Server, conn: posix.socket_t) !void {
+    fn runLocal(self: *Server) !void {
+        std.debug.print("Starting local PipeWire capture...\n", .{});
+
+        var capture = AudioCapture.init(self.pw_target, self.pw_channel) catch |err| {
+            std.debug.print("Failed to start PipeWire capture: {}\n", .{err});
+            return err;
+        };
+        defer capture.deinit();
+
+        const stdout_fd: posix.fd_t = 1; // STDOUT_FILENO
+        std.debug.print("Capturing audio, transcribing to stdout\n", .{});
+
+        self.handleConnection(capture.getFd(), stdout_fd) catch |err| {
+            std.debug.print("Local capture error: {}\n", .{err});
+            return err;
+        };
+    }
+
+    fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t) !void {
         var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4);
         defer pipeline.deinit();
 
@@ -101,7 +138,7 @@ pub const Server = struct {
         while (true) {
             // Use poll for timeout support during active speech
             var fds = [_]posix.pollfd{.{
-                .fd = conn,
+                .fd = audio_fd,
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
@@ -117,7 +154,7 @@ pub const Server = struct {
                 // Poll timeout — no data arrived
                 timed_out = true;
             } else {
-                n = posix.read(conn, &recv_buf) catch |err| switch (err) {
+                n = posix.read(audio_fd, &recv_buf) catch |err| switch (err) {
                     error.ConnectionResetByPeer => return,
                     else => return err,
                 };
@@ -160,7 +197,7 @@ pub const Server = struct {
                                 var flush_ts_buf: [32]u8 = undefined;
                                 const ts = formatElapsed(&flush_ts_buf, start_ns);
                                 std.debug.print("    [{s}s] FINAL FLUSH words={d} timed_out={} closed={}\n", .{ ts, result.words.len, timed_out, client_closed });
-                                _ = emitNewWords(conn, start_ns, result.text, result.words, frame_offset, result.words.len, &last_emitted_frame, &emitted_in_utterance) catch {};
+                                _ = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, result.words.len, &last_emitted_frame, &emitted_in_utterance) catch {};
                             }
                         }
                     }
@@ -185,6 +222,7 @@ pub const Server = struct {
                     0;
                 const vad_samples = try utils.pcmToFloat(self.allocator, pcm_buf.items[vad_start..]);
                 defer self.allocator.free(vad_samples);
+
                 break :blk self.vad.hasSpeech(vad_samples);
             };
             const vad_ms = msFromNs(t_vad);
@@ -281,7 +319,7 @@ pub const Server = struct {
                             else
                                 stable_count;
 
-                            const did_emit = emitNewWords(conn, start_ns, result.text, result.words, frame_offset, emit_count, &last_emitted_frame, &emitted_in_utterance) catch return;
+                            const did_emit = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, emit_count, &last_emitted_frame, &emitted_in_utterance) catch return;
                             if (did_emit) {
                                 cycles_without_emit = 0;
                             } else {
@@ -362,14 +400,14 @@ fn formatElapsed(buf: []u8, start_ns: i128) []u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}", .{ elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch buf[0..3];
 }
 
-/// Write a timestamped delta to the connection and log it.
-fn emitDelta(conn: posix.socket_t, start_ns: i128, delta: []const u8) error{BrokenPipe}!void {
+/// Write a timestamped delta to the output fd and log it.
+fn emitDelta(output_fd: posix.fd_t, start_ns: i128, delta: []const u8) error{BrokenPipe}!void {
     var ts_buf: [32]u8 = undefined;
     const ts = formatElapsed(&ts_buf, start_ns);
-    _ = posix.write(conn, ts) catch return error.BrokenPipe;
-    _ = posix.write(conn, "\t") catch return error.BrokenPipe;
-    _ = posix.write(conn, delta) catch return error.BrokenPipe;
-    _ = posix.write(conn, "\n") catch return error.BrokenPipe;
+    _ = posix.write(output_fd, ts) catch return error.BrokenPipe;
+    _ = posix.write(output_fd, "\t") catch return error.BrokenPipe;
+    _ = posix.write(output_fd, delta) catch return error.BrokenPipe;
+    _ = posix.write(output_fd, "\n") catch return error.BrokenPipe;
     std.debug.print("  [{s}s] >> {s}\n", .{ ts, delta });
 }
 
@@ -377,7 +415,7 @@ fn emitDelta(conn: posix.socket_t, start_ns: i128, delta: []const u8) error{Brok
 /// `count` limits how many words from the start of `words` to consider.
 /// Returns true if any words were emitted.
 fn emitNewWords(
-    conn: posix.socket_t,
+    output_fd: posix.fd_t,
     start_ns: i128,
     text: []const u8,
     words: []const utils.TimedWord,
@@ -408,7 +446,7 @@ fn emitNewWords(
         const emit_start = if (emitted_in_utterance.* and raw_start > 0) raw_start - 1 else raw_start;
         const emit_end = words[li].text_end;
         if (emit_end > emit_start and emit_end <= text.len) {
-            try emitDelta(conn, start_ns, text[emit_start..emit_end]);
+            try emitDelta(output_fd, start_ns, text[emit_start..emit_end]);
             last_emitted_frame.* = words[li].frame + frame_offset;
             emitted_in_utterance.* = true;
             return true;

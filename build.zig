@@ -7,6 +7,9 @@ pub fn build(b: *std.Build) void {
     // --- Build whisper.cpp via CMake (shared libs) ---
     const cmake_build_dir = "whisper.cpp/build-zig";
 
+    // Skip CMake if shared libs already exist (avoids re-running configure on every build)
+    const skip_cmake = b.option(bool, "skip-cmake", "Skip CMake build (use existing whisper.cpp shared libs)") orelse false;
+
     const cmake_configure = b.addSystemCommand(&.{
         "cmake",
         "-S",
@@ -45,6 +48,18 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(b.path("whisper.cpp/include"));
     exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
 
+    // PipeWire: pkg-config provides include paths for both pipewire-0.3 and spa-0.2
+    exe.linkSystemLibrary("libpipewire-0.3");
+
+    // C helper for PipeWire SPA format building (variadic macros that Zig can't handle)
+    exe.root_module.addCSourceFile(.{
+        .file = b.path("src/pw_helpers.c"),
+        .flags = &.{
+            "-I/usr/include/pipewire-0.3",
+            "-I/usr/include/spa-0.2",
+        },
+    });
+
     // Library paths for shared libs built by CMake
     exe.root_module.addLibraryPath(b.path(cmake_build_dir ++ "/src"));
     exe.root_module.addLibraryPath(b.path(cmake_build_dir ++ "/ggml/src"));
@@ -67,8 +82,10 @@ pub fn build(b: *std.Build) void {
     // System dependencies
     exe.linkLibC();
 
-    // Ensure CMake runs before Zig compilation
-    exe.step.dependOn(&cmake_build.step);
+    // Ensure CMake runs before Zig compilation (unless skipped)
+    if (!skip_cmake) {
+        exe.step.dependOn(&cmake_build.step);
+    }
 
     b.installArtifact(exe);
 
