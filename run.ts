@@ -8,6 +8,7 @@ process.env.FORCE_COLOR = "1";
 
 const BINARY = "./zig-out/bin/whisper-dictate";
 const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
+const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
 const SCRIPT_DIR = import.meta.dir;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -166,20 +167,44 @@ async function ensureSubmodule() {
     }
 }
 
+async function confirm(message: string): Promise<boolean> {
+    process.stdout.write(`${message} [Y/n] `);
+    for await (const line of console) {
+        const answer = line.trim().toLowerCase();
+        return answer === "" || answer === "y" || answer === "yes";
+    }
+    return false;
+}
+
 async function ensureModels() {
-    if (!existsSync(MODEL)) {
-        console.error(`Model not found: ${MODEL}`);
-        console.error("");
-        console.error("Download it with:");
-        console.error(`  cd whisper.cpp/models && ./download-ggml-model.sh large-v3-turbo-q5_0`);
+    const missing: string[] = [];
+    if (!existsSync(MODEL)) missing.push(`Whisper model (large-v3-turbo-q5_0, ~574 MB)`);
+    if (!existsSync(VAD_MODEL)) missing.push(`VAD model (silero-v5.1.2, ~2 MB)`);
+
+    if (missing.length === 0) return;
+
+    console.log(`Missing models:\n${missing.map(m => `  - ${m}`).join("\n")}`);
+    if (!await confirm("Download now?")) {
+        console.error("Models required. Download manually:");
+        console.error("  cd whisper.cpp/models && ./download-ggml-model.sh large-v3-turbo-q5_0");
+        console.error("  cd whisper.cpp/models && ./download-vad-model.sh silero-v5.1.2");
         process.exit(1);
+    }
+
+    if (!existsSync(MODEL)) {
+        console.log("Downloading Whisper model...");
+        await $`cd whisper.cpp/models && ./download-ggml-model.sh large-v3-turbo-q5_0`;
+    }
+    if (!existsSync(VAD_MODEL)) {
+        console.log("Downloading VAD model...");
+        await $`cd whisper.cpp/models && ./download-vad-model.sh silero-v5.1.2`;
     }
 }
 
 function ensureBinary() {
     if (!existsSync(BINARY)) {
         console.error(`Binary not found: ${BINARY}`);
-        console.error("Run: ./run.ts build");
+        console.error("Run: ./run");
         process.exit(1);
     }
 }
@@ -189,6 +214,14 @@ function ensureFile(path: string, label?: string) {
         console.error(`File not found: ${path}${label ? ` (${label})` : ""}`);
         process.exit(1);
     }
+}
+
+/** Write content to path only if it differs from existing file. Returns true if written. */
+async function writeIfChanged(path: string, content: string): Promise<boolean> {
+    const existing = await file(path).text().catch(() => "");
+    if (existing === content) return false;
+    await Bun.write(path, content);
+    return true;
 }
 
 function wavDuration(path: string): string {
@@ -234,7 +267,7 @@ export async function setup() {
         const ydotooldActive = await $`systemctl --user is-active ydotoold`.quiet().nothrow();
         if (ydotooldActive.exitCode !== 0) {
             console.log("Setting up ydotoold user service...");
-            await Bun.write(`${serviceDir}/ydotoold.service`, `[Unit]
+            await writeIfChanged(`${serviceDir}/ydotoold.service`, `[Unit]
 Description=ydotool daemon
 Documentation=https://github.com/ReimuNotMoe/ydotool
 
@@ -252,9 +285,7 @@ WantedBy=default.target
         }
     }
 
-    // whisper.service
-    console.log("Installing whisper systemd user service...");
-
+    // whisper.service — write only if changed (incremental)
     const envLines = [`Environment=PATH=${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`];
     let afterLine = "";
     let requiresLine = "";
@@ -269,7 +300,7 @@ WantedBy=default.target
         envLines.push(`Environment=DISPLAY=${process.env.DISPLAY || ":0"}`);
     }
 
-    await Bun.write(`${serviceDir}/whisper.service`, `[Unit]
+    const serviceContent = `[Unit]
 Description=Whisper push-to-talk dictation
 ${afterLine}
 ${requiresLine}
@@ -284,14 +315,18 @@ ${envLines.join("\n")}
 
 [Install]
 WantedBy=default.target
-`);
+`;
 
-    await $`systemctl --user daemon-reload`;
-    await $`systemctl --user enable whisper.service`;
-    console.log("whisper.service installed and enabled");
+    const servicePath = `${serviceDir}/whisper.service`;
+    if (await writeIfChanged(servicePath, serviceContent)) {
+        await $`systemctl --user daemon-reload`;
+    }
+    // Always ensure enabled (idempotent)
+    await $`systemctl --user enable whisper.service`.quiet().nothrow();
+    console.log("whisper.service ready");
     console.log("");
     console.log("Start dictation with:");
-    console.log("  systemctl --user start whisper");
+    console.log("  systemctl --user start whisper.service");
 }
 
 export async function testStream(wavFile = "jfk.wav") {
@@ -652,7 +687,7 @@ export async function pwDetect(targetDevice?: string) {
     if (bestDelta < 3) {
         console.log("WARNING: No channel showed significant speech activity (delta < 3dB).");
         console.log("Make sure you spoke during the speech recording phase.");
-        console.log("Try again, or specify a device: ./run.ts pw-detect <device-name>");
+        console.log("Try again, or specify a device: ./run pw-detect <device-name>");
     } else {
         const bestName = getName(bestChannel);
         const speechDb = rmsToDb(speechRms[bestChannel]);
@@ -661,7 +696,7 @@ export async function pwDetect(targetDevice?: string) {
         console.log(`  --pw-channel ${bestName}`);
         console.log("");
         if (speechDb < -30) {
-            console.log(`Note: Signal is quiet (${speechDb.toFixed(1)} dB). Gain normalization (on by default) will boost it.`);
+            console.log(`Note: Signal is quiet (${speechDb.toFixed(1)} dB). Check your hardware gain settings.`);
         }
     }
 
@@ -680,7 +715,7 @@ const commands: Record<string, Function> = {
     "pw-detect": pwDetect,
 };
 
-const command = process.argv[2] || "build";
+const command = process.argv[2] || "setup";
 const args = process.argv.slice(3);
 
 const fn = commands[command];

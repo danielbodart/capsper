@@ -17,42 +17,32 @@ Uses a custom streaming speech recognition server written in Zig, linking [whisp
 - NVIDIA GPU with ~4 GB VRAM
 - CUDA toolkit
 - PipeWire (default audio server on modern Ubuntu/Fedora)
-- [mise](https://mise.jdx.dev) — installs Zig 0.15.2 and Bun automatically via `bootstrap.sh`
 - An F24 key — either hardware-mapped (e.g. a programmable keyboard) or software-mapped via keyd (set up automatically on Wayland)
 
 ## Setup
 
 ```bash
-# Clone with submodules (whisper.cpp)
 git clone --recurse-submodules https://github.com/danielbodart/whisper.git
 cd whisper
-
-# Download the models (~574 MB total)
-cd whisper.cpp/models
-./download-ggml-model.sh large-v3-turbo-q5_0
-./download-vad-model.sh silero-v5.1.2
-cd ../..
-
-# Build the Zig binary (installs mise/bun/zig on first run, builds whisper.cpp via CMake)
-./run.ts build
-
-# Install system dependencies + create systemd service
-./run.ts setup
+./run
 ```
 
-`./run.ts setup` handles:
-- Installing system packages (`xinput`/`xdotool` or `evtest`/`ydotool`, `pv`, `ncat`)
-- On Wayland: configuring keyd (Caps Lock to F24) and uinput permissions
-- Creating a systemd user service for background operation
+This auto-detects and handles everything:
+- Installs toolchain (mise, Zig 0.15.2, Bun) on first run via `bootstrap.sh`
+- Installs system packages (`xinput`/`xdotool` or `evtest`/`ydotool`, `pv`, `ncat`, `cmake`)
+- Initialises the whisper.cpp submodule if needed
+- Downloads models (~574 MB Whisper model + VAD model) if missing
+- Builds whisper.cpp shared libs via CMake with CUDA
+- Compiles the Zig server binary
+- On Wayland: configures keyd (Caps Lock to F24) and uinput permissions
+- Creates and enables a systemd user service
+
+Every step is incremental — re-running `./run` is fast if everything is already set up.
 
 ## Usage
 
 ```bash
-# Start dictation directly
-./whisper.sh
-
-# Or via systemd (after setup)
-systemctl --user start whisper
+systemctl --user start whisper.service
 ```
 
 Hold F24 (or Caps Lock if keyd is configured) and speak. Release to stop. Text appears in the focused window.
@@ -62,7 +52,7 @@ Hold F24 (or Caps Lock if keyd is configured) and speak. Release to stop. Text a
 For multi-channel audio interfaces, use `pw-detect` to find which channel carries your microphone signal:
 
 ```bash
-./run.ts pw-detect
+./run pw-detect
 ```
 
 This records silence and speech, then shows per-channel signal levels and recommends the correct `--pw-channel` flag. Set it via environment variable:
@@ -134,28 +124,28 @@ All commands go through the Bun-based task runner (`run.ts`), which bootstraps i
 
 ```bash
 # Build (default command)
-./run.ts build
+./run build
 
 # Force rebuild including whisper.cpp CMake + CUDA
-./run.ts rebuild
+./run rebuild
 
 # Unit + property tests (no GPU required)
 mise exec zig -- zig build test
 
 # Stream jfk.wav at real-time rate via TCP
-./run.ts test-stream jfk.wav
+./run test-stream jfk.wav
 
 # Stream via PipeWire loopback (tests full PipeWire path)
-./run.ts test-pw-stream jfk.wav
+./run test-pw-stream jfk.wav
 
 # Long-running stability test (jfk.wav × 20 loops, ~3.7 min)
-./run.ts test-long-stream
+./run test-long-stream
 
 # Compare streaming output against reference transcript
-./run.ts test-compare
+./run test-compare
 
 # Detect best PipeWire channel for your microphone
-./run.ts pw-detect
+./run pw-detect
 ```
 
 ## Environment variables
@@ -196,6 +186,6 @@ cd whisper.cpp/models && ./download-ggml-model.sh large-v3-turbo-q5_0
 git submodule update --init --recursive
 ```
 
-**PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). For multi-channel devices, run `./run.ts pw-detect` to find the correct channel.
+**PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). For multi-channel devices, run `./run pw-detect` to find the correct channel.
 
-**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `./run.ts pw-detect` and set `WHISPER_PW_CHANNEL` accordingly.
+**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `./run pw-detect` and set `WHISPER_PW_CHANNEL` accordingly.

@@ -9,7 +9,7 @@ Full roadmap for making whisper-dictate production-ready for public use.
 
 ## 2. Model Management
 
-- [ ] **Add model download to `run.ts`** — `./run.ts download-models` that wraps whisper.cpp's download scripts for both the Whisper model and VAD model
+- [ ] **Add model download to `run.ts`** — `./run download-models` that wraps whisper.cpp's download scripts for both the Whisper model and VAD model
 - [ ] **Check models on startup** — if model file doesn't exist, print a clear error with the exact download command instead of a cryptic "Failed to load model"
 - [ ] **Support XDG paths** — look for models in `~/.local/share/whisper-dictate/models/` as a fallback, not just relative paths from cwd
 
@@ -28,7 +28,7 @@ Full roadmap for making whisper-dictate production-ready for public use.
 
 ## 4. Error Messages & User Feedback
 
-- [ ] **Print model path on load failure** — "Failed to load model: /path/to/model.bin — file not found. Download with: ./run.ts download-models"
+- [ ] **Print model path on load failure** — "Failed to load model: /path/to/model.bin — file not found. Download with: ./run download-models"
 - [ ] **Print VAD model path on failure** — same pattern as above
 - [ ] **Make warmup failure non-fatal** — currently returns (exits) on warmup failure despite printing "Warning"
 - [ ] **Add startup summary** — after model load, print: model name, GPU status, port, input mode, PipeWire channel
