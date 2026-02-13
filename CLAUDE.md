@@ -81,6 +81,7 @@ Static linking is intentionally avoided — Zig's bundled libc++ conflicts with 
 - **AlignAtt always `is_last=true`**: The frame_threshold=25 is too conservative for short streaming buffers. Server-side word stability checking handles hallucination filtering instead.
 - **Word-level delta tracking**: Stability is checked at word granularity (not byte), using case-insensitive comparison with trailing punctuation stripped. This handles Whisper changing "so" to "so," between cycles.
 - **Sliding window**: Audio buffer capped at 15s (`max_buffer_bytes=480000`). When trimmed, prev_text offset scanning (up to 6 words) realigns the emitted word count.
+- **PipeWire FFI must go through C helpers**: Passing `spa_pod**` params through Zig FFI breaks SPA format negotiation (ports get generic names like `input_1`, auto-connect fails, resampling doesn't happen). All PipeWire calls involving SPA pods or variadic macros must be in `src/pw_helpers.c`, not called directly from Zig.
 
 ## Workflow
 
