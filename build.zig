@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
 
     // Use a disk-backed temp dir for nvcc intermediate files.
     // Default /tmp is tmpfs (RAM-backed) and nvcc can fill 16GB+ during CUDA kernel compilation.
-    const nvcc_tmp = cmake_build_dir ++ "/tmp";
+    const nvcc_tmp = b.fmt("{s}/{s}/tmp", .{ b.build_root.path orelse ".", cmake_build_dir });
 
     const cmake_configure = b.addSystemCommand(&.{
         "cmake",

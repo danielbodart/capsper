@@ -139,6 +139,7 @@ async function ensureDeps() {
     if (!await which("nvidia-smi")) {
         console.error("WARNING: nvidia-smi not found. CUDA may not be available.");
     }
+    if (!await which("nvcc")) missing.push("nvidia-cuda-toolkit");
 
     // Runtime deps (X11 vs Wayland)
     if (isWayland()) {
@@ -169,11 +170,16 @@ async function ensureSubmodule() {
 
 async function confirm(message: string): Promise<boolean> {
     process.stdout.write(`${message} [Y/n] `);
-    for await (const line of console) {
-        const answer = line.trim().toLowerCase();
-        return answer === "" || answer === "y" || answer === "yes";
-    }
-    return false;
+    return new Promise<boolean>(resolve => {
+        const onData = (chunk: Buffer) => {
+            process.stdin.removeListener("data", onData);
+            process.stdin.pause();
+            const answer = chunk.toString().trim().toLowerCase();
+            resolve(answer === "" || answer === "y" || answer === "yes");
+        };
+        process.stdin.resume();
+        process.stdin.on("data", onData);
+    });
 }
 
 async function ensureModels() {
@@ -229,6 +235,15 @@ function wavDuration(path: string): string {
     return (rawSize / 32000).toFixed(1);
 }
 
+async function isKeydConfigured(): Promise<boolean> {
+    const { exitCode: active } = await $`systemctl is-active --quiet keyd`.quiet().nothrow();
+    if (active !== 0) return false;
+    const { exitCode: hasMapping } = await $`grep -qi 'capslock.*=.*f24' /etc/keyd/default.conf`.quiet().nothrow();
+    return hasMapping === 0;
+}
+
+type PwDetectResult = { channel: string; target?: string };
+
 // ─── Commands ──────────────────────────────────────────────────────────────
 
 export async function build() {
@@ -252,17 +267,73 @@ export async function clean() {
     console.log("Cleaned.");
 }
 
-export async function setup() {
-    await build();
-
+async function updateServiceFile(pw: PwDetectResult) {
     const home = process.env.HOME!;
     const serviceDir = `${home}/.config/systemd/user`;
     await $`mkdir -p ${serviceDir}`;
 
+    const envLines = [`Environment=PATH=${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`];
+    let afterLine = "";
+    let requiresLine = "";
+
+    if (isWayland()) {
+        afterLine = "After=ydotoold.service";
+        requiresLine = "Requires=ydotoold.service";
+        envLines.push(`Environment=XDG_SESSION_TYPE=wayland`);
+        envLines.push(`Environment=WAYLAND_DISPLAY=${process.env.WAYLAND_DISPLAY || "wayland-0"}`);
+    } else {
+        envLines.push(`Environment=XDG_SESSION_TYPE=x11`);
+        envLines.push(`Environment=DISPLAY=${process.env.DISPLAY || ":0"}`);
+    }
+
+    let execStart = `${SCRIPT_DIR}/whisper.sh --pw-channel ${pw.channel}`;
+    if (pw.target) {
+        execStart += ` --pw-target ${pw.target}`;
+    }
+
+    const serviceContent = `[Unit]
+Description=Whisper push-to-talk dictation
+${afterLine}
+${requiresLine}
+
+[Service]
+Type=simple
+WorkingDirectory=${SCRIPT_DIR}
+ExecStart=${execStart}
+Restart=always
+RestartSec=5
+${envLines.join("\n")}
+
+[Install]
+WantedBy=default.target
+`;
+
+    const servicePath = `${serviceDir}/whisper.service`;
+    if (await writeIfChanged(servicePath, serviceContent)) {
+        await $`systemctl --user daemon-reload`;
+        console.log("whisper.service updated");
+    }
+    await $`systemctl --user enable whisper.service`.quiet().nothrow();
+}
+
+export async function setup() {
+    await build();
+
     // Wayland: keyd + ydotoold
     if (isWayland()) {
-        console.log("Setting up keyd (Caps Lock → F24) and uinput permissions...");
-        await $`sudo ${SCRIPT_DIR}/setup-keyd.sh`;
+        const serviceDir = `${process.env.HOME!}/.config/systemd/user`;
+        await $`mkdir -p ${serviceDir}`;
+        if (await isKeydConfigured()) {
+            console.log("keyd already configured (Caps Lock → F24) — skipping.");
+        } else {
+            console.log("Whisper dictation on Wayland needs keyd to remap Caps Lock to F24 (the push-to-talk key).");
+            console.log("This requires sudo to write /etc/keyd/default.conf.");
+            if (await confirm("Install keyd configuration?")) {
+                await $`sudo ${SCRIPT_DIR}/setup-keyd.sh`;
+            } else {
+                console.log("Skipping keyd setup. You'll need to configure F24 manually.");
+            }
+        }
 
         const ydotooldActive = await $`systemctl --user is-active ydotoold`.quiet().nothrow();
         if (ydotooldActive.exitCode !== 0) {
@@ -285,48 +356,40 @@ WantedBy=default.target
         }
     }
 
-    // whisper.service — write only if changed (incremental)
-    const envLines = [`Environment=PATH=${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`];
-    let afterLine = "";
-    let requiresLine = "";
+    // Audio configuration — optionally run pwDetect to find the best mic channel
+    let pwResult: PwDetectResult = { channel: "FL" };
 
-    if (isWayland()) {
-        afterLine = "After=ydotoold.service";
-        requiresLine = "Requires=ydotoold.service";
-        envLines.push(`Environment=XDG_SESSION_TYPE=wayland`);
-        envLines.push(`Environment=WAYLAND_DISPLAY=${process.env.WAYLAND_DISPLAY || "wayland-0"}`);
+    console.log("\n=== Audio Configuration ===");
+    if (await confirm("Run microphone channel detection? (No = use default FL)")) {
+        let audioConfigured = false;
+        while (!audioConfigured) {
+            try {
+                pwResult = await pwDetect();
+                audioConfigured = true;
+            } catch (e: any) {
+                console.error(`\nAudio detection failed: ${e.message}`);
+                if (await confirm("Skip and use default channel FL?")) {
+                    audioConfigured = true;
+                } else if (!await confirm("Retry?")) {
+                    process.exit(1);
+                }
+            }
+        }
     } else {
-        envLines.push(`Environment=XDG_SESSION_TYPE=x11`);
-        envLines.push(`Environment=DISPLAY=${process.env.DISPLAY || ":0"}`);
+        console.log("Using default channel: FL");
     }
 
-    const serviceContent = `[Unit]
-Description=Whisper push-to-talk dictation
-${afterLine}
-${requiresLine}
+    await updateServiceFile(pwResult);
+    console.log("\nwhisper.service ready");
 
-[Service]
-Type=simple
-WorkingDirectory=${SCRIPT_DIR}
-ExecStart=${SCRIPT_DIR}/whisper.sh
-Restart=always
-RestartSec=5
-${envLines.join("\n")}
-
-[Install]
-WantedBy=default.target
-`;
-
-    const servicePath = `${serviceDir}/whisper.service`;
-    if (await writeIfChanged(servicePath, serviceContent)) {
-        await $`systemctl --user daemon-reload`;
+    if (await confirm("Start the dictation service now?")) {
+        await $`systemctl --user restart whisper.service`;
+        console.log("Service started. Check status with:");
+        console.log("  systemctl --user status whisper.service");
+    } else {
+        console.log("\nStart manually with:");
+        console.log("  systemctl --user start whisper.service");
     }
-    // Always ensure enabled (idempotent)
-    await $`systemctl --user enable whisper.service`.quiet().nothrow();
-    console.log("whisper.service ready");
-    console.log("");
-    console.log("Start dictation with:");
-    console.log("  systemctl --user start whisper.service");
 }
 
 export async function testStream(wavFile = "jfk.wav") {
@@ -521,13 +584,17 @@ export async function testCompare(name = "long-recording") {
     }
 }
 
-export async function pwDetect(targetDevice?: string) {
+export async function pwDetect(targetDevice?: string, durationArg?: string): Promise<PwDetectResult> {
     if (!await which("pw-record")) {
         console.error("ERROR: pw-record not found. Install PipeWire.");
         process.exit(1);
     }
 
-    const RECORD_SECS = 2;
+    const RECORD_SECS = durationArg ? parseInt(durationArg, 10) : 5;
+    if (isNaN(RECORD_SECS) || RECORD_SECS < 1) {
+        console.error("ERROR: Duration must be a positive integer (seconds).");
+        process.exit(1);
+    }
     const SAMPLE_RATE = 48000;
     const FORMAT = "s32"; // pw-record default for multichannel devices
 
@@ -536,13 +603,44 @@ export async function pwDetect(targetDevice?: string) {
     console.log(targetDevice
         ? `Probing device: ${targetDevice}`
         : "Probing default audio source...");
+    console.log(`Recording duration: ${RECORD_SECS}s per phase`);
     console.log("");
 
-    // Step 2: Record silence baseline (2 seconds)
-    console.log(`Recording ${RECORD_SECS}s of SILENCE (don't speak)...`);
+    // Wait for Enter keypress
+    async function waitForEnter(prompt: string) {
+        process.stdout.write(prompt);
+        return new Promise<void>(resolve => {
+            const onData = () => {
+                process.stdin.removeListener("data", onData);
+                process.stdin.pause();
+                if (wasTTYRaw) process.stdin.setRawMode(false);
+                resolve();
+            };
+            const wasTTYRaw = process.stdin.isTTY;
+            if (wasTTYRaw) process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on("data", onData);
+        });
+    }
+
+    function startRecording(outFile: string) {
+        const args = ["pw-record", `--rate=${SAMPLE_RATE}`, `--format=${FORMAT}`, ...targetArgs, outFile];
+        return Bun.spawn(args, { stdout: "ignore", stderr: "ignore" });
+    }
+
+    async function stopRecording(proc: ReturnType<typeof Bun.spawn>) {
+        proc.kill();
+        await proc.exited;
+    }
+
+    // Step 2: Record silence baseline
+    await waitForEnter("Press ENTER to start recording SILENCE (stay quiet)...");
+    console.log(`Recording ${RECORD_SECS}s of silence...`);
     const silenceFile = tmpFile("pw-detect-silence", ".wav");
-    await $`pw-record --rate=${SAMPLE_RATE} --format=${FORMAT} ${targetArgs} ${silenceFile} &
-            PID=$!; sleep ${RECORD_SECS}; kill $PID 2>/dev/null; wait $PID 2>/dev/null; true`.quiet().nothrow();
+    const silenceProc = startRecording(silenceFile);
+    await Bun.sleep(RECORD_SECS * 1000);
+    await stopRecording(silenceProc);
+    console.log("Done.\n");
 
     // Parse WAV to get channel count
     const silenceData = await file(silenceFile).arrayBuffer();
@@ -582,7 +680,7 @@ export async function pwDetect(targetDevice?: string) {
     console.log(`  Samples per channel: ${samplesPerChannel}`);
     console.log("");
 
-    // Compute per-channel RMS for silence
+    // Compute per-channel RMS
     function channelRms(view: DataView, offset: number, nChannels: number, nSamples: number, bps: number, channel: number): number {
         let sumSq = 0;
         const scale = bps === 4 ? 2147483648 : (bps === 2 ? 32768 : 128);
@@ -608,12 +706,14 @@ export async function pwDetect(targetDevice?: string) {
         silenceRms.push(channelRms(silenceView, dataOffset, numChannels, samplesPerChannel, bytesPerSample, ch));
     }
 
-    // Step 3: Record with speech (2 seconds)
-    console.log(`Now SPEAK for ${RECORD_SECS}s...`);
-    await Bun.sleep(500); // brief pause so user sees the prompt
+    // Step 3: Record with speech
+    await waitForEnter("Press ENTER to start recording SPEECH (talk normally)...");
+    console.log(`Recording ${RECORD_SECS}s of speech...`);
     const speechFile = tmpFile("pw-detect-speech", ".wav");
-    await $`pw-record --rate=${SAMPLE_RATE} --format=${FORMAT} ${targetArgs} ${speechFile} &
-            PID=$!; sleep ${RECORD_SECS}; kill $PID 2>/dev/null; wait $PID 2>/dev/null; true`.quiet().nothrow();
+    const speechProc = startRecording(speechFile);
+    await Bun.sleep(RECORD_SECS * 1000);
+    await stopRecording(speechProc);
+    console.log("Done.\n");
 
     const speechData = await file(speechFile).arrayBuffer();
     const speechView = new DataView(speechData);
@@ -645,14 +745,8 @@ export async function pwDetect(targetDevice?: string) {
     }
 
     // Step 4: Show results table
-    console.log("");
     console.log("=== Channel Analysis ===");
     console.log("");
-
-    const channelNames = (n: number): string => {
-        if (n <= 2) return n === 0 ? "FL" : "FR";
-        return `AUX${n - 2}`;  // PipeWire maps ch2+ to AUX0, AUX1, ...
-    };
 
     // For multi-channel devices, PipeWire typically uses AUX0..AUXN
     const getName = (ch: number): string => {
@@ -684,27 +778,52 @@ export async function pwDetect(targetDevice?: string) {
     console.log("");
 
     // Step 5: Recommendation
-    if (bestDelta < 3) {
-        console.log("WARNING: No channel showed significant speech activity (delta < 3dB).");
-        console.log("Make sure you spoke during the speech recording phase.");
-        console.log("Try again, or specify a device: ./run pw-detect <device-name>");
-    } else {
-        const bestName = getName(bestChannel);
-        const speechDb = rmsToDb(speechRms[bestChannel]);
-        console.log(`Recommended channel: ${bestName} (speech: ${speechDb.toFixed(1)} dB, delta: ${bestDelta.toFixed(1)} dB)`);
-        console.log("");
-        console.log(`  --pw-channel ${bestName}`);
-        console.log("");
-        if (speechDb < -30) {
-            console.log(`Note: Signal is quiet (${speechDb.toFixed(1)} dB). Check your hardware gain settings.`);
-        }
-    }
+    const bestName = getName(bestChannel);
+    const speechDb = rmsToDb(speechRms[bestChannel]);
 
     // Cleanup
     await $`rm -f ${silenceFile} ${speechFile}`.nothrow();
+
+    if (bestDelta < 3) {
+        console.log("WARNING: No channel showed significant speech activity (delta < 3dB).");
+        console.log("Make sure you spoke during the speech recording phase.");
+        console.log("Falling back to AUX2.");
+        return { channel: "AUX2", target: targetDevice };
+    }
+
+    console.log(`Recommended channel: ${bestName} (speech: ${speechDb.toFixed(1)} dB, delta: ${bestDelta.toFixed(1)} dB)`);
+    console.log("");
+    console.log(`  --pw-channel ${bestName}`);
+    console.log("");
+    if (speechDb < -30) {
+        console.log(`Note: Signal is quiet (${speechDb.toFixed(1)} dB). Check your hardware gain settings.`);
+    }
+
+    return { channel: bestName, target: targetDevice };
 }
 
 // ─── Command dispatch ──────────────────────────────────────────────────────
+
+async function pwDetectCli(...cliArgs: string[]) {
+    let targetDevice: string | undefined;
+    let duration: string | undefined;
+    let doUpdateService = false;
+
+    for (let i = 0; i < cliArgs.length; i++) {
+        if (cliArgs[i] === "--update-service") {
+            doUpdateService = true;
+        } else if (!targetDevice) {
+            targetDevice = cliArgs[i];
+        } else {
+            duration = cliArgs[i];
+        }
+    }
+    const result = await pwDetect(targetDevice, duration);
+    if (doUpdateService) {
+        await updateServiceFile(result);
+        console.log("\nService file updated. Restart with: systemctl --user restart whisper.service");
+    }
+}
 
 const commands: Record<string, Function> = {
     build, rebuild, clean, setup,
@@ -712,7 +831,7 @@ const commands: Record<string, Function> = {
     "test-pw-stream": testPwStream,
     "test-long-stream": testLongStream,
     "test-compare": testCompare,
-    "pw-detect": pwDetect,
+    "pw-detect": pwDetectCli,
 };
 
 const command = process.argv[2] || "setup";

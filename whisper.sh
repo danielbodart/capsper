@@ -8,6 +8,25 @@ set -uo pipefail
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --pw-channel)
+            WHISPER_PW_CHANNEL="${WHISPER_PW_CHANNEL:-$2}"
+            shift 2
+            ;;
+        --pw-target)
+            WHISPER_PW_TARGET="${WHISPER_PW_TARGET:-$2}"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Usage: $0 [--pw-channel CHANNEL] [--pw-target TARGET]" >&2
+            exit 1
+            ;;
+    esac
+done
+
 # Configuration
 SERVER_BIN="$SCRIPT_DIR/zig-out/bin/whisper-dictate"
 LOG_FILE="/tmp/whisper-dictation.log"
