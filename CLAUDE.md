@@ -23,17 +23,19 @@ Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `b
 ### Testing
 
 ```bash
-# Short integration test: stream jfk.wav (~11s) at real-time rate
-./run.ts test-stream jfk.wav
+# Unit + property tests (fast, no GPU required)
+./run.ts test
 
-# Long integration test: loop jfk.wav 20x (~3.7 min) to verify sliding window stability
-./run.ts test-long-stream
+# All integration tests (requires GPU + built binary)
+./run.ts slow-test
 
-# Comparison test: stream long-recording.wav, compare against batch transcript (~1m42s)
-./run.ts test-compare
-
-# PipeWire integration test
-./run.ts test-pw-stream jfk.wav
+# Individual integration tests
+./run.ts slow-test stream              # TCP stream jfk.wav (~11s)
+./run.ts slow-test stream custom.wav   # TCP stream custom file
+./run.ts slow-test long-stream         # Loop jfk.wav 20x (~3.7 min)
+./run.ts slow-test compare             # Compare against reference transcript
+./run.ts slow-test compare dictation   # Compare with testdata/dictation.wav
+./run.ts slow-test pw-stream           # PipeWire loopback test
 ```
 
 Unit tests and property tests run automatically as part of `./run.ts` (via `zig build`). Unit tests live inline in `src/utils.zig` and `src/alignatt.zig` (pure Zig modules with no C deps). Property-based tests in `src/prop_tests.zig` use [minish](https://github.com/CogitatorTech/minish) for fuzz-like coverage of word-level delta/stability functions. Integration tests are self-contained: each starts its own server with `--port 0` (OS-assigned port), parses the port from the "Listening on port" log line, and cleans up on exit.
@@ -63,7 +65,7 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 
 ### Scripts & Task Runner
 
-- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `build`, `rebuild`, `clean`, `setup`, `test`, `dist`, `ci`, `test-stream`, `test-pw-stream`, `test-long-stream`, `test-compare`.
+- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `build`, `rebuild`, `clean`, `setup`, `test`, `slow-test`, `dist`, `ci`.
 - **`install.sh`** — Self-contained bash installer. Ships in dist tarball. Subcommands: `install` (default), `pw-detect`, `setup-dev` (called by `run.ts setup`).
 
 ### Build System
@@ -85,7 +87,7 @@ Static linking is intentionally avoided — Zig's bundled libc++ conflicts with 
 
 ## Workflow
 
-**Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test. Use `./run.ts test-compare` to get a baseline before and after changes — it gives concrete word coverage numbers to measure improvement.
+**Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test. Use `./run.ts slow-test compare` to get a baseline before and after changes — it gives concrete word coverage numbers to measure improvement.
 
 ## Conventions
 
