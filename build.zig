@@ -7,8 +7,15 @@ pub fn build(b: *std.Build) void {
     // --- Build whisper.cpp via CMake (shared libs) ---
     const cmake_build_dir = "whisper.cpp/build-zig";
 
-    // Skip CMake if shared libs already exist (avoids re-running configure on every build)
-    const skip_cmake = b.option(bool, "skip-cmake", "Skip CMake build (use existing whisper.cpp shared libs)") orelse false;
+    // Auto-skip CMake if shared libs already exist (CUDA compilation is expensive).
+    // Use -Dforce-cmake to rebuild, or run `./run.ts clean` to start fresh.
+    const force_cmake = b.option(bool, "force-cmake", "Force CMake rebuild even if shared libs exist") orelse false;
+    const libs_exist = if (std.fs.cwd().statFile(cmake_build_dir ++ "/ggml/src/ggml-cuda/libggml-cuda.so")) |_| true else |_| false;
+    const run_cmake = force_cmake or !libs_exist;
+
+    // Use a disk-backed temp dir for nvcc intermediate files.
+    // Default /tmp is tmpfs (RAM-backed) and nvcc can fill 16GB+ during CUDA kernel compilation.
+    const nvcc_tmp = cmake_build_dir ++ "/tmp";
 
     const cmake_configure = b.addSystemCommand(&.{
         "cmake",
@@ -24,6 +31,9 @@ pub fn build(b: *std.Build) void {
         "-DWHISPER_BUILD_SERVER=OFF",
     });
 
+    const mkdir_nvcc_tmp = b.addSystemCommand(&.{ "mkdir", "-p", nvcc_tmp });
+    mkdir_nvcc_tmp.step.dependOn(&cmake_configure.step);
+
     const cmake_build = b.addSystemCommand(&.{
         "cmake",
         "--build",
@@ -32,7 +42,8 @@ pub fn build(b: *std.Build) void {
         "Release",
         "-j",
     });
-    cmake_build.step.dependOn(&cmake_configure.step);
+    cmake_build.setEnvironmentVariable("TMPDIR", nvcc_tmp);
+    cmake_build.step.dependOn(&mkdir_nvcc_tmp.step);
 
     // --- Zig executable ---
     const exe = b.addExecutable(.{
@@ -82,8 +93,8 @@ pub fn build(b: *std.Build) void {
     // System dependencies
     exe.linkLibC();
 
-    // Ensure CMake runs before Zig compilation (unless skipped)
-    if (!skip_cmake) {
+    // Ensure CMake runs before Zig compilation (unless libs already built)
+    if (run_cmake) {
         exe.step.dependOn(&cmake_build.step);
     }
 

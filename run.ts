@@ -45,17 +45,15 @@ async function waitForLog(logFile: string, pattern: RegExp, proc: ReturnType<typ
 /** Start the whisper-dictate server with given args, wait for ready, return handle. */
 async function startServer(args: string[]): Promise<{ proc: ReturnType<typeof spawn>; port: number; logFile: string; kill: () => void }> {
     const logFile = tmpFile("whisper-server", ".log");
-    const logFd = Bun.file(logFile).writer();
 
     const proc = spawn([BINARY, ...args], {
-        stdout: logFd,
-        stderr: logFd,
+        stdout: Bun.file(logFile),
+        stderr: Bun.file(logFile),
     });
 
     const kill = () => {
         proc.kill();
         try { proc.kill(9); } catch {}
-        logFd.end();
     };
 
     try {
@@ -73,19 +71,15 @@ async function startServer(args: string[]): Promise<{ proc: ReturnType<typeof sp
 async function startLocalServer(args: string[]): Promise<{ proc: ReturnType<typeof spawn>; outputFile: string; logFile: string; kill: () => void }> {
     const logFile = tmpFile("whisper-server", ".log");
     const outputFile = tmpFile("whisper-pw-stream", ".txt");
-    const logWriter = Bun.file(logFile).writer();
-    const outWriter = Bun.file(outputFile).writer();
 
     const proc = spawn([BINARY, ...args], {
-        stdout: outWriter,
-        stderr: logWriter,
+        stdout: Bun.file(outputFile),
+        stderr: Bun.file(logFile),
     });
 
     const kill = () => {
         proc.kill();
         try { proc.kill(9); } catch {}
-        logWriter.end();
-        outWriter.end();
     };
 
     try {
@@ -210,6 +204,14 @@ export async function build() {
     await ensureModels();
     console.log("Building...");
     await $`zig build`;
+}
+
+export async function rebuild() {
+    await ensureDeps();
+    await ensureSubmodule();
+    await ensureModels();
+    console.log("Rebuilding (forcing CMake + CUDA recompilation)...");
+    await $`zig build -Dforce-cmake`;
 }
 
 export async function clean() {
@@ -670,7 +672,7 @@ export async function pwDetect(targetDevice?: string) {
 // ─── Command dispatch ──────────────────────────────────────────────────────
 
 const commands: Record<string, Function> = {
-    build, clean, setup,
+    build, rebuild, clean, setup,
     "test-stream": testStream,
     "test-pw-stream": testPwStream,
     "test-long-stream": testLongStream,
