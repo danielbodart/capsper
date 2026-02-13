@@ -1,5 +1,6 @@
 import { $, spawn, file } from "bun";
-import { existsSync, statSync } from "fs";
+import { existsSync, readFileSync, statSync } from "fs";
+import { createConnection } from "net";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -125,4 +126,41 @@ export function ensureBinary(): void {
 export function wavDuration(path: string): string {
     const rawSize = statSync(path).size - 44;
     return (rawSize / 32000).toFixed(1);
+}
+
+/** Read a WAV file, strip the 44-byte header, return raw PCM buffer. */
+export function readPcm(wavFile: string): Buffer {
+    return readFileSync(wavFile).subarray(44);
+}
+
+/** Stream PCM data to a TCP server at real-time rate, return server response.
+ *  Sends ~100ms chunks at 32000 bytes/sec, then shuts down the write side
+ *  so the server sees EOF immediately and flushes. */
+export function streamPcm(port: number, pcm: Buffer, bytesPerSec = 32000): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const socket = createConnection(port, "localhost");
+        const chunks: Buffer[] = [];
+        const CHUNK_MS = 100;
+        const CHUNK_BYTES = Math.ceil(bytesPerSec * CHUNK_MS / 1000);
+        let offset = 0;
+        let timer: ReturnType<typeof setTimeout>;
+
+        socket.on("connect", () => {
+            const sendNext = () => {
+                if (offset >= pcm.length) {
+                    socket.end();
+                    return;
+                }
+                const end = Math.min(offset + CHUNK_BYTES, pcm.length);
+                socket.write(pcm.subarray(offset, end));
+                offset = end;
+                timer = setTimeout(sendNext, CHUNK_MS);
+            };
+            sendNext();
+        });
+
+        socket.on("data", (data) => chunks.push(data));
+        socket.on("end", () => resolve(Buffer.concat(chunks).toString()));
+        socket.on("error", (err) => { clearTimeout(timer); reject(err); });
+    });
 }

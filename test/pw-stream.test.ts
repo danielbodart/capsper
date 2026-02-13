@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll } from "bun:test";
 import { $, spawn, file } from "bun";
-import { hasGpu, ensureBinary, ensureFile, wavDuration, startLocalServer } from "./helpers";
+import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer } from "./helpers";
 
 const gpu = await hasGpu();
 
@@ -50,8 +50,8 @@ describe.skipIf(!gpu)("pw-stream", () => {
 
                 await pwcat.exited;
 
-                // Give the server time to flush trailing transcription
-                await Bun.sleep(3000);
+                // Wait for server to flush trailing transcription (2s silence timeout + transcribe)
+                await waitForLog(server.logFile, /flush → idle/, server.proc, 10);
 
                 const output = await file(server.outputFile).text();
                 console.error("");

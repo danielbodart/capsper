@@ -135,6 +135,15 @@ export async function setup() {
     await $`bash ${installSh} setup-dev ${SCRIPT_DIR}`;
 }
 
+/** Default target: build → unit tests → quick integration tests (stream + pw-stream). */
+export async function dev() {
+    await build();
+    console.log("Running unit + property tests...");
+    await $`zig build test`;
+    console.log("Running integration smoke tests...");
+    await $`bun test test/stream.test.ts test/pw-stream.test.ts`;
+}
+
 export async function test() {
     await $`zig build test`;
 }
@@ -190,11 +199,11 @@ export async function ci() {
 // ─── Command dispatch ──────────────────────────────────────────────────────
 
 const commands: Record<string, Function> = {
-    build, rebuild, clean, setup, test, dist, ci,
+    dev, build, rebuild, clean, setup, test, dist, ci,
     "slow-test": slowTest,
 };
 
-const command = process.argv[2] || "build";
+const command = process.argv[2] || "dev";
 const args = process.argv.slice(3);
 
 const fn = commands[command];

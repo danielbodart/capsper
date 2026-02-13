@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll } from "bun:test";
-import { $, file } from "bun";
-import { hasGpu, ensureBinary, ensureFile, wavDuration, tmpFile, startServer, normalize, compareWords } from "./helpers";
+import { file } from "bun";
+import { hasGpu, ensureBinary, ensureFile, wavDuration, startServer, readPcm, streamPcm, normalize, compareWords } from "./helpers";
 
 const gpu = await hasGpu();
 
@@ -15,7 +15,6 @@ describe.skipIf(!gpu)("compare", () => {
         ensureFile(ref, "reference transcript");
 
         const duration = wavDuration(wav);
-        const streamOutput = tmpFile("whisper-compare", ".txt");
 
         const server = await startServer(["--port", "0", "--verbose"]);
 
@@ -27,9 +26,9 @@ describe.skipIf(!gpu)("compare", () => {
             console.error("");
             console.error("Streaming at real-time rate...");
 
-            await $`tail -c +45 ${wav} | pv -qL 32000 | nc -q 1 localhost ${server.port} > ${streamOutput}`;
+            const pcm = readPcm(wav);
+            const rawOutput = await streamPcm(server.port, pcm);
 
-            const rawOutput = await file(streamOutput).text();
             console.error("");
             console.error("=== Raw Streaming Output ===");
             console.error(rawOutput);
@@ -88,7 +87,6 @@ describe.skipIf(!gpu)("compare", () => {
             expect(coveragePct).toBeGreaterThanOrEqual(50);
         } finally {
             server.kill();
-            await $`rm -f ${streamOutput}`.nothrow();
         }
     }, 240_000);
 });

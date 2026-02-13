@@ -7,8 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `bootstrap.sh` + mise.
 
 ```bash
-# Build (checks deps, inits submodule, runs CMake + Zig compilation)
+# Default: build + unit tests + quick integration smoke tests (stream + pw-stream)
 ./run.ts
+
+# Build only (no tests)
+./run.ts build
 
 # Clean build artifacts
 ./run.ts clean
@@ -65,7 +68,7 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 
 ### Scripts & Task Runner
 
-- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `build`, `rebuild`, `clean`, `setup`, `test`, `slow-test`, `dist`, `ci`.
+- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `dev` (default), `build`, `rebuild`, `clean`, `setup`, `test`, `slow-test`, `dist`, `ci`.
 - **`install.sh`** — Self-contained bash installer. Ships in dist tarball. Subcommands: `install` (default), `pw-detect`, `setup-dev` (called by `run.ts setup`).
 
 ### Build System
