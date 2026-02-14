@@ -206,6 +206,46 @@ EOF
     echo "capsper.service installed."
 }
 
+# ─── CUDA Runtime ─────────────────────────────────────────────────────────
+
+check_cuda_libraries() {
+    # libcudart and libcublas are needed at runtime by the bundled whisper.cpp CUDA backend.
+    # These come from the CUDA toolkit packages, not the nvidia driver.
+    local missing=()
+    ldconfig -p 2>/dev/null | grep -q 'libcudart\.so\.13' || missing+=("libcudart.so.13")
+    ldconfig -p 2>/dev/null | grep -q 'libcublas\.so\.13' || missing+=("libcublas.so.13")
+    ldconfig -p 2>/dev/null | grep -q 'libcublasLt\.so\.13' || missing+=("libcublasLt.so.13")
+
+    [ ${#missing[@]} -eq 0 ] && return
+
+    echo ""
+    echo "=== CUDA Runtime Libraries ==="
+    echo "Missing: ${missing[*]}"
+    echo ""
+    echo "These are provided by the CUDA 13 toolkit packages (~600 MB):"
+    echo "  sudo apt install cuda-cudart-13-0 libcublas-13-0"
+    echo ""
+    echo "If apt can't find them, add the NVIDIA package repository first:"
+    echo "  https://developer.nvidia.com/cuda-downloads"
+    echo ""
+
+    if command -v apt >/dev/null 2>&1; then
+        if confirm "Try to install them now? (requires sudo)"; then
+            if sudo apt install -y cuda-cudart-13-0 libcublas-13-0; then
+                echo "CUDA runtime libraries installed."
+                return
+            else
+                echo ""
+                echo "apt install failed. You may need to add the NVIDIA repository first."
+                echo "See: https://developer.nvidia.com/cuda-downloads"
+                die "Missing CUDA runtime libraries."
+            fi
+        fi
+    fi
+
+    die "Missing CUDA runtime libraries. Install them with: sudo apt install cuda-cudart-13-0 libcublas-13-0"
+}
+
 # ─── Subcommands ──────────────────────────────────────────────────────────────
 
 cmd_install() {
@@ -217,6 +257,7 @@ cmd_install() {
 
     # Check runtime deps
     require_cmd nvidia-smi "NVIDIA driver required for CUDA inference."
+    check_cuda_libraries
     command -v pw-cli >/dev/null 2>&1 || echo "WARNING: pw-cli not found. PipeWire may not be installed."
 
     # Permissions

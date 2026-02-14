@@ -19,6 +19,7 @@ Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://g
 
 - Linux (Debian/Ubuntu)
 - NVIDIA GPU with ~4 GB VRAM
+- CUDA 13 runtime libraries (~600 MB — the installer will set this up for you)
 - PipeWire (default audio server on modern Ubuntu/Fedora)
 
 ## Install
