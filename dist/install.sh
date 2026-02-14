@@ -174,12 +174,15 @@ install_service() {
     local work_dir="$1"
     local binary="$2"
     local channel="$3"
-    local target="${4:-}"
+    local model_dir="$4"
+    local target="${5:-}"
 
     local service_dir="$HOME/.config/systemd/user"
     mkdir -p "$service_dir"
 
     local exec_start="$binary --trigger capslock --pw-channel $channel"
+    exec_start="$exec_start --model $model_dir/$WHISPER_MODEL_NAME"
+    exec_start="$exec_start --vad-model $model_dir/$VAD_MODEL_NAME"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
 
     cat > "$service_dir/capsper.service" <<EOF
@@ -222,13 +225,15 @@ cmd_install() {
     # Download models
     download_models "$SCRIPT_DIR/models"
 
-    # Audio detection
+    # Audio configuration
     local channel="FL"
     PW_TARGET=""
     echo ""
     echo "=== Audio Configuration ==="
-    if confirm "Run microphone channel detection? (No = use default FL)"; then
+    if confirm "Select audio device?"; then
         select_device "$SCRIPT_DIR/bin/capsper"
+    fi
+    if confirm "Run microphone channel detection? (No = use default FL)"; then
         local detect_output
         detect_output=$(pw_detect "$SCRIPT_DIR/bin/capsper" "$PW_TARGET")
         echo "$detect_output"
@@ -239,7 +244,7 @@ cmd_install() {
     fi
 
     # Systemd service
-    install_service "$SCRIPT_DIR" "$SCRIPT_DIR/bin/capsper" "$channel" "$PW_TARGET"
+    install_service "$SCRIPT_DIR" "$SCRIPT_DIR/bin/capsper" "$channel" "$SCRIPT_DIR/models" "$PW_TARGET"
 
     echo ""
     if confirm "Start the dictation service now?"; then
@@ -263,8 +268,10 @@ cmd_setup_dev() {
     PW_TARGET=""
     echo ""
     echo "=== Audio Configuration ==="
-    if confirm "Run microphone channel detection? (No = use default FL)"; then
+    if confirm "Select audio device?"; then
         select_device "$project_dir/dist/bin/capsper"
+    fi
+    if confirm "Run microphone channel detection? (No = use default FL)"; then
         local detect_output
         detect_output=$(pw_detect "$project_dir/dist/bin/capsper" "$PW_TARGET")
         echo "$detect_output"
@@ -274,7 +281,7 @@ cmd_setup_dev() {
         echo "Using default channel: FL"
     fi
 
-    install_service "$project_dir" "$project_dir/dist/bin/capsper" "$channel" "$PW_TARGET"
+    install_service "$project_dir" "$project_dir/dist/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET"
 
     echo ""
     echo "capsper.service ready"

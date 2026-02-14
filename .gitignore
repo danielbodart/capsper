@@ -1,4 +1,5 @@
 dist/bin/
+dist/models/
 .zig-cache/
 whisper.cpp/build-zig/
 tools/
