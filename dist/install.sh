@@ -210,7 +210,7 @@ EOF
 
 check_cuda_libraries() {
     # libcudart and libcublas are needed at runtime by the bundled whisper.cpp CUDA backend.
-    # These come from the CUDA toolkit packages, not the nvidia driver.
+    # These come from the CUDA toolkit packages (any CUDA 13.x), not the nvidia driver.
     local missing=()
     ldconfig -p 2>/dev/null | grep -q 'libcudart\.so\.13' || missing+=("libcudart.so.13")
     ldconfig -p 2>/dev/null | grep -q 'libcublas\.so\.13' || missing+=("libcublas.so.13")
@@ -218,12 +218,22 @@ check_cuda_libraries() {
 
     [ ${#missing[@]} -eq 0 ] && return
 
+    # Find available CUDA 13.x packages (could be 13-0, 13-1, etc.)
+    local cudart_pkg="" cublas_pkg=""
+    if command -v apt-cache >/dev/null 2>&1; then
+        cudart_pkg=$(apt-cache search --names-only '^cuda-cudart-13-' 2>/dev/null | sort -V | tail -1 | awk '{print $1}')
+        cublas_pkg=$(apt-cache search --names-only '^libcublas-13-' 2>/dev/null | sort -V | tail -1 | awk '{print $1}')
+    fi
+    # Fallback if apt-cache didn't find anything
+    : "${cudart_pkg:=cuda-cudart-13-1}"
+    : "${cublas_pkg:=libcublas-13-1}"
+
     echo ""
     echo "=== CUDA Runtime Libraries ==="
     echo "Missing: ${missing[*]}"
     echo ""
     echo "These are provided by the CUDA 13 toolkit packages (~600 MB):"
-    echo "  sudo apt install cuda-cudart-13-0 libcublas-13-0"
+    echo "  sudo apt install $cudart_pkg $cublas_pkg"
     echo ""
     echo "If apt can't find them, add the NVIDIA package repository first:"
     echo "  https://developer.nvidia.com/cuda-downloads"
@@ -231,7 +241,7 @@ check_cuda_libraries() {
 
     if command -v apt >/dev/null 2>&1; then
         if confirm "Try to install them now? (requires sudo)"; then
-            if sudo apt install -y cuda-cudart-13-0 libcublas-13-0; then
+            if sudo apt install -y "$cudart_pkg" "$cublas_pkg"; then
                 echo "CUDA runtime libraries installed."
                 return
             else
@@ -243,7 +253,7 @@ check_cuda_libraries() {
         fi
     fi
 
-    die "Missing CUDA runtime libraries. Install them with: sudo apt install cuda-cudart-13-0 libcublas-13-0"
+    die "Missing CUDA runtime libraries. Install them with: sudo apt install $cudart_pkg $cublas_pkg"
 }
 
 # ─── Subcommands ──────────────────────────────────────────────────────────────
