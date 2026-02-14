@@ -22,10 +22,8 @@ pub fn listSources() void {
         return;
     }
 
-    if (count == 0) {
-        std.debug.print("No audio sources found.\n", .{});
+    if (count == 0)
         return;
-    }
 
     std.debug.print("\n", .{});
     std.debug.print("  {s:<40} {s:<10} {s}\n", .{ "Name", "Channels", "Description" });
