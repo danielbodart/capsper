@@ -29,6 +29,9 @@ async function ensureDeps(opts?: { cuda?: boolean }) {
     const { exitCode: pwCheck } = await $`pkg-config --exists libpipewire-0.3`.quiet().nothrow();
     if (pwCheck !== 0) missing.push("libpipewire-0.3-dev");
 
+    // Git LFS (needed to pull real shared libs from LFS)
+    if (!await which("git-lfs")) missing.push("git-lfs");
+
     // Streaming test deps
     if (!await which("pv")) missing.push("pv");
     if (!await which("nc") && !await which("ncat")) missing.push("ncat");
@@ -57,6 +60,16 @@ async function ensureSubmodule() {
     if (!existsSync("whisper.cpp/CMakeLists.txt")) {
         console.log("Initializing whisper.cpp submodule...");
         await $`git submodule update --init --recursive`;
+    }
+}
+
+async function ensureLfs() {
+    // Check if any versioned .so files are LFS pointers instead of real binaries
+    const { stdout } = await $`head -c 20 dist/lib/*.so.*.*.* 2>/dev/null || true`.quiet();
+    if (stdout.toString().includes("version https://git-lfs")) {
+        console.log("LFS pointer files detected in dist/lib/ — pulling real binaries...");
+        await $`git lfs install`;
+        await $`git lfs pull`;
     }
 }
 
@@ -123,6 +136,7 @@ async function version(): Promise<string> {
 export async function build() {
     await ensureDeps();
     await ensureSubmodule();
+    await ensureLfs();
     if (!process.env.CI) await ensureModels();
     const ver = await version();
     console.log(`Building v${ver}...`);
@@ -185,6 +199,18 @@ export async function slowTest(testName?: string, ...extra: string[]) {
 
 export async function dist() {
     ensureBinary();
+
+    // Validate that shared libs are real ELF binaries, not LFS pointers
+    const { stdout } = await $`file dist/lib/*.so`.quiet();
+    const lines = stdout.toString().trim().split("\n");
+    const bad = lines.filter(l => !l.includes("ELF"));
+    if (bad.length > 0) {
+        console.error("ERROR: dist/lib/ contains non-ELF files (likely LFS pointers):");
+        bad.forEach(l => console.error(`  ${l}`));
+        console.error("Run: git lfs pull");
+        process.exit(1);
+    }
+
     await $`cp -n test/jfk.wav dist/bin/ 2>/dev/null || true`;
     const ver = await version();
     const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
@@ -194,6 +220,7 @@ export async function dist() {
 
 export async function ci() {
     await ensureSubmodule();
+    await ensureLfs();
     const ver = await version();
     console.log("Running tests...");
     await $`zig build test`;
