@@ -158,6 +158,7 @@ pub fn build(b: *std.Build) void {
         "-DCMAKE_BUILD_TYPE=Release",
         "-DBUILD_SHARED_LIBS=ON",
         "-DGGML_CUDA=ON",
+        "-DCMAKE_CUDA_ARCHITECTURES=75-virtual;86-virtual;89-virtual;120a-virtual",
         "-DWHISPER_BUILD_TESTS=OFF",
         "-DWHISPER_BUILD_EXAMPLES=OFF",
         "-DWHISPER_BUILD_SERVER=OFF",

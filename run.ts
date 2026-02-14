@@ -126,7 +126,7 @@ export async function build() {
     if (!process.env.CI) await ensureModels();
     const ver = await version();
     console.log(`Building v${ver}...`);
-    await $`zig build --prefix dist -Dversion=${ver}`;
+    await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe`;
 }
 
 export async function rebuildWhisper(...args: string[]) {
@@ -198,7 +198,7 @@ export async function ci() {
     console.log("Running tests...");
     await $`zig build test`;
     console.log(`Building v${ver}...`);
-    await $`zig build --prefix dist -Dversion=${ver}`;
+    await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe`;
     await dist();
     if (process.env.GH_TOKEN) {
         const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
