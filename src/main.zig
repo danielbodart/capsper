@@ -208,7 +208,8 @@ pub fn main() !void {
         };
         defer if (resolved_path.ptr != wf.ptr) allocator.free(resolved_path);
 
-        std.debug.print("Warming up with: {s}\n", .{resolved_path});
+        std.debug.print("Warming up with: {s} (first run may be slow due to CUDA kernel compilation)\n", .{resolved_path});
+        const warmup_start = std.time.nanoTimestamp();
         const samples = loadWav(allocator, resolved_path) catch |err| {
             std.debug.print("Warning: warmup file not found ({s}), skipping warmup: {}\n", .{ resolved_path, err });
             break :warmup;
@@ -222,7 +223,8 @@ pub fn main() !void {
             std.debug.print("Warmup result: \"{s}\"\n", .{result.text});
             allocator.free(result.text);
         }
-        std.debug.print("Warmup complete\n", .{});
+        const warmup_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - warmup_start, 1_000_000));
+        std.debug.print("Warmup complete ({d}.{d:0>1}s)\n", .{ warmup_ms / 1000, (warmup_ms % 1000) / 100 });
     }
 
     if (dry_run) {

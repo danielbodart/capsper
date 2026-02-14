@@ -7,6 +7,7 @@ import { join } from "path";
 export const BINARY = "./dist/bin/capsper";
 export const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
 export const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
+export const WARMUP_FILE = "test/jfk.wav";
 
 export async function hasGpu(): Promise<boolean> {
     const { exitCode } = await $`nvidia-smi`.quiet().nothrow();
@@ -38,7 +39,7 @@ export async function waitForLog(logFile: string, pattern: RegExp, proc: ReturnT
 export async function startServer(args: string[]): Promise<{ proc: ReturnType<typeof spawn>; port: number; logFile: string; kill: () => void }> {
     const logFile = tmpFile("whisper-server", ".log");
 
-    const proc = spawn([BINARY, ...args], {
+    const proc = spawn([BINARY, "--warmup-file", WARMUP_FILE, ...args], {
         stdout: Bun.file(logFile),
         stderr: Bun.file(logFile),
     });
@@ -49,7 +50,8 @@ export async function startServer(args: string[]): Promise<{ proc: ReturnType<ty
     };
 
     try {
-        const line = await waitForLog(logFile, /Listening on port (\d+)/, proc);
+        // 180s timeout: first-time CUDA PTX compilation during warmup can take minutes
+        const line = await waitForLog(logFile, /Listening on port (\d+)/, proc, 180);
         const port = parseInt(line.match(/\d+/)![0]);
         console.error(`Server ready on port ${port} (PID ${proc.pid})`);
         return { proc, port, logFile, kill };
@@ -64,7 +66,7 @@ export async function startLocalServer(args: string[]): Promise<{ proc: ReturnTy
     const logFile = tmpFile("whisper-server", ".log");
     const outputFile = tmpFile("whisper-pw-stream", ".txt");
 
-    const proc = spawn([BINARY, ...args], {
+    const proc = spawn([BINARY, "--warmup-file", WARMUP_FILE, ...args], {
         stdout: Bun.file(outputFile),
         stderr: Bun.file(logFile),
     });
@@ -75,7 +77,8 @@ export async function startLocalServer(args: string[]): Promise<{ proc: ReturnTy
     };
 
     try {
-        await waitForLog(logFile, /Capturing audio/, proc);
+        // 180s timeout: first-time CUDA PTX compilation during warmup can take minutes
+        await waitForLog(logFile, /Capturing audio/, proc, 180);
         console.error(`Server capturing audio (PID ${proc.pid})`);
         return { proc, outputFile, logFile, kill };
     } catch (e) {

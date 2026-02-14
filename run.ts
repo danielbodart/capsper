@@ -211,7 +211,6 @@ export async function dist() {
         process.exit(1);
     }
 
-    await $`cp -n test/jfk.wav dist/bin/ 2>/dev/null || true`;
     const ver = await version();
     const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
     await $`tar -czf ${tarball} -C dist bin/ lib/ install.sh`;
