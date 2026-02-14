@@ -344,11 +344,18 @@ cmd_install() {
     local is_upgrade=false
     local update_config=false
 
+    local was_active=false
+
     if [ -f "$service_file" ]; then
         is_upgrade=true
+        if systemctl --user is-active --quiet capsper.service 2>/dev/null; then
+            was_active=true
+        fi
         echo "Previous capsper installation detected."
-        echo "Stopping current service..."
-        systemctl --user stop capsper.service 2>/dev/null || true
+        if $was_active; then
+            echo "Stopping current service..."
+            systemctl --user stop capsper.service 2>/dev/null || true
+        fi
         echo ""
         if confirm_default_no "Update configuration?"; then
             update_config=true
@@ -429,11 +436,15 @@ cmd_install() {
 
     echo ""
     if run_dry_run; then
-        if $is_upgrade; then
+        if $is_upgrade && $was_active; then
             echo "Restarting service..."
             systemctl --user restart capsper.service
             echo "Service restarted. Check status with:"
             echo "  systemctl --user status capsper.service"
+        elif $is_upgrade; then
+            echo "Service was not running before upgrade, leaving it stopped."
+            echo "Start manually with:"
+            echo "  systemctl --user start capsper.service"
         elif confirm "Start the dictation service now?"; then
             systemctl --user restart capsper.service
             echo "Service started. Check status with:"
