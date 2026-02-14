@@ -174,6 +174,7 @@ pub fn build(b: *std.Build) void {
         cmake_build_dir,
         "--config",
         "Release",
+        "--parallel",
     });
     cmake_build.setEnvironmentVariable("TMPDIR", nvcc_tmp);
     cmake_build.step.dependOn(&mkdir_nvcc_tmp.step);
