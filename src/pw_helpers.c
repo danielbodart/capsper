@@ -6,6 +6,8 @@
 #include <spa/utils/result.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
 
 /* Build a SPA pod for S16_LE mono capture at the given channel position.
    Called from Zig because spa_format_audio_raw_build uses complex C macros
@@ -96,6 +98,7 @@ struct enum_data {
     struct pw_source_info *results;
     uint32_t max_results;
     uint32_t count;
+    uint32_t total_globals;
     struct pw_main_loop *loop;
     int pending_sync;
     struct pw_registry *registry;
@@ -127,6 +130,8 @@ on_registry_global(void *data, uint32_t id, uint32_t permissions,
 {
     struct enum_data *d = data;
     (void)permissions;
+
+    d->total_globals++;
 
     if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0 || !props)
         return;
@@ -176,30 +181,29 @@ on_core_done(void *data, uint32_t id, int seq)
         pw_main_loop_quit(d->loop);
 }
 
-/* Enumerate PipeWire Audio/Source nodes synchronously.
-   Returns the number of sources found (up to max_results).
-   Caller provides the results array. Returns -1 on error. */
-int
-pw_enumerate_sources(struct pw_source_info *results, uint32_t max_results)
+/* Single-attempt enumeration of PipeWire Audio/Source nodes.
+   If n_globals is non-NULL, writes the total number of registry globals seen. */
+static int
+pw_enumerate_sources_once(struct pw_source_info *results, uint32_t max_results,
+                          uint32_t *n_globals)
 {
-    pw_init(NULL, NULL);
-
     struct pw_main_loop *loop = pw_main_loop_new(NULL);
-    if (!loop) { pw_deinit(); return -1; }
+    if (!loop) return -1;
 
     struct pw_context *context = pw_context_new(pw_main_loop_get_loop(loop), NULL, 0);
-    if (!context) { pw_main_loop_destroy(loop); pw_deinit(); return -1; }
+    if (!context) { pw_main_loop_destroy(loop); return -1; }
 
     struct pw_core *core = pw_context_connect(context, NULL, 0);
-    if (!core) { pw_context_destroy(context); pw_main_loop_destroy(loop); pw_deinit(); return -1; }
+    if (!core) { pw_context_destroy(context); pw_main_loop_destroy(loop); return -1; }
 
     struct pw_registry *registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
-    if (!registry) { pw_core_disconnect(core); pw_context_destroy(context); pw_main_loop_destroy(loop); pw_deinit(); return -1; }
+    if (!registry) { pw_core_disconnect(core); pw_context_destroy(context); pw_main_loop_destroy(loop); return -1; }
 
     struct enum_data data = {
         .results = results,
         .max_results = max_results,
         .count = 0,
+        .total_globals = 0,
         .loop = loop,
         .pending_sync = 0,
         .registry = registry,
@@ -243,7 +247,46 @@ pw_enumerate_sources(struct pw_source_info *results, uint32_t max_results)
     pw_core_disconnect(core);
     pw_context_destroy(context);
     pw_main_loop_destroy(loop);
+
+    if (n_globals)
+        *n_globals = data.total_globals;
+    return (int)data.count;
+}
+
+/* Enumerate PipeWire Audio/Source nodes synchronously.
+   Returns the number of sources found (up to max_results).
+   Caller provides the results array. Returns -1 on error.
+
+   After suspend/resume or reboot, WirePlumber may not have created
+   Audio/Source nodes yet when PipeWire itself is already running.
+   If we get 0 sources on the first try, retry a few times. */
+int
+pw_enumerate_sources(struct pw_source_info *results, uint32_t max_results)
+{
+    uint32_t n_globals = 0;
+    pw_init(NULL, NULL);
+    int count = pw_enumerate_sources_once(results, max_results, &n_globals);
     pw_deinit();
 
-    return (int)data.count;
+    if (count > 0)
+        return count;
+
+    /* 0 or fewer sources — WirePlumber may still be starting up, or the
+       audio hardware may be waking from deep sleep. Retry with 500ms
+       intervals up to ~5s total. */
+    fprintf(stderr, "Waiting for audio devices "
+            "(saw %u PipeWire objects, 0 audio sources)...\n", n_globals);
+    static const int max_retries = 10;
+    const struct timespec wait = { .tv_sec = 0, .tv_nsec = 500000000 };
+
+    for (int i = 0; i < max_retries; i++) {
+        nanosleep(&wait, NULL);
+        pw_init(NULL, NULL);
+        count = pw_enumerate_sources_once(results, max_results, NULL);
+        pw_deinit();
+        if (count > 0)
+            break;
+    }
+
+    return count;
 }
