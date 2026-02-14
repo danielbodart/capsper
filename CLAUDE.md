@@ -17,7 +17,7 @@ Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `b
 ./run.ts clean
 
 # Run directly (loads model, grabs keyboard, CapsLock = push-to-talk)
-./dist/bin/zigsper --trigger capslock --pw-channel AUX2
+./dist/bin/zigsper --trigger capslock --pw-channel FL
 
 # First-time setup (builds, configures evdev permissions, installs systemd service)
 ./run.ts setup
@@ -60,11 +60,12 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 - **`input.zig`** — evdev/uinput input handling. Grabs physical keyboards, forwards all keys through virtual uinput keyboard, intercepts trigger key for push-to-talk, injects transcribed text as keystrokes. Includes hotplug (inotify) and panic sequence (Enter+Backspace+Escape = ungrab).
 - **`pipeline.zig`** — Low-level whisper.cpp integration. Manually drives mel spectrogram, encode, and autoregressive decode loop (no `whisper_full`). Implements AlignAtt streaming policy via cross-attention analysis to decide when to stop decoding.
 - **`alignatt.zig`** — AlignAtt attention analysis: z-score normalization, median filtering, head averaging, stopping/rewind detection.
-- **`utils.zig`** — Pure utility functions (no C deps): word counting, byte offsets, word-level delta/stability tracking, PCM-to-float conversion, buffer trimming. Independently unit-tested.
+- **`utils.zig`** — Pure utility functions (no C deps): word counting, byte offsets, word-level delta/stability tracking, PCM-to-float conversion, buffer trimming, per-channel RMS analysis. Independently unit-tested.
 - **`audio_capture.zig`** — PipeWire audio capture via `pw_thread_loop` + `pw_stream`.
+- **`pw_detect.zig`** — PipeWire device enumeration (`--pw-list`) and interactive channel detection (`--pw-detect`). Records silence/speech, compares per-channel RMS to recommend the best `--pw-channel`.
 - **`vad.zig`** — Thin wrapper around whisper.cpp's Silero VAD.
 - **`whisper_c.zig`** / **`pipewire_c.zig`** — C import bridges for whisper.cpp and PipeWire.
-- **`pw_helpers.c`** — C helpers for PipeWire SPA pod building and `pw_stream_connect` (variadic C calls that Zig can't handle).
+- **`pw_helpers.c`** — C helpers for PipeWire SPA pod building, `pw_stream_connect`, and PipeWire source enumeration (variadic C calls and SPA macros that Zig can't handle).
 
 ### Scripts & Task Runner
 

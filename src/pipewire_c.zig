@@ -56,17 +56,37 @@ pub extern fn pw_connect_capture(
     channel_position: u32,
 ) c_int;
 
-// SPA audio channel positions (u32 constants)
-pub const SPA_AUDIO_CHANNEL_AUX0: u32 = pw.SPA_AUDIO_CHANNEL_AUX0;
-pub const SPA_AUDIO_CHANNEL_AUX1: u32 = pw.SPA_AUDIO_CHANNEL_AUX1;
-pub const SPA_AUDIO_CHANNEL_AUX2: u32 = pw.SPA_AUDIO_CHANNEL_AUX2;
-pub const SPA_AUDIO_CHANNEL_AUX3: u32 = pw.SPA_AUDIO_CHANNEL_AUX3;
-pub const SPA_AUDIO_CHANNEL_AUX4: u32 = pw.SPA_AUDIO_CHANNEL_AUX4;
-pub const SPA_AUDIO_CHANNEL_AUX5: u32 = pw.SPA_AUDIO_CHANNEL_AUX5;
-pub const SPA_AUDIO_CHANNEL_AUX6: u32 = pw.SPA_AUDIO_CHANNEL_AUX6;
-pub const SPA_AUDIO_CHANNEL_AUX7: u32 = pw.SPA_AUDIO_CHANNEL_AUX7;
+// SPA audio channel positions
 pub const SPA_AUDIO_CHANNEL_MONO: u32 = pw.SPA_AUDIO_CHANNEL_MONO;
 pub const SPA_AUDIO_CHANNEL_FL: u32 = pw.SPA_AUDIO_CHANNEL_FL;
+// AUX channels are sequential: AUX0 = 0x1000, AUX1 = 0x1001, ..., AUX63 = 0x103F
+pub const SPA_AUDIO_CHANNEL_START_AUX: u32 = pw.SPA_AUDIO_CHANNEL_START_Aux; // 0x1000
+
+pub fn spaAudioChannelAux(n: u32) u32 {
+    return SPA_AUDIO_CHANNEL_START_AUX + n;
+}
+
+// C helper to connect a capture stream for multi-channel recording (channel detection).
+pub extern fn pw_connect_capture_multi(
+    stream: *pw_stream,
+    rate: u32,
+    channels: u32,
+) c_int;
+
+// Source enumeration result (matches struct pw_source_info in pw_helpers.c)
+pub const PW_SOURCE_NAME_MAX = 256;
+pub const pw_source_info = extern struct {
+    id: u32,
+    name: [PW_SOURCE_NAME_MAX]u8,
+    description: [PW_SOURCE_NAME_MAX]u8,
+    channels: u32,
+};
+
+// Synchronous enumeration of Audio/Source nodes. Returns count or -1 on error.
+pub extern fn pw_enumerate_sources(
+    results: [*]pw_source_info,
+    max_results: u32,
+) c_int;
 
 // PipeWire property keys
 pub const PW_KEY_MEDIA_TYPE = pw.PW_KEY_MEDIA_TYPE;

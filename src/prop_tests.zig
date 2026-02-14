@@ -588,6 +588,50 @@ fn prop_analyzeAttention_peak_preserved(n: usize) !void {
 }
 
 // ============================================================================
+// channelRms / rmsToDb property tests
+// ============================================================================
+
+// Generator for random S16_LE PCM bytes (pairs of bytes)
+const pcm_byte_gen = mgen.intRange(i16, -32768, 32767);
+
+// channelRms is always non-negative
+fn prop_channelRms_non_negative(val: i16) !void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(i16, &buf, val, .little);
+    const rms = utils.channelRms(&buf, 1, 0);
+    try std.testing.expect(rms >= 0);
+}
+
+// channelRms of silence is exactly zero
+fn prop_channelRms_silence(_: i16) !void {
+    const silence = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    const rms = utils.channelRms(&silence, 1, 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), rms, 1e-15);
+}
+
+// channelRms <= 1.0 for any valid S16_LE input
+fn prop_channelRms_bounded(val: i16) !void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(i16, &buf, val, .little);
+    const rms = utils.channelRms(&buf, 1, 0);
+    try std.testing.expect(rms <= 1.0 + 1e-10);
+}
+
+// rmsToDb is monotonically increasing
+fn prop_rmsToDb_monotonic(val: i16) !void {
+    // Map i16 to two RMS values in (0, 1]
+    const abs_val: f64 = @abs(@as(f64, @floatFromInt(val)));
+    const rms1: f64 = (abs_val + 1) / 32769.0;
+    const rms2: f64 = rms1 * 0.5;
+    try std.testing.expect(utils.rmsToDb(rms2) <= utils.rmsToDb(rms1));
+}
+
+// rmsToDb(1.0) == 0 dB
+fn prop_rmsToDb_unity(_: i16) !void {
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), utils.rmsToDb(1.0), 1e-10);
+}
+
+// ============================================================================
 // input.zig property tests
 // ============================================================================
 
@@ -837,5 +881,17 @@ pub fn main() !void {
     std.debug.print("prop: eventsForText count consistency... ", .{});
     try minish.check(allocator, ascii_text_gen, prop_eventsForText_count, .{ .num_runs = runs });
 
-    std.debug.print("\nAll 39 property tests passed!\n", .{});
+    // channelRms / rmsToDb
+    std.debug.print("prop: channelRms non-negative... ", .{});
+    try minish.check(allocator, pcm_byte_gen, prop_channelRms_non_negative, .{ .num_runs = runs });
+    std.debug.print("prop: channelRms silence is zero... ", .{});
+    try minish.check(allocator, pcm_byte_gen, prop_channelRms_silence, .{ .num_runs = runs });
+    std.debug.print("prop: channelRms bounded... ", .{});
+    try minish.check(allocator, pcm_byte_gen, prop_channelRms_bounded, .{ .num_runs = runs });
+    std.debug.print("prop: rmsToDb monotonic... ", .{});
+    try minish.check(allocator, pcm_byte_gen, prop_rmsToDb_monotonic, .{ .num_runs = runs });
+    std.debug.print("prop: rmsToDb unity... ", .{});
+    try minish.check(allocator, pcm_byte_gen, prop_rmsToDb_unity, .{ .num_runs = runs });
+
+    std.debug.print("\nAll 44 property tests passed!\n", .{});
 }

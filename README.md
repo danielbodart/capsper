@@ -15,7 +15,7 @@ Uses a custom streaming speech recognition server written in Zig, linking [whisp
 
 - Linux (Debian/Ubuntu)
 - NVIDIA GPU with ~4 GB VRAM
-- CUDA toolkit
+- CUDA toolkit (only needed for `rebuild-whisper`; pre-built libs committed via Git LFS)
 - PipeWire (default audio server on modern Ubuntu/Fedora)
 - User in the `input` group (for evdev keyboard grab and uinput text injection)
 
@@ -29,11 +29,10 @@ cd zigsper
 
 This auto-detects and handles everything:
 - Installs toolchain (mise, Zig 0.15.2, Bun) on first run via `bootstrap.sh`
-- Installs system packages (`pv`, `ncat`, `cmake`)
+- Installs system packages (`pv`, `ncat`)
 - Initialises the whisper.cpp submodule if needed
 - Downloads models (~574 MB Whisper model + VAD model) if missing
-- Builds whisper.cpp shared libs via CMake with CUDA
-- Compiles the Zig binary
+- Compiles the Zig binary (pre-built whisper.cpp shared libs are committed via Git LFS)
 - Configures uinput permissions (for text injection via virtual keyboard)
 - Creates and enables a systemd user service
 
@@ -49,17 +48,21 @@ Hold CapsLock and speak. Release to stop. Text appears in the focused window.
 
 ### PipeWire channel selection
 
-For multi-channel audio interfaces, use `pw-detect` to find which channel carries your microphone signal:
+For multi-channel audio interfaces, first list available sources:
 
 ```bash
-./run pw-detect
+zigsper --pw-list
 ```
 
-This records silence and speech, then shows per-channel signal levels and recommends the correct `--pw-channel` flag. Set it via environment variable:
+Then run interactive channel detection to find which channel carries your microphone signal:
 
 ```bash
-ZIGSPER_PW_CHANNEL=AUX2 systemctl --user restart zigsper.service
+zigsper --pw-detect
+# Or target a specific device:
+zigsper --pw-detect --pw-target alsa_input.usb-Focusrite_Vocaster...
 ```
+
+This records silence and speech, then shows per-channel signal levels and recommends the correct `--pw-channel` flag.
 
 ## Architecture
 
@@ -84,7 +87,8 @@ A single self-contained binary (`src/`):
 | `utils.zig` | Pure utility functions (word counting, PCM conversion, delta tracking) |
 | `vad.zig` | Silero VAD wrapper for speech/silence detection |
 | `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream` |
-| `pw_helpers.c` | C helpers for PipeWire SPA pod building (Zig FFI can't call variadic C macros) |
+| `pw_detect.zig` | PipeWire device enumeration and interactive channel detection |
+| `pw_helpers.c` | C helpers for PipeWire SPA pod building and source enumeration |
 
 ## Server options
 
@@ -101,7 +105,10 @@ zigsper [OPTIONS]
   --trigger-passthrough   Forward trigger key to OS after interception
   --type-delay MS         Delay between injected keystrokes in ms (default: 12)
   --pw-target NODE        PipeWire capture target node name
-  --pw-channel CHANNEL    PipeWire channel: MONO, FL, AUX0-AUX7 (default: AUX2)
+  --pw-channel CHANNEL    PipeWire channel: MONO, FL, AUX0-AUX63 (default: FL)
+  --pw-list               List available PipeWire audio sources
+  --pw-detect             Interactive channel detection (record silence + speech)
+  --detect-duration SECS  Duration per detection phase (default: 5)
   --verbose               Enable verbose logging
 ```
 
@@ -111,35 +118,29 @@ All commands go through the Bun-based task runner (`run.ts`), which bootstraps i
 
 ```bash
 # Build (default command)
-./run build
+./run.ts build
 
-# Force rebuild including whisper.cpp CMake + CUDA
-./run rebuild
+# Rebuild whisper.cpp shared libs (only needed after bumping submodule)
+./run.ts rebuild-whisper
 
 # Unit + property tests (no GPU required)
-mise exec zig -- zig build test
+./run.ts test
 
-# Stream jfk.wav at real-time rate via TCP
-./run test-stream jfk.wav
+# All integration tests (requires GPU + built binary)
+./run.ts slow-test
 
-# Stream via PipeWire loopback (tests full PipeWire path)
-./run test-pw-stream jfk.wav
-
-# Long-running stability test (jfk.wav × 20 loops, ~3.7 min)
-./run test-long-stream
-
-# Compare streaming output against reference transcript
-./run test-compare
-
-# Detect best PipeWire channel for your microphone
-./run pw-detect
+# Individual integration tests
+./run.ts slow-test stream         # TCP stream jfk.wav
+./run.ts slow-test pw-stream      # PipeWire loopback test
+./run.ts slow-test compare        # Compare against reference transcript
+./run.ts slow-test long-stream    # jfk.wav × 20 loops (~3.7 min)
 ```
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `ZIGSPER_PW_CHANNEL` | `AUX2` | PipeWire channel to capture |
+| `ZIGSPER_PW_CHANNEL` | `FL` | PipeWire channel to capture |
 | `ZIGSPER_PW_TARGET` | *(unset)* | PipeWire node to capture from |
 
 ## Performance
@@ -166,11 +167,12 @@ cd whisper.cpp/models && ./download-ggml-model.sh large-v3-turbo-q5_0
 
 **Keyboard locked up** — press Enter+Backspace+Escape simultaneously to trigger the panic sequence and ungrab all keyboards.
 
-**Build fails with CMake errors** — ensure the whisper.cpp submodule is initialised:
+**Build fails** — ensure the whisper.cpp submodule is initialised and Git LFS files are pulled:
 ```bash
 git submodule update --init --recursive
+git lfs pull
 ```
 
-**PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). For multi-channel devices, run `./run pw-detect` to find the correct channel.
+**PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). Use `zigsper --pw-list` to see available sources, and `zigsper --pw-detect` to find the correct channel for multi-channel devices.
 
-**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `./run pw-detect` and set `ZIGSPER_PW_CHANNEL` accordingly.
+**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `zigsper --pw-detect` and set `--pw-channel` accordingly.

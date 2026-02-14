@@ -10,6 +10,7 @@ const TypeCallback = server_mod.TypeCallback;
 const InputHandler = @import("input.zig").InputHandler;
 const input_mod = @import("input.zig");
 const utils = @import("utils.zig");
+const pw_detect = @import("pw_detect.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
@@ -25,11 +26,14 @@ pub fn main() !void {
     var warmup_file: ?[:0]const u8 = "jfk.wav";
     var input_mode: InputMode = .tcp;
     var pw_target: ?[:0]const u8 = null;
-    var pw_channel: u32 = pw.SPA_AUDIO_CHANNEL_AUX2;
+    var pw_channel: u32 = pw.SPA_AUDIO_CHANNEL_FL;
     var verbose: bool = false;
     var trigger_key: ?u16 = null;
     var trigger_passthrough: bool = false;
     var type_delay_us: u64 = 12_000; // 12ms
+    var do_pw_list: bool = false;
+    var do_pw_detect: bool = false;
+    var detect_duration: u32 = 5;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -73,7 +77,7 @@ pub fn main() !void {
             if (i < args.len) {
                 pw_channel = parseChannelName(args[i]) orelse {
                     std.debug.print("Invalid --pw-channel value '{s}'\n", .{args[i]});
-                    std.debug.print("Expected: MONO, FL, AUX0-AUX7\n", .{});
+                    std.debug.print("Expected: MONO, FL, AUX0-AUX63\n", .{});
                     return;
                 };
             }
@@ -91,13 +95,31 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--type-delay")) {
             i += 1;
             if (i < args.len) type_delay_us = std.fmt.parseInt(u64, args[i], 10) catch 12_000;
+        } else if (std.mem.eql(u8, arg, "--pw-list")) {
+            do_pw_list = true;
+        } else if (std.mem.eql(u8, arg, "--pw-detect")) {
+            do_pw_detect = true;
+        } else if (std.mem.eql(u8, arg, "--detect-duration")) {
+            i += 1;
+            if (i < args.len) detect_duration = std.fmt.parseInt(u32, args[i], 10) catch 5;
         } else {
             std.debug.print("Usage: zigsper [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
             std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
             std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
             std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
+            std.debug.print("       [--pw-list] [--pw-detect [--detect-duration SECS]]\n", .{});
             return;
         }
+    }
+
+    // PipeWire utility commands (early exit, no model loading needed)
+    if (do_pw_list) {
+        pw_detect.listSources();
+        return;
+    }
+    if (do_pw_detect) {
+        pw_detect.detectChannel(allocator, pw_target, detect_duration);
+        return;
     }
 
     // --trigger implies --input local (PipeWire capture) and starts paused (trigger key controls recording)
@@ -187,17 +209,15 @@ pub fn main() !void {
 }
 
 /// Parse a channel name string to a SPA audio channel position constant.
+/// Supports MONO, FL, and AUX0-AUX63.
 fn parseChannelName(name: []const u8) ?u32 {
     if (std.ascii.eqlIgnoreCase(name, "MONO")) return pw.SPA_AUDIO_CHANNEL_MONO;
     if (std.ascii.eqlIgnoreCase(name, "FL")) return pw.SPA_AUDIO_CHANNEL_FL;
-    if (std.ascii.eqlIgnoreCase(name, "AUX0")) return pw.SPA_AUDIO_CHANNEL_AUX0;
-    if (std.ascii.eqlIgnoreCase(name, "AUX1")) return pw.SPA_AUDIO_CHANNEL_AUX1;
-    if (std.ascii.eqlIgnoreCase(name, "AUX2")) return pw.SPA_AUDIO_CHANNEL_AUX2;
-    if (std.ascii.eqlIgnoreCase(name, "AUX3")) return pw.SPA_AUDIO_CHANNEL_AUX3;
-    if (std.ascii.eqlIgnoreCase(name, "AUX4")) return pw.SPA_AUDIO_CHANNEL_AUX4;
-    if (std.ascii.eqlIgnoreCase(name, "AUX5")) return pw.SPA_AUDIO_CHANNEL_AUX5;
-    if (std.ascii.eqlIgnoreCase(name, "AUX6")) return pw.SPA_AUDIO_CHANNEL_AUX6;
-    if (std.ascii.eqlIgnoreCase(name, "AUX7")) return pw.SPA_AUDIO_CHANNEL_AUX7;
+    // Parse AUXn (case-insensitive prefix, numeric suffix)
+    if (name.len >= 4 and std.ascii.eqlIgnoreCase(name[0..3], "AUX")) {
+        const n = std.fmt.parseInt(u32, name[3..], 10) catch return null;
+        if (n <= 63) return pw.spaAudioChannelAux(n);
+    }
     return null;
 }
 

@@ -180,6 +180,32 @@ pub fn wavToFloat(allocator: std.mem.Allocator, data: []const u8, header: WavHea
     return result;
 }
 
+/// Compute RMS (root mean square) for a single channel from interleaved S16_LE PCM.
+/// Returns a normalized value in [0, 1].
+pub fn channelRms(pcm_bytes: []const u8, num_channels: u16, channel: u16) f64 {
+    if (num_channels == 0) return 0;
+    const bytes_per_sample: usize = 2; // S16_LE
+    const frame_size = @as(usize, num_channels) * bytes_per_sample;
+    const n_frames = pcm_bytes.len / frame_size;
+    if (n_frames == 0) return 0;
+
+    var sum_sq: f64 = 0;
+    for (0..n_frames) |i| {
+        const offset = i * frame_size + @as(usize, channel) * bytes_per_sample;
+        if (offset + 2 > pcm_bytes.len) break;
+        const raw = std.mem.readInt(i16, pcm_bytes[offset..][0..2], .little);
+        const norm: f64 = @as(f64, @floatFromInt(raw)) / 32768.0;
+        sum_sq += norm * norm;
+    }
+    return @sqrt(sum_sq / @as(f64, @floatFromInt(n_frames)));
+}
+
+/// Convert RMS to decibels. Returns -100 for silence.
+pub fn rmsToDb(rms: f64) f64 {
+    if (rms < 1e-10) return -100;
+    return 20.0 * @log10(rms);
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -592,5 +618,62 @@ test "wavToFloat: stereo reads first channel" {
     try std.testing.expectEqual(@as(usize, 2), samples.len);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), samples[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), samples[1], 1e-6);
+}
+
+// --- channelRms tests ---
+
+test "channelRms: silence is zero" {
+    const pcm = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }; // 4 mono frames of silence
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), channelRms(&pcm, 1, 0), 1e-10);
+}
+
+test "channelRms: max amplitude" {
+    // 2 mono frames: +32767, -32767
+    var pcm: [4]u8 = undefined;
+    std.mem.writeInt(i16, pcm[0..2], 32767, .little);
+    std.mem.writeInt(i16, pcm[2..4], -32767, .little);
+    const rms = channelRms(&pcm, 1, 0);
+    // 32767/32768 ≈ 0.99997, RMS of identical magnitude = same value
+    try std.testing.expectApproxEqAbs(@as(f64, 32767.0 / 32768.0), rms, 1e-4);
+}
+
+test "channelRms: stereo picks correct channel" {
+    // 2 stereo frames: L=16384 R=0, L=16384 R=0
+    var pcm: [8]u8 = undefined;
+    std.mem.writeInt(i16, pcm[0..2], 16384, .little); // L
+    std.mem.writeInt(i16, pcm[2..4], 0, .little); // R
+    std.mem.writeInt(i16, pcm[4..6], 16384, .little); // L
+    std.mem.writeInt(i16, pcm[6..8], 0, .little); // R
+    // Channel 0 (L) should have RMS = 0.5
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), channelRms(&pcm, 2, 0), 1e-4);
+    // Channel 1 (R) should be silent
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), channelRms(&pcm, 2, 1), 1e-10);
+}
+
+test "channelRms: empty input" {
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), channelRms(&.{}, 1, 0), 1e-10);
+}
+
+test "channelRms: zero channels returns zero" {
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), channelRms(&[_]u8{ 0, 0 }, 0, 0), 1e-10);
+}
+
+// --- rmsToDb tests ---
+
+test "rmsToDb: silence" {
+    try std.testing.expectApproxEqAbs(@as(f64, -100.0), rmsToDb(0.0), 1e-10);
+}
+
+test "rmsToDb: full scale" {
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), rmsToDb(1.0), 1e-10);
+}
+
+test "rmsToDb: half amplitude is about -6dB" {
+    try std.testing.expectApproxEqAbs(@as(f64, -6.0206), rmsToDb(0.5), 0.001);
+}
+
+test "rmsToDb: monotonically increasing" {
+    try std.testing.expect(rmsToDb(0.1) < rmsToDb(0.5));
+    try std.testing.expect(rmsToDb(0.5) < rmsToDb(1.0));
 }
 
