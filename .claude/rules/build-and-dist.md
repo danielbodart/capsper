@@ -22,6 +22,13 @@ Pre-built whisper.cpp shared libraries are committed in `dist/lib/` via Git LFS 
 
 Static linking is intentionally avoided — Zig's bundled libc++ conflicts with whisper.cpp's libstdc++ dependency.
 
+## CPU Target
+
+- **Dist builds target `x86_64_v3`** (AVX2+FMA+BMI) — matches our GPU support floor (GTX 1650+). Both `build()` and `ci()` pass `-Dcpu=x86_64_v3` to zig build.
+- **`GGML_NATIVE=OFF`** in `build.zig` CMake configure — ensures whisper.cpp shared libs use explicit feature flags (SSE4.2, AVX, AVX2, FMA, F16C, BMI2) instead of `-march=native`.
+- The `dist()` target validates no AVX-512 instructions are present in the binary.
+
 ## CI
 
-**CI workflows must only call `run.ts` targets** — no build/packaging logic in `.github/workflows/`. Everything must be testable locally via `./run.ts <target>`. CI-only behaviour (e.g. `gh release create`) is gated on env vars like `GH_TOKEN` inside `run.ts`, not split into separate workflow steps.
+- **Local and CI builds must be identical.** Same flags, same CPU target, same optimizations. No "dev mode" divergence — unknown differences between local and CI builds cause bugs that only appear in production.
+- **CI workflows must only call `run.ts` targets** — no build/packaging logic in `.github/workflows/`. Everything must be testable locally via `./run.ts <target>`. CI-only behaviour (e.g. `gh release create`) is gated on env vars like `GH_TOKEN` inside `run.ts`, not split into separate workflow steps.

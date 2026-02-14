@@ -91,5 +91,3 @@ dist/
 - Model: `ggml-large-v3-turbo-q5_0.bin` (573 MB, q5_0 quantization)
 - Audio format: 16kHz mono S16_LE PCM (32000 bytes/sec)
 - Default server port: 43007
-- **Local and CI builds must be identical.** Same flags, same CPU target, same optimizations. No "dev mode" divergence — unknown differences between local and CI builds cause bugs that only appear in production.
-- **Dist builds target `x86_64_v3`** (AVX2+FMA+BMI) — matches our GPU support floor (GTX 1650+). Both `build()` and `ci()` pass `-Dcpu=x86_64_v3` to zig build. The `dist()` target validates no AVX-512 instructions are present.

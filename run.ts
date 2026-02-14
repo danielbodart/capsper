@@ -140,7 +140,7 @@ export async function build() {
     if (!process.env.CI) await ensureModels();
     const ver = await version();
     console.log(`Building v${ver}...`);
-    await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe`;
+    await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
 }
 
 export async function rebuildWhisper(...args: string[]) {
@@ -223,6 +223,15 @@ export async function dist() {
         process.exit(1);
     }
 
+    // Validate no AVX-512 instructions in the binary (must be portable to x86_64_v3)
+    const { stdout: objdumpOut } = await $`objdump -d dist/bin/capsper | grep -c 'zmm\\|%k[0-7],'`.quiet().nothrow();
+    const avx512Count = parseInt(objdumpOut.toString().trim()) || 0;
+    if (avx512Count > 0) {
+        console.error(`ERROR: binary contains ${avx512Count} AVX-512 instructions (not portable)`);
+        console.error("Rebuild with: -Dcpu=x86_64_v3");
+        process.exit(1);
+    }
+
     const ver = await version();
     const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
     await $`tar -czf ${tarball} -C dist bin/ lib/ install.sh`;
@@ -236,7 +245,7 @@ export async function ci() {
     console.log("Running tests...");
     await $`zig build test`;
     console.log(`Building v${ver}...`);
-    await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe`;
+    await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
     await dist();
     if (process.env.GH_TOKEN) {
         const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;

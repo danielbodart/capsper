@@ -165,6 +165,7 @@ pub fn build(b: *std.Build) void {
         "-DWHISPER_BUILD_TESTS=OFF",
         "-DWHISPER_BUILD_EXAMPLES=OFF",
         "-DWHISPER_BUILD_SERVER=OFF",
+        "-DGGML_NATIVE=OFF",
     });
     cmake_configure.addArg(b.fmt("-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={s}", .{abs_dist_lib}));
     // Ensure shared libs use $ORIGIN RPATH so they find each other when installed
