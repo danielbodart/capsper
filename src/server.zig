@@ -159,6 +159,8 @@ pub const Server = struct {
         var pcm_trim_total: usize = 0; // cumulative bytes trimmed (for absolute frame calc)
         var last_emitted_frame: usize = 0; // absolute frame of last emitted word
         var emitted_in_utterance: bool = false; // whether we've emitted anything in current utterance
+        var last_emitted_word_buf: [64]u8 = undefined; // text of last emitted word (for text-aware dedup)
+        var last_emitted_word_len: usize = 0;
 
         var recv_buf: [32768]u8 = undefined;
         var state: State = .idle;
@@ -166,6 +168,7 @@ pub const Server = struct {
         var silence_start_pos: usize = 0;
         var cycle_count: usize = 0;
         var cycles_without_emit: usize = 0; // force-emit after too many dry cycles
+        var trailing_transcribe_done: bool = false; // limit trailing_silence to 1 extra transcription
         var was_paused: bool = is_paused.load(.monotonic); // track previous pause state for transition detection
 
         while (true) {
@@ -254,7 +257,7 @@ pub const Server = struct {
                                     const ts = formatElapsed(&flush_ts_buf, start_ns);
                                     std.debug.print("    [{s}s] FINAL FLUSH words={d} timed_out={} closed={}\n", .{ ts, result.words.len, timed_out, client_closed });
                                 }
-                                _ = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, result.words.len, &last_emitted_frame, &emitted_in_utterance, type_cb) catch {};
+                                _ = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, result.words.len, &last_emitted_frame, &emitted_in_utterance, last_emitted_word_buf[0..last_emitted_word_len], &last_emitted_word_buf, &last_emitted_word_len, type_cb) catch {};
                             }
                         }
                     }
@@ -310,6 +313,7 @@ pub const Server = struct {
                         std.debug.print("[{s}s] speaking → trailing_silence (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .trailing_silence;
                         silence_start_pos = pcm_buf.items.len;
+                        trailing_transcribe_done = false;
                         // Transcribe before entering silence to capture trailing words
                         should_transcribe = true;
                     } else {
@@ -324,8 +328,9 @@ pub const Server = struct {
                         should_transcribe = true;
                     } else if (pcm_buf.items.len - silence_start_pos >= silence_timeout_bytes) {
                         should_flush = true;
-                    } else {
-                        continue;
+                    } else if (!trailing_transcribe_done) {
+                        should_transcribe = true;
+                        trailing_transcribe_done = true;
                     }
                 },
             }
@@ -372,12 +377,10 @@ pub const Server = struct {
                                 abs_words.len
                             else if (cycles_without_emit >= 4)
                                 abs_words.len // Force-emit after 4+ dry cycles (~4s) to prevent stalls
-                            else if (stable_count >= 2)
-                                stable_count - 1 // Hold back last stable word — deferred to next cycle when it's no longer at the boundary
                             else
                                 stable_count;
 
-                            const did_emit = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, emit_count, &last_emitted_frame, &emitted_in_utterance, type_cb) catch return;
+                            const did_emit = emitNewWords(output_fd, start_ns, result.text, result.words, frame_offset, emit_count, &last_emitted_frame, &emitted_in_utterance, last_emitted_word_buf[0..last_emitted_word_len], &last_emitted_word_buf, &last_emitted_word_len, type_cb) catch return;
                             if (did_emit) {
                                 cycles_without_emit = 0;
                             } else {
@@ -425,6 +428,12 @@ pub const Server = struct {
                 if (should_flush) {
                     const flush_ts = formatElapsed(&ts_buf, start_ns);
                     std.debug.print("[{s}s] flush → idle\n", .{flush_ts});
+                    // Boost last_emitted_frame past the last word to prevent
+                    // cross-utterance re-emission due to frame drift after trim
+                    if (prev_words.items.len > 0) {
+                        const last_word_frame = prev_words.items[prev_words.items.len - 1].frame;
+                        last_emitted_frame = @max(last_emitted_frame, last_word_frame + frame_tolerance);
+                    }
                     // Keep prev_words from flush transcription — allows the first post-flush
                     // cycle to use stability checking against the flush result, capturing words
                     // like "How it works" that appear in both the flush and first new cycle.
@@ -490,6 +499,9 @@ fn emitNewWords(
     count: usize,
     last_emitted_frame: *usize,
     emitted_in_utterance: *bool,
+    last_emitted_word: []const u8,
+    last_emitted_word_buf: *[64]u8,
+    last_emitted_word_len: *usize,
     type_cb: ?TypeCallback,
 ) error{BrokenPipe}!bool {
     if (count == 0 or words.len == 0) return false;
@@ -507,8 +519,26 @@ fn emitNewWords(
         }
     }
 
-    if (first_new) |fi| {
+    if (first_new) |fi_raw| {
+        var fi = fi_raw;
         const li = last_new.?;
+
+        // Text-aware dedup: if the first "new" word matches the last emitted word's
+        // text and is within frame_tolerance, it's the same word drifted by whisper's
+        // cross-attention jitter. Skip it. This catches drift >dedup_guard_frames
+        // without raising the guard so high that legitimate new words get blocked.
+        if (last_emitted_word.len > 0 and fi <= li) {
+            const w = words[fi];
+            const abs_frame = w.frame + frame_offset;
+            if (abs_frame <= last_emitted_frame.* + frame_tolerance) {
+                const word_text = text[w.text_start..w.text_end];
+                if (std.ascii.eqlIgnoreCase(word_text, last_emitted_word)) {
+                    fi += 1; // skip duplicate
+                }
+            }
+        }
+
+        if (fi > li) return false; // all words were duplicates
 
         // Build emission range: include space before first word for non-first emissions
         const raw_start = words[fi].text_start;
@@ -518,6 +548,12 @@ fn emitNewWords(
             try emitDelta(output_fd, start_ns, text[emit_start..emit_end], type_cb);
             last_emitted_frame.* = words[li].frame + frame_offset;
             emitted_in_utterance.* = true;
+            // Track last emitted word text for next cycle's text-aware dedup
+            const last_w = words[li];
+            const last_text = text[last_w.text_start..last_w.text_end];
+            const copy_len = @min(last_text.len, last_emitted_word_buf.len);
+            @memcpy(last_emitted_word_buf[0..copy_len], last_text[0..copy_len]);
+            last_emitted_word_len.* = copy_len;
             return true;
         }
     }
