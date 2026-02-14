@@ -4,6 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // --- Build options ---
+    const version_str = b.option([]const u8, "version", "Version string") orelse "0.0.0";
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version_str);
+
     // --- Zig executable ---
     const exe = b.addExecutable(.{
         .name = "capsper",
@@ -13,6 +18,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addOptions("build_options", options);
 
     // Include paths for whisper.h and ggml.h
     exe.root_module.addIncludePath(b.path("whisper.cpp/include"));

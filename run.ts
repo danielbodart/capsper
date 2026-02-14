@@ -107,14 +107,26 @@ function ensureBinary() {
     }
 }
 
+// ─── Version ────────────────────────────────────────────────────────────────
+
+async function version(): Promise<string> {
+    const branch = process.env.GITHUB_REF_NAME
+        || (await $`git rev-parse --abbrev-ref HEAD`.quiet()).text().trim();
+    const buildNumber = process.env.GITHUB_RUN_NUMBER
+        || new Date().toISOString().replace(/[-:T]/g, '').split('.')[0];
+    const revisions = (await $`git rev-list --count ${branch}`.quiet()).text().trim();
+    return `0.${revisions}.${buildNumber}`;
+}
+
 // ─── Commands ──────────────────────────────────────────────────────────────
 
 export async function build() {
     await ensureDeps();
     await ensureSubmodule();
     if (!process.env.CI) await ensureModels();
-    console.log("Building...");
-    await $`zig build --prefix dist`;
+    const ver = await version();
+    console.log(`Building v${ver}...`);
+    await $`zig build --prefix dist -Dversion=${ver}`;
 }
 
 export async function rebuildWhisper(...args: string[]) {
@@ -179,16 +191,26 @@ export async function dist() {
 
 export async function ci() {
     await ensureSubmodule();
+    const ver = await version();
     console.log("Running tests...");
     await $`zig build test`;
-    console.log("Building...");
-    await $`zig build --prefix dist`;
+    console.log(`Building v${ver}...`);
+    await $`zig build --prefix dist -Dversion=${ver}`;
+    // Export version for subsequent CI steps
+    const output = process.env.GITHUB_OUTPUT;
+    if (output) {
+        await $`echo version=${ver} >> ${output}`;
+    }
 }
 
 // ─── Command dispatch ──────────────────────────────────────────────────────
 
+async function printVersion() {
+    console.log(await version());
+}
+
 const commands: Record<string, Function> = {
-    dev, build, clean, setup, test, dist, ci,
+    dev, build, clean, setup, test, dist, ci, version: printVersion,
     "slow-test": slowTest,
     "rebuild-whisper": rebuildWhisper,
 };

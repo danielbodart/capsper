@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @import("whisper_c.zig");
 const pw = @import("pipewire_c.zig");
 const Vad = @import("vad.zig").Vad;
@@ -38,7 +39,10 @@ pub fn main() !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+        if (std.mem.eql(u8, arg, "--version")) {
+            std.debug.print("capsper {s}\n", .{build_options.version});
+            return;
+        } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             verbose = true;
         } else if (std.mem.eql(u8, arg, "--model") or std.mem.eql(u8, arg, "-m")) {
             i += 1;
@@ -229,6 +233,7 @@ fn printUsage() void {
     std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
     std.debug.print("       [--pw-list] [--pw-detect [--detect-duration SECS]]\n", .{});
+    std.debug.print("       [--version]\n", .{});
 }
 
 pub fn loadWav(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {

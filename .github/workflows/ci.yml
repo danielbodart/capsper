@@ -2,6 +2,8 @@ name: CI
 on:
   push:
     branches: [trunk]
+permissions:
+  contents: write
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -14,7 +16,9 @@ jobs:
         with:
           submodules: recursive
           lfs: true
+          fetch-depth: 0
       - name: CI
+        id: ci
         run: ./run ci
         env:
           CI: "true"
@@ -22,3 +26,14 @@ jobs:
         with:
           name: capsper-linux-x86_64
           path: dist/
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ci.outputs.version }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          cp jfk.wav dist/
+          tar -czf "capsper-linux-x86_64-${VERSION}.tar.gz" -C dist bin/ lib/ install.sh jfk.wav
+          gh release create "v${VERSION}" "capsper-linux-x86_64-${VERSION}.tar.gz" \
+            --title "v${VERSION}" \
+            --notes "$COMMIT_MSG"
