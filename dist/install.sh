@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
 WHISPER_MODEL_NAME="ggml-large-v3-turbo-q5_0.bin"
 VAD_MODEL_NAME="ggml-silero-v5.1.2.bin"
 WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${WHISPER_MODEL_NAME}"
-VAD_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${VAD_MODEL_NAME}"
+VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/${VAD_MODEL_NAME}"
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 
