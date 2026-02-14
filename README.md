@@ -4,7 +4,7 @@
 
 Does CapsLock annoy you? Ever wished it actually did something useful instead of SHOUTING AT PEOPLE BY ACCIDENT?
 
-Ever wished you had a friendly ghost whispering your words onto the screen? Well now you do. Capsper is your friendly neighbourhood ghost writer — hold CapsLock, speak, and watch your words appear. No cloud, no subscription, no latency worth complaining about. Just a local GPU, a haunted key, and a little whisper magic.
+Ever wished you could just whisper to a friendly ghost and have your words appear on screen? Well now you can. Capsper is your friendly neighbourhood ghost writer — hold CapsLock, speak, and he types it out for you. No cloud, no subscription, no latency worth complaining about. Just a local GPU, a haunted key, and a little whisper magic.
 
 Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://github.com/ggml-org/whisper.cpp) server written in Zig with [AlignAtt](https://aclanthology.org/2023.findings-emnlp.744/) for low-latency transcription. Works on both X11 and Wayland.
 
