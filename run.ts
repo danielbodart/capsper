@@ -149,8 +149,9 @@ export async function setup() {
     await build();
 
     // Delegate permissions, audio detection, and service setup to install.sh
-    const installSh = join(SCRIPT_DIR, "install.sh");
-    await $`bash ${installSh} setup-dev ${SCRIPT_DIR}`;
+    // (auto-detects dev mode via ../.git)
+    const installSh = join(SCRIPT_DIR, "dist", "install.sh");
+    await $`bash ${installSh}`;
 }
 
 /** Default target: build → unit tests → quick integration tests (stream + pw-stream). */

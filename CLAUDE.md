@@ -70,7 +70,7 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 ### Scripts & Task Runner
 
 - **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `dev` (default), `build`, `clean`, `setup`, `test`, `slow-test`, `rebuild-whisper`, `dist`, `ci`.
-- **`install.sh`** — Self-contained bash installer. Ships in dist tarball. Subcommands: `install` (default), `pw-detect`, `setup-dev` (called by `run.ts setup`).
+- **`install.sh`** — Self-contained bash installer. Ships in dist tarball. Subcommands: `install` (default), `pw-detect`. Auto-detects dev mode (git checkout via `../.git`) vs user install (`~/.local/share/capsper/`).
 
 ### Build System & `dist/` Layout
 

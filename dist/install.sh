@@ -4,10 +4,12 @@ set -euo pipefail
 # Self-contained installer for capsper.
 # Ships in the dist tarball alongside the binary and shared libs.
 #
+# In a git checkout (dev mode), installs in-situ pointing at the source tree.
+# Otherwise, copies to ~/.local/share/capsper/ for a proper user install.
+#
 # Usage:
 #   ./install.sh              Full interactive setup (download models, permissions, systemd)
 #   ./install.sh pw-detect    Detect best PipeWire microphone channel (delegates to capsper --pw-detect)
-#   ./install.sh setup-dev DIR  Developer mode: permissions + pw-detect + systemd (called by run.ts)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
 
@@ -15,6 +17,8 @@ WHISPER_MODEL_NAME="ggml-large-v3-turbo-q5_0.bin"
 VAD_MODEL_NAME="ggml-silero-v5.1.2.bin"
 WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${WHISPER_MODEL_NAME}"
 VAD_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${VAD_MODEL_NAME}"
+
+INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -32,6 +36,10 @@ confirm() {
 
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "$1 not found. $2"
+}
+
+is_dev_mode() {
+    [ -d "$SCRIPT_DIR/../.git" ]
 }
 
 # ─── Permissions ──────────────────────────────────────────────────────────────
@@ -81,7 +89,12 @@ download_models() {
     for m in "${missing[@]}"; do echo "  - $m"; done
 
     if ! confirm "Download now?"; then
-        die "Models required. Download manually into $model_dir/"
+        echo ""
+        echo "Models directory: $model_dir"
+        echo "Copy the following files there before starting capsper:"
+        [ ! -f "$model_dir/$WHISPER_MODEL_NAME" ] && echo "  - $WHISPER_MODEL_NAME"
+        [ ! -f "$model_dir/$VAD_MODEL_NAME" ] && echo "  - $VAD_MODEL_NAME"
+        return
     fi
 
     require_cmd curl "Install curl to download models."
@@ -256,86 +269,109 @@ check_cuda_libraries() {
     die "Missing CUDA runtime libraries. Install them with: sudo apt install $cudart_pkg $cublas_pkg"
 }
 
-# ─── Subcommands ──────────────────────────────────────────────────────────────
+# ─── Install Files ────────────────────────────────────────────────────────
 
-cmd_install() {
-    echo "=== Capsper Installer ==="
-    echo ""
+install_files() {
+    echo "Installing to $INSTALL_DIR ..."
 
-    # Verify we're in a dist directory with the binary
-    [ -f "$SCRIPT_DIR/bin/capsper" ] || die "capsper binary not found in $SCRIPT_DIR/bin"
+    [ -d "$SCRIPT_DIR/lib" ] || die "dist/lib/ not found. If this is a git checkout, run: git lfs pull"
 
-    # Check runtime deps
-    require_cmd nvidia-smi "NVIDIA driver required for CUDA inference."
-    check_cuda_libraries
-    command -v pw-cli >/dev/null 2>&1 || echo "WARNING: pw-cli not found. PipeWire may not be installed."
+    mkdir -p "$INSTALL_DIR"
 
-    # Permissions
-    check_permissions
+    # Copy bin/ and lib/ (overwrite on upgrade)
+    cp -a "$SCRIPT_DIR/bin" "$INSTALL_DIR/"
+    cp -a "$SCRIPT_DIR/lib" "$INSTALL_DIR/"
 
-    # Download models
-    download_models "$SCRIPT_DIR/models"
+    # Symlink into ~/.local/bin so capsper is on PATH
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$INSTALL_DIR/bin/capsper" "$HOME/.local/bin/capsper"
 
-    # Audio configuration
-    local channel="FL"
-    PW_TARGET=""
-    echo ""
-    echo "=== Audio Configuration ==="
-    if confirm "Select audio device?"; then
-        select_device "$SCRIPT_DIR/bin/capsper"
-    fi
-    if confirm "Run microphone channel detection? (No = use default FL)"; then
-        local detect_output
-        detect_output=$(pw_detect "$SCRIPT_DIR/bin/capsper" "$PW_TARGET")
-        echo "$detect_output"
-        channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
-        [ -z "$channel" ] && channel="FL"
-    else
-        echo "Using default channel: FL"
-    fi
+    echo "Installed. Binary: $INSTALL_DIR/bin/capsper"
+    echo "Symlink:  ~/.local/bin/capsper"
 
-    # Systemd service
-    install_service "$SCRIPT_DIR" "$SCRIPT_DIR/bin/capsper" "$channel" "$SCRIPT_DIR/models" "$PW_TARGET"
-
-    echo ""
-    if confirm "Start the dictation service now?"; then
-        systemctl --user restart capsper.service
-        echo "Service started. Check status with:"
-        echo "  systemctl --user status capsper.service"
-    else
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
         echo ""
-        echo "Start manually with:"
-        echo "  systemctl --user start capsper.service"
+        echo "NOTE: ~/.local/bin is not on your PATH."
+        echo "Add to your shell rc file:"
+        echo '  export PATH="$HOME/.local/bin:$PATH"'
     fi
 }
 
-cmd_setup_dev() {
-    # Called from run.ts setup — binary is in the source tree
-    local project_dir="${1:?Usage: install.sh setup-dev PROJECT_DIR}"
+# ─── Subcommands ──────────────────────────────────────────────────────────────
 
-    check_permissions
+cmd_install() {
+    # Verify we're in a dist directory with the binary
+    [ -f "$SCRIPT_DIR/bin/capsper" ] || die "capsper binary not found in $SCRIPT_DIR/bin"
 
-    local channel="FL"
-    PW_TARGET=""
-    echo ""
-    echo "=== Audio Configuration ==="
-    if confirm "Select audio device?"; then
-        select_device "$project_dir/dist/bin/capsper"
-    fi
-    if confirm "Run microphone channel detection? (No = use default FL)"; then
-        local detect_output
-        detect_output=$(pw_detect "$project_dir/dist/bin/capsper" "$PW_TARGET")
-        echo "$detect_output"
-        channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
-        [ -z "$channel" ] && channel="FL"
+    if is_dev_mode; then
+        echo "=== Capsper Developer Setup ==="
+        echo "(detected git checkout)"
+        echo ""
+
+        local project_dir
+        project_dir="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+        check_permissions
+
+        local channel="FL"
+        PW_TARGET=""
+        echo ""
+        echo "=== Audio Configuration ==="
+        if confirm "Select audio device?"; then
+            select_device "$SCRIPT_DIR/bin/capsper"
+        fi
+        if confirm "Run microphone channel detection? (No = use default FL)"; then
+            local detect_output
+            detect_output=$(pw_detect "$SCRIPT_DIR/bin/capsper" "$PW_TARGET")
+            echo "$detect_output"
+            channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
+            [ -z "$channel" ] && channel="FL"
+        else
+            echo "Using default channel: FL"
+        fi
+
+        install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET"
     else
-        echo "Using default channel: FL"
+        echo "=== Capsper Installer ==="
+        echo ""
+
+        # Check runtime deps
+        require_cmd nvidia-smi "NVIDIA driver required for CUDA inference."
+        check_cuda_libraries
+        command -v pw-cli >/dev/null 2>&1 || echo "WARNING: pw-cli not found. PipeWire may not be installed."
+
+        # Permissions
+        check_permissions
+
+        # Copy files to ~/.local/share/capsper/
+        install_files
+
+        # Download models
+        download_models "$INSTALL_DIR/models"
+
+        # Audio configuration
+        local channel="FL"
+        PW_TARGET=""
+        echo ""
+        echo "=== Audio Configuration ==="
+        if confirm "Select audio device?"; then
+            select_device "$INSTALL_DIR/bin/capsper"
+        fi
+        if confirm "Run microphone channel detection? (No = use default FL)"; then
+            local detect_output
+            detect_output=$(pw_detect "$INSTALL_DIR/bin/capsper" "$PW_TARGET")
+            echo "$detect_output"
+            channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
+            [ -z "$channel" ] && channel="FL"
+        else
+            echo "Using default channel: FL"
+        fi
+
+        # Systemd service
+        install_service "$INSTALL_DIR" "$INSTALL_DIR/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET"
     fi
 
-    install_service "$project_dir" "$project_dir/dist/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET"
-
     echo ""
-    echo "capsper.service ready"
     if confirm "Start the dictation service now?"; then
         systemctl --user restart capsper.service
         echo "Service started. Check status with:"
@@ -351,7 +387,6 @@ cmd_setup_dev() {
 
 case "${1:-install}" in
     install)    cmd_install ;;
-    setup-dev)  shift; cmd_setup_dev "$@" ;;
     pw-detect)  shift; pw_detect "$SCRIPT_DIR/bin/capsper" "$@" ;;
-    *)          die "Unknown command: $1. Usage: install.sh [install|pw-detect|setup-dev]" ;;
+    *)          die "Unknown command: $1. Usage: install.sh [install|pw-detect]" ;;
 esac
