@@ -1,5 +1,6 @@
 const cimport = @cImport({
     @cInclude("whisper.h");
+    @cInclude("ggml-backend.h");
 });
 
 // Re-export all declarations from the C import
@@ -58,3 +59,11 @@ pub const whisper_vad_segments_get_segment_t0 = cimport.whisper_vad_segments_get
 pub const whisper_vad_segments_get_segment_t1 = cimport.whisper_vad_segments_get_segment_t1;
 pub const whisper_vad_free_segments = cimport.whisper_vad_free_segments;
 pub const whisper_vad_free = cimport.whisper_vad_free;
+
+// ggml backend device enumeration
+pub const ggml_backend_dev_count = cimport.ggml_backend_dev_count;
+pub const ggml_backend_dev_get = cimport.ggml_backend_dev_get;
+pub const ggml_backend_dev_name = cimport.ggml_backend_dev_name;
+pub const ggml_backend_dev_description = cimport.ggml_backend_dev_description;
+pub const ggml_backend_dev_type = cimport.ggml_backend_dev_type;
+pub const GGML_BACKEND_DEVICE_TYPE_GPU = cimport.GGML_BACKEND_DEVICE_TYPE_GPU;

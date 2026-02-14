@@ -154,6 +154,7 @@ capsper [OPTIONS]
   --pw-detect             Interactive channel detection (record silence + speech)
   --detect-duration SECS  Duration per detection phase (default: 5)
   --verbose               Enable verbose logging
+  --dry-run               Load models, run warmup, then exit (validates setup)
 ```
 
 ## Building & testing
@@ -197,6 +198,8 @@ On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
 - First transcription: ~1.4s total
 
 ## Troubleshooting
+
+**"No CUDA GPU detected"** — capsper requires a CUDA-capable NVIDIA GPU and won't fall back to CPU. Ensure CUDA 13 runtime libraries are installed (`sudo apt install cuda-cudart-13-1 libcublas-13-1`) and that `nvidia-smi` shows your GPU.
 
 **Server fails to start** — check `/tmp/capsper.log`. Ensure CUDA is installed and GPU has sufficient VRAM.
 

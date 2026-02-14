@@ -33,6 +33,7 @@ pub fn main() !void {
     var trigger_key: ?u16 = null;
     var trigger_passthrough: bool = false;
     var type_delay_us: u64 = 12_000; // 12ms
+    var dry_run: bool = false;
     var do_pw_list: bool = false;
     var do_pw_detect: bool = false;
     var detect_duration: u32 = 5;
@@ -107,6 +108,8 @@ pub fn main() !void {
             do_pw_list = true;
         } else if (std.mem.eql(u8, arg, "--pw-detect")) {
             do_pw_detect = true;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
         } else if (std.mem.eql(u8, arg, "--detect-duration")) {
             i += 1;
             if (i < args.len) detect_duration = std.fmt.parseInt(u32, args[i], 10) catch 5;
@@ -151,6 +154,8 @@ pub fn main() !void {
     };
     defer c.whisper_free(ctx);
 
+    if (!requireGpu()) std.process.exit(1);
+
     // Load VAD model
     std.debug.print("Loading VAD model: {s}\n", .{vad_model_path});
     var vad = Vad.init(vad_model_path) catch |err| {
@@ -159,34 +164,36 @@ pub fn main() !void {
     };
     defer vad.deinit();
 
-    // Initialize evdev input handler (if --trigger specified)
+    // Initialize evdev input handler (if --trigger specified, skip in dry-run)
     var input_handler: ?InputHandler = null;
     var type_callback: ?TypeCallback = null;
 
-    if (trigger_key) |tkey| {
-        std.debug.print("Initializing evdev input handler (trigger=keycode {d})\n", .{tkey});
-        input_handler = InputHandler.init(.{
-            .trigger_key = tkey,
-            .trigger_passthrough = trigger_passthrough,
-            .type_delay_us = type_delay_us,
-            .pause_fn = &server_mod.setPaused,
-        }) catch |err| {
-            std.debug.print("Failed to init input handler: {}\n", .{err});
-            std.debug.print("Check: is user in 'input' group? Is /dev/uinput accessible?\n", .{});
-            return;
-        };
-        type_callback = .{
-            .context = @ptrCast(&input_handler.?),
-            .func = &InputHandler.typeTextCallback,
-        };
+    if (!dry_run) {
+        if (trigger_key) |tkey| {
+            std.debug.print("Initializing evdev input handler (trigger=keycode {d})\n", .{tkey});
+            input_handler = InputHandler.init(.{
+                .trigger_key = tkey,
+                .trigger_passthrough = trigger_passthrough,
+                .type_delay_us = type_delay_us,
+                .pause_fn = &server_mod.setPaused,
+            }) catch |err| {
+                std.debug.print("Failed to init input handler: {}\n", .{err});
+                std.debug.print("Check: is user in 'input' group? Is /dev/uinput accessible?\n", .{});
+                return;
+            };
+            type_callback = .{
+                .context = @ptrCast(&input_handler.?),
+                .func = &InputHandler.typeTextCallback,
+            };
+        }
+
+        // Start paused when using trigger key (evdev controls pause directly)
+        if (trigger_key != null) {
+            server_mod.setPaused(true);
+        }
     }
     defer {
         if (input_handler != null) input_handler.?.deinit();
-    }
-
-    // Start paused when using trigger key (evdev controls pause directly)
-    if (trigger_key != null) {
-        server_mod.setPaused(true);
     }
 
     // Warmup
@@ -218,6 +225,11 @@ pub fn main() !void {
         std.debug.print("Warmup complete\n", .{});
     }
 
+    if (dry_run) {
+        std.debug.print("Dry run complete\n", .{});
+        return;
+    }
+
     // Start input handler thread (after warmup, before server)
     if (input_handler != null) {
         try input_handler.?.start();
@@ -241,13 +253,32 @@ fn parseChannelName(name: []const u8) ?u32 {
     return null;
 }
 
+fn requireGpu() bool {
+    const dev_count = c.ggml_backend_dev_count();
+    var i: usize = 0;
+    while (i < dev_count) : (i += 1) {
+        const dev = c.ggml_backend_dev_get(i);
+        if (c.ggml_backend_dev_type(dev) == c.GGML_BACKEND_DEVICE_TYPE_GPU) {
+            std.debug.print("GPU: {s} ({s})\n", .{
+                std.mem.span(c.ggml_backend_dev_description(dev)),
+                std.mem.span(c.ggml_backend_dev_name(dev)),
+            });
+            return true;
+        }
+    }
+    std.debug.print("GPU: none\n", .{});
+    std.debug.print("ERROR: No CUDA GPU detected. Capsper requires a CUDA-capable GPU.\n", .{});
+    std.debug.print("CPU inference is too slow for real-time dictation.\n", .{});
+    return false;
+}
+
 fn printUsage() void {
     std.debug.print("Usage: capsper [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
     std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
     std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
     std.debug.print("       [--pw-list] [--pw-detect [--detect-duration SECS]]\n", .{});
-    std.debug.print("       [--version]\n", .{});
+    std.debug.print("       [--dry-run] [--version]\n", .{});
 }
 
 pub fn loadWav(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {

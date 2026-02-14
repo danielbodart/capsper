@@ -219,6 +219,33 @@ EOF
     echo "capsper.service installed."
 }
 
+run_dry_run() {
+    local service_file="$HOME/.config/systemd/user/capsper.service"
+    local exec_start
+    exec_start=$(grep '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
+
+    if [ -z "$exec_start" ]; then
+        echo "WARNING: Could not read service file, skipping validation."
+        return 0
+    fi
+
+    echo ""
+    echo "=== Validating Setup ==="
+    echo ""
+
+    local exit_code=0
+    $exec_start --dry-run 2>&1 || exit_code=$?
+
+    echo ""
+
+    if [ $exit_code -ne 0 ]; then
+        echo "Setup validation failed. Fix the issues above before starting the service."
+        return 1
+    fi
+
+    echo "Setup validated successfully."
+}
+
 # ─── CUDA Runtime ─────────────────────────────────────────────────────────
 
 check_cuda_libraries() {
@@ -372,7 +399,7 @@ cmd_install() {
     fi
 
     echo ""
-    if confirm "Start the dictation service now?"; then
+    if run_dry_run && confirm "Start the dictation service now?"; then
         systemctl --user restart capsper.service
         echo "Service started. Check status with:"
         echo "  systemctl --user status capsper.service"
