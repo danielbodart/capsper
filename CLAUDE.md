@@ -17,7 +17,7 @@ Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `b
 ./run.ts clean
 
 # Run directly (loads model, grabs keyboard, CapsLock = push-to-talk)
-./zig-out/bin/zigsper --trigger capslock --pw-channel AUX2
+./dist/bin/zigsper --trigger capslock --pw-channel AUX2
 
 # First-time setup (builds, configures evdev permissions, installs systemd service)
 ./run.ts setup
@@ -68,14 +68,26 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 
 ### Scripts & Task Runner
 
-- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `dev` (default), `build`, `rebuild`, `clean`, `setup`, `test`, `slow-test`, `dist`, `ci`.
+- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `dev` (default), `build`, `clean`, `setup`, `test`, `slow-test`, `rebuild-whisper`, `dist`, `ci`.
 - **`install.sh`** — Self-contained bash installer. Ships in dist tarball. Subcommands: `install` (default), `pw-detect`, `setup-dev` (called by `run.ts setup`).
 
-### Build System
+### Build System & `dist/` Layout
 
-`build.zig` drives a two-stage build:
-1. CMake builds whisper.cpp as **shared libraries** (with CUDA, flash attention) into `whisper.cpp/build-zig/`
-2. Zig compiles the server binary, linking those shared libs with RPaths set for runtime discovery
+Pre-built whisper.cpp shared libraries are committed in `dist/lib/` via Git LFS (~43 MB). The Zig build links against these directly — no CMake step needed for normal builds.
+
+```
+dist/
+├── bin/zigsper              (built by zig — gitignored)
+├── lib/                     (pre-built .so files — committed via LFS)
+│   ├── libwhisper.so.1.8.3, libwhisper.so.1, libwhisper.so
+│   ├── libggml-cuda.so.0.9.6, libggml-cuda.so.0, libggml-cuda.so
+│   └── (libggml, libggml-base, libggml-cpu — same pattern)
+└── install.sh               (committed)
+```
+
+- `zig build --prefix dist` — builds binary to `dist/bin/`, links libs from `dist/lib/`
+- `zig build rebuild-libs --prefix dist` — rebuilds whisper.cpp shared libs via CMake (only needed after bumping the whisper.cpp submodule)
+- RPATH is `$ORIGIN/../lib` so `dist/bin/zigsper` finds `dist/lib/*.so` at runtime
 
 Static linking is intentionally avoided — Zig's bundled libc++ conflicts with whisper.cpp's libstdc++ dependency.
 

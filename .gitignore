@@ -1,6 +1,5 @@
-zig-out/
+dist/bin/
 .zig-cache/
 whisper.cpp/build-zig/
-dist/
 tools/
 .idea/

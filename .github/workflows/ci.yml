@@ -5,22 +5,15 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    container:
-      image: nvidia/cuda:13.0.0-devel-ubuntu22.04
     steps:
       - name: Install system deps
         run: |
-          apt-get update
-          apt-get install -y git curl ca-certificates cmake pkg-config patchelf pv ncat libpipewire-0.3-dev
-          git config --global safe.directory '*'
+          sudo apt-get update
+          sudo apt-get install -y git-lfs pkg-config pv ncat libpipewire-0.3-dev
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: actions/cache@v4
-        with:
-          path: whisper.cpp/build-zig
-          key: whisper-cuda-${{ hashFiles('.gitmodules') }}
-          restore-keys: whisper-cuda-
+          lfs: true
       - name: CI
         run: ./run ci
         env:

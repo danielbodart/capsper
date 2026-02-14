@@ -347,7 +347,7 @@ cmd_setup_dev() {
         echo "Using default channel: FL"
     fi
 
-    install_service "$project_dir" "$project_dir/zig-out/bin/zigsper" "$channel"
+    install_service "$project_dir" "$project_dir/dist/bin/zigsper" "$channel"
 
     echo ""
     echo "zigsper.service ready"

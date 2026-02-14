@@ -4,49 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // --- Build whisper.cpp via CMake (shared libs) ---
-    const cmake_build_dir = "whisper.cpp/build-zig";
-
-    // Auto-skip CMake if shared libs already exist (CUDA compilation is expensive).
-    // Use -Dforce-cmake to rebuild, or run `./run.ts clean` to start fresh.
-    const force_cmake = b.option(bool, "force-cmake", "Force CMake rebuild even if shared libs exist") orelse false;
-    const libs_exist = if (std.fs.cwd().statFile(cmake_build_dir ++ "/ggml/src/ggml-cuda/libggml-cuda.so")) |_| true else |_| false;
-    const run_cmake = force_cmake or !libs_exist;
-
-    // Use a disk-backed temp dir for nvcc intermediate files.
-    // Default /tmp is tmpfs (RAM-backed) and nvcc can fill 16GB+ during CUDA kernel compilation.
-    const nvcc_tmp = b.fmt("{s}/{s}/tmp", .{ b.build_root.path orelse ".", cmake_build_dir });
-
-    const cmake_configure = b.addSystemCommand(&.{
-        "cmake",
-        "-S",
-        "whisper.cpp",
-        "-B",
-        cmake_build_dir,
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DBUILD_SHARED_LIBS=ON",
-        "-DGGML_CUDA=ON",
-        "-DWHISPER_BUILD_TESTS=OFF",
-        "-DWHISPER_BUILD_EXAMPLES=OFF",
-        "-DWHISPER_BUILD_SERVER=OFF",
-    });
-
-    const mkdir_nvcc_tmp = b.addSystemCommand(&.{ "mkdir", "-p", nvcc_tmp });
-    mkdir_nvcc_tmp.step.dependOn(&cmake_configure.step);
-
-    const cmake_jobs = b.option([]const u8, "cmake-jobs", "Limit CMake build parallelism (e.g. '2')");
-    const cmake_build = b.addSystemCommand(&.{
-        "cmake",
-        "--build",
-        cmake_build_dir,
-        "--config",
-        "Release",
-        "-j",
-    });
-    if (cmake_jobs) |jobs| cmake_build.addArg(jobs);
-    cmake_build.setEnvironmentVariable("TMPDIR", nvcc_tmp);
-    cmake_build.step.dependOn(&mkdir_nvcc_tmp.step);
-
     // --- Zig executable ---
     const exe = b.addExecutable(.{
         .name = "zigsper",
@@ -73,17 +30,10 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Library paths for shared libs built by CMake
-    exe.root_module.addLibraryPath(b.path(cmake_build_dir ++ "/src"));
-    exe.root_module.addLibraryPath(b.path(cmake_build_dir ++ "/ggml/src"));
-    exe.root_module.addLibraryPath(b.path(cmake_build_dir ++ "/ggml/src/ggml-cpu"));
-    exe.root_module.addLibraryPath(b.path(cmake_build_dir ++ "/ggml/src/ggml-cuda"));
-
-    // Runtime library search paths (so the binary can find .so files)
-    exe.root_module.addRPath(b.path(cmake_build_dir ++ "/src"));
-    exe.root_module.addRPath(b.path(cmake_build_dir ++ "/ggml/src"));
-    exe.root_module.addRPath(b.path(cmake_build_dir ++ "/ggml/src/ggml-cpu"));
-    exe.root_module.addRPath(b.path(cmake_build_dir ++ "/ggml/src/ggml-cuda"));
+    // Link from pre-built shared libs in dist/lib/ (committed via Git LFS)
+    exe.root_module.addLibraryPath(b.path("dist/lib"));
+    exe.root_module.addRPathSpecial("$ORIGIN/../lib");
+    exe.each_lib_rpath = false;
 
     // Link whisper.cpp and its dependencies
     exe.linkSystemLibrary("whisper");
@@ -94,11 +44,6 @@ pub fn build(b: *std.Build) void {
 
     // System dependencies
     exe.linkLibC();
-
-    // Ensure CMake runs before Zig compilation (unless libs already built)
-    if (run_cmake) {
-        exe.step.dependOn(&cmake_build.step);
-    }
 
     b.installArtifact(exe);
 
@@ -187,4 +132,44 @@ pub fn build(b: *std.Build) void {
 
     // Also include prop tests in the main test step
     test_step.dependOn(&run_prop.step);
+
+    // --- Rebuild whisper.cpp shared libs (cmake → dist/lib/) ---
+    const rebuild_step = b.step("rebuild-libs", "Rebuild whisper.cpp shared libs into dist/lib/");
+
+    const cmake_build_dir = ".zig-cache/cmake";
+    const abs_dist_lib = b.pathJoin(&.{ b.build_root.path orelse ".", "dist/lib" });
+
+    // Use a disk-backed temp dir for nvcc intermediate files.
+    // Default /tmp is tmpfs (RAM-backed) and nvcc can fill 16GB+ during CUDA kernel compilation.
+    const nvcc_tmp = b.fmt("{s}/{s}/tmp", .{ b.build_root.path orelse ".", cmake_build_dir });
+
+    const cmake_configure = b.addSystemCommand(&.{
+        "cmake",
+        "-S",
+        "whisper.cpp",
+        "-B",
+        cmake_build_dir,
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DGGML_CUDA=ON",
+        "-DWHISPER_BUILD_TESTS=OFF",
+        "-DWHISPER_BUILD_EXAMPLES=OFF",
+        "-DWHISPER_BUILD_SERVER=OFF",
+    });
+    cmake_configure.addArg(b.fmt("-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={s}", .{abs_dist_lib}));
+
+    const mkdir_nvcc_tmp = b.addSystemCommand(&.{ "mkdir", "-p", nvcc_tmp });
+    mkdir_nvcc_tmp.step.dependOn(&cmake_configure.step);
+
+    const cmake_build = b.addSystemCommand(&.{
+        "cmake",
+        "--build",
+        cmake_build_dir,
+        "--config",
+        "Release",
+    });
+    cmake_build.setEnvironmentVariable("TMPDIR", nvcc_tmp);
+    cmake_build.step.dependOn(&mkdir_nvcc_tmp.step);
+
+    rebuild_step.dependOn(&cmake_build.step);
 }

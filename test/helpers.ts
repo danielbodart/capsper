@@ -4,7 +4,7 @@ import { createConnection } from "net";
 import { tmpdir } from "os";
 import { join } from "path";
 
-export const BINARY = "./zig-out/bin/zigsper";
+export const BINARY = "./dist/bin/zigsper";
 export const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
 export const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
 
