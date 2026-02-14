@@ -2,9 +2,11 @@
   <img src="logo.png" alt="CAPSPER!" width="400">
 </p>
 
-Push-to-talk voice dictation for Linux. Hold a key, speak, release — text is typed into whatever window is focused.
+Does CapsLock annoy you? Ever wished it actually did something useful instead of SHOUTING AT PEOPLE BY ACCIDENT?
 
-Uses a custom streaming speech recognition server written in Zig, linking [whisper.cpp](https://github.com/ggml-org/whisper.cpp) for local GPU inference with the `large-v3-turbo` model. Implements [AlignAtt](https://aclanthology.org/2023.findings-emnlp.744/) simultaneous speech processing for low-latency streaming transcription with word-level stability checking.
+Ever wished you had a friendly ghost whispering your words onto the screen? Well now you do. Capsper is your friendly neighbourhood ghost writer — hold CapsLock, speak, and watch your words appear. No cloud, no subscription, no latency worth complaining about. Just a local GPU, a haunted key, and a little whisper magic.
+
+Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://github.com/ggml-org/whisper.cpp) server written in Zig with [AlignAtt](https://aclanthology.org/2023.findings-emnlp.744/) for low-latency transcription. Works on both X11 and Wayland.
 
 ## How it works
 
@@ -17,28 +19,19 @@ Uses a custom streaming speech recognition server written in Zig, linking [whisp
 
 - Linux (Debian/Ubuntu)
 - NVIDIA GPU with ~4 GB VRAM
-- CUDA toolkit (only needed for `rebuild-whisper`; pre-built libs committed via Git LFS)
 - PipeWire (default audio server on modern Ubuntu/Fedora)
-- User in the `input` group (for evdev keyboard grab and uinput text injection)
 
-## Setup
+## Install
+
+Download the [latest release](https://github.com/danielbodart/capsper/releases/latest), extract it, and run the installer:
 
 ```bash
-git clone --recurse-submodules https://github.com/danielbodart/capsper.git
-cd capsper
-./run
+tar -xzf capsper-linux-x86_64-*.tar.gz
+cd capsper-linux-x86_64-*
+./install.sh
 ```
 
-This auto-detects and handles everything:
-- Installs toolchain (mise, Zig 0.15.2, Bun) on first run via `bootstrap.sh`
-- Installs system packages (`pv`, `ncat`)
-- Initialises the whisper.cpp submodule if needed
-- Downloads models (~574 MB Whisper model + VAD model) if missing
-- Compiles the Zig binary (pre-built whisper.cpp shared libs are committed via Git LFS)
-- Configures uinput permissions (for text injection via virtual keyboard)
-- Creates and enables a systemd user service
-
-Every step is incremental — re-running `./run` is fast if everything is already set up.
+The installer walks you through everything interactively — downloading models (~574 MB), setting up permissions for keyboard grab and text injection, detecting your microphone channel, and installing a systemd user service.
 
 ## Usage
 
@@ -65,6 +58,28 @@ capsper --pw-detect --pw-target alsa_input.usb-Focusrite_Vocaster...
 ```
 
 This records silence and speech, then shows per-channel signal levels and recommends the correct `--pw-channel` flag.
+
+## Development
+
+Want to hack on Capsper? You'll need the [requirements](#requirements) above plus CUDA toolkit if you want to rebuild the whisper.cpp shared libs (pre-built libs are committed via Git LFS, so this is only needed after bumping the submodule).
+
+```bash
+git clone --recurse-submodules https://github.com/danielbodart/capsper.git
+cd capsper
+./run
+```
+
+This auto-detects and handles everything:
+- Installs toolchain (mise, Zig 0.15.2, Bun) on first run via `bootstrap.sh`
+- Installs system packages (`pv`, `ncat`)
+- Initialises the whisper.cpp submodule if needed
+- Downloads models (~574 MB Whisper model + VAD model) if missing
+- Compiles the Zig binary (pre-built whisper.cpp shared libs are committed via Git LFS)
+- Runs unit and property tests, then integration smoke tests
+- Configures uinput permissions (for text injection via virtual keyboard)
+- Creates and enables a systemd user service
+
+Every step is incremental — re-running `./run` is fast if everything is already set up.
 
 ## Architecture
 
@@ -118,7 +133,7 @@ capsper [OPTIONS]
 
 ## Building & testing
 
-All commands go through the Bun-based task runner (`run.ts`), which bootstraps its own toolchain via `bootstrap.sh` + mise.
+All commands go through the Bun-based task runner (`run.ts`), which bootstraps its own toolchain via `bootstrap.sh` + mise. See [Development](#development) for first-time setup.
 
 ```bash
 # Build (default command)
