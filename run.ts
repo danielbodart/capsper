@@ -200,8 +200,9 @@ export async function slowTest(testName?: string, ...extra: string[]) {
 export async function dist() {
     ensureBinary();
 
-    // Validate that shared libs are real ELF binaries, not LFS pointers
-    const { stdout } = await $`file dist/lib/*.so`.quiet();
+    // Validate that versioned shared libs are real ELF binaries, not LFS pointers
+    // (skip bare .so symlinks — only check the actual .so.X.Y.Z files)
+    const { stdout } = await $`file dist/lib/*.so.*.*.*`.quiet();
     const lines = stdout.toString().trim().split("\n");
     const bad = lines.filter(l => !l.includes("ELF"));
     if (bad.length > 0) {
