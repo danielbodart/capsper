@@ -22,7 +22,6 @@ jobs:
         env:
           CI: "true"
           GH_TOKEN: ${{ github.token }}
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
       - uses: actions/upload-artifact@v4
         with:
           name: capsper-linux-x86_64

@@ -202,7 +202,7 @@ export async function ci() {
     await dist();
     if (process.env.GH_TOKEN) {
         const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
-        const commitMsg = process.env.COMMIT_MSG || "";
+        const commitMsg = (await $`git log -1 --format=%s`.quiet()).text().trim();
         console.log(`Creating release v${ver}...`);
         await $`gh release create v${ver} ${tarball} --title v${ver} --notes ${commitMsg}`;
     }
