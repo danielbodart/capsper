@@ -113,3 +113,4 @@ Static linking is intentionally avoided — Zig's bundled libc++ conflicts with 
 - Audio format: 16kHz mono S16_LE PCM (32000 bytes/sec)
 - Default server port: 43007
 - User is on X11 (not Wayland)
+- **CI workflows must only call `run.ts` targets** — no build/packaging logic in `.github/workflows/`. Everything must be testable locally via `./run.ts <target>`. CI-only behaviour (e.g. `gh release create`) is gated on env vars like `GH_TOKEN` inside `run.ts`, not split into separate workflow steps.

@@ -186,8 +186,10 @@ export async function slowTest(testName?: string, ...extra: string[]) {
 export async function dist() {
     ensureBinary();
     await $`cp -n test/jfk.wav dist/bin/ 2>/dev/null || true`;
-    const { stdout: totalSize } = await $`du -sh dist/`.quiet();
-    console.log(`dist/ ready: ${totalSize.toString().trim().split("\t")[0]}`);
+    const ver = await version();
+    const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
+    await $`tar -czf ${tarball} -C dist bin/ lib/ install.sh`;
+    console.log(`Tarball: ${tarball}`);
 }
 
 export async function ci() {
@@ -197,10 +199,12 @@ export async function ci() {
     await $`zig build test`;
     console.log(`Building v${ver}...`);
     await $`zig build --prefix dist -Dversion=${ver}`;
-    // Export version for subsequent CI steps
-    const output = process.env.GITHUB_OUTPUT;
-    if (output) {
-        await $`echo version=${ver} >> ${output}`;
+    await dist();
+    if (process.env.GH_TOKEN) {
+        const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
+        const commitMsg = process.env.COMMIT_MSG || "";
+        console.log(`Creating release v${ver}...`);
+        await $`gh release create v${ver} ${tarball} --title v${ver} --notes ${commitMsg}`;
     }
 }
 
