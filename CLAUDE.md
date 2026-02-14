@@ -41,12 +41,6 @@ Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `b
 ./run.ts slow-test pw-stream           # PipeWire loopback test
 ```
 
-Unit tests and property tests run automatically as part of `./run.ts` (via `zig build`). Unit tests live inline in `src/utils.zig` and `src/alignatt.zig` (pure Zig modules with no C deps). Property-based tests in `src/prop_tests.zig` use [minish](https://github.com/CogitatorTech/minish) for fuzz-like coverage of word-level delta/stability functions. Integration tests are self-contained: each starts its own server with `--port 0` (OS-assigned port), parses the port from the "Listening on port" log line, and cleans up on exit.
-
-**When writing new code, add unit tests for any pure functions** (functions that don't depend on whisper.cpp C types). Keep testable logic in modules that don't import `whisper_c.zig` so tests run fast without requiring the GPU or model.
-
-**For functions with tricky invariants** (word matching, offset calculations, stability/delta logic), add property-based tests in `src/prop_tests.zig` using minish. Good candidates: functions that are idempotent, symmetric, have roundtrip relationships, or where edge cases around spaces/punctuation/empty strings matter. Property tests catch bugs that hand-written examples miss.
-
 ## Architecture
 
 Push-to-talk voice dictation for Linux. Self-contained binary: grabs keyboards via evdev, intercepts CapsLock as trigger, captures audio via PipeWire, transcribes with whisper.cpp, injects text as keystrokes via uinput. No external tools needed (no xdotool, ydotool, keyd, xinput). Works on both X11 and Wayland.
@@ -86,21 +80,6 @@ dist/
 └── install.sh               (committed)
 ```
 
-- `zig build --prefix dist` — builds binary to `dist/bin/`, links libs from `dist/lib/`
-- `zig build rebuild-libs --prefix dist` — rebuilds whisper.cpp shared libs via CMake (only needed after bumping the whisper.cpp submodule)
-- RPATH is `$ORIGIN/../lib` so `dist/bin/capsper` finds `dist/lib/*.so` at runtime
-
-Static linking is intentionally avoided — Zig's bundled libc++ conflicts with whisper.cpp's libstdc++ dependency.
-
-## Key Technical Details
-
-- **30-second padding**: whisper.cpp's mel computation requires 480000 samples (30s). Short audio must be zero-padded or the decoder emits immediate EOT.
-- **Split prompt decode**: `whisper_get_logits_from_state()` reads from offset 0, but batch decode only populates logits for the last token. Prompt tokens are decoded in two calls: batch first N-1, then the last token alone.
-- **AlignAtt always `is_last=true`**: The frame_threshold=25 is too conservative for short streaming buffers. Server-side word stability checking handles hallucination filtering instead.
-- **Word-level delta tracking**: Stability is checked at word granularity (not byte), using case-insensitive comparison with trailing punctuation stripped. This handles Whisper changing "so" to "so," between cycles.
-- **Sliding window**: Audio buffer capped at 15s (`max_buffer_bytes=480000`). When trimmed, prev_text offset scanning (up to 6 words) realigns the emitted word count.
-- **PipeWire FFI must go through C helpers**: Passing `spa_pod**` params through Zig FFI breaks SPA format negotiation (ports get generic names like `input_1`, auto-connect fails, resampling doesn't happen). All PipeWire calls involving SPA pods or variadic macros must be in `src/pw_helpers.c`, not called directly from Zig.
-
 ## Workflow
 
 **Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test. Use `./run.ts slow-test compare` to get a baseline before and after changes — it gives concrete word coverage numbers to measure improvement.
@@ -112,5 +91,5 @@ Static linking is intentionally avoided — Zig's bundled libc++ conflicts with 
 - Model: `ggml-large-v3-turbo-q5_0.bin` (573 MB, q5_0 quantization)
 - Audio format: 16kHz mono S16_LE PCM (32000 bytes/sec)
 - Default server port: 43007
-- User is on X11 (not Wayland)
-- **CI workflows must only call `run.ts` targets** — no build/packaging logic in `.github/workflows/`. Everything must be testable locally via `./run.ts <target>`. CI-only behaviour (e.g. `gh release create`) is gated on env vars like `GH_TOKEN` inside `run.ts`, not split into separate workflow steps.
+- **Local and CI builds must be identical.** Same flags, same CPU target, same optimizations. No "dev mode" divergence — unknown differences between local and CI builds cause bugs that only appear in production.
+- **Dist builds target `x86_64_v3`** (AVX2+FMA+BMI) — matches our GPU support floor (GTX 1650+). Both `build()` and `ci()` pass `-Dcpu=x86_64_v3` to zig build. The `dist()` target validates no AVX-512 instructions are present.

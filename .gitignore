@@ -4,3 +4,4 @@ dist/models/
 whisper.cpp/build-zig/
 tools/
 .idea/
+CLAUDE.local.md
