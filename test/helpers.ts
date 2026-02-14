@@ -4,7 +4,7 @@ import { createConnection } from "net";
 import { tmpdir } from "os";
 import { join } from "path";
 
-export const BINARY = "./dist/bin/zigsper";
+export const BINARY = "./dist/bin/capsper";
 export const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
 export const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
 
@@ -34,7 +34,7 @@ export async function waitForLog(logFile: string, pattern: RegExp, proc: ReturnT
     throw new Error(`Timed out waiting for ${pattern} after ${timeoutSec}s. Log:\n${log.slice(-2000)}`);
 }
 
-/** Start the zigsper server with given args, wait for ready, return handle. */
+/** Start the capsper server with given args, wait for ready, return handle. */
 export async function startServer(args: string[]): Promise<{ proc: ReturnType<typeof spawn>; port: number; logFile: string; kill: () => void }> {
     const logFile = tmpFile("whisper-server", ".log");
 

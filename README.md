@@ -1,4 +1,6 @@
-# Zigsper
+<p align="center">
+  <img src="logo.png" alt="CAPSPER!" width="400">
+</p>
 
 Push-to-talk voice dictation for Linux. Hold a key, speak, release — text is typed into whatever window is focused.
 
@@ -22,8 +24,8 @@ Uses a custom streaming speech recognition server written in Zig, linking [whisp
 ## Setup
 
 ```bash
-git clone --recurse-submodules https://github.com/danielbodart/zigsper.git
-cd zigsper
+git clone --recurse-submodules https://github.com/danielbodart/capsper.git
+cd capsper
 ./run
 ```
 
@@ -41,7 +43,7 @@ Every step is incremental — re-running `./run` is fast if everything is alread
 ## Usage
 
 ```bash
-systemctl --user start zigsper.service
+systemctl --user start capsper.service
 ```
 
 Hold CapsLock and speak. Release to stop. Text appears in the focused window.
@@ -51,15 +53,15 @@ Hold CapsLock and speak. Release to stop. Text appears in the focused window.
 For multi-channel audio interfaces, first list available sources:
 
 ```bash
-zigsper --pw-list
+capsper --pw-list
 ```
 
 Then run interactive channel detection to find which channel carries your microphone signal:
 
 ```bash
-zigsper --pw-detect
+capsper --pw-detect
 # Or target a specific device:
-zigsper --pw-detect --pw-target alsa_input.usb-Focusrite_Vocaster...
+capsper --pw-detect --pw-target alsa_input.usb-Focusrite_Vocaster...
 ```
 
 This records silence and speech, then shows per-channel signal levels and recommends the correct `--pw-channel` flag.
@@ -67,7 +69,7 @@ This records silence and speech, then shows per-channel signal levels and recomm
 ## Architecture
 
 ```
-Physical Keyboard ──evdev──→ zigsper ──uinput──→ Virtual Keyboard → Apps
+Physical Keyboard ──evdev──→ capsper ──uinput──→ Virtual Keyboard → Apps
                               │
                               ├─ Trigger key held → PipeWire audio capture
                               ├─ whisper.cpp (GPU) + Silero VAD
@@ -93,7 +95,7 @@ A single self-contained binary (`src/`):
 ## Server options
 
 ```
-zigsper [OPTIONS]
+capsper [OPTIONS]
 
   --model, -m PATH        Whisper model path (default: whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin)
   --vad-model PATH        VAD model path (default: whisper.cpp/models/ggml-silero-v5.1.2.bin)
@@ -140,8 +142,8 @@ All commands go through the Bun-based task runner (`run.ts`), which bootstraps i
 
 | Variable | Default | Description |
 |---|---|---|
-| `ZIGSPER_PW_CHANNEL` | `FL` | PipeWire channel to capture |
-| `ZIGSPER_PW_TARGET` | *(unset)* | PipeWire node to capture from |
+| `CAPSPER_PW_CHANNEL` | `FL` | PipeWire channel to capture |
+| `CAPSPER_PW_TARGET` | *(unset)* | PipeWire node to capture from |
 
 ## Performance
 
@@ -154,7 +156,7 @@ On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
 
 ## Troubleshooting
 
-**Server fails to start** — check `/tmp/zigsper.log`. Ensure CUDA is installed and GPU has sufficient VRAM.
+**Server fails to start** — check `/tmp/capsper.log`. Ensure CUDA is installed and GPU has sufficient VRAM.
 
 **"Failed to load model"** — model file not found. Download it:
 ```bash
@@ -173,6 +175,6 @@ git submodule update --init --recursive
 git lfs pull
 ```
 
-**PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). Use `zigsper --pw-list` to see available sources, and `zigsper --pw-detect` to find the correct channel for multi-channel devices.
+**PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). Use `capsper --pw-list` to see available sources, and `capsper --pw-detect` to find the correct channel for multi-channel devices.
 
-**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `zigsper --pw-detect` and set `--pw-channel` accordingly.
+**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `capsper --pw-detect` and set `--pw-channel` accordingly.

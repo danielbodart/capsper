@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Self-contained installer for zigsper.
+# Self-contained installer for capsper.
 # Ships in the dist tarball alongside the binary and shared libs.
 #
 # Usage:
 #   ./install.sh              Full interactive setup (download models, permissions, systemd)
-#   ./install.sh pw-detect    Detect best PipeWire microphone channel (delegates to zigsper --pw-detect)
+#   ./install.sh pw-detect    Detect best PipeWire microphone channel (delegates to capsper --pw-detect)
 #   ./install.sh setup-dev DIR  Developer mode: permissions + pw-detect + systemd (called by run.ts)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -104,7 +104,7 @@ pw_detect() {
     local target="${1:-}"
     local detect_args=(--pw-detect)
     [ -n "$target" ] && detect_args+=(--pw-target "$target")
-    "$SCRIPT_DIR/zigsper" "${detect_args[@]}"
+    "$SCRIPT_DIR/capsper" "${detect_args[@]}"
 }
 
 # ─── Systemd Service ─────────────────────────────────────────────────────────
@@ -121,9 +121,9 @@ install_service() {
     local exec_start="$binary --trigger capslock --pw-channel $channel"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
 
-    cat > "$service_dir/zigsper.service" <<EOF
+    cat > "$service_dir/capsper.service" <<EOF
 [Unit]
-Description=Zigsper push-to-talk dictation
+Description=Capsper push-to-talk dictation
 
 [Service]
 Type=simple
@@ -138,18 +138,18 @@ WantedBy=default.target
 EOF
 
     systemctl --user daemon-reload
-    systemctl --user enable zigsper.service 2>/dev/null || true
-    echo "zigsper.service installed."
+    systemctl --user enable capsper.service 2>/dev/null || true
+    echo "capsper.service installed."
 }
 
 # ─── Subcommands ──────────────────────────────────────────────────────────────
 
 cmd_install() {
-    echo "=== Zigsper Installer ==="
+    echo "=== Capsper Installer ==="
     echo ""
 
     # Verify we're in a dist directory with the binary
-    [ -f "$SCRIPT_DIR/zigsper" ] || die "zigsper binary not found in $SCRIPT_DIR"
+    [ -f "$SCRIPT_DIR/capsper" ] || die "capsper binary not found in $SCRIPT_DIR"
 
     # Check runtime deps
     require_cmd nvidia-smi "NVIDIA driver required for CUDA inference."
@@ -176,17 +176,17 @@ cmd_install() {
     fi
 
     # Systemd service
-    install_service "$SCRIPT_DIR" "$SCRIPT_DIR/zigsper" "$channel"
+    install_service "$SCRIPT_DIR" "$SCRIPT_DIR/capsper" "$channel"
 
     echo ""
     if confirm "Start the dictation service now?"; then
-        systemctl --user restart zigsper.service
+        systemctl --user restart capsper.service
         echo "Service started. Check status with:"
-        echo "  systemctl --user status zigsper.service"
+        echo "  systemctl --user status capsper.service"
     else
         echo ""
         echo "Start manually with:"
-        echo "  systemctl --user start zigsper.service"
+        echo "  systemctl --user start capsper.service"
     fi
 }
 
@@ -209,18 +209,18 @@ cmd_setup_dev() {
         echo "Using default channel: FL"
     fi
 
-    install_service "$project_dir" "$project_dir/dist/bin/zigsper" "$channel"
+    install_service "$project_dir" "$project_dir/dist/bin/capsper" "$channel"
 
     echo ""
-    echo "zigsper.service ready"
+    echo "capsper.service ready"
     if confirm "Start the dictation service now?"; then
-        systemctl --user restart zigsper.service
+        systemctl --user restart capsper.service
         echo "Service started. Check status with:"
-        echo "  systemctl --user status zigsper.service"
+        echo "  systemctl --user status capsper.service"
     else
         echo ""
         echo "Start manually with:"
-        echo "  systemctl --user start zigsper.service"
+        echo "  systemctl --user start capsper.service"
     fi
 }
 

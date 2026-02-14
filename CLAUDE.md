@@ -17,7 +17,7 @@ Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `b
 ./run.ts clean
 
 # Run directly (loads model, grabs keyboard, CapsLock = push-to-talk)
-./dist/bin/zigsper --trigger capslock --pw-channel FL
+./dist/bin/capsper --trigger capslock --pw-channel FL
 
 # First-time setup (builds, configures evdev permissions, installs systemd service)
 ./run.ts setup
@@ -78,7 +78,7 @@ Pre-built whisper.cpp shared libraries are committed in `dist/lib/` via Git LFS 
 
 ```
 dist/
-├── bin/zigsper              (built by zig — gitignored)
+├── bin/capsper              (built by zig — gitignored)
 ├── lib/                     (pre-built .so files — committed via LFS)
 │   ├── libwhisper.so.1.8.3, libwhisper.so.1, libwhisper.so
 │   ├── libggml-cuda.so.0.9.6, libggml-cuda.so.0, libggml-cuda.so
@@ -88,7 +88,7 @@ dist/
 
 - `zig build --prefix dist` — builds binary to `dist/bin/`, links libs from `dist/lib/`
 - `zig build rebuild-libs --prefix dist` — rebuilds whisper.cpp shared libs via CMake (only needed after bumping the whisper.cpp submodule)
-- RPATH is `$ORIGIN/../lib` so `dist/bin/zigsper` finds `dist/lib/*.so` at runtime
+- RPATH is `$ORIGIN/../lib` so `dist/bin/capsper` finds `dist/lib/*.so` at runtime
 
 Static linking is intentionally avoided — Zig's bundled libc++ conflicts with whisper.cpp's libstdc++ dependency.
 

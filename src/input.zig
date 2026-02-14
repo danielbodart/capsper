@@ -782,7 +782,7 @@ fn createUinput() !posix.fd_t {
 
     // Device metadata
     var setup: UinputSetup = std.mem.zeroes(UinputSetup);
-    const name = "zigsper";
+    const name = "capsper";
     @memcpy(setup.name[0..name.len], name);
     setup.id.bustype = BUS_VIRTUAL;
     setup.id.vendor = VIRTUAL_VENDOR;

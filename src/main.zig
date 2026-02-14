@@ -103,7 +103,7 @@ pub fn main() !void {
             i += 1;
             if (i < args.len) detect_duration = std.fmt.parseInt(u32, args[i], 10) catch 5;
         } else {
-            std.debug.print("Usage: zigsper [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
+            std.debug.print("Usage: capsper [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
             std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
             std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
             std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});

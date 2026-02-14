@@ -5,7 +5,7 @@ import { join } from "path";
 
 process.env.FORCE_COLOR = "1";
 
-const BINARY = "./dist/bin/zigsper";
+const BINARY = "./dist/bin/capsper";
 const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
 const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
 const SCRIPT_DIR = import.meta.dir;
