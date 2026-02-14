@@ -118,7 +118,7 @@ capsper [OPTIONS]
   --model, -m PATH        Whisper model path (default: whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin)
   --vad-model PATH        VAD model path (default: whisper.cpp/models/ggml-silero-v5.1.2.bin)
   --port, -p PORT         TCP port (default: 43007, use 0 for OS-assigned)
-  --warmup-file PATH      WAV file for GPU warmup (default: jfk.wav)
+  --warmup-file PATH      WAV file for GPU warmup (default: jfk.wav next to binary)
   --no-warmup             Skip warmup inference
   --input tcp|local       Input mode: tcp (socket) or local (PipeWire capture)
   --trigger KEY           Trigger key for push-to-talk (default: capslock)

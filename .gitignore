@@ -1,6 +1,5 @@
 dist/bin/
 dist/models/
-dist/jfk.wav
 .zig-cache/
 whisper.cpp/build-zig/
 tools/

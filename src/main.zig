@@ -25,6 +25,7 @@ pub fn main() !void {
     var vad_model_path: [:0]const u8 = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
     var port: u16 = 43007;
     var warmup_file: ?[:0]const u8 = "jfk.wav";
+    var warmup_file_is_default = true;
     var input_mode: InputMode = .tcp;
     var pw_target: ?[:0]const u8 = null;
     var pw_channel: u32 = pw.SPA_AUDIO_CHANNEL_FL;
@@ -58,7 +59,10 @@ pub fn main() !void {
             };
         } else if (std.mem.eql(u8, arg, "--warmup-file")) {
             i += 1;
-            if (i < args.len) warmup_file = args[i];
+            if (i < args.len) {
+                warmup_file = args[i];
+                warmup_file_is_default = false;
+            }
         } else if (std.mem.eql(u8, arg, "--no-warmup")) {
             warmup_file = null;
         } else if (std.mem.eql(u8, arg, "--input")) {
@@ -186,11 +190,21 @@ pub fn main() !void {
     }
 
     // Warmup
-    if (warmup_file) |wf| {
-        std.debug.print("Warming up with: {s}\n", .{wf});
-        const samples = loadWav(allocator, wf) catch |err| {
-            std.debug.print("Warning: warmup file load failed: {}\n", .{err});
-            return;
+    if (warmup_file) |wf| warmup: {
+        // Default warmup file lives next to the binary; user-provided paths resolve from CWD
+        const resolved_path = blk: {
+            if (!warmup_file_is_default or std.fs.path.isAbsolute(wf)) break :blk wf;
+            const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch break :blk wf;
+            defer allocator.free(exe_dir);
+            const joined = std.fs.path.joinZ(allocator, &.{ exe_dir, wf }) catch break :blk wf;
+            break :blk joined;
+        };
+        defer if (resolved_path.ptr != wf.ptr) allocator.free(resolved_path);
+
+        std.debug.print("Warming up with: {s}\n", .{resolved_path});
+        const samples = loadWav(allocator, resolved_path) catch |err| {
+            std.debug.print("Warning: warmup file not found ({s}), skipping warmup: {}\n", .{ resolved_path, err });
+            break :warmup;
         };
         defer allocator.free(samples);
 

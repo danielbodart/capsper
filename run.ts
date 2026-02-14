@@ -185,7 +185,7 @@ export async function slowTest(testName?: string, ...extra: string[]) {
 
 export async function dist() {
     ensureBinary();
-    await $`cp -n test/jfk.wav dist/ 2>/dev/null || true`;
+    await $`cp -n test/jfk.wav dist/bin/ 2>/dev/null || true`;
     const { stdout: totalSize } = await $`du -sh dist/`.quiet();
     console.log(`dist/ ready: ${totalSize.toString().trim().split("\t")[0]}`);
 }
