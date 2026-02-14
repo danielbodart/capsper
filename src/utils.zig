@@ -677,3 +677,4 @@ test "rmsToDb: monotonically increasing" {
     try std.testing.expect(rmsToDb(0.5) < rmsToDb(1.0));
 }
 
+

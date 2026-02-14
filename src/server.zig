@@ -39,6 +39,10 @@ const min_transcribe_bytes: usize = 16000; // 0.5s — minimum audio worth trans
 const frame_tolerance: usize = 10;
 // Bytes per encoder frame: 320 samples × 2 bytes/sample = 640
 const bytes_per_frame: usize = 640;
+// Guard band for frame-based dedup: ignore words within this many frames of
+// last_emitted_frame to absorb cross-attention jitter (1-5 frames typical).
+// 4 frames = 80ms, safely below minimum inter-word gap (~5 frames for fast speech).
+const dedup_guard_frames: usize = 4;
 
 const State = enum { idle, speaking, trailing_silence };
 
@@ -368,6 +372,8 @@ pub const Server = struct {
                                 abs_words.len
                             else if (cycles_without_emit >= 4)
                                 abs_words.len // Force-emit after 4+ dry cycles (~4s) to prevent stalls
+                            else if (stable_count >= 2)
+                                stable_count - 1 // Hold back last stable word — deferred to next cycle when it's no longer at the boundary
                             else
                                 stable_count;
 
@@ -472,7 +478,7 @@ fn emitDelta(output_fd: posix.fd_t, start_ns: i128, delta: []const u8, type_cb: 
     std.debug.print("  [{s}s] >> {s}\n", .{ ts, delta });
 }
 
-/// Emit words from text that are past last_emitted_frame.
+/// Emit words from text that are past last_emitted_frame (plus guard band).
 /// `count` limits how many words from the start of `words` to consider.
 /// Returns true if any words were emitted.
 fn emitNewWords(
@@ -490,12 +496,12 @@ fn emitNewWords(
 
     const limit = @min(count, words.len);
 
-    // Find contiguous range of new words (frame > last_emitted_frame)
+    // Find contiguous range of new words (frame past guard band around last_emitted_frame)
     var first_new: ?usize = null;
     var last_new: ?usize = null;
     for (0..limit) |i| {
         const abs_frame = words[i].frame + frame_offset;
-        if (abs_frame > last_emitted_frame.*) {
+        if (abs_frame > last_emitted_frame.* + dedup_guard_frames) {
             if (first_new == null) first_new = i;
             last_new = i;
         }
@@ -503,6 +509,7 @@ fn emitNewWords(
 
     if (first_new) |fi| {
         const li = last_new.?;
+
         // Build emission range: include space before first word for non-first emissions
         const raw_start = words[fi].text_start;
         const emit_start = if (emitted_in_utterance.* and raw_start > 0) raw_start - 1 else raw_start;
