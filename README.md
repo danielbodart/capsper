@@ -94,6 +94,8 @@ A single self-contained binary (`src/`):
 
 ## Server options
 
+Running `capsper` with no arguments prints usage and exits.
+
 ```
 capsper [OPTIONS]
 

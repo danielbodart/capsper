@@ -103,13 +103,15 @@ pub fn main() !void {
             i += 1;
             if (i < args.len) detect_duration = std.fmt.parseInt(u32, args[i], 10) catch 5;
         } else {
-            std.debug.print("Usage: capsper [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
-            std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
-            std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
-            std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
-            std.debug.print("       [--pw-list] [--pw-detect [--detect-duration SECS]]\n", .{});
+            printUsage();
             return;
         }
+    }
+
+    // No arguments: show usage
+    if (args.len == 1) {
+        printUsage();
+        return;
     }
 
     // PipeWire utility commands (early exit, no model loading needed)
@@ -219,6 +221,14 @@ fn parseChannelName(name: []const u8) ?u32 {
         if (n <= 63) return pw.spaAudioChannelAux(n);
     }
     return null;
+}
+
+fn printUsage() void {
+    std.debug.print("Usage: capsper [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
+    std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
+    std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
+    std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
+    std.debug.print("       [--pw-list] [--pw-detect [--detect-duration SECS]]\n", .{});
 }
 
 pub fn loadWav(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {

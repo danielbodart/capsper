@@ -9,7 +9,7 @@ set -euo pipefail
 #   ./install.sh pw-detect    Detect best PipeWire microphone channel (delegates to capsper --pw-detect)
 #   ./install.sh setup-dev DIR  Developer mode: permissions + pw-detect + systemd (called by run.ts)
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
 
 WHISPER_MODEL_NAME="ggml-large-v3-turbo-q5_0.bin"
 VAD_MODEL_NAME="ggml-silero-v5.1.2.bin"
@@ -98,13 +98,74 @@ download_models() {
     echo "Models downloaded."
 }
 
-# ─── PipeWire Channel Detection ──────────────────────────────────────────────
+# ─── PipeWire Device Selection & Channel Detection ───────────────────────────
+
+# Show numbered list of PipeWire sources, let user pick by number.
+# Sets PW_TARGET to the selected device name (empty = default).
+select_device() {
+    local binary="$1"
+    PW_TARGET=""
+
+    # Capture --pw-list output (goes to stderr)
+    local list_output
+    list_output=$("$binary" --pw-list 2>&1) || true
+
+    # Extract device lines: lines after the separator that aren't blank or the footer
+    local -a device_names=()
+    local -a device_lines=()
+    local past_separator=false
+    while IFS= read -r line; do
+        if [[ "$line" == *"--------"* ]]; then
+            past_separator=true
+            continue
+        fi
+        if $past_separator; then
+            # Stop at blank lines or footer
+            [[ -z "${line// /}" ]] && break
+            [[ "$line" == *"Use --pw-target"* ]] && break
+            # Extract device name (first field after leading whitespace)
+            local name
+            name=$(echo "$line" | awk '{print $1}')
+            if [ -n "$name" ]; then
+                device_names+=("$name")
+                device_lines+=("$(echo "$line" | sed 's/^  //')")
+            fi
+        fi
+    done <<< "$list_output"
+
+    if [ ${#device_names[@]} -eq 0 ]; then
+        echo "No PipeWire audio sources found."
+        return
+    fi
+
+    echo ""
+    echo "Available audio sources:"
+    echo ""
+    for i in "${!device_names[@]}"; do
+        printf "  %d) %s\n" "$((i + 1))" "${device_lines[$i]}"
+    done
+    echo ""
+    printf "Select a device [1-%d] (Enter = default): " "${#device_names[@]}"
+    read -r choice
+
+    if [ -n "$choice" ]; then
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#device_names[@]}" ]; then
+            PW_TARGET="${device_names[$((choice - 1))]}"
+            echo "Selected: $PW_TARGET"
+        else
+            echo "Invalid choice. Using default device."
+        fi
+    else
+        echo "Using default device."
+    fi
+}
 
 pw_detect() {
-    local target="${1:-}"
+    local binary="$1"
+    local target="${2:-}"
     local detect_args=(--pw-detect)
     [ -n "$target" ] && detect_args+=(--pw-target "$target")
-    "$SCRIPT_DIR/capsper" "${detect_args[@]}"
+    "$binary" "${detect_args[@]}"
 }
 
 # ─── Systemd Service ─────────────────────────────────────────────────────────
@@ -149,7 +210,7 @@ cmd_install() {
     echo ""
 
     # Verify we're in a dist directory with the binary
-    [ -f "$SCRIPT_DIR/capsper" ] || die "capsper binary not found in $SCRIPT_DIR"
+    [ -f "$SCRIPT_DIR/bin/capsper" ] || die "capsper binary not found in $SCRIPT_DIR/bin"
 
     # Check runtime deps
     require_cmd nvidia-smi "NVIDIA driver required for CUDA inference."
@@ -163,11 +224,13 @@ cmd_install() {
 
     # Audio detection
     local channel="FL"
+    PW_TARGET=""
     echo ""
     echo "=== Audio Configuration ==="
     if confirm "Run microphone channel detection? (No = use default FL)"; then
+        select_device "$SCRIPT_DIR/bin/capsper"
         local detect_output
-        detect_output=$(pw_detect)
+        detect_output=$(pw_detect "$SCRIPT_DIR/bin/capsper" "$PW_TARGET")
         echo "$detect_output"
         channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
         [ -z "$channel" ] && channel="FL"
@@ -176,7 +239,7 @@ cmd_install() {
     fi
 
     # Systemd service
-    install_service "$SCRIPT_DIR" "$SCRIPT_DIR/capsper" "$channel"
+    install_service "$SCRIPT_DIR" "$SCRIPT_DIR/bin/capsper" "$channel" "$PW_TARGET"
 
     echo ""
     if confirm "Start the dictation service now?"; then
@@ -197,11 +260,13 @@ cmd_setup_dev() {
     check_permissions
 
     local channel="FL"
+    PW_TARGET=""
     echo ""
     echo "=== Audio Configuration ==="
     if confirm "Run microphone channel detection? (No = use default FL)"; then
+        select_device "$project_dir/dist/bin/capsper"
         local detect_output
-        detect_output=$(pw_detect)
+        detect_output=$(pw_detect "$project_dir/dist/bin/capsper" "$PW_TARGET")
         echo "$detect_output"
         channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
         [ -z "$channel" ] && channel="FL"
@@ -209,7 +274,7 @@ cmd_setup_dev() {
         echo "Using default channel: FL"
     fi
 
-    install_service "$project_dir" "$project_dir/dist/bin/capsper" "$channel"
+    install_service "$project_dir" "$project_dir/dist/bin/capsper" "$channel" "$PW_TARGET"
 
     echo ""
     echo "capsper.service ready"
@@ -229,6 +294,6 @@ cmd_setup_dev() {
 case "${1:-install}" in
     install)    cmd_install ;;
     setup-dev)  shift; cmd_setup_dev "$@" ;;
-    pw-detect)  shift; pw_detect "$@" ;;
+    pw-detect)  shift; pw_detect "$SCRIPT_DIR/bin/capsper" "$@" ;;
     *)          die "Unknown command: $1. Usage: install.sh [install|pw-detect|setup-dev]" ;;
 esac
