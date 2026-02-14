@@ -12,7 +12,7 @@ Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://g
 
 1. A single Zig binary grabs your keyboard via evdev, intercepts CapsLock as push-to-talk
 2. Audio is captured directly via PipeWire while the trigger key is held
-3. Incremental transcription runs on the GPU with VAD (Silero) and word-level stability checking
+3. Incremental transcription runs on the GPU with VAD (Silero, on CPU) and word-level stability checking
 4. Transcribed text is injected as keystrokes via uinput into the focused window
 
 ## Requirements
@@ -100,7 +100,7 @@ Every step is incremental — re-running `./run` is fast if everything is alread
 Physical Keyboard ──evdev──→ capsper ──uinput──→ Virtual Keyboard → Apps
                               │
                               ├─ Trigger key held → PipeWire audio capture
-                              ├─ whisper.cpp (GPU) + Silero VAD
+                              ├─ whisper.cpp (GPU) + Silero VAD (CPU)
                               ├─ AlignAtt streaming + word-level stability
                               └─ All other keys → forwarded transparently
 ```
@@ -119,6 +119,18 @@ A single self-contained binary (`src/`):
 | `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream` |
 | `pw_detect.zig` | PipeWire device enumeration and interactive channel detection |
 | `pw_helpers.c` | C helpers for PipeWire SPA pod building and source enumeration |
+
+### Technical highlights
+
+**Manual decode loop with cross-attention introspection** — Instead of using whisper.cpp's high-level `whisper_full()`, Capsper manually drives the mel spectrogram → encode → decode pipeline token by token. This gives per-token access to the decoder's cross-attention weights, which is how AlignAtt decides when to stop: it watches where each attention head is "looking" in the audio, and stops when attention drifts past the end of the buffer or jumps backwards (a sign of hallucination). The attention values go through z-score normalisation, median filtering, and head averaging before the stopping decision.
+
+**Frame-based word stability** — Each decoded word carries a frame position extracted from its cross-attention peak (which audio frame the model was attending to). Between decode cycles, Capsper compares words by both frame position (±200ms tolerance) and text (case-insensitive, trailing punctuation stripped). Only words that appear in two consecutive cycles at roughly the same temporal position are emitted. This hybrid approach handles Whisper's tendency to shift attention slightly between cycles — "so" at frame 100 might become "so," at frame 103 — without emitting duplicates or missing legitimate repetitions.
+
+**CPU-only VAD** — Silero voice activity detection runs on the CPU (2 threads, ~5ms per check) while whisper.cpp transcription runs on the GPU. This avoids GPU context switching overhead for the frequent VAD checks (every 0.5–1s) and means VAD has zero impact on transcription throughput.
+
+**Transparent keyboard forwarding** — Rather than intercepting specific keys, Capsper grabs all physical keyboards via `EVIOCGRAB` and creates a uinput virtual keyboard that forwards every event transparently. Only the trigger key (CapsLock) is consumed; all other keys pass through unchanged. This means the grab is invisible to applications while giving Capsper exclusive access to the trigger. The virtual keyboard also handles text injection — transcribed text is emitted as synthetic keystrokes with proper shift-state handling, which works on both X11 and Wayland without any external tools. A panic sequence (Enter+Backspace+Escape simultaneously) ungrab all keyboards as a safety net.
+
+**Sliding window with absolute frame tracking** — Audio is capped at a 15-second sliding window. When the buffer is trimmed, the trimmed byte count is accumulated and converted to a frame offset, so word frame positions remain globally unique across the entire utterance. This prevents re-emission of already-typed words after a buffer wrap.
 
 ## Server options
 
