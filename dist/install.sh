@@ -34,6 +34,16 @@ confirm() {
     esac
 }
 
+confirm_default_no() {
+    local prompt="$1"
+    printf '%s [y/N] ' "$prompt"
+    read -r answer
+    case "${answer,,}" in
+        y|yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "$1 not found. $2"
 }
@@ -330,6 +340,21 @@ cmd_install() {
     # Verify we're in a dist directory with the binary
     [ -f "$SCRIPT_DIR/bin/capsper" ] || die "capsper binary not found in $SCRIPT_DIR/bin"
 
+    local service_file="$HOME/.config/systemd/user/capsper.service"
+    local is_upgrade=false
+    local update_config=false
+
+    if [ -f "$service_file" ]; then
+        is_upgrade=true
+        echo "Previous capsper installation detected."
+        echo "Stopping current service..."
+        systemctl --user stop capsper.service 2>/dev/null || true
+        echo ""
+        if confirm_default_no "Update configuration?"; then
+            update_config=true
+        fi
+    fi
+
     if is_dev_mode; then
         echo "=== Capsper Developer Setup ==="
         echo "(detected git checkout)"
@@ -340,69 +365,84 @@ cmd_install() {
 
         check_permissions
 
-        local channel="FL"
-        PW_TARGET=""
-        echo ""
-        echo "=== Audio Configuration ==="
-        if confirm "Select audio device?"; then
-            select_device "$SCRIPT_DIR/bin/capsper"
-        fi
-        if confirm "Run microphone channel detection? (No = use default FL)"; then
-            local detect_output
-            detect_output=$(pw_detect "$SCRIPT_DIR/bin/capsper" "$PW_TARGET")
-            echo "$detect_output"
-            channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
-            [ -z "$channel" ] && channel="FL"
-        else
-            echo "Using default channel: FL"
-        fi
+        if ! $is_upgrade || $update_config; then
+            local channel="FL"
+            PW_TARGET=""
+            echo ""
+            echo "=== Audio Configuration ==="
+            if confirm "Select audio device?"; then
+                select_device "$SCRIPT_DIR/bin/capsper"
+            fi
+            if confirm "Run microphone channel detection? (No = use default FL)"; then
+                local detect_output
+                detect_output=$(pw_detect "$SCRIPT_DIR/bin/capsper" "$PW_TARGET")
+                echo "$detect_output"
+                channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
+                [ -z "$channel" ] && channel="FL"
+            else
+                echo "Using default channel: FL"
+            fi
 
-        install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET"
+            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET"
+        fi
     else
         echo "=== Capsper Installer ==="
         echo ""
 
-        # Check runtime deps
+        # Check runtime deps (always, even on upgrade)
         require_cmd nvidia-smi "NVIDIA driver required for CUDA inference."
         check_cuda_libraries
         command -v pw-cli >/dev/null 2>&1 || echo "WARNING: pw-cli not found. PipeWire may not be installed."
 
-        # Permissions
-        check_permissions
-
-        # Copy files to ~/.local/share/capsper/
+        # Copy files to ~/.local/share/capsper/ (always, this is the upgrade)
         install_files
 
-        # Download models
+        # Download models (always, in case new models are needed)
         download_models "$INSTALL_DIR/models"
 
-        # Audio configuration
-        local channel="FL"
-        PW_TARGET=""
-        echo ""
-        echo "=== Audio Configuration ==="
-        if confirm "Select audio device?"; then
-            select_device "$INSTALL_DIR/bin/capsper"
-        fi
-        if confirm "Run microphone channel detection? (No = use default FL)"; then
-            local detect_output
-            detect_output=$(pw_detect "$INSTALL_DIR/bin/capsper" "$PW_TARGET")
-            echo "$detect_output"
-            channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
-            [ -z "$channel" ] && channel="FL"
-        else
-            echo "Using default channel: FL"
-        fi
+        # Permissions (always, even on upgrade)
+        check_permissions
 
-        # Systemd service
-        install_service "$INSTALL_DIR" "$INSTALL_DIR/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET"
+        if ! $is_upgrade || $update_config; then
+            # Audio configuration
+            local channel="FL"
+            PW_TARGET=""
+            echo ""
+            echo "=== Audio Configuration ==="
+            if confirm "Select audio device?"; then
+                select_device "$INSTALL_DIR/bin/capsper"
+            fi
+            if confirm "Run microphone channel detection? (No = use default FL)"; then
+                local detect_output
+                detect_output=$(pw_detect "$INSTALL_DIR/bin/capsper" "$PW_TARGET")
+                echo "$detect_output"
+                channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
+                [ -z "$channel" ] && channel="FL"
+            else
+                echo "Using default channel: FL"
+            fi
+
+            # Systemd service
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET"
+        fi
     fi
 
     echo ""
-    if run_dry_run && confirm "Start the dictation service now?"; then
-        systemctl --user restart capsper.service
-        echo "Service started. Check status with:"
-        echo "  systemctl --user status capsper.service"
+    if run_dry_run; then
+        if $is_upgrade; then
+            echo "Restarting service..."
+            systemctl --user restart capsper.service
+            echo "Service restarted. Check status with:"
+            echo "  systemctl --user status capsper.service"
+        elif confirm "Start the dictation service now?"; then
+            systemctl --user restart capsper.service
+            echo "Service started. Check status with:"
+            echo "  systemctl --user status capsper.service"
+        else
+            echo ""
+            echo "Start manually with:"
+            echo "  systemctl --user start capsper.service"
+        fi
     else
         echo ""
         echo "Start manually with:"
