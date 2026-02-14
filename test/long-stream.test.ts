@@ -6,12 +6,12 @@ const gpu = await hasGpu();
 describe.skipIf(!gpu)("long-stream", () => {
     beforeAll(() => {
         ensureBinary();
-        ensureFile("jfk.wav");
+        ensureFile("test/jfk.wav");
     });
 
     test("streams 20 loops of jfk.wav without crashing", async () => {
         const LOOPS = 20;
-        const pcmOnce = readPcm("jfk.wav");
+        const pcmOnce = readPcm("test/jfk.wav");
         const pcm = Buffer.concat(Array.from({ length: LOOPS }, () => pcmOnce));
         const totalDuration = (pcm.length / 32000).toFixed(1);
 

@@ -7,7 +7,7 @@ describe.skipIf(!gpu)("stream", () => {
     beforeAll(() => ensureBinary());
 
     test("streams wav file via TCP at real-time rate", async () => {
-        const wavFile = process.env.TEST_WAV ?? "jfk.wav";
+        const wavFile = process.env.TEST_WAV ?? "test/jfk.wav";
         ensureFile(wavFile);
         const duration = wavDuration(wavFile);
 

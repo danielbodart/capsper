@@ -9,8 +9,8 @@ describe.skipIf(!gpu)("compare", () => {
 
     test("streaming output matches reference transcript", async () => {
         const name = process.env.TEST_NAME ?? "long-recording";
-        const wav = `testdata/${name}.wav`;
-        const ref = `testdata/${name}.txt`;
+        const wav = `test/${name}.wav`;
+        const ref = `test/${name}.txt`;
         ensureFile(wav);
         ensureFile(ref, "reference transcript");
 

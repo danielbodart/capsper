@@ -8,7 +8,7 @@ describe.skipIf(!gpu)("pw-stream", () => {
     beforeAll(() => ensureBinary());
 
     test("streams wav file via PipeWire loopback", async () => {
-        const wavFile = process.env.TEST_WAV ?? "jfk.wav";
+        const wavFile = process.env.TEST_WAV ?? "test/jfk.wav";
         ensureFile(wavFile);
         const duration = wavDuration(wavFile);
 

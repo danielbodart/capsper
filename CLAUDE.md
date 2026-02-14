@@ -37,7 +37,7 @@ Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `b
 ./run.ts slow-test stream custom.wav   # TCP stream custom file
 ./run.ts slow-test long-stream         # Loop jfk.wav 20x (~3.7 min)
 ./run.ts slow-test compare             # Compare against reference transcript
-./run.ts slow-test compare dictation   # Compare with testdata/dictation.wav
+./run.ts slow-test compare dictation   # Compare with test/dictation.wav
 ./run.ts slow-test pw-stream           # PipeWire loopback test
 ```
 
