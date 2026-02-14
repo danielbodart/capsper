@@ -196,3 +196,15 @@ git lfs pull
 **PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). Use `capsper --pw-list` to see available sources, and `capsper --pw-detect` to find the correct channel for multi-channel devices.
 
 **Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `capsper --pw-detect` and set `--pw-channel` accordingly.
+
+## Acknowledgements
+
+Capsper's streaming approach is inspired by [SimulStreaming](https://github.com/ufal/SimulStreaming) (ÚFAL, Charles University), which implements AlignAtt-based simultaneous speech processing and won the IWSLT 2025 Simultaneous Speech Translation Shared Task. We borrowed the core idea of using cross-attention analysis to decide when it's safe to emit partial transcriptions.
+
+Where SimulStreaming targets multilingual translation with Whisper + a 9B-parameter LLM (requiring 10+ GB VRAM and a full Python/PyTorch stack), Capsper takes a different path:
+
+- **Dictation only** — no translation layer, just fast speech-to-text in the focused window
+- **~1.7 GB VRAM** vs 5–10+ GB, thanks to a quantised model and no LLM
+- **Single Zig binary** — deterministic memory management, no garbage collector, no Python runtime
+- **Near-zero idle usage** — no CPU or GPU activity when you're not speaking
+- **Direct hardware integration** — evdev keyboard grab, PipeWire audio capture, and uinput text injection with no external tools
