@@ -167,6 +167,10 @@ pub fn build(b: *std.Build) void {
         "-DWHISPER_BUILD_SERVER=OFF",
     });
     cmake_configure.addArg(b.fmt("-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={s}", .{abs_dist_lib}));
+    // Ensure shared libs use $ORIGIN RPATH so they find each other when installed
+    // anywhere, not just the build directory.
+    cmake_configure.addArg("-DCMAKE_INSTALL_RPATH=$ORIGIN");
+    cmake_configure.addArg("-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON");
 
     const mkdir_nvcc_tmp = b.addSystemCommand(&.{ "mkdir", "-p", nvcc_tmp });
     mkdir_nvcc_tmp.step.dependOn(&cmake_configure.step);

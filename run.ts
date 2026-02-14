@@ -212,6 +212,17 @@ export async function dist() {
         process.exit(1);
     }
 
+    // Validate no shared lib has a hardcoded absolute RUNPATH (must be $ORIGIN or empty)
+    const { stdout: rpathOut } = await $`readelf -d dist/lib/*.so.*.*.* 2>/dev/null`.quiet();
+    const rpathLines = rpathOut.toString().split("\n").filter(l => l.includes("RUNPATH") || l.includes("RPATH"));
+    const absolutePaths = rpathLines.filter(l => l.includes("Library") && !l.includes("$ORIGIN") && /\/[a-zA-Z]/.test(l));
+    if (absolutePaths.length > 0) {
+        console.error("ERROR: shared libs have hardcoded absolute RUNPATH (won't work when installed):");
+        absolutePaths.forEach(l => console.error(`  ${l.trim()}`));
+        console.error("Rebuild with: ./run.ts rebuild-whisper");
+        process.exit(1);
+    }
+
     const ver = await version();
     const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
     await $`tar -czf ${tarball} -C dist bin/ lib/ install.sh`;
