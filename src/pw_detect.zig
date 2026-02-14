@@ -212,10 +212,12 @@ fn captureMultiChannel(
 
     // Create pipe
     const pipe_fds = try posix.pipe();
+    // zwanzig-disable: store-violations-engine
     errdefer {
         posix.close(pipe_fds[0]);
         posix.close(pipe_fds[1]);
     }
+    // zwanzig-enable: store-violations-engine
 
     // Init PipeWire
     pw.pw_init(null, null);
@@ -274,6 +276,7 @@ fn captureMultiChannel(
 
     // Read audio for the specified duration
     var buf = try allocator.alloc(u8, expected_bytes);
+    // zwanzig-disable-next-line: store-violations-engine
     errdefer allocator.free(buf);
     var total_read: usize = 0;
 
@@ -296,6 +299,7 @@ fn captureMultiChannel(
     pw.pw_stream_destroy(stream);
     pw.pw_thread_loop_destroy(thread_loop);
     posix.close(pipe_fds[0]);
+    // zwanzig-disable-next-line: store-violations-engine
     posix.close(pipe_fds[1]);
     std.heap.page_allocator.destroy(stream_data);
     pw.pw_deinit();

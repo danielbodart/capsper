@@ -530,6 +530,7 @@ fn makeMinimalWav(comptime data_size: u32) [44]u8 {
     // data chunk
     @memcpy(wav[36..40], "data");
     std.mem.writeInt(u32, wav[40..44], data_size, .little);
+    // zwanzig-disable-next-line: stack-escape-engine
     return wav;
 }
 

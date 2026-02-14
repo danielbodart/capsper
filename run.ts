@@ -168,9 +168,11 @@ export async function setup() {
     await $`bash ${installSh}`;
 }
 
-/** Default target: build → unit tests → quick integration tests (stream + pw-stream). */
+/** Default target: build → lint → unit tests → quick integration tests (stream + pw-stream). */
 export async function dev() {
     await build();
+    console.log("Running static analysis...");
+    await $`zig build analyze`;
     console.log("Running unit + property tests...");
     await $`zig build test`;
     console.log("Running integration smoke tests...");
@@ -238,10 +240,16 @@ export async function dist() {
     console.log(`Tarball: ${tarball}`);
 }
 
+export async function lint() {
+    await $`zig build analyze`;
+}
+
 export async function ci() {
     await ensureSubmodule();
     await ensureLfs();
     const ver = await version();
+    console.log("Running static analysis...");
+    await $`zig build analyze`;
     console.log("Running tests...");
     await $`zig build test`;
     console.log(`Building v${ver}...`);
@@ -262,7 +270,7 @@ async function printVersion() {
 }
 
 const commands: Record<string, Function> = {
-    dev, build, clean, setup, test, dist, ci, version: printVersion,
+    dev, build, clean, setup, test, lint, dist, ci, version: printVersion,
     "slow-test": slowTest,
     "rebuild-whisper": rebuildWhisper,
 };

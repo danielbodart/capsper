@@ -6,6 +6,10 @@
             .url = "https://github.com/CogitatorTech/minish/archive/main.tar.gz",
             .hash = "minish-0.1.0-SQtSTWHkAQACfz3xGuWHU8zbx320vK_47r2yto3Pq0Rf",
         },
+        .zwanzig = .{
+            .url = "https://github.com/forketyfork/zwanzig/archive/refs/tags/v0.8.1.tar.gz",
+            .hash = "zwanzig-0.8.1-oiXZlsqhFQB0jB-80jJNdP5CH0bgBIGjhWeNaQgHpqZP",
+        },
     },
     .fingerprint = 0x96b25de6bfb46ec7,
     .minimum_zig_version = "0.15.2",

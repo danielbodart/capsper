@@ -39,6 +39,7 @@ pub fn analyzeAttention(
 
     // Working buffer: [n_heads][n_audio_ctx]
     const buf = try allocator.alloc(f32, n_heads * n_audio_ctx);
+    // zwanzig-disable-next-line: store-violations-engine
     errdefer allocator.free(buf);
 
     // Extract and z-score normalize per head
