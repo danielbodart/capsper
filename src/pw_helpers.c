@@ -50,8 +50,7 @@ pw_connect_capture(struct pw_stream *stream,
     return pw_stream_connect(stream,
         PW_DIRECTION_INPUT,
         PW_ID_ANY,
-        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS
-            | PW_STREAM_FLAG_INACTIVE,
+        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
         &pod, 1);
 }
 

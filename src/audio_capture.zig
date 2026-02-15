@@ -15,6 +15,7 @@ pub const AudioCapture = struct {
     thread_loop: *pw.pw_thread_loop,
     stream: *pw.pw_stream,
     stream_data: *StreamData,
+    channel_position: u32,
     pipe_read_fd: posix.fd_t,
     pipe_write_fd: posix.fd_t,
 
@@ -52,7 +53,7 @@ pub const AudioCapture = struct {
         errdefer std.heap.page_allocator.destroy(stream_data);
 
         // Create thread loop (PipeWire manages the thread)
-        const thread_loop = pw.pw_thread_loop_new("whisper-capture", null) orelse {
+        const thread_loop = pw.pw_thread_loop_new("capsper", null) orelse {
             log.err("Failed to create PipeWire thread loop", .{});
             return error.PipeWireInitFailed;
         };
@@ -82,10 +83,11 @@ pub const AudioCapture = struct {
             return error.PipeWireInitFailed;
         }
 
-        // Create stream (takes ownership of props)
+        // Create stream (takes ownership of props). Not connected yet —
+        // call setActive(true) to connect and start streaming.
         const stream = pw.pw_stream_new_simple(
             loop,
-            "whisper-capture",
+            "capsper",
             props,
             &stream_events,
             stream_data,
@@ -98,14 +100,6 @@ pub const AudioCapture = struct {
         // Store stream pointer so the callback can access it
         stream_data.stream = stream;
 
-        // Connect stream with SPA format negotiation via C helper.
-        // (Passing spa_pod** through Zig FFI breaks format negotiation.)
-        const connect_result = pw.pw_connect_capture(stream, 16000, channel_position);
-        if (connect_result < 0) {
-            log.err("Failed to connect PipeWire stream: {d}", .{connect_result});
-            return error.PipeWireConnectFailed;
-        }
-
         // Start the thread loop
         const start_result = pw.pw_thread_loop_start(thread_loop);
         if (start_result < 0) {
@@ -114,24 +108,31 @@ pub const AudioCapture = struct {
         }
 
         if (target) |t| {
-            log.info("PipeWire capture started (target={s}, channel=0x{x})", .{ t, channel_position });
+            log.info("PipeWire capture ready (target={s}, channel=0x{x})", .{ t, channel_position });
         } else {
-            log.info("PipeWire capture started (default source, channel=0x{x})", .{channel_position});
+            log.info("PipeWire capture ready (default source, channel=0x{x})", .{channel_position});
         }
 
         return .{
             .thread_loop = thread_loop,
             .stream = stream,
             .stream_data = stream_data,
+            .channel_position = channel_position,
             .pipe_read_fd = pipe_fds[0],
             .pipe_write_fd = pipe_fds[1],
         };
     }
 
+    /// Connect or disconnect the PipeWire stream. When disconnected, no
+    /// source-output exists so the desktop microphone indicator disappears.
     pub fn setActive(self: *AudioCapture, active: bool) void {
         pw.pw_thread_loop_lock(self.thread_loop);
         defer pw.pw_thread_loop_unlock(self.thread_loop);
-        _ = pw.pw_stream_set_active(self.stream, active);
+        if (active) {
+            _ = pw.pw_connect_capture(self.stream, 16000, self.channel_position);
+        } else {
+            _ = pw.pw_stream_disconnect(self.stream);
+        }
     }
 
     pub fn getFd(self: *const AudioCapture) posix.fd_t {
