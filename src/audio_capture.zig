@@ -128,6 +128,12 @@ pub const AudioCapture = struct {
         };
     }
 
+    pub fn setActive(self: *AudioCapture, active: bool) void {
+        pw.pw_thread_loop_lock(self.thread_loop);
+        defer pw.pw_thread_loop_unlock(self.thread_loop);
+        _ = pw.pw_stream_set_active(self.stream, active);
+    }
+
     pub fn getFd(self: *const AudioCapture) posix.fd_t {
         return self.pipe_read_fd;
     }

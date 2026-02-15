@@ -12,8 +12,16 @@ const net = std.net;
 // Default unpaused; main.zig sets to paused when --trigger is used.
 pub var is_paused = std.atomic.Value(bool).init(false);
 
+// Global capture pointer — set by runLocal so setPaused can toggle the PipeWire stream.
+// When non-null, setPaused also activates/deactivates the stream so the desktop
+// microphone indicator only appears during active recording.
+var capture_ptr = std.atomic.Value(?*AudioCapture).init(null);
+
 pub fn setPaused(paused: bool) void {
     is_paused.store(paused, .monotonic);
+    if (capture_ptr.load(.monotonic)) |cap| {
+        cap.setActive(!paused);
+    }
 }
 
 /// Type-erased callback for injecting text (used by evdev/uinput mode).
@@ -128,6 +136,14 @@ pub const Server = struct {
             return err;
         };
         defer capture.deinit();
+
+        // Register capture so setPaused can toggle stream active state.
+        // If not starting paused (no --trigger), activate the stream immediately.
+        capture_ptr.store(&capture, .monotonic);
+        defer capture_ptr.store(null, .monotonic);
+        if (!is_paused.load(.monotonic)) {
+            capture.setActive(true);
+        }
 
         const stdout_fd: posix.fd_t = 1; // STDOUT_FILENO
         if (self.type_callback != null) {

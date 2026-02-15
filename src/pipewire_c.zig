@@ -38,6 +38,11 @@ pub const PW_STREAM_FLAG_AUTOCONNECT: c_uint = pw.PW_STREAM_FLAG_AUTOCONNECT;
 pub const PW_STREAM_FLAG_MAP_BUFFERS: c_uint = pw.PW_STREAM_FLAG_MAP_BUFFERS;
 pub const PW_STREAM_FLAG_RT_PROCESS: c_uint = pw.PW_STREAM_FLAG_RT_PROCESS;
 
+// Stream control
+pub const pw_stream_set_active = pw.pw_stream_set_active;
+pub const pw_thread_loop_lock = pw.pw_thread_loop_lock;
+pub const pw_thread_loop_unlock = pw.pw_thread_loop_unlock;
+
 // C helper for building SPA audio format pod (avoids variadic macro issues in Zig).
 // Takes a raw buffer to write into; returns a pointer into that buffer.
 pub extern fn pw_build_audio_format(
