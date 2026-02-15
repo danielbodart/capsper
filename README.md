@@ -70,6 +70,21 @@ Disable auto-updates:
 systemctl --user disable --now capsper-update.timer
 ```
 
+### Domain terms
+
+If you frequently use jargon, tool names, or domain-specific vocabulary, you can provide a text file of terms to improve transcription accuracy:
+
+```bash
+capsper --trigger capslock --domain-terms ~/my-terms.txt
+```
+
+The terms file is plain text — comma-separated, one per line, or prose. These terms are tokenized and injected into the Whisper decoder as context, biasing it toward your vocabulary without overriding acoustic evidence.
+
+Example `my-terms.txt`:
+```
+Kubernetes, kubectl, Terraform, Ansible, gRPC, PostgreSQL
+```
+
 ### PipeWire channel selection
 
 For multi-channel audio interfaces, first list available sources:
@@ -180,6 +195,7 @@ capsper [OPTIONS]
   --type-delay MS         Delay between injected keystrokes in ms (default: 12)
   --pw-target NODE        PipeWire capture target node name
   --pw-channel CHANNEL    PipeWire channel: MONO, FL, AUX0-AUX63 (default: FL)
+  --domain-terms FILE     Text file of domain terms to bias transcription toward
   --pw-list               List available PipeWire audio sources
   --pw-detect             Interactive channel detection (record silence + speech)
   --detect-duration SECS  Duration per detection phase (default: 5)

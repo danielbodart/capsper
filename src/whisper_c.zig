@@ -35,6 +35,8 @@ pub const whisper_token_to_str = cimport.whisper_token_to_str;
 pub const whisper_lang_id = cimport.whisper_lang_id;
 pub const whisper_n_vocab = cimport.whisper_n_vocab;
 pub const whisper_n_len_from_state = cimport.whisper_n_len_from_state;
+pub const whisper_token_prev = cimport.whisper_token_prev;
+pub const whisper_tokenize = cimport.whisper_tokenize;
 
 // Enums/constants
 pub const WHISPER_AHEADS_LARGE_V3_TURBO = cimport.WHISPER_AHEADS_LARGE_V3_TURBO;

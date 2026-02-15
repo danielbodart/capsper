@@ -66,6 +66,7 @@ pub const Server = struct {
     pw_channel: u32,
     verbose: bool,
     type_callback: ?TypeCallback,
+    prompt_tokens: []const c.whisper_token,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -77,6 +78,7 @@ pub const Server = struct {
         pw_channel: u32,
         verbose: bool,
         type_callback: ?TypeCallback,
+        prompt_tokens: []const c.whisper_token,
     ) Server {
         return .{
             .allocator = allocator,
@@ -88,6 +90,7 @@ pub const Server = struct {
             .pw_channel = pw_channel,
             .verbose = verbose,
             .type_callback = type_callback,
+            .prompt_tokens = prompt_tokens,
         };
     }
 
@@ -159,7 +162,7 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
-        var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4, self.verbose);
+        var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4, self.verbose, self.prompt_tokens);
         defer pipeline.deinit();
 
         const start_ns = std.time.nanoTimestamp();

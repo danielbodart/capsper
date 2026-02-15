@@ -32,11 +32,15 @@ pub const Pipeline = struct {
 
     // Special tokens
     sot: c.whisper_token,
+    sot_prev: c.whisper_token,
     lang_en: c.whisper_token,
     tok_transcribe: c.whisper_token,
     notimestamps: c.whisper_token,
     eot: c.whisper_token,
     n_vocab: usize,
+
+    // Domain terms pre-tokenized (owned by caller, must outlive Pipeline)
+    prompt_tokens: []const c.whisper_token,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -44,6 +48,7 @@ pub const Pipeline = struct {
         config: alignatt.Config,
         n_threads: c_int,
         verbose: bool,
+        prompt_tokens: []const c.whisper_token,
     ) !Pipeline {
         const state = c.whisper_init_state(ctx) orelse return error.StateInitFailed;
 
@@ -55,11 +60,13 @@ pub const Pipeline = struct {
             .n_threads = n_threads,
             .verbose = verbose,
             .sot = c.whisper_token_sot(ctx),
+            .sot_prev = c.whisper_token_prev(ctx),
             .lang_en = c.whisper_token_lang(ctx, c.whisper_lang_id("en")),
             .tok_transcribe = c.whisper_token_transcribe(ctx),
             .notimestamps = c.whisper_token_not(ctx),
             .eot = c.whisper_token_eot(ctx),
             .n_vocab = @intCast(c.whisper_n_vocab(ctx)),
+            .prompt_tokens = prompt_tokens,
         };
     }
 
@@ -130,18 +137,35 @@ pub const Pipeline = struct {
         }
         timing.encode_ms = msFromNs(t_encode);
 
-        // Step 3: Build prompt: [sot] [lang_en] [transcribe] [notimestamps] [context...]
-        // Context tokens give the model memory of previously decoded text,
-        // improving consistency between consecutive transcription cycles.
-        const base_prompt = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
-        const max_context: usize = 100; // Limit context to avoid exceeding model capacity
+        // Step 3: Build prompt matching whisper.cpp convention:
+        //   [startofprev] [prompt_tokens...] [context_tokens...] [sot] [lang] [transcribe] [notimestamps]
+        // prompt_tokens: domain terms that bias the decoder toward specific vocabulary.
+        // context_tokens: previously decoded tokens for consistency between cycles.
+        // startofprev is only included when there are prompt or context tokens.
+        const sot_seq = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
+        const max_prefix: usize = 219; // Token budget for prompt + context (448 - 4 sot_seq - 1 startofprev - 224 max_decode)
+        const prompt_len = @min(self.prompt_tokens.len, max_prefix);
+        const max_context = max_prefix - prompt_len;
         const ctx_len = @min(context_tokens.len, max_context);
-        const full_prompt = try self.allocator.alloc(c.whisper_token, base_prompt.len + ctx_len);
+        const has_prefix = prompt_len > 0 or ctx_len > 0;
+        const prefix_len: usize = if (has_prefix) 1 + prompt_len + ctx_len else 0; // 1 for startofprev
+
+        const full_prompt = try self.allocator.alloc(c.whisper_token, prefix_len + sot_seq.len);
         defer self.allocator.free(full_prompt);
-        @memcpy(full_prompt[0..base_prompt.len], &base_prompt);
-        if (ctx_len > 0) {
-            @memcpy(full_prompt[base_prompt.len..], context_tokens[context_tokens.len - ctx_len ..]);
+        var pos: usize = 0;
+        if (has_prefix) {
+            full_prompt[pos] = self.sot_prev;
+            pos += 1;
+            if (prompt_len > 0) {
+                @memcpy(full_prompt[pos..][0..prompt_len], self.prompt_tokens[0..prompt_len]);
+                pos += prompt_len;
+            }
+            if (ctx_len > 0) {
+                @memcpy(full_prompt[pos..][0..ctx_len], context_tokens[context_tokens.len - ctx_len ..]);
+                pos += ctx_len;
+            }
         }
+        @memcpy(full_prompt[pos..][0..sot_seq.len], &sot_seq);
 
         // Decode prompt in two parts: batch the first N-1 tokens, then decode the
         // last token separately. whisper.cpp only populates logits for the last token

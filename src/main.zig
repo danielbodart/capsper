@@ -37,6 +37,7 @@ pub fn main() !void {
     var do_pw_list: bool = false;
     var do_pw_detect: bool = false;
     var detect_duration: u32 = 5;
+    var domain_terms_path: ?[:0]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -113,6 +114,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--detect-duration")) {
             i += 1;
             if (i < args.len) detect_duration = std.fmt.parseInt(u32, args[i], 10) catch 5;
+        } else if (std.mem.eql(u8, arg, "--domain-terms")) {
+            i += 1;
+            if (i < args.len) domain_terms_path = args[i];
         } else {
             printUsage();
             return;
@@ -163,6 +167,37 @@ pub fn main() !void {
         return;
     };
     defer vad.deinit();
+
+    // Tokenize domain terms (requires whisper context)
+    var prompt_tokens: []c.whisper_token = &.{};
+    if (domain_terms_path) |dpath| {
+        const terms_file = std.fs.cwd().openFile(dpath, .{}) catch |err| {
+            std.debug.print("Failed to open domain terms file '{s}': {}\n", .{ dpath, err });
+            return;
+        };
+        defer terms_file.close();
+
+        const terms_raw = terms_file.readToEndAlloc(allocator, 8192) catch |err| {
+            std.debug.print("Failed to read domain terms file: {}\n", .{err});
+            return;
+        };
+        defer allocator.free(terms_raw);
+
+        // Null-terminate for whisper_tokenize (C API)
+        const terms_text = try allocator.dupeZ(u8, terms_raw);
+        defer allocator.free(terms_text);
+
+        var token_buf: [224]c.whisper_token = undefined;
+        const n_tokens = c.whisper_tokenize(ctx, terms_text.ptr, &token_buf, token_buf.len);
+        if (n_tokens < 0) {
+            std.debug.print("Failed to tokenize domain terms (file may be too long or contain invalid text)\n", .{});
+            return;
+        }
+        prompt_tokens = try allocator.dupe(c.whisper_token, token_buf[0..@intCast(n_tokens)]);
+        std.debug.print("Domain terms: {d} tokens from {s}\n", .{ n_tokens, dpath });
+    }
+    // zwanzig-disable-next-line: store-violations-engine
+    defer if (prompt_tokens.len > 0) allocator.free(prompt_tokens);
 
     // Initialize evdev input handler (if --trigger specified, skip in dry-run)
     var input_handler: ?InputHandler = null;
@@ -216,7 +251,7 @@ pub fn main() !void {
         };
         defer allocator.free(samples);
 
-        var pipeline = try Pipeline.init(allocator, ctx, .{}, 4, verbose);
+        var pipeline = try Pipeline.init(allocator, ctx, .{}, 4, verbose, prompt_tokens);
         defer pipeline.deinit();
 
         if (try pipeline.transcribe(samples, true)) |result| {
@@ -240,7 +275,7 @@ pub fn main() !void {
     }
 
     // Start server
-    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, type_callback);
+    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, type_callback, prompt_tokens);
     try server.run();
 }
 
@@ -281,6 +316,7 @@ fn printUsage() void {
     std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
     std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
+    std.debug.print("       [--domain-terms FILE]\n", .{});
     std.debug.print("       [--pw-list] [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
 }

@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeAll } from "bun:test";
 import { file } from "bun";
+import { existsSync } from "fs";
 import { hasGpu, ensureBinary, ensureFile, wavDuration, startServer, readPcm, streamPcm, normalize, compareWords } from "./helpers";
 
 const gpu = await hasGpu();
@@ -16,7 +17,14 @@ describe.skipIf(!gpu)("compare", () => {
 
         const duration = wavDuration(wav);
 
-        const server = await startServer(["--port", "0", "--verbose"]);
+        const termsFile = `test/${name}-terms.txt`;
+        const serverArgs = ["--port", "0", "--verbose"];
+        if (existsSync(termsFile)) {
+            serverArgs.push("--domain-terms", termsFile);
+            console.error(`Domain terms: ${termsFile}`);
+        }
+
+        const server = await startServer(serverArgs);
 
         try {
             console.error("=== Streaming Comparison Test ===");

@@ -1,0 +1,1 @@
+xdotool, ydotool, arecord, nc, Silero, AlignAtt, Zig, whisper.cpp, F24, V3 Turbo, VAD, TCP, Wayland, push-to-talk
