@@ -174,6 +174,7 @@ export async function dev() {
     await build();
     console.log("Running static analysis...");
     await $`zig build analyze`;
+    await $`shellcheck dist/*.sh bootstrap.sh`;
     console.log("Running unit + property tests...");
     await $`zig build test`;
     console.log("Running integration smoke tests...");
@@ -244,6 +245,7 @@ export async function dist() {
 
 export async function lint() {
     await $`zig build analyze`;
+    await $`shellcheck dist/*.sh bootstrap.sh`;
 }
 
 export async function ci() {
@@ -252,6 +254,7 @@ export async function ci() {
     const ver = await version();
     console.log("Running static analysis...");
     await $`zig build analyze`;
+    await $`shellcheck dist/*.sh bootstrap.sh`;
     console.log("Running tests...");
     await $`zig build test`;
     console.log(`Building v${ver}...`);

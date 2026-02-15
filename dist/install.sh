@@ -151,6 +151,7 @@ select_device() {
             name=$(echo "$line" | awk '{print $1}')
             if [ -n "$name" ]; then
                 device_names+=("$name")
+                # shellcheck disable=SC2001
                 device_lines+=("$(echo "$line" | sed 's/^  //')")
             fi
         fi
@@ -433,7 +434,7 @@ install_files() {
 
     # Clean up old flat layout (migration from pre-versioned installs)
     if [ -d "$INSTALL_DIR/bin" ] && [ ! -L "$INSTALL_DIR/bin" ]; then
-        rm -rf "$INSTALL_DIR/bin" "$INSTALL_DIR/lib"
+        rm -rf "${INSTALL_DIR:?}/bin" "${INSTALL_DIR:?}/lib"
         echo "Migrated from flat layout to versioned directories."
     fi
 
@@ -461,6 +462,7 @@ install_files() {
         echo ""
         echo "NOTE: ~/.local/bin is not on your PATH."
         echo "Add to your shell rc file:"
+        # shellcheck disable=SC2016
         echo '  export PATH="$HOME/.local/bin:$PATH"'
     fi
 }
