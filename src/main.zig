@@ -212,7 +212,7 @@ pub fn main() !void {
     // zwanzig-disable-next-line: store-violations-engine
     defer if (prompt_tokens.len > 0) allocator.free(prompt_tokens);
 
-    // --transcribe: batch transcription and exit
+    // --transcribe: batch transcription using whisper_full (non-streaming) and exit
     if (transcribe_file) |tfile| {
         const samples = loadWav(allocator, tfile) catch |err| {
             std.debug.print("Failed to load WAV file '{s}': {}\n", .{ tfile, err });
@@ -220,16 +220,29 @@ pub fn main() !void {
         };
         defer allocator.free(samples);
 
-        var pipeline = try Pipeline.init(allocator, ctx, .{}, 4, verbose, prompt_tokens);
-        defer pipeline.deinit();
+        var params = c.whisper_full_default_params(c.WHISPER_SAMPLING_GREEDY);
+        params.language = "en";
+        params.n_threads = 4;
+        params.no_timestamps = true;
+        params.print_progress = false;
+        params.print_realtime = false;
+        params.print_special = false;
+        params.print_timestamps = false;
 
-        if (try pipeline.transcribe(samples, true)) |result| {
-            defer allocator.free(result.text);
-            defer allocator.free(result.words);
-            defer allocator.free(result.tokens);
-            _ = std.posix.write(1, result.text) catch {};
-            _ = std.posix.write(1, "\n") catch {};
+        if (c.whisper_full(ctx, params, samples.ptr, @intCast(samples.len)) != 0) {
+            std.debug.print("Transcription failed\n", .{});
+            return;
         }
+
+        const n_segments = c.whisper_full_n_segments(ctx);
+        var seg: c_int = 0;
+        while (seg < n_segments) : (seg += 1) {
+            const text = c.whisper_full_get_segment_text(ctx, seg);
+            if (text != null) {
+                _ = std.posix.write(1, std.mem.span(text)) catch {};
+            }
+        }
+        _ = std.posix.write(1, "\n") catch {};
         return;
     }
 

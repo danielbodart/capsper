@@ -50,9 +50,12 @@ pub const Recorder = struct {
         self.dir.close();
     }
 
-    /// Called on idle→speaking. Clears buffers for new utterance.
-    pub fn startUtterance(self: *Recorder) void {
+    /// Called on idle→speaking. Seeds rec_buf with current pcm_buf (which contains
+    /// the pre-speech audio that triggered VAD) so the recording captures the full
+    /// utterance from the start, not just audio arriving after the state transition.
+    pub fn startUtterance(self: *Recorder, initial_pcm: []const u8) void {
         self.rec_buf.clearRetainingCapacity();
+        self.rec_buf.appendSlice(self.allocator, initial_pcm) catch {};
         self.diag_buf.clearRetainingCapacity();
         self.emit_buf.clearRetainingCapacity();
         self.active = true;

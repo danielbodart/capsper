@@ -335,7 +335,7 @@ pub const Server = struct {
                         std.debug.print("[{s}s] idle → speaking (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .speaking;
                         should_transcribe = true;
-                        if (self.recorder) |rec| rec.startUtterance();
+                        if (self.recorder) |rec| rec.startUtterance(pcm_buf.items);
                     } else {
                         const old_len = pcm_buf.items.len;
                         utils.trimBuffer(&pcm_buf, idle_keep_bytes);
