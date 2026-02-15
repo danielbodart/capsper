@@ -204,10 +204,13 @@ install_service() {
     local service_dir="$HOME/.config/systemd/user"
     mkdir -p "$service_dir"
 
+    local domain_terms="${7:-}"
+
     local exec_start="$binary --trigger capslock --pw-channel $channel"
     exec_start="$exec_start --model $model_dir/$WHISPER_MODEL_NAME"
     exec_start="$exec_start --vad-model $model_dir/$VAD_MODEL_NAME"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
+    [ -n "$domain_terms" ] && exec_start="$exec_start --domain-terms $domain_terms"
 
     {
         echo "[Unit]"
@@ -333,6 +336,9 @@ extract_service_config() {
 
     SAVED_TARGET=$(echo "$exec_start" | sed -n 's/.*--pw-target \([^ ]*\).*/\1/p')
     SAVED_TARGET="${SAVED_TARGET:-}"
+
+    SAVED_DOMAIN_TERMS=$(echo "$exec_start" | sed -n 's/.*--domain-terms \([^ ]*\).*/\1/p')
+    SAVED_DOMAIN_TERMS="${SAVED_DOMAIN_TERMS:-}"
 }
 
 install_update_timer() {
@@ -515,7 +521,21 @@ cmd_install() {
                 echo "Using default channel: FL"
             fi
 
-            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET"
+            # Domain terms
+            local domain_terms=""
+            echo ""
+            echo "=== Domain Terms (optional) ==="
+            echo "Improve accuracy for jargon and technical terms by providing a text file"
+            echo "of words you use often (e.g. tool names, project names, acronyms)."
+            if confirm_default_no "Do you have a domain terms file?"; then
+                printf 'Path to terms file: '
+                read -r domain_terms
+                if [ -n "$domain_terms" ] && [ ! -f "$domain_terms" ]; then
+                    echo "WARNING: File not found: $domain_terms (continuing anyway)"
+                fi
+            fi
+
+            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET" false "$domain_terms"
         fi
     else
         echo "=== Capsper Installer ==="
@@ -554,6 +574,20 @@ cmd_install() {
                 echo "Using default channel: FL"
             fi
 
+            # Domain terms
+            local domain_terms=""
+            echo ""
+            echo "=== Domain Terms (optional) ==="
+            echo "Improve accuracy for jargon and technical terms by providing a text file"
+            echo "of words you use often (e.g. tool names, project names, acronyms)."
+            if confirm_default_no "Do you have a domain terms file?"; then
+                printf 'Path to terms file: '
+                read -r domain_terms
+                if [ -n "$domain_terms" ] && [ ! -f "$domain_terms" ]; then
+                    echo "WARNING: File not found: $domain_terms (continuing anyway)"
+                fi
+            fi
+
             # Auto-updates
             local enable_updates=true
             echo ""
@@ -561,7 +595,7 @@ cmd_install() {
                 enable_updates=false
             fi
 
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" $enable_updates
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" $enable_updates "$domain_terms"
 
             if $enable_updates; then
                 install_update_timer
@@ -573,7 +607,7 @@ cmd_install() {
 
             if has_auto_update; then
                 # Auto-update already configured: keep it, just update paths
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS"
             else
                 # Pre-auto-update install: offer to enable
                 local enable_updates=true
@@ -582,7 +616,7 @@ cmd_install() {
                     enable_updates=false
                 fi
 
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS"
 
                 if $enable_updates; then
                     install_update_timer
