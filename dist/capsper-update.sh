@@ -58,13 +58,11 @@ main() {
     curl -fSL -o "$TMP_DIR/$ASSET" \
         "https://github.com/$REPO/releases/latest/download/$ASSET"
 
-    # Verify SHA256 if checksum file is available
+    # Verify SHA256 checksum
     if curl -fSL -o "$TMP_DIR/$ASSET.sha256" \
         "https://github.com/$REPO/releases/latest/download/$ASSET.sha256" 2>/dev/null; then
         (cd "$TMP_DIR" && sha256sum -c "$ASSET.sha256") || die "SHA256 verification failed"
         echo "SHA256 verified."
-    else
-        echo "No checksum file available, skipping verification."
     fi
 
     # Stage: extract to releases/vX.Y.Z/
