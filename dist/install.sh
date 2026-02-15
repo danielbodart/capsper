@@ -317,6 +317,10 @@ check_cuda_libraries() {
 
 # ─── Update Infrastructure ─────────────────────────────────────────────────
 
+has_auto_update() {
+    [ -f "$HOME/.config/systemd/user/capsper-update.timer" ]
+}
+
 extract_service_config() {
     local service_file="$HOME/.config/systemd/user/capsper.service"
     [ -f "$service_file" ] || return 1
@@ -550,16 +554,42 @@ cmd_install() {
                 echo "Using default channel: FL"
             fi
 
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" true
+            # Auto-updates
+            local enable_updates=true
+            echo ""
+            if ! confirm "Enable automatic updates?"; then
+                enable_updates=false
+            fi
+
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" $enable_updates
+
+            if $enable_updates; then
+                install_update_timer
+                install_rollback_service
+            fi
         else
             # Upgrade without config change: preserve audio settings, update paths
             extract_service_config
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true
-        fi
 
-        # Install update timer and rollback service (always)
-        install_update_timer
-        install_rollback_service
+            if has_auto_update; then
+                # Auto-update already configured: keep it, just update paths
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true
+            else
+                # Pre-auto-update install: offer to enable
+                local enable_updates=true
+                echo ""
+                if ! confirm "Enable automatic updates?"; then
+                    enable_updates=false
+                fi
+
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates
+
+                if $enable_updates; then
+                    install_update_timer
+                    install_rollback_service
+                fi
+            fi
+        fi
     fi
 
     echo ""
