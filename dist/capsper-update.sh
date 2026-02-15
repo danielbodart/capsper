@@ -9,8 +9,11 @@ set -euo pipefail
 REPO="danielbodart/capsper"
 ASSET="capsper-linux-x86_64.tar.gz"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
+TMP_DIR=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
 
 current_version() {
     cat "$INSTALL_DIR/current/VERSION" 2>/dev/null || echo "unknown"
@@ -50,17 +53,15 @@ main() {
 
     echo "Downloading $latest_tag..."
 
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    trap 'rm -rf "$tmp_dir"' EXIT
+    TMP_DIR=$(mktemp -d)
 
-    curl -fSL -o "$tmp_dir/$ASSET" \
+    curl -fSL -o "$TMP_DIR/$ASSET" \
         "https://github.com/$REPO/releases/latest/download/$ASSET"
 
     # Verify SHA256 if checksum file is available
-    if curl -fSL -o "$tmp_dir/$ASSET.sha256" \
+    if curl -fSL -o "$TMP_DIR/$ASSET.sha256" \
         "https://github.com/$REPO/releases/latest/download/$ASSET.sha256" 2>/dev/null; then
-        (cd "$tmp_dir" && sha256sum -c "$ASSET.sha256") || die "SHA256 verification failed"
+        (cd "$TMP_DIR" && sha256sum -c "$ASSET.sha256") || die "SHA256 verification failed"
         echo "SHA256 verified."
     else
         echo "No checksum file available, skipping verification."
@@ -70,7 +71,7 @@ main() {
     local release_dir="$INSTALL_DIR/releases/$latest_tag"
     rm -rf "$release_dir"
     mkdir -p "$release_dir"
-    tar -xzf "$tmp_dir/$ASSET" -C "$release_dir"
+    tar -xzf "$TMP_DIR/$ASSET" -C "$release_dir"
 
     # Validate critical files exist
     [ -f "$release_dir/bin/capsper" ] || die "Extracted release is missing capsper binary"
