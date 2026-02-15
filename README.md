@@ -103,6 +103,25 @@ capsper --pw-detect --pw-target alsa_input.usb-Focusrite_Vocaster...
 
 This records silence and speech, then shows per-channel signal levels and recommends the correct `--pw-channel` flag.
 
+### Debug recording
+
+To diagnose transcription issues (e.g. dropped words), enable per-utterance recording:
+
+```bash
+mkdir /tmp/capsper-debug
+capsper --trigger capslock --pw-channel FL --record-dir /tmp/capsper-debug
+```
+
+Each utterance produces a pair of files (`000.wav`/`000.log`, `001.wav`/`001.log`, etc.) in a ring buffer — old files are overwritten after `--record-keep` pairs (default 50). The WAV contains the full utterance audio and the log contains emitted text plus a per-cycle diagnostic trace.
+
+Batch-transcribe a captured WAV to compare streaming vs non-streaming results:
+
+```bash
+capsper --transcribe /tmp/capsper-debug/005.wav
+```
+
+This loads the model, transcribes the entire file in one shot, prints the result, and exits.
+
 ## Acknowledgements
 
 Capsper's streaming approach is inspired by [SimulStreaming](https://github.com/ufal/SimulStreaming) (ÚFAL, Charles University), which implements AlignAtt-based simultaneous speech processing and won the IWSLT 2025 Simultaneous Speech Translation Shared Task. We borrowed the core idea of using cross-attention analysis to decide when it's safe to emit partial transcriptions.
@@ -159,6 +178,7 @@ A single self-contained binary (`src/`):
 | `server.zig` | Streaming state machine, word-level delta emission |
 | `pipeline.zig` | Low-level whisper.cpp integration, mel/encode/decode loop |
 | `alignatt.zig` | Cross-attention analysis for streaming stop/rewind decisions |
+| `recorder.zig` | Per-utterance debug recording (WAV + diagnostic log capture) |
 | `utils.zig` | Pure utility functions (word counting, PCM conversion, delta tracking) |
 | `vad.zig` | Silero VAD wrapper for speech/silence detection |
 | `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream` |
@@ -196,6 +216,9 @@ capsper [OPTIONS]
   --pw-target NODE        PipeWire capture target node name
   --pw-channel CHANNEL    PipeWire channel: MONO, FL, AUX0-AUX63 (default: FL)
   --domain-terms FILE     Text file of domain terms to bias transcription toward
+  --record-dir DIR        Record each utterance to DIR (WAV + diagnostic log)
+  --record-keep N         Number of recording pairs to keep (default: 50, ring buffer)
+  --transcribe FILE       Batch-transcribe a WAV file (non-streaming) and exit
   --pw-list               List available PipeWire audio sources
   --pw-detect             Interactive channel detection (record silence + speech)
   --detect-duration SECS  Duration per detection phase (default: 5)

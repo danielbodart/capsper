@@ -206,6 +206,30 @@ pub fn rmsToDb(rms: f64) f64 {
     return 20.0 * @log10(rms);
 }
 
+/// Write a RIFF/WAVE file (16kHz mono S16_LE PCM).
+/// Inverse of parseWavHeader(). Takes any writer for testability.
+pub fn writeWav(writer: anytype, pcm_bytes: []const u8) !void {
+    const data_size: u32 = @intCast(pcm_bytes.len);
+    const file_size: u32 = 36 + data_size;
+    // RIFF header
+    try writer.writeAll("RIFF");
+    try writer.writeInt(u32, file_size, .little);
+    try writer.writeAll("WAVE");
+    // fmt chunk (16kHz, mono, 16-bit PCM)
+    try writer.writeAll("fmt ");
+    try writer.writeInt(u32, 16, .little);
+    try writer.writeInt(u16, 1, .little);
+    try writer.writeInt(u16, 1, .little);
+    try writer.writeInt(u32, 16000, .little);
+    try writer.writeInt(u32, 32000, .little);
+    try writer.writeInt(u16, 2, .little);
+    try writer.writeInt(u16, 16, .little);
+    // data chunk
+    try writer.writeAll("data");
+    try writer.writeInt(u32, data_size, .little);
+    try writer.writeAll(pcm_bytes);
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -678,4 +702,39 @@ test "rmsToDb: monotonically increasing" {
     try std.testing.expect(rmsToDb(0.5) < rmsToDb(1.0));
 }
 
+// --- writeWav tests ---
 
+test "writeWav: roundtrip with parseWavHeader" {
+    var buf: [148]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const pcm = [_]u8{ 0x00, 0x40, 0xFF, 0x7F }; // 16384, 32767 as S16_LE
+    try writeWav(fbs.writer(), &pcm);
+    const written = fbs.getWritten();
+    const header = try parseWavHeader(written);
+    try std.testing.expectEqual(@as(u16, 1), header.channels);
+    try std.testing.expectEqual(@as(usize, 44), header.data_start);
+    try std.testing.expectEqual(@as(u32, 4), header.data_size);
+    try std.testing.expectEqualSlices(u8, &pcm, written[44..48]);
+}
+
+test "writeWav: empty PCM produces valid header" {
+    var buf: [44]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeWav(fbs.writer(), &[_]u8{});
+    const written = fbs.getWritten();
+    try std.testing.expectEqual(@as(usize, 44), written.len);
+    const header = try parseWavHeader(written);
+    try std.testing.expectEqual(@as(u32, 0), header.data_size);
+}
+
+test "writeWav: header fields correct" {
+    var buf: [48]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeWav(fbs.writer(), &[_]u8{ 0, 0, 0, 0 });
+    const w = fbs.getWritten();
+    try std.testing.expectEqualStrings("RIFF", w[0..4]);
+    try std.testing.expectEqual(@as(u32, 40), std.mem.readInt(u32, w[4..8], .little));
+    try std.testing.expectEqualStrings("WAVE", w[8..12]);
+    try std.testing.expectEqual(@as(u32, 16000), std.mem.readInt(u32, w[24..28], .little));
+    try std.testing.expectEqual(@as(u32, 32000), std.mem.readInt(u32, w[28..32], .little));
+}

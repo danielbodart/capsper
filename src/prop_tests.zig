@@ -404,6 +404,42 @@ fn prop_wav_reject_short(text: []const u8) !void {
 }
 
 // ============================================================================
+// writeWav roundtrip property
+// ============================================================================
+
+// writeWav → parseWavHeader → data bytes match, samples roundtrip
+fn prop_writeWav_roundtrip(raw_pcm: []const u8) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const pcm_len = raw_pcm.len & ~@as(usize, 1);
+
+    var buf = std.ArrayListUnmanaged(u8){};
+    defer buf.deinit(allocator);
+    try utils.writeWav(buf.writer(allocator), raw_pcm[0..pcm_len]);
+
+    const header = try utils.parseWavHeader(buf.items);
+    try std.testing.expectEqual(@as(u16, 1), header.channels);
+    try std.testing.expectEqual(@as(usize, 44), header.data_start);
+    try std.testing.expectEqual(@as(u32, @intCast(pcm_len)), header.data_size);
+
+    // Raw data bytes roundtrip
+    try std.testing.expectEqualSlices(u8, raw_pcm[0..pcm_len], buf.items[44..]);
+
+    // Full roundtrip: write → parse → wavToFloat → verify samples
+    if (pcm_len >= 2) {
+        const samples = try utils.wavToFloat(allocator, buf.items, header);
+        defer allocator.free(samples);
+        for (samples, 0..) |s, idx| {
+            const raw = std.mem.readInt(i16, raw_pcm[idx * 2 ..][0..2], .little);
+            const expected: f32 = @as(f32, @floatFromInt(raw)) / 32768.0;
+            try std.testing.expectApproxEqAbs(expected, s, 1e-7);
+        }
+    }
+}
+
+// ============================================================================
 // pcmToFloat additional properties
 // ============================================================================
 
@@ -833,6 +869,10 @@ pub fn main() !void {
     std.debug.print("prop: WAV reject short data... ", .{});
     try minish.check(allocator, word_text_gen, prop_wav_reject_short, .{ .num_runs = runs });
 
+    // writeWav roundtrip
+    std.debug.print("prop: writeWav roundtrip... ", .{});
+    try minish.check(allocator, word_text_gen, prop_writeWav_roundtrip, .{ .num_runs = runs });
+
     // pcmToFloat length
     std.debug.print("prop: pcmToFloat length... ", .{});
     try minish.check(allocator, word_text_gen, prop_pcmToFloat_length, .{ .num_runs = runs });
@@ -893,5 +933,5 @@ pub fn main() !void {
     std.debug.print("prop: rmsToDb unity... ", .{});
     try minish.check(allocator, pcm_byte_gen, prop_rmsToDb_unity, .{ .num_runs = runs });
 
-    std.debug.print("\nAll 44 property tests passed!\n", .{});
+    std.debug.print("\nAll 45 property tests passed!\n", .{});
 }

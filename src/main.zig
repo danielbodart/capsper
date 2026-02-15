@@ -12,6 +12,7 @@ const InputHandler = @import("input.zig").InputHandler;
 const input_mod = @import("input.zig");
 const utils = @import("utils.zig");
 const pw_detect = @import("pw_detect.zig");
+const Recorder = @import("recorder.zig").Recorder;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
@@ -38,6 +39,9 @@ pub fn main() !void {
     var do_pw_detect: bool = false;
     var detect_duration: u32 = 5;
     var domain_terms_path: ?[:0]const u8 = null;
+    var record_dir: ?[:0]const u8 = null;
+    var record_keep: usize = 50;
+    var transcribe_file: ?[:0]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -117,6 +121,15 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--domain-terms")) {
             i += 1;
             if (i < args.len) domain_terms_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--record-dir")) {
+            i += 1;
+            if (i < args.len) record_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--record-keep")) {
+            i += 1;
+            if (i < args.len) record_keep = std.fmt.parseInt(usize, args[i], 10) catch 50;
+        } else if (std.mem.eql(u8, arg, "--transcribe")) {
+            i += 1;
+            if (i < args.len) transcribe_file = args[i];
         } else {
             printUsage();
             return;
@@ -199,6 +212,27 @@ pub fn main() !void {
     // zwanzig-disable-next-line: store-violations-engine
     defer if (prompt_tokens.len > 0) allocator.free(prompt_tokens);
 
+    // --transcribe: batch transcription and exit
+    if (transcribe_file) |tfile| {
+        const samples = loadWav(allocator, tfile) catch |err| {
+            std.debug.print("Failed to load WAV file '{s}': {}\n", .{ tfile, err });
+            return;
+        };
+        defer allocator.free(samples);
+
+        var pipeline = try Pipeline.init(allocator, ctx, .{}, 4, verbose, prompt_tokens);
+        defer pipeline.deinit();
+
+        if (try pipeline.transcribe(samples, true)) |result| {
+            defer allocator.free(result.text);
+            defer allocator.free(result.words);
+            defer allocator.free(result.tokens);
+            _ = std.posix.write(1, result.text) catch {};
+            _ = std.posix.write(1, "\n") catch {};
+        }
+        return;
+    }
+
     // Initialize evdev input handler (if --trigger specified, skip in dry-run)
     var input_handler: ?InputHandler = null;
     var type_callback: ?TypeCallback = null;
@@ -269,13 +303,25 @@ pub fn main() !void {
         return;
     }
 
+    // Create recorder if --record-dir specified
+    var recorder_storage: Recorder = undefined;
+    var recorder: ?*Recorder = null;
+    if (record_dir) |rdir| {
+        recorder_storage = Recorder.init(allocator, rdir, record_keep) catch |err| {
+            std.debug.print("Failed to open record directory '{s}': {}\n", .{ rdir, err });
+            return;
+        };
+        recorder = &recorder_storage;
+    }
+    defer if (recorder) |rec| rec.deinit();
+
     // Start input handler thread (after warmup, before server)
     if (input_handler != null) {
         try input_handler.?.start();
     }
 
     // Start server
-    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, type_callback, prompt_tokens);
+    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, type_callback, prompt_tokens, recorder);
     try server.run();
 }
 
@@ -317,6 +363,8 @@ fn printUsage() void {
     std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
     std.debug.print("       [--domain-terms FILE]\n", .{});
+    std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
+    std.debug.print("       [--transcribe FILE]\n", .{});
     std.debug.print("       [--pw-list] [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
 }
