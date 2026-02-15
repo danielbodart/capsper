@@ -81,6 +81,25 @@ pub fn isBlankOrPunct(text: []const u8) bool {
     return true;
 }
 
+/// Strip trailing punctuation from a word for comparison.
+/// Whisper may change "loop." to "loop" or "so" to "so," between cycles.
+pub fn stripTrailingPunct(word: []const u8) []const u8 {
+    var end = word.len;
+    while (end > 0) {
+        switch (word[end - 1]) {
+            '.', ',', '!', '?', ';', ':' => end -= 1,
+            else => break,
+        }
+    }
+    return word[0..end];
+}
+
+/// Compare two words ignoring case and trailing punctuation.
+/// Used for dedup: "loop." and "Loop" are considered the same word.
+pub fn wordsMatchForDedup(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(stripTrailingPunct(a), stripTrailingPunct(b));
+}
+
 /// A word with its audio frame position from cross-attention analysis.
 /// frame is in encoder frame units (50fps = 20ms/frame).
 pub const TimedWord = struct {
@@ -442,6 +461,73 @@ test "isBlankOrPunct: two-char punct rejected (len > 1)" {
 
 test "isBlankOrPunct: word starting with space" {
     try std.testing.expect(!isBlankOrPunct(" the"));
+}
+
+// --- stripTrailingPunct tests ---
+
+test "stripTrailingPunct: no punctuation" {
+    try std.testing.expectEqualStrings("hello", stripTrailingPunct("hello"));
+}
+
+test "stripTrailingPunct: single period" {
+    try std.testing.expectEqualStrings("loop", stripTrailingPunct("loop."));
+}
+
+test "stripTrailingPunct: comma" {
+    try std.testing.expectEqualStrings("so", stripTrailingPunct("so,"));
+}
+
+test "stripTrailingPunct: multiple punct" {
+    try std.testing.expectEqualStrings("what", stripTrailingPunct("what?!"));
+}
+
+test "stripTrailingPunct: all punct" {
+    try std.testing.expectEqualStrings("", stripTrailingPunct("..."));
+}
+
+test "stripTrailingPunct: empty string" {
+    try std.testing.expectEqualStrings("", stripTrailingPunct(""));
+}
+
+test "stripTrailingPunct: mid-word punct preserved" {
+    try std.testing.expectEqualStrings("don't", stripTrailingPunct("don't"));
+}
+
+test "stripTrailingPunct: semicolon and colon" {
+    try std.testing.expectEqualStrings("note", stripTrailingPunct("note;"));
+    try std.testing.expectEqualStrings("step", stripTrailingPunct("step:"));
+}
+
+// --- wordsMatchForDedup tests ---
+
+test "wordsMatchForDedup: identical" {
+    try std.testing.expect(wordsMatchForDedup("loop", "loop"));
+}
+
+test "wordsMatchForDedup: punct difference" {
+    try std.testing.expect(wordsMatchForDedup("loop.", "loop"));
+    try std.testing.expect(wordsMatchForDedup("loop", "loop."));
+}
+
+test "wordsMatchForDedup: case difference" {
+    try std.testing.expect(wordsMatchForDedup("So", "so"));
+    try std.testing.expect(wordsMatchForDedup("AND", "and"));
+}
+
+test "wordsMatchForDedup: case and punct" {
+    try std.testing.expect(wordsMatchForDedup("So,", "so"));
+    try std.testing.expect(wordsMatchForDedup("Good.", "good"));
+}
+
+test "wordsMatchForDedup: different words" {
+    try std.testing.expect(!wordsMatchForDedup("loop", "look"));
+    try std.testing.expect(!wordsMatchForDedup("the", "they"));
+}
+
+test "wordsMatchForDedup: empty strings" {
+    try std.testing.expect(wordsMatchForDedup("", ""));
+    // All-punct matches empty
+    try std.testing.expect(wordsMatchForDedup("...", ""));
 }
 
 // --- findTimedStableCount tests ---

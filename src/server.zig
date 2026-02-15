@@ -537,6 +537,8 @@ fn emitDelta(output_fd: posix.fd_t, start_ns: i128, delta: []const u8, type_cb: 
     if (recorder) |rec| rec.logEmit(delta);
 }
 
+const stripTrailingPunct = utils.stripTrailingPunct;
+
 /// Emit words from text that are past last_emitted_frame (plus guard band).
 /// `count` limits how many words from the start of `words` to consider.
 /// Returns true if any words were emitted.
@@ -572,20 +574,48 @@ fn emitNewWords(
 
     if (first_new) |fi_raw| {
         var fi = fi_raw;
-        const li = last_new.?;
+        var li = last_new.?;
 
-        // Text-aware dedup: if the first "new" word matches the last emitted word's
-        // text and is within frame_tolerance, it's the same word drifted by whisper's
-        // cross-attention jitter. Skip it. This catches drift >dedup_guard_frames
+        // Text-aware dedup: skip any new words that match the last emitted word's
+        // text (ignoring case and trailing punctuation) and are within frame_tolerance.
+        // This catches whisper's cross-attention jitter (>dedup_guard_frames drift)
         // without raising the guard so high that legitimate new words get blocked.
-        if (last_emitted_word.len > 0 and fi <= li) {
-            const w = words[fi];
-            const abs_frame = w.frame + frame_offset;
-            if (abs_frame <= last_emitted_frame.* + frame_tolerance) {
+        // Check leading words from the front and trailing words from the back.
+        if (last_emitted_word.len > 0) {
+            const emitted_bare = stripTrailingPunct(last_emitted_word);
+            // Skip leading duplicates — text match only, no frame constraint.
+            // Cross-attention can drift arbitrarily between cycles as audio grows,
+            // so frame proximity is unreliable for the first word.
+            // If the duplicate gained punctuation (e.g. "loop" → "loop."), emit
+            // just the new punctuation — whisper is telling us "end of sentence".
+            while (fi <= li) {
+                const w = words[fi];
                 const word_text = text[w.text_start..w.text_end];
-                if (std.ascii.eqlIgnoreCase(word_text, last_emitted_word)) {
-                    fi += 1; // skip duplicate
+                const word_bare = stripTrailingPunct(word_text);
+                if (!std.ascii.eqlIgnoreCase(word_bare, emitted_bare)) break;
+                // Emit gained punctuation (e.g. "." from "loop" → "loop.")
+                // Only if the previously emitted word had less punctuation.
+                const emitted_punct = last_emitted_word.len - emitted_bare.len;
+                const new_punct_len = word_text.len - word_bare.len;
+                if (new_punct_len > emitted_punct) {
+                    const punct = word_text[word_bare.len + emitted_punct ..];
+                    emitDelta(output_fd, start_ns, punct, type_cb, recorder) catch return false;
+                    // Update last_emitted_word to include the punctuation
+                    const full_len = @min(word_text.len, last_emitted_word_buf.len);
+                    @memcpy(last_emitted_word_buf[0..full_len], word_text[0..full_len]);
+                    last_emitted_word_len.* = full_len;
                 }
+                fi += 1;
+            }
+            // Skip trailing duplicates (e.g. "future" re-emitted at flush).
+            // No frame check here: at flush, whisper re-transcribes the full buffer
+            // and the last word can drift arbitrarily far in frame position.
+            while (li >= fi) {
+                const w = words[li];
+                const word_bare = stripTrailingPunct(text[w.text_start..w.text_end]);
+                if (!std.ascii.eqlIgnoreCase(word_bare, emitted_bare)) break;
+                if (li == 0) return false;
+                li -= 1;
             }
         }
 

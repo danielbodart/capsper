@@ -141,6 +141,39 @@ fn prop_isBlankOrPunct_length(text: []const u8) !void {
 }
 
 // ============================================================================
+// stripTrailingPunct properties
+// ============================================================================
+
+// Result is always a prefix of the input
+fn prop_stripTrailingPunct_prefix(text: []const u8) !void {
+    const stripped = utils.stripTrailingPunct(text);
+    try std.testing.expect(stripped.len <= text.len);
+    // Must be a prefix (same pointer start, subset of bytes)
+    if (stripped.len > 0) {
+        try std.testing.expectEqualStrings(stripped, text[0..stripped.len]);
+    }
+}
+
+// Stripping is idempotent: strip(strip(x)) == strip(x)
+fn prop_stripTrailingPunct_idempotent(text: []const u8) !void {
+    const once = utils.stripTrailingPunct(text);
+    const twice = utils.stripTrailingPunct(once);
+    try std.testing.expectEqualStrings(once, twice);
+}
+
+// wordsMatchForDedup is reflexive: every word matches itself
+fn prop_wordsMatchForDedup_reflexive(text: []const u8) !void {
+    try std.testing.expect(utils.wordsMatchForDedup(text, text));
+}
+
+// wordsMatchForDedup is symmetric: match(a,b) == match(b,a)
+fn prop_wordsMatchForDedup_symmetric(pair: std.meta.Tuple(&.{ []const u8, []const u8 })) !void {
+    const a = pair[0];
+    const b = pair[1];
+    try std.testing.expectEqual(utils.wordsMatchForDedup(a, b), utils.wordsMatchForDedup(b, a));
+}
+
+// ============================================================================
 // trimBuffer properties
 // ============================================================================
 
@@ -833,6 +866,16 @@ pub fn main() !void {
     std.debug.print("prop: isBlankOrPunct length... ", .{});
     try minish.check(allocator, word_text_gen, prop_isBlankOrPunct_length, .{ .num_runs = runs });
 
+    // stripTrailingPunct
+    std.debug.print("prop: stripTrailingPunct is prefix... ", .{});
+    try minish.check(allocator, punct_text_gen, prop_stripTrailingPunct_prefix, .{ .num_runs = runs });
+    std.debug.print("prop: stripTrailingPunct idempotent... ", .{});
+    try minish.check(allocator, punct_text_gen, prop_stripTrailingPunct_idempotent, .{ .num_runs = runs });
+    std.debug.print("prop: wordsMatchForDedup reflexive... ", .{});
+    try minish.check(allocator, punct_text_gen, prop_wordsMatchForDedup_reflexive, .{ .num_runs = runs });
+    std.debug.print("prop: wordsMatchForDedup symmetric... ", .{});
+    try minish.check(allocator, text_pair_gen, prop_wordsMatchForDedup_symmetric, .{ .num_runs = runs });
+
     // trimBuffer
     std.debug.print("prop: trimBuffer bounded... ", .{});
     try minish.check(allocator, word_text_gen, prop_trimBuffer_bounded, .{ .num_runs = runs });
@@ -933,5 +976,5 @@ pub fn main() !void {
     std.debug.print("prop: rmsToDb unity... ", .{});
     try minish.check(allocator, pcm_byte_gen, prop_rmsToDb_unity, .{ .num_runs = runs });
 
-    std.debug.print("\nAll 45 property tests passed!\n", .{});
+    std.debug.print("\nAll 48 property tests passed!\n", .{});
 }
