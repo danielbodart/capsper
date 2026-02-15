@@ -24,11 +24,9 @@ Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://g
 
 ## Install
 
-Download the [latest release](https://github.com/danielbodart/capsper/releases/latest), extract it, and run the installer:
-
 ```bash
-tar -xzf capsper-linux-x86_64-*.tar.gz
-cd capsper-linux-x86_64-*
+mkdir capsper && cd capsper
+curl -fSL https://github.com/danielbodart/capsper/releases/latest/download/capsper-linux-x86_64.tar.gz | tar -xz
 ./install.sh
 ```
 
@@ -41,6 +39,36 @@ systemctl --user start capsper.service
 ```
 
 Hold CapsLock and speak. Release to stop. Text appears in the focused window.
+
+## Auto-updates
+
+Capsper checks for updates daily via a systemd timer. When a new version is found, it's downloaded and staged in the background. The update is applied automatically on the next service restart — capsper is never interrupted mid-session.
+
+Check for updates manually:
+
+```bash
+~/.local/share/capsper/capsper-update.sh
+```
+
+Apply a staged update:
+
+```bash
+systemctl --user restart capsper.service
+```
+
+If a new version crashes repeatedly (3 times within 60 seconds), capsper automatically rolls back to the previous version. You can also roll back manually:
+
+```bash
+~/.local/share/capsper/capsper-rollback.sh --force
+systemctl --user reset-failed capsper.service
+systemctl --user start capsper.service
+```
+
+Disable auto-updates:
+
+```bash
+systemctl --user disable --now capsper-update.timer
+```
 
 ### PipeWire channel selection
 

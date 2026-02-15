@@ -199,6 +199,7 @@ install_service() {
     local channel="$3"
     local model_dir="$4"
     local target="${5:-}"
+    local with_updates="${6:-false}"
 
     local service_dir="$HOME/.config/systemd/user"
     mkdir -p "$service_dir"
@@ -208,21 +209,29 @@ install_service() {
     exec_start="$exec_start --vad-model $model_dir/$VAD_MODEL_NAME"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
 
-    cat > "$service_dir/capsper.service" <<EOF
-[Unit]
-Description=Capsper push-to-talk dictation
-
-[Service]
-Type=simple
-WorkingDirectory=$work_dir
-ExecStart=$exec_start
-Restart=always
-RestartSec=5
-Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
-
-[Install]
-WantedBy=default.target
-EOF
+    {
+        echo "[Unit]"
+        echo "Description=Capsper push-to-talk dictation"
+        if $with_updates; then
+            echo "StartLimitBurst=3"
+            echo "StartLimitIntervalSec=60"
+            echo "OnFailure=capsper-rollback.service"
+        fi
+        echo ""
+        echo "[Service]"
+        echo "Type=simple"
+        echo "WorkingDirectory=$work_dir"
+        if $with_updates; then
+            echo "ExecStartPre=$INSTALL_DIR/capsper-apply-update.sh"
+        fi
+        echo "ExecStart=$exec_start"
+        echo "Restart=always"
+        echo "RestartSec=5"
+        echo "Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        echo ""
+        echo "[Install]"
+        echo "WantedBy=default.target"
+    } > "$service_dir/capsper.service"
 
     systemctl --user daemon-reload
     systemctl --user enable capsper.service 2>/dev/null || true
@@ -306,24 +315,136 @@ check_cuda_libraries() {
     die "Missing CUDA runtime libraries. Install them with: sudo apt install $cudart_pkg $cublas_pkg"
 }
 
+# ─── Update Infrastructure ─────────────────────────────────────────────────
+
+extract_service_config() {
+    local service_file="$HOME/.config/systemd/user/capsper.service"
+    [ -f "$service_file" ] || return 1
+
+    local exec_start
+    exec_start=$(grep '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
+
+    SAVED_CHANNEL=$(echo "$exec_start" | sed -n 's/.*--pw-channel \([^ ]*\).*/\1/p')
+    SAVED_CHANNEL="${SAVED_CHANNEL:-FL}"
+
+    SAVED_TARGET=$(echo "$exec_start" | sed -n 's/.*--pw-target \([^ ]*\).*/\1/p')
+    SAVED_TARGET="${SAVED_TARGET:-}"
+}
+
+install_update_timer() {
+    local service_dir="$HOME/.config/systemd/user"
+
+    cat > "$service_dir/capsper-update.service" <<EOF
+[Unit]
+Description=Check for capsper updates
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/capsper-update.sh
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+EOF
+
+    cat > "$service_dir/capsper-update.timer" <<EOF
+[Unit]
+Description=Daily capsper update check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now capsper-update.timer 2>/dev/null || true
+    echo "capsper-update.timer installed."
+}
+
+install_rollback_service() {
+    local service_dir="$HOME/.config/systemd/user"
+
+    cat > "$service_dir/capsper-rollback.service" <<EOF
+[Unit]
+Description=Capsper auto-rollback
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/capsper-rollback.sh
+EOF
+
+    systemctl --user daemon-reload
+    echo "capsper-rollback.service installed."
+}
+
 # ─── Install Files ────────────────────────────────────────────────────────
 
 install_files() {
     echo "Installing to $INSTALL_DIR ..."
 
     [ -d "$SCRIPT_DIR/lib" ] || die "dist/lib/ not found. If this is a git checkout, run: git lfs pull"
+    [ -f "$SCRIPT_DIR/VERSION" ] || die "VERSION file not found in dist."
 
-    mkdir -p "$INSTALL_DIR"
+    local ver
+    ver=$(cat "$SCRIPT_DIR/VERSION")
+    local release_dir="$INSTALL_DIR/releases/v$ver"
 
-    # Copy bin/ and lib/ (overwrite on upgrade)
-    cp -a "$SCRIPT_DIR/bin" "$INSTALL_DIR/"
-    cp -a "$SCRIPT_DIR/lib" "$INSTALL_DIR/"
+    mkdir -p "$release_dir"
+
+    # Copy bin/ and lib/ into versioned directory
+    cp -a "$SCRIPT_DIR/bin" "$release_dir/"
+    cp -a "$SCRIPT_DIR/lib" "$release_dir/"
+    cp "$SCRIPT_DIR/VERSION" "$release_dir/"
+
+    # Save current version for rollback (if upgrading)
+    local current_target
+    current_target=$(readlink "$INSTALL_DIR/current" 2>/dev/null || true)
+    if [ -n "$current_target" ]; then
+        local current_name
+        current_name=$(basename "$current_target")
+        if [ "$current_name" != "v$ver" ]; then
+            echo "$current_name" > "$INSTALL_DIR/.previous-version"
+            date +%s > "$INSTALL_DIR/.update-applied-at"
+        fi
+    fi
+
+    # Atomic symlink swap
+    ln -sfn "releases/v$ver" "$INSTALL_DIR/current.tmp"
+    mv -T "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
+
+    # Install update scripts
+    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh; do
+        if [ -f "$SCRIPT_DIR/$script" ]; then
+            cp "$SCRIPT_DIR/$script" "$INSTALL_DIR/"
+            chmod +x "$INSTALL_DIR/$script"
+        fi
+    done
+
+    # Clean up old flat layout (migration from pre-versioned installs)
+    if [ -d "$INSTALL_DIR/bin" ] && [ ! -L "$INSTALL_DIR/bin" ]; then
+        rm -rf "$INSTALL_DIR/bin" "$INSTALL_DIR/lib"
+        echo "Migrated from flat layout to versioned directories."
+    fi
+
+    # Clean up old releases (keep current + previous)
+    local prev
+    prev=$(cat "$INSTALL_DIR/.previous-version" 2>/dev/null || true)
+    for dir in "$INSTALL_DIR/releases"/v*; do
+        [ -d "$dir" ] || continue
+        local name
+        name=$(basename "$dir")
+        [ "$name" = "v$ver" ] && continue
+        [ "$name" = "$prev" ] && continue
+        echo "Removing old release: $name"
+        rm -rf "$dir"
+    done
 
     # Symlink into ~/.local/bin so capsper is on PATH
     mkdir -p "$HOME/.local/bin"
-    ln -sf "$INSTALL_DIR/bin/capsper" "$HOME/.local/bin/capsper"
+    ln -sf "$INSTALL_DIR/current/bin/capsper" "$HOME/.local/bin/capsper"
 
-    echo "Installed. Binary: $INSTALL_DIR/bin/capsper"
+    echo "Installed v$ver. Binary: $INSTALL_DIR/current/bin/capsper"
     echo "Symlink:  ~/.local/bin/capsper"
 
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
@@ -417,11 +538,11 @@ cmd_install() {
             echo ""
             echo "=== Audio Configuration ==="
             if confirm "Select audio device?"; then
-                select_device "$INSTALL_DIR/bin/capsper"
+                select_device "$INSTALL_DIR/current/bin/capsper"
             fi
             if confirm "Run microphone channel detection? (No = use default FL)"; then
                 local detect_output
-                detect_output=$(pw_detect "$INSTALL_DIR/bin/capsper" "$PW_TARGET")
+                detect_output=$(pw_detect "$INSTALL_DIR/current/bin/capsper" "$PW_TARGET")
                 echo "$detect_output"
                 channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
                 [ -z "$channel" ] && channel="FL"
@@ -429,9 +550,16 @@ cmd_install() {
                 echo "Using default channel: FL"
             fi
 
-            # Systemd service
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET"
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" true
+        else
+            # Upgrade without config change: preserve audio settings, update paths
+            extract_service_config
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true
         fi
+
+        # Install update timer and rollback service (always)
+        install_update_timer
+        install_rollback_service
     fi
 
     echo ""

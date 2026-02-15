@@ -9,6 +9,7 @@ const BINARY = "./dist/bin/capsper";
 const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
 const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
 const SCRIPT_DIR = import.meta.dir;
+const TARBALL = "capsper-linux-x86_64.tar.gz";
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -235,9 +236,10 @@ export async function dist() {
     }
 
     const ver = await version();
-    const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
-    await $`tar -czf ${tarball} -C dist bin/ lib/ install.sh`;
-    console.log(`Tarball: ${tarball}`);
+    await Bun.write("dist/VERSION", ver);
+    await $`tar -czf ${TARBALL} -C dist bin/ lib/ install.sh capsper-update.sh capsper-apply-update.sh capsper-rollback.sh VERSION`;
+    await $`sha256sum ${TARBALL} > ${TARBALL}.sha256`;
+    console.log(`Tarball: ${TARBALL} (v${ver})`);
 }
 
 export async function lint() {
@@ -256,10 +258,9 @@ export async function ci() {
     await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
     await dist();
     if (process.env.GH_TOKEN) {
-        const tarball = `capsper-linux-x86_64-${ver}.tar.gz`;
         const commitMsg = (await $`git log -1 --format=%s`.quiet()).text().trim();
         console.log(`Creating release v${ver}...`);
-        await $`gh release create v${ver} ${tarball} --title v${ver} --notes ${commitMsg}`;
+        await $`gh release create v${ver} ${TARBALL} ${TARBALL}.sha256 --title v${ver} --notes ${commitMsg}`;
     }
 }
 

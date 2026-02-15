@@ -1,7 +1,10 @@
 dist/bin/
 dist/models/
+dist/VERSION
 .zig-cache/
 whisper.cpp/build-zig/
 tools/
 .idea/
 CLAUDE.local.md
+capsper-linux-x86_64.tar.gz
+capsper-linux-x86_64.tar.gz.sha256
