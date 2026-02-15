@@ -38,11 +38,11 @@ The installer walks you through everything interactively — downloading models 
 systemctl --user start capsper.service
 ```
 
-Hold CapsLock and speak. Release to stop. Text appears in the focused window.
+Hold CapsLock and speak. Release to stop. Text appears in the focused window. CapsLock is the default trigger — you can use any key with `--trigger` (see [Server options](#server-options)).
 
 ## Auto-updates
 
-Capsper checks for updates daily via a systemd timer. When a new version is found, it's downloaded and staged in the background. The update is applied automatically on the next service restart — capsper is never interrupted mid-session.
+Capsper can optionally check for updates daily via a systemd timer (the installer offers to set this up). When a new version is found, it's downloaded and staged in the background. The update is applied automatically on the next service restart — capsper is never interrupted mid-session.
 
 Check for updates manually:
 
@@ -72,7 +72,7 @@ systemctl --user disable --now capsper-update.timer
 
 ### Domain terms
 
-If you frequently use jargon, tool names, or domain-specific vocabulary, you can provide a text file of terms to improve transcription accuracy:
+If you frequently use jargon, tool names, or domain-specific vocabulary, you can provide a text file of terms to improve transcription accuracy. The installer can set this up for you, or you can configure it manually:
 
 ```bash
 capsper --trigger capslock --domain-terms ~/my-terms.txt
