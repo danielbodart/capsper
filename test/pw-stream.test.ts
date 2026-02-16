@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll } from "bun:test";
 import { $, spawn, file } from "bun";
-import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer } from "./helpers";
+import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, trackProc } from "./helpers";
 
 const gpu = await hasGpu();
 
@@ -22,6 +22,7 @@ describe.skipIf(!gpu)("pw-stream", () => {
             `--playback-props=media.class=Audio/Source node.name=${LOOPBACK_SOURCE}`,
             "-C", "1", "-m", "MONO",
         ], { stdout: "ignore", stderr: "ignore" });
+        trackProc(loopback);
 
         await Bun.sleep(1000);
 
@@ -47,6 +48,7 @@ describe.skipIf(!gpu)("pw-stream", () => {
                     "--rate=16000", "--channels=1", "--format=s16",
                     wavFile,
                 ], { stdout: "ignore", stderr: "ignore" });
+                trackProc(pwcat);
 
                 await pwcat.exited;
 

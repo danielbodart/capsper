@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll } from "bun:test";
 import { spawn, file } from "bun";
 import { $ } from "bun";
 import { existsSync } from "fs";
-import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, normalize, compareWords } from "./helpers";
+import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, normalize, compareWords, trackProc } from "./helpers";
 
 const gpu = await hasGpu();
 
@@ -28,6 +28,7 @@ describe.skipIf(!gpu)("compare", () => {
             `--playback-props=media.class=Audio/Source node.name=${LOOPBACK_SOURCE}`,
             "-C", "1", "-m", "MONO",
         ], { stdout: "ignore", stderr: "ignore" });
+        trackProc(loopback);
 
         await Bun.sleep(1000);
 
@@ -65,6 +66,7 @@ describe.skipIf(!gpu)("compare", () => {
                     "--rate=16000", "--channels=1", "--format=s16",
                     wav,
                 ], { stdout: "ignore", stderr: "ignore" });
+                trackProc(pwcat);
 
                 await pwcat.exited;
 

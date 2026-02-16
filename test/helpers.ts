@@ -9,6 +9,27 @@ export const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
 export const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
 export const WARMUP_FILE = "test/jfk.wav";
 
+// Track all spawned child processes so we can kill them on exit/signal.
+// Prevents orphaned capsper processes holding GPU memory after Ctrl+C.
+const childProcs = new Set<ReturnType<typeof spawn>>();
+
+function killAllChildren() {
+    for (const proc of childProcs) {
+        try { proc.kill(); } catch {}
+        try { proc.kill(9); } catch {}
+    }
+    childProcs.clear();
+}
+
+process.on("exit", killAllChildren);
+process.on("SIGINT", () => { killAllChildren(); process.exit(1); });
+process.on("SIGTERM", () => { killAllChildren(); process.exit(1); });
+
+export function trackProc(proc: ReturnType<typeof spawn>): void {
+    childProcs.add(proc);
+    proc.exited.then(() => childProcs.delete(proc));
+}
+
 export async function hasGpu(): Promise<boolean> {
     const { exitCode } = await $`nvidia-smi`.quiet().nothrow();
     return exitCode === 0;
@@ -43,8 +64,10 @@ export async function startServer(args: string[]): Promise<{ proc: ReturnType<ty
         stdout: Bun.file(logFile),
         stderr: Bun.file(logFile),
     });
+    trackProc(proc);
 
     const kill = () => {
+        childProcs.delete(proc);
         proc.kill();
         try { proc.kill(9); } catch {}
     };
@@ -70,8 +93,10 @@ export async function startLocalServer(args: string[]): Promise<{ proc: ReturnTy
         stdout: Bun.file(outputFile),
         stderr: Bun.file(logFile),
     });
+    trackProc(proc);
 
     const kill = () => {
+        childProcs.delete(proc);
         proc.kill();
         try { proc.kill(9); } catch {}
     };
