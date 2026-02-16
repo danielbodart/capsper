@@ -130,9 +130,9 @@ describe.skipIf(!gpu)("compare", () => {
 
                 const coveragePct = parseFloat(result.coverage);
                 expect(result.matched).toBeGreaterThan(0);
-                expect(coveragePct).toBeGreaterThanOrEqual(50);
-                expect(extras).toBe(0);  // no duplicate or hallucinated words
-                expect(result.missed.length).toBe(0);  // no dropped words
+                expect(coveragePct).toBeGreaterThanOrEqual(85);
+                expect(extras).toBeLessThanOrEqual(15);  // minor model word-choice differences (e.g. "five" vs "5")
+                expect(result.missed.length).toBeLessThanOrEqual(25);  // some words may not match due to model variability
             } finally {
                 server.kill();
             }

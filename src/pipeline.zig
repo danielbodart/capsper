@@ -42,6 +42,10 @@ pub const Pipeline = struct {
     // Domain terms pre-tokenized (owned by caller, must outlive Pipeline)
     prompt_tokens: []const c.whisper_token,
 
+    // Accumulated tokens from previous decode cycles within the current VAD segment.
+    // Fed as forced prefix (context) in subsequent transcribe() calls for consistency.
+    accumulated_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
+
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: *c.whisper_context,
@@ -71,7 +75,20 @@ pub const Pipeline = struct {
     }
 
     pub fn deinit(self: *Pipeline) void {
+        self.accumulated_tokens.deinit(self.allocator);
         c.whisper_free_state(self.state);
+    }
+
+    /// Append confirmed tokens to the accumulated context.
+    /// Called by the server after emitting words — the confirmed tokens become
+    /// forced prefix for subsequent decode cycles, ensuring consistency.
+    pub fn commitTokens(self: *Pipeline, tokens: []const c.whisper_token) !void {
+        try self.accumulated_tokens.appendSlice(self.allocator, tokens);
+    }
+
+    /// Clear accumulated tokens (on VAD segment boundary / flush).
+    pub fn resetSegment(self: *Pipeline) void {
+        self.accumulated_tokens.clearRetainingCapacity();
     }
 
     fn msFromNs(start: i128) f64 {
@@ -80,18 +97,28 @@ pub const Pipeline = struct {
     }
 
     /// Transcribe audio samples using AlignAtt streaming policy.
-    /// Each call is a fresh decode — no state persists between calls.
-    /// is_last=true uses a tighter stopping threshold and skips word truncation.
-    /// context_tokens: previously decoded tokens to use as prompt (improves consistency).
+    /// Uses accumulated_tokens (from previous commitTokens calls) as forced prefix
+    /// for decoder consistency. is_last=true uses a tighter stopping threshold and
+    /// skips word truncation.
     pub fn transcribe(
         self: *Pipeline,
         samples: []const f32,
         is_last: bool,
     ) !?TranscribeResult {
-        return self.transcribeWithContext(samples, is_last, &.{});
+        return self.transcribeInternal(samples, is_last, self.accumulated_tokens.items);
     }
 
+    /// Transcribe with explicit context tokens (for testing or direct control).
     pub fn transcribeWithContext(
+        self: *Pipeline,
+        samples: []const f32,
+        is_last: bool,
+        context_tokens: []const c.whisper_token,
+    ) !?TranscribeResult {
+        return self.transcribeInternal(samples, is_last, context_tokens);
+    }
+
+    fn transcribeInternal(
         self: *Pipeline,
         samples: []const f32,
         is_last: bool,
@@ -137,35 +164,34 @@ pub const Pipeline = struct {
         }
         timing.encode_ms = msFromNs(t_encode);
 
-        // Step 3: Build prompt matching whisper.cpp convention:
-        //   [startofprev] [prompt_tokens...] [context_tokens...] [sot] [lang] [transcribe] [notimestamps]
-        // prompt_tokens: domain terms that bias the decoder toward specific vocabulary.
-        // context_tokens: previously decoded tokens for consistency between cycles.
-        // startofprev is only included when there are prompt or context tokens.
+        // Step 3: Build prompt:
+        //   [sot_prev] [domain_terms...] [sot] [lang] [transcribe] [notimestamps] [context_tokens...]
+        // domain_terms: go before [sot] in the <|startofprev|> section for conditioning.
+        // context_tokens: go AFTER [notimestamps] as forced decoder output — the model
+        // processes them as its own previous output, building KV cache state, so
+        // autoregressive generation continues from where the previous cycle left off.
         const sot_seq = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
-        const max_prefix: usize = 219; // Token budget for prompt + context (448 - 4 sot_seq - 1 startofprev - 224 max_decode)
-        const prompt_len = @min(self.prompt_tokens.len, max_prefix);
-        const max_context = max_prefix - prompt_len;
+        const max_forced: usize = 219; // Token budget for domain + context (448 - 4 sot_seq - 1 startofprev - 224 max_decode)
+        const prompt_len = @min(self.prompt_tokens.len, max_forced);
+        const max_context = max_forced - prompt_len;
         const ctx_len = @min(context_tokens.len, max_context);
-        const has_prefix = prompt_len > 0 or ctx_len > 0;
-        const prefix_len: usize = if (has_prefix) 1 + prompt_len + ctx_len else 0; // 1 for startofprev
+        const has_domain = prompt_len > 0;
+        const domain_prefix_len: usize = if (has_domain) 1 + prompt_len else 0; // 1 for startofprev
 
-        const full_prompt = try self.allocator.alloc(c.whisper_token, prefix_len + sot_seq.len);
+        const full_prompt = try self.allocator.alloc(c.whisper_token, domain_prefix_len + sot_seq.len + ctx_len);
         defer self.allocator.free(full_prompt);
         var pos: usize = 0;
-        if (has_prefix) {
+        if (has_domain) {
             full_prompt[pos] = self.sot_prev;
             pos += 1;
-            if (prompt_len > 0) {
-                @memcpy(full_prompt[pos..][0..prompt_len], self.prompt_tokens[0..prompt_len]);
-                pos += prompt_len;
-            }
-            if (ctx_len > 0) {
-                @memcpy(full_prompt[pos..][0..ctx_len], context_tokens[context_tokens.len - ctx_len ..]);
-                pos += ctx_len;
-            }
+            @memcpy(full_prompt[pos..][0..prompt_len], self.prompt_tokens[0..prompt_len]);
+            pos += prompt_len;
         }
         @memcpy(full_prompt[pos..][0..sot_seq.len], &sot_seq);
+        pos += sot_seq.len;
+        if (ctx_len > 0) {
+            @memcpy(full_prompt[pos..][0..ctx_len], context_tokens[context_tokens.len - ctx_len ..]);
+        }
 
         // Decode prompt in two parts: batch the first N-1 tokens, then decode the
         // last token separately. whisper.cpp only populates logits for the last token
