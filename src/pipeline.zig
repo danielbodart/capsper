@@ -44,8 +44,14 @@ pub const Pipeline = struct {
     prompt_tokens: []const c.whisper_token,
 
     // Accumulated tokens from previous decode cycles within the current VAD segment.
-    // Fed as forced prefix (context) in subsequent transcribe() calls for consistency.
+    // Fed as forced decoder output AFTER [notimestamps] for consistency.
+    // These only correspond to audio currently in the buffer.
     accumulated_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
+
+    // Context tokens from audio that has been trimmed from the buffer.
+    // Fed as conditioning BEFORE [sot] (in the <|startofprev|> section).
+    // The model uses these as a hint but isn't forced to reproduce them.
+    context_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
 
     // Incremental mel spectrogram cache. Persists across transcribe cycles within
     // a VAD segment; reset on segment boundary or 15s buffer trim.
@@ -83,6 +89,7 @@ pub const Pipeline = struct {
     pub fn deinit(self: *Pipeline) void {
         self.mel_buffer.deinit();
         self.accumulated_tokens.deinit(self.allocator);
+        self.context_tokens.deinit(self.allocator);
         c.whisper_free_state(self.state);
     }
 
@@ -93,20 +100,28 @@ pub const Pipeline = struct {
         try self.accumulated_tokens.appendSlice(self.allocator, tokens);
     }
 
-    /// Clear accumulated tokens and mel cache (on VAD segment boundary / flush).
+    /// Clear accumulated tokens, context tokens, and mel cache (on VAD segment boundary / flush).
     pub fn resetSegment(self: *Pipeline) void {
         self.accumulated_tokens.clearRetainingCapacity();
+        self.context_tokens.clearRetainingCapacity();
         self.mel_buffer.reset();
     }
 
-    /// Drop tokens from the front proportional to the fraction of audio trimmed.
-    /// Called after trimBuffer removes audio from the front of the PCM buffer.
-    /// Keeps remaining tokens approximately aligned with the remaining audio.
-    pub fn trimAccumulatedTokens(self: *Pipeline, trimmed_bytes: usize, old_buffer_bytes: usize) void {
+    /// Demote tokens from accumulated (forced) to context (conditioning) when audio
+    /// is trimmed from the front of the buffer. The trimmed audio's tokens move to
+    /// the <|startofprev|> section (before [sot]) where they serve as a hint to the
+    /// model without being forced as output. This avoids the misalignment that
+    /// proportional dropping caused (hallucination / EOT at buffer boundary).
+    pub fn demoteTokens(self: *Pipeline, trimmed_bytes: usize, old_buffer_bytes: usize) !void {
         const n = self.accumulated_tokens.items.len;
         if (n == 0 or trimmed_bytes == 0 or old_buffer_bytes == 0) return;
         const drop = @min(n, n * trimmed_bytes / old_buffer_bytes);
         if (drop == 0) return;
+
+        // Move front tokens to context (conditioning)
+        try self.context_tokens.appendSlice(self.allocator, self.accumulated_tokens.items[0..drop]);
+
+        // Shift remaining tokens to front
         const remaining = n - drop;
         std.mem.copyForwards(
             c.whisper_token,
@@ -133,21 +148,21 @@ pub const Pipeline = struct {
         return self.transcribeInternal(samples, is_last, self.accumulated_tokens.items);
     }
 
-    /// Transcribe with explicit context tokens (for testing or direct control).
+    /// Transcribe with explicit forced tokens (for testing or direct control).
     pub fn transcribeWithContext(
         self: *Pipeline,
         samples: []const f32,
         is_last: bool,
-        context_tokens: []const c.whisper_token,
+        forced_tokens: []const c.whisper_token,
     ) !?TranscribeResult {
-        return self.transcribeInternal(samples, is_last, context_tokens);
+        return self.transcribeInternal(samples, is_last, forced_tokens);
     }
 
     fn transcribeInternal(
         self: *Pipeline,
         samples: []const f32,
         is_last: bool,
-        context_tokens: []const c.whisper_token,
+        forced_tokens: []const c.whisper_token,
     ) !?TranscribeResult {
         const t_total = std.time.nanoTimestamp();
         var timing = Timing{};
@@ -179,33 +194,53 @@ pub const Pipeline = struct {
         }
         timing.encode_ms = msFromNs(t_encode);
 
-        // Step 3: Build prompt:
-        //   [sot_prev] [domain_terms...] [sot] [lang] [transcribe] [notimestamps] [context_tokens...]
-        // domain_terms: go before [sot] in the <|startofprev|> section for conditioning.
-        // context_tokens: go AFTER [notimestamps] as forced decoder output — the model
-        // processes them as its own previous output, building KV cache state, so
-        // autoregressive generation continues from where the previous cycle left off.
+        // Step 3: Build prompt — two-tier token system:
+        //   [sot_prev] [domain_terms...] [context_tokens...] [sot] [lang] [transcribe] [notimestamps] [forced_tokens...]
+        //
+        // Before [sot] (<|startofprev|> section) = conditioning:
+        //   - domain_terms: fixed vocabulary hints (protected from trimming)
+        //   - context_tokens: tokens from audio that was trimmed from the buffer;
+        //     the model uses these as a hint but isn't forced to reproduce them
+        //
+        // After [notimestamps] = forced decoder output:
+        //   - forced_tokens: tokens corresponding to audio still in the buffer;
+        //     the model processes these as its own previous output, building KV cache
+        //     state, so autoregressive generation continues from where it left off
         const sot_seq = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
-        const max_forced: usize = 219; // Token budget for domain + context (448 - 4 sot_seq - 1 startofprev - 224 max_decode)
-        const prompt_len = @min(self.prompt_tokens.len, max_forced);
-        const max_context = max_forced - prompt_len;
-        const ctx_len = @min(context_tokens.len, max_context);
-        const has_domain = prompt_len > 0;
-        const domain_prefix_len: usize = if (has_domain) 1 + prompt_len else 0; // 1 for startofprev
+        const max_decode: usize = 224;
+        const total_budget: usize = 448 - sot_seq.len - max_decode; // tokens available for prefix sections
 
-        const full_prompt = try self.allocator.alloc(c.whisper_token, domain_prefix_len + sot_seq.len + ctx_len);
+        // Allocate budget: domain terms first (protected), then context, then forced
+        const domain_len = @min(self.prompt_tokens.len, total_budget);
+        const context_budget = total_budget - domain_len;
+        const ctx_len = @min(self.context_tokens.items.len, context_budget);
+        const forced_budget = context_budget - ctx_len;
+        const forced_len = @min(forced_tokens.len, forced_budget);
+
+        // Need [sot_prev] prefix if we have any conditioning tokens (domain or context)
+        const has_conditioning = domain_len > 0 or ctx_len > 0;
+        const prefix_len: usize = if (has_conditioning) 1 + domain_len + ctx_len else 0;
+
+        const full_prompt = try self.allocator.alloc(c.whisper_token, prefix_len + sot_seq.len + forced_len);
         defer self.allocator.free(full_prompt);
         var pos: usize = 0;
-        if (has_domain) {
+        if (has_conditioning) {
             full_prompt[pos] = self.sot_prev;
             pos += 1;
-            @memcpy(full_prompt[pos..][0..prompt_len], self.prompt_tokens[0..prompt_len]);
-            pos += prompt_len;
+            if (domain_len > 0) {
+                @memcpy(full_prompt[pos..][0..domain_len], self.prompt_tokens[0..domain_len]);
+                pos += domain_len;
+            }
+            if (ctx_len > 0) {
+                // Use most recent context tokens (trim from front when budget exceeded)
+                @memcpy(full_prompt[pos..][0..ctx_len], self.context_tokens.items[self.context_tokens.items.len - ctx_len ..]);
+                pos += ctx_len;
+            }
         }
         @memcpy(full_prompt[pos..][0..sot_seq.len], &sot_seq);
         pos += sot_seq.len;
-        if (ctx_len > 0) {
-            @memcpy(full_prompt[pos..][0..ctx_len], context_tokens[context_tokens.len - ctx_len ..]);
+        if (forced_len > 0) {
+            @memcpy(full_prompt[pos..][0..forced_len], forced_tokens[forced_tokens.len - forced_len ..]);
         }
 
         // Decode prompt in two parts: batch the first N-1 tokens, then decode the
@@ -310,29 +345,35 @@ pub const Pipeline = struct {
             // Update the frame for this token
             token_frames.items[token_frames.items.len - 1] = most_attended;
 
-            const decision = alignatt.checkStopping(
-                most_attended, content_frames, last_attend_frame, is_last, self.config,
-            );
-            last_attend_frame = most_attended;
+            // On flush (is_last), skip attention-based stopping entirely — let the
+            // model run to EOT. The forced prefix anchors output, and stopping early
+            // drops trailing words (the token that triggers attn_end gets stripped).
+            // SimulStreaming also skips rewind detection on is_last for the same reason.
+            if (!is_last) {
+                const decision = alignatt.checkStopping(
+                    most_attended, content_frames, last_attend_frame, is_last, self.config,
+                );
 
-            switch (decision) {
-                .stop_attention_at_end => {
-                    // Strip the token that triggered the stop
-                    if (generated.items.len > 0) {
-                        _ = generated.pop();
-                        _ = token_frames.pop();
-                    }
-                    timing.stop_reason = "attn_end";
-                    break;
-                },
-                .rewind_detected => {
-                    std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
-                    was_rewind = true;
-                    timing.stop_reason = "rewind";
-                    break;
-                },
-                .continue_decoding => {},
+                switch (decision) {
+                    .stop_attention_at_end => {
+                        // Strip the token that triggered the stop
+                        if (generated.items.len > 0) {
+                            _ = generated.pop();
+                            _ = token_frames.pop();
+                        }
+                        timing.stop_reason = "attn_end";
+                        break;
+                    },
+                    .rewind_detected => {
+                        std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
+                        was_rewind = true;
+                        timing.stop_reason = "rewind";
+                        break;
+                    },
+                    .continue_decoding => {},
+                }
             }
+            last_attend_frame = most_attended;
         }
 
         timing.decode_ms = msFromNs(t_decode);
@@ -354,7 +395,7 @@ pub const Pipeline = struct {
         // Truncate last (potentially incomplete) word — but only when there's no
         // forced prefix. With accumulated tokens, the prefix already anchors prior
         // words, and truncation of short continuations causes emission deadlocks.
-        if (!is_last and n_tokens_to_use > 0 and context_tokens.len == 0) {
+        if (!is_last and n_tokens_to_use > 0 and forced_tokens.len == 0) {
             n_tokens_to_use = truncateLastWord(self.ctx, generated.items);
         }
         if (n_tokens_to_use == 0) return null;
