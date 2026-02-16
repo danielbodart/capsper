@@ -76,15 +76,14 @@ pub const Recorder = struct {
         state_name: []const u8,
         buf_ms: usize,
         word_count: usize,
-        stable_count: usize,
         text: []const u8,
     ) void {
         if (!self.active) return;
         var ts_buf: [32]u8 = undefined;
         const ts = formatElapsed(&ts_buf, start_ns);
         const w = self.diag_buf.writer(self.allocator);
-        std.fmt.format(w, "[{s}s] cycle={d} {s} buf={d}ms words={d} stable={d} | \"{s}\"\n", .{
-            ts, cycle, state_name, buf_ms, word_count, stable_count, utils.textPreview(text),
+        std.fmt.format(w, "[{s}s] cycle={d} {s} buf={d}ms words={d} | \"{s}\"\n", .{
+            ts, cycle, state_name, buf_ms, word_count, utils.textPreview(text),
         }) catch {};
     }
 

@@ -281,7 +281,7 @@ pub const Server = struct {
                                 defer self.allocator.free(delta);
                                 emitDelta(output_fd, start_ns, delta, type_cb, self.recorder) catch {};
                                 if (self.recorder) |rec| {
-                                    rec.logCycle(start_ns, cycle_count, "FINAL", pcm_buf.items.len * 1000 / 32000, result.words.len, result.words.len, result.text);
+                                    rec.logCycle(start_ns, cycle_count, "FINAL", pcm_buf.items.len * 1000 / 32000, result.words.len, result.text);
                                 }
                             }
                         }
@@ -429,7 +429,7 @@ pub const Server = struct {
                                     .trailing_silence => "trailing",
                                     .idle => "idle",
                                 };
-                                rec.logCycle(start_ns, cycle_count, state_name, buf_duration_ms, result.words.len, result.words.len, result.text);
+                                rec.logCycle(start_ns, cycle_count, state_name, buf_duration_ms, result.words.len, result.text);
                             }
                         } else if (self.verbose) {
                             const ts = formatElapsed(&ts_buf, start_ns);
