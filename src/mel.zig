@@ -10,7 +10,7 @@ pub const WHISPER_N_FRAMES: usize = 3000; // 30s at 100fps
 
 /// Incremental mel spectrogram buffer.
 /// Computes only new mel frames as audio grows, caches previous frames.
-/// Produces output compatible with whisper_set_mel_with_state().
+/// Maintains a persistent output buffer for whisper_set_mel_with_state().
 pub const MelBuffer = struct {
     allocator: std.mem.Allocator,
     n_mel: usize, // 80 or 128, determined at runtime from model
@@ -27,6 +27,10 @@ pub const MelBuffer = struct {
     raw_mel: std.ArrayListUnmanaged(f32) = .{},
     n_computed: usize = 0,
 
+    // Persistent output buffer [n_mel * WHISPER_N_FRAMES] — row-major by mel band.
+    // Reused across cycles to avoid per-cycle allocation.
+    output_buf: []f32,
+
     // Audio samples (the full growing buffer). Stored so we can access any sample
     // for frame computation (frames near the boundary overlap old + new samples).
     samples: []const f32 = &.{},
@@ -36,6 +40,9 @@ pub const MelBuffer = struct {
         errdefer allocator.free(filters);
         computeMelFilters(filters, n_mel);
 
+        const output_buf = try allocator.alloc(f32, n_mel * WHISPER_N_FRAMES);
+        errdefer allocator.free(output_buf);
+
         var hann: [N_FFT]f32 = undefined;
         computeHannWindow(&hann);
 
@@ -44,10 +51,12 @@ pub const MelBuffer = struct {
             .n_mel = n_mel,
             .filters = filters,
             .hann = hann,
+            .output_buf = output_buf,
         };
     }
 
     pub fn deinit(self: *MelBuffer) void {
+        self.allocator.free(self.output_buf);
         self.raw_mel.deinit(self.allocator);
         self.allocator.free(self.filters);
     }
@@ -90,39 +99,31 @@ pub const MelBuffer = struct {
         return new_frame_count;
     }
 
-    /// Export normalized mel in whisper.cpp format.
-    /// Output layout: row-major by mel band — output[band * n_total + frame].
-    /// Pads with silence (normalized log10(1e-10)) to n_total frames.
-    pub fn exportForWhisper(self: *const MelBuffer, output: []f32, n_total: usize) void {
-        std.debug.assert(output.len == self.n_mel * n_total);
+    /// Normalize cached raw mel into the persistent output buffer.
+    /// Output layout: row-major by mel band — output[band * WHISPER_N_FRAMES + frame].
+    /// Pads with silence to WHISPER_N_FRAMES (30s). Returns the buffer directly.
+    pub fn exportForWhisper(self: *MelBuffer) []f32 {
+        const silence_raw: f32 = comptime @floatCast(@log10(1e-10));
 
         // Find global max across all cached raw frames
-        var mmax: f32 = -1e20;
+        var mmax: f32 = silence_raw;
         for (self.raw_mel.items) |v| {
             if (v > mmax) mmax = v;
         }
 
-        // Silence frames have raw value log10(1e-10) = -10
-        const silence_raw: f32 = comptime @floatCast(@log10(1e-10));
-
-        // Handle empty buffer edge case
-        if (self.n_computed == 0) mmax = silence_raw;
-
         const clamp_floor = mmax - 8.0;
+        const silence_norm = (@max(silence_raw, clamp_floor) + 4.0) / 4.0;
 
-        // Write output in row-major-by-mel-band layout with normalization
         for (0..self.n_mel) |band| {
-            const row_start = band * n_total;
-            for (0..n_total) |frame| {
-                const raw = if (frame < self.n_computed)
-                    self.raw_mel.items[frame * self.n_mel + band]
-                else
-                    silence_raw;
-
-                const clamped = @max(raw, clamp_floor);
-                output[row_start + frame] = (clamped + 4.0) / 4.0;
+            const row_start = band * WHISPER_N_FRAMES;
+            for (0..self.n_computed) |frame| {
+                const raw = self.raw_mel.items[frame * self.n_mel + band];
+                self.output_buf[row_start + frame] = (@max(raw, clamp_floor) + 4.0) / 4.0;
             }
+            @memset(self.output_buf[row_start + self.n_computed .. row_start + WHISPER_N_FRAMES], silence_norm);
         }
+
+        return self.output_buf;
     }
 
     fn computeFrame(
@@ -519,10 +520,9 @@ test "MelBuffer export format" {
 
     _ = try buf.addSamples(&samples);
 
-    // Export to whisper format (3000 frames)
-    const output = try allocator.alloc(f32, n_mel * WHISPER_N_FRAMES);
-    defer allocator.free(output);
-    buf.exportForWhisper(output, WHISPER_N_FRAMES);
+    // Export uses persistent buffer — no allocation
+    const output = buf.exportForWhisper();
+    try std.testing.expectEqual(n_mel * WHISPER_N_FRAMES, output.len);
 
     // Content frames should have varying values
     var has_variation = false;

@@ -142,17 +142,12 @@ pub const Pipeline = struct {
         timing.state_init_ms = msFromNs(t_state);
 
         // Step 1: Incremental mel spectrogram
-        // Only computes new frames since last cycle; caches previous frames.
+        // Only computes new FFT frames since last cycle; caches previous frames.
         const t_mel = std.time.nanoTimestamp();
         _ = try self.mel_buffer.addSamples(samples);
+        const mel_data = self.mel_buffer.exportForWhisper();
 
-        // Export to whisper.cpp format: [n_mel * 3000] row-major by mel band, padded to 30s
-        const n_mel = self.mel_buffer.n_mel;
-        const mel_data = try self.allocator.alloc(f32, n_mel * mel.WHISPER_N_FRAMES);
-        defer self.allocator.free(mel_data);
-        self.mel_buffer.exportForWhisper(mel_data, mel.WHISPER_N_FRAMES);
-
-        if (c.whisper_set_mel_with_state(self.ctx, self.state, mel_data.ptr, @intCast(mel.WHISPER_N_FRAMES), @intCast(n_mel)) != 0) {
+        if (c.whisper_set_mel_with_state(self.ctx, self.state, mel_data.ptr, @intCast(mel.WHISPER_N_FRAMES), @intCast(self.mel_buffer.n_mel)) != 0) {
             return error.MelFailed;
         }
         timing.mel_ms = msFromNs(t_mel);
