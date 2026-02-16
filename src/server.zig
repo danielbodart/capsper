@@ -410,14 +410,14 @@ pub const Server = struct {
                                 const cycle_ms = msFromNs(t_cycle);
                                 const accum = pipeline.accumulated_tokens.items.len;
                                 if (should_flush) {
-                                    std.debug.print("    [{s}s] cycle={d} FLUSH words={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms\n", .{
+                                    std.debug.print("    [{s}s] cycle={d} FLUSH words={d} buf={d}ms | {s} state={d:.0}ms mel={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms\n", .{
                                         ts, cycle_count, result.words.len, buf_duration_ms,
-                                        utils.textPreview(result.text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
+                                        utils.textPreview(result.text), t.state_init_ms, t.mel_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
                                     });
                                 } else {
-                                    std.debug.print("    [{s}s] cycle={d} words={d} accum={d} buf={d}ms | {s} state={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) cycle={d:.0}ms EMIT\n", .{
+                                    std.debug.print("    [{s}s] cycle={d} words={d} accum={d} buf={d}ms | {s} state={d:.0}ms mel={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) cycle={d:.0}ms EMIT\n", .{
                                         ts, cycle_count, result.words.len, accum, buf_duration_ms,
-                                        utils.textPreview(result.text), t.state_init_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, cycle_ms,
+                                        utils.textPreview(result.text), t.state_init_ms, t.mel_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, cycle_ms,
                                     });
                                 }
                             }

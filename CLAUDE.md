@@ -80,6 +80,17 @@ dist/
 └── install.sh               (committed)
 ```
 
+## Deployment
+
+To update the running capsper service after CI passes:
+
+```bash
+~/.local/share/capsper/capsper-update.sh    # downloads from GitHub Releases, stages, verifies SHA256
+systemctl --user restart capsper             # apply-update.sh runs as ExecStartPre, swaps symlink
+```
+
+Do NOT manually download CI artifacts or stage releases by hand — the update script handles everything.
+
 ## Workflow
 
 **Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test. Use `./run.ts slow-test compare` to get a baseline before and after changes — it gives concrete word coverage numbers to measure improvement.
