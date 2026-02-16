@@ -18,107 +18,19 @@ const word_text_gen = mgen.string(.{
     .custom_chars = "abcdefghij ",
 });
 
-// Generator for text with punctuation (like Whisper with trailing commas/periods)
-const punct_text_gen = mgen.string(.{
-    .min_len = 0,
-    .max_len = 60,
-    .charset = .custom,
-    .custom_chars = "abcdefghij .,!?",
-});
-
-// Pairs of text for two-argument properties
-const text_pair_gen = mgen.tuple2([]const u8, []const u8, word_text_gen, word_text_gen);
-
 // Numeric generators for alignatt
 const frame_gen = mgen.intRange(usize, 0, 1500); // audio frame indices
 const small_frame_gen = mgen.intRange(usize, 1, 200); // small frame counts for attention arrays
-
-// ============================================================================
-// countWords properties
-// ============================================================================
-
-// countWords(text) <= text.len (each word is at least 1 char)
-fn prop_countWords_bounded_by_length(text: []const u8) !void {
-    const count = utils.countWords(text);
-    try std.testing.expect(count <= text.len);
-}
-
-// countWords should be the same regardless of leading/trailing spaces
-fn prop_countWords_ignores_leading_trailing(text: []const u8) !void {
-    const trimmed = std.mem.trim(u8, text, " ");
-    try std.testing.expectEqual(utils.countWords(trimmed), utils.countWords(text));
-}
-
-// ============================================================================
-// byteOffsetAfterWords properties
-// ============================================================================
-
-// byteOffsetAfterWords(text, 0) == 0 always
-fn prop_byteOffset_zero_is_zero(text: []const u8) !void {
-    try std.testing.expectEqual(@as(usize, 0), utils.byteOffsetAfterWords(text, 0));
-}
-
-// byteOffsetAfterWords(text, n) <= text.len for all n
-fn prop_byteOffset_bounded(text: []const u8) !void {
-    const count = utils.countWords(text);
-    // Check a few values: 0, 1, count, count+1
-    for ([_]usize{ 0, 1, count, count + 1, count + 10 }) |n| {
-        const offset = utils.byteOffsetAfterWords(text, n);
-        try std.testing.expect(offset <= text.len);
-    }
-}
-
-// byteOffsetAfterWords is monotonically non-decreasing
-fn prop_byteOffset_monotonic(text: []const u8) !void {
-    const count = utils.countWords(text);
-    var prev: usize = 0;
-    for (0..count + 2) |n| {
-        const offset = utils.byteOffsetAfterWords(text, n);
-        try std.testing.expect(offset >= prev);
-        prev = offset;
-    }
-}
-
-// byteOffsetAfterWords(text, countWords(text)) == text.len when text has no trailing spaces
-fn prop_byteOffset_at_count_is_end(text: []const u8) !void {
-    const trimmed = std.mem.trimRight(u8, text, " ");
-    const count = utils.countWords(trimmed);
-    if (count > 0) {
-        try std.testing.expectEqual(trimmed.len, utils.byteOffsetAfterWords(trimmed, count));
-    }
-}
-
-// ============================================================================
-// wordDelta properties
-// ============================================================================
-
-// wordDelta(text, 0) == text
-fn prop_wordDelta_zero_is_identity(text: []const u8) !void {
-    try std.testing.expectEqualStrings(text, utils.wordDelta(text, 0));
-}
-
-// countWords(wordDelta(text, n)) == countWords(text) - n (when n <= count)
-fn prop_wordDelta_reduces_count(text: []const u8) !void {
-    const trimmed = std.mem.trim(u8, text, " ");
-    const count = utils.countWords(trimmed);
-    if (count >= 2) {
-        const delta = utils.wordDelta(trimmed, 1);
-        const delta_trimmed = std.mem.trimLeft(u8, delta, " ");
-        try std.testing.expectEqual(count - 1, utils.countWords(delta_trimmed));
-    }
-}
 
 // ============================================================================
 // pcmToFloat roundtrip property
 // ============================================================================
 
 // Converting i16 to float should always be in [-1.0, 1.0]
-fn prop_pcmToFloat_range(pair: struct { []const u8, []const u8 }) !void {
-    // Use the first string's bytes as PCM data (reinterpreted)
+fn prop_pcmToFloat_range(data: []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    const data = pair[0];
     if (data.len < 2) return; // need at least one sample
     // Ensure even length
     const even_len = data.len & ~@as(usize, 1);
@@ -138,39 +50,6 @@ fn prop_isBlankOrPunct_length(text: []const u8) !void {
     if (text.len > 1) {
         try std.testing.expect(!utils.isBlankOrPunct(text));
     }
-}
-
-// ============================================================================
-// stripTrailingPunct properties
-// ============================================================================
-
-// Result is always a prefix of the input
-fn prop_stripTrailingPunct_prefix(text: []const u8) !void {
-    const stripped = utils.stripTrailingPunct(text);
-    try std.testing.expect(stripped.len <= text.len);
-    // Must be a prefix (same pointer start, subset of bytes)
-    if (stripped.len > 0) {
-        try std.testing.expectEqualStrings(stripped, text[0..stripped.len]);
-    }
-}
-
-// Stripping is idempotent: strip(strip(x)) == strip(x)
-fn prop_stripTrailingPunct_idempotent(text: []const u8) !void {
-    const once = utils.stripTrailingPunct(text);
-    const twice = utils.stripTrailingPunct(once);
-    try std.testing.expectEqualStrings(once, twice);
-}
-
-// wordsMatchForDedup is reflexive: every word matches itself
-fn prop_wordsMatchForDedup_reflexive(text: []const u8) !void {
-    try std.testing.expect(utils.wordsMatchForDedup(text, text));
-}
-
-// wordsMatchForDedup is symmetric: match(a,b) == match(b,a)
-fn prop_wordsMatchForDedup_symmetric(pair: std.meta.Tuple(&.{ []const u8, []const u8 })) !void {
-    const a = pair[0];
-    const b = pair[1];
-    try std.testing.expectEqual(utils.wordsMatchForDedup(a, b), utils.wordsMatchForDedup(b, a));
 }
 
 // ============================================================================
@@ -209,139 +88,6 @@ fn prop_trimBuffer_preserves_tail(text: []const u8) !void {
         const original_tail = text[text.len - buf.items.len ..];
         try std.testing.expectEqualSlices(u8, original_tail, buf.items);
     }
-}
-
-// ============================================================================
-// Cross-function properties
-// ============================================================================
-
-// byteOffsetAfterWords roundtrip: countWords(text[0..offset(text, n)]) == n
-// for well-formed text (no trailing spaces, n <= word count)
-fn prop_byteOffset_countWords_roundtrip(text: []const u8) !void {
-    const trimmed = std.mem.trim(u8, text, " ");
-    const total = utils.countWords(trimmed);
-    if (total == 0) return;
-
-    for (1..total + 1) |n| {
-        const offset = utils.byteOffsetAfterWords(trimmed, n);
-        const prefix = trimmed[0..offset];
-        const prefix_count = utils.countWords(prefix);
-        try std.testing.expectEqual(n, prefix_count);
-    }
-}
-
-// wordDelta + countWords: emitting wordDelta(text, n) should give us
-// exactly countWords(text) - n words (for well-formed trimmed text)
-fn prop_wordDelta_word_count(text: []const u8) !void {
-    const trimmed = std.mem.trim(u8, text, " ");
-    const total = utils.countWords(trimmed);
-    if (total == 0) return;
-
-    for (0..total + 1) |n| {
-        const delta = utils.wordDelta(trimmed, n);
-        const delta_trimmed = std.mem.trimLeft(u8, delta, " ");
-        try std.testing.expectEqual(total - n, utils.countWords(delta_trimmed));
-    }
-}
-
-// ============================================================================
-// findTimedStableCount properties
-// ============================================================================
-
-// Reflexive: same words always match themselves (tolerance >= 0)
-fn prop_timedStable_reflexive(n: usize) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var prng = std.Random.DefaultPrng.init(@intCast(n));
-    const word_count = 1 + (n % 10); // 1..10 words
-    const words = try allocator.alloc(utils.TimedWord, word_count);
-    defer allocator.free(words);
-
-    var frame: usize = 0;
-    for (words) |*w| {
-        frame += prng.random().intRangeAtMost(usize, 1, 50);
-        w.* = .{ .text_start = 0, .text_end = 1, .frame = frame };
-    }
-
-    // Same words should always fully match with tolerance 0
-    try std.testing.expectEqual(word_count, utils.findTimedStableCount(words, words, 0));
-}
-
-// Larger tolerance never decreases the stable count
-fn prop_timedStable_tolerance_monotonic(n: usize) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var prng = std.Random.DefaultPrng.init(@intCast(n));
-    const count = 1 + (n % 8);
-
-    const prev = try allocator.alloc(utils.TimedWord, count);
-    defer allocator.free(prev);
-    const curr = try allocator.alloc(utils.TimedWord, count);
-    defer allocator.free(curr);
-
-    var frame: usize = 0;
-    for (prev) |*w| {
-        frame += prng.random().intRangeAtMost(usize, 1, 50);
-        w.* = .{ .text_start = 0, .text_end = 1, .frame = frame };
-    }
-    frame = 0;
-    for (curr) |*w| {
-        frame += prng.random().intRangeAtMost(usize, 1, 50);
-        w.* = .{ .text_start = 0, .text_end = 1, .frame = frame };
-    }
-
-    const stable_0 = utils.findTimedStableCount(prev, curr, 0);
-    const stable_5 = utils.findTimedStableCount(prev, curr, 5);
-    const stable_50 = utils.findTimedStableCount(prev, curr, 50);
-
-    try std.testing.expect(stable_0 <= stable_5);
-    try std.testing.expect(stable_5 <= stable_50);
-}
-
-// Empty prev always returns 0
-fn prop_timedStable_empty_prev(n: usize) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const count = 1 + (n % 10);
-    const curr = try allocator.alloc(utils.TimedWord, count);
-    defer allocator.free(curr);
-    for (curr, 0..) |*w, i| {
-        w.* = .{ .text_start = 0, .text_end = 1, .frame = i * 10 };
-    }
-
-    try std.testing.expectEqual(@as(usize, 0), utils.findTimedStableCount(&.{}, curr, 100));
-}
-
-// Result is bounded by min(prev.len, curr.len)
-fn prop_timedStable_bounded(n: usize) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var prng = std.Random.DefaultPrng.init(@intCast(n));
-    const prev_count = 1 + (n % 8);
-    const curr_count = 1 + ((n / 8) % 8);
-
-    const prev = try allocator.alloc(utils.TimedWord, prev_count);
-    defer allocator.free(prev);
-    const curr = try allocator.alloc(utils.TimedWord, curr_count);
-    defer allocator.free(curr);
-
-    for (prev) |*w| {
-        w.* = .{ .text_start = 0, .text_end = 1, .frame = prng.random().intRangeAtMost(usize, 0, 500) };
-    }
-    for (curr) |*w| {
-        w.* = .{ .text_start = 0, .text_end = 1, .frame = prng.random().intRangeAtMost(usize, 0, 500) };
-    }
-
-    const stable = utils.findTimedStableCount(prev, curr, 5);
-    try std.testing.expect(stable <= curr_count);
 }
 
 // ============================================================================
@@ -836,67 +582,19 @@ pub fn main() !void {
 
     std.debug.print("\n=== Property-Based Tests (minish) ===\n\n", .{});
 
-    // countWords
-    std.debug.print("prop: countWords bounded by length... ", .{});
-    try minish.check(allocator, word_text_gen, prop_countWords_bounded_by_length, .{ .num_runs = runs });
-    std.debug.print("prop: countWords ignores leading/trailing spaces... ", .{});
-    try minish.check(allocator, word_text_gen, prop_countWords_ignores_leading_trailing, .{ .num_runs = runs });
-
-    // byteOffsetAfterWords
-    std.debug.print("prop: byteOffset zero is zero... ", .{});
-    try minish.check(allocator, word_text_gen, prop_byteOffset_zero_is_zero, .{ .num_runs = runs });
-    std.debug.print("prop: byteOffset bounded... ", .{});
-    try minish.check(allocator, word_text_gen, prop_byteOffset_bounded, .{ .num_runs = runs });
-    std.debug.print("prop: byteOffset monotonic... ", .{});
-    try minish.check(allocator, word_text_gen, prop_byteOffset_monotonic, .{ .num_runs = runs });
-    std.debug.print("prop: byteOffset at count is end... ", .{});
-    try minish.check(allocator, word_text_gen, prop_byteOffset_at_count_is_end, .{ .num_runs = runs });
-
-    // wordDelta
-    std.debug.print("prop: wordDelta zero is identity... ", .{});
-    try minish.check(allocator, word_text_gen, prop_wordDelta_zero_is_identity, .{ .num_runs = runs });
-    std.debug.print("prop: wordDelta reduces count... ", .{});
-    try minish.check(allocator, word_text_gen, prop_wordDelta_reduces_count, .{ .num_runs = runs });
-
     // pcmToFloat
     std.debug.print("prop: pcmToFloat range... ", .{});
-    try minish.check(allocator, text_pair_gen, prop_pcmToFloat_range, .{ .num_runs = runs });
+    try minish.check(allocator, word_text_gen, prop_pcmToFloat_range, .{ .num_runs = runs });
 
     // isBlankOrPunct
     std.debug.print("prop: isBlankOrPunct length... ", .{});
     try minish.check(allocator, word_text_gen, prop_isBlankOrPunct_length, .{ .num_runs = runs });
-
-    // stripTrailingPunct
-    std.debug.print("prop: stripTrailingPunct is prefix... ", .{});
-    try minish.check(allocator, punct_text_gen, prop_stripTrailingPunct_prefix, .{ .num_runs = runs });
-    std.debug.print("prop: stripTrailingPunct idempotent... ", .{});
-    try minish.check(allocator, punct_text_gen, prop_stripTrailingPunct_idempotent, .{ .num_runs = runs });
-    std.debug.print("prop: wordsMatchForDedup reflexive... ", .{});
-    try minish.check(allocator, punct_text_gen, prop_wordsMatchForDedup_reflexive, .{ .num_runs = runs });
-    std.debug.print("prop: wordsMatchForDedup symmetric... ", .{});
-    try minish.check(allocator, text_pair_gen, prop_wordsMatchForDedup_symmetric, .{ .num_runs = runs });
 
     // trimBuffer
     std.debug.print("prop: trimBuffer bounded... ", .{});
     try minish.check(allocator, word_text_gen, prop_trimBuffer_bounded, .{ .num_runs = runs });
     std.debug.print("prop: trimBuffer preserves tail... ", .{});
     try minish.check(allocator, word_text_gen, prop_trimBuffer_preserves_tail, .{ .num_runs = runs });
-
-    // Deep cross-function properties
-    std.debug.print("prop: byteOffset/countWords roundtrip... ", .{});
-    try minish.check(allocator, word_text_gen, prop_byteOffset_countWords_roundtrip, .{ .num_runs = runs });
-    std.debug.print("prop: wordDelta word count... ", .{});
-    try minish.check(allocator, word_text_gen, prop_wordDelta_word_count, .{ .num_runs = runs });
-
-    // findTimedStableCount
-    std.debug.print("prop: timedStable reflexive... ", .{});
-    try minish.check(allocator, frame_gen, prop_timedStable_reflexive, .{ .num_runs = runs });
-    std.debug.print("prop: timedStable tolerance monotonic... ", .{});
-    try minish.check(allocator, frame_gen, prop_timedStable_tolerance_monotonic, .{ .num_runs = runs });
-    std.debug.print("prop: timedStable empty prev... ", .{});
-    try minish.check(allocator, frame_gen, prop_timedStable_empty_prev, .{ .num_runs = runs });
-    std.debug.print("prop: timedStable bounded... ", .{});
-    try minish.check(allocator, frame_gen, prop_timedStable_bounded, .{ .num_runs = runs });
 
     // textPreview
     std.debug.print("prop: textPreview bounded... ", .{});
@@ -976,5 +674,5 @@ pub fn main() !void {
     std.debug.print("prop: rmsToDb unity... ", .{});
     try minish.check(allocator, pcm_byte_gen, prop_rmsToDb_unity, .{ .num_runs = runs });
 
-    std.debug.print("\nAll 48 property tests passed!\n", .{});
+    std.debug.print("\nAll 30 property tests passed!\n", .{});
 }

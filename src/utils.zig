@@ -1,42 +1,5 @@
 const std = @import("std");
 
-/// Count the number of space-separated words in text.
-pub fn countWords(text: []const u8) usize {
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        while (i < text.len and text[i] == ' ') : (i += 1) {}
-        if (i >= text.len) break;
-        count += 1;
-        while (i < text.len and text[i] != ' ') : (i += 1) {}
-    }
-    return count;
-}
-
-/// Return byte offset in `text` just past the Nth word.
-/// If n >= total words, returns text.len.
-pub fn byteOffsetAfterWords(text: []const u8, n: usize) usize {
-    if (n == 0) return 0;
-    var words: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        // skip spaces
-        while (i < text.len and text[i] == ' ') : (i += 1) {}
-        if (i >= text.len) break;
-        // found a word
-        words += 1;
-        // skip word chars
-        while (i < text.len and text[i] != ' ') : (i += 1) {}
-        if (words == n) return i;
-    }
-    return text.len;
-}
-
-/// Get text from position after `skip_words` to end.
-pub fn wordDelta(text: []const u8, skip_words: usize) []const u8 {
-    return text[byteOffsetAfterWords(text, skip_words)..];
-}
-
 /// Return a short preview of text for logging (first ~60 chars).
 pub fn textPreview(text: []const u8) []const u8 {
     return if (text.len <= 60) text else text[0..60];
@@ -81,25 +44,6 @@ pub fn isBlankOrPunct(text: []const u8) bool {
     return true;
 }
 
-/// Strip trailing punctuation from a word for comparison.
-/// Whisper may change "loop." to "loop" or "so" to "so," between cycles.
-pub fn stripTrailingPunct(word: []const u8) []const u8 {
-    var end = word.len;
-    while (end > 0) {
-        switch (word[end - 1]) {
-            '.', ',', '!', '?', ';', ':' => end -= 1,
-            else => break,
-        }
-    }
-    return word[0..end];
-}
-
-/// Compare two words ignoring case and trailing punctuation.
-/// Used for dedup: "loop." and "Loop" are considered the same word.
-pub fn wordsMatchForDedup(a: []const u8, b: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(stripTrailingPunct(a), stripTrailingPunct(b));
-}
-
 /// A word with its audio frame position from cross-attention analysis.
 /// frame is in encoder frame units (50fps = 20ms/frame).
 pub const TimedWord = struct {
@@ -107,25 +51,6 @@ pub const TimedWord = struct {
     text_end: usize, // byte offset one past last char of word
     frame: usize, // audio frame (relative to PCM buffer start)
 };
-
-/// Count how many words in the contiguous prefix of `curr` have a frame-matching
-/// word in `prev` (within ±tolerance frames). Stops at the first unmatched word.
-pub fn findTimedStableCount(prev: []const TimedWord, curr: []const TimedWord, tolerance: usize) usize {
-    var count: usize = 0;
-    for (curr) |cw| {
-        var matched = false;
-        for (prev) |pw| {
-            const diff = if (cw.frame >= pw.frame) cw.frame - pw.frame else pw.frame - cw.frame;
-            if (diff <= tolerance) {
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) break;
-        count += 1;
-    }
-    return count;
-}
 
 /// Parse a WAV file header from raw bytes. Returns metadata needed to extract samples.
 /// Validates RIFF/WAVE structure, PCM format (audio_format=1), and 16-bit samples.
@@ -252,71 +177,6 @@ pub fn writeWav(writer: anytype, pcm_bytes: []const u8) !void {
 // ============================================================
 // Tests
 // ============================================================
-
-test "countWords: empty string" {
-    try std.testing.expectEqual(@as(usize, 0), countWords(""));
-}
-
-test "countWords: single word" {
-    try std.testing.expectEqual(@as(usize, 1), countWords("hello"));
-}
-
-test "countWords: multiple words" {
-    try std.testing.expectEqual(@as(usize, 4), countWords("the quick brown fox"));
-}
-
-test "countWords: leading and trailing spaces" {
-    try std.testing.expectEqual(@as(usize, 2), countWords("  hello world  "));
-}
-
-test "countWords: multiple spaces between words" {
-    try std.testing.expectEqual(@as(usize, 3), countWords("one   two   three"));
-}
-
-test "countWords: only spaces" {
-    try std.testing.expectEqual(@as(usize, 0), countWords("     "));
-}
-
-test "byteOffsetAfterWords: n=0 returns 0" {
-    try std.testing.expectEqual(@as(usize, 0), byteOffsetAfterWords("hello world", 0));
-}
-
-test "byteOffsetAfterWords: n=1 past first word" {
-    try std.testing.expectEqual(@as(usize, 5), byteOffsetAfterWords("hello world", 1));
-}
-
-test "byteOffsetAfterWords: n=2 past second word" {
-    try std.testing.expectEqual(@as(usize, 11), byteOffsetAfterWords("hello world", 2));
-}
-
-test "byteOffsetAfterWords: n exceeds words returns text.len" {
-    try std.testing.expectEqual(@as(usize, 5), byteOffsetAfterWords("hello", 5));
-}
-
-test "byteOffsetAfterWords: leading spaces" {
-    // "  hello world" — skip 2 spaces, "hello" is chars 2..7
-    try std.testing.expectEqual(@as(usize, 7), byteOffsetAfterWords("  hello world", 1));
-}
-
-test "byteOffsetAfterWords: empty string" {
-    try std.testing.expectEqual(@as(usize, 0), byteOffsetAfterWords("", 1));
-}
-
-test "wordDelta: skip 0 returns full text" {
-    try std.testing.expectEqualStrings("hello world", wordDelta("hello world", 0));
-}
-
-test "wordDelta: skip 1 returns from second word" {
-    try std.testing.expectEqualStrings(" world", wordDelta("hello world", 1));
-}
-
-test "wordDelta: skip all returns empty" {
-    try std.testing.expectEqualStrings("", wordDelta("hello world", 2));
-}
-
-test "wordDelta: skip more than total returns empty" {
-    try std.testing.expectEqualStrings("", wordDelta("hello", 5));
-}
 
 test "textPreview: short text unchanged" {
     try std.testing.expectEqualStrings("hello", textPreview("hello"));
@@ -461,164 +321,6 @@ test "isBlankOrPunct: two-char punct rejected (len > 1)" {
 
 test "isBlankOrPunct: word starting with space" {
     try std.testing.expect(!isBlankOrPunct(" the"));
-}
-
-// --- stripTrailingPunct tests ---
-
-test "stripTrailingPunct: no punctuation" {
-    try std.testing.expectEqualStrings("hello", stripTrailingPunct("hello"));
-}
-
-test "stripTrailingPunct: single period" {
-    try std.testing.expectEqualStrings("loop", stripTrailingPunct("loop."));
-}
-
-test "stripTrailingPunct: comma" {
-    try std.testing.expectEqualStrings("so", stripTrailingPunct("so,"));
-}
-
-test "stripTrailingPunct: multiple punct" {
-    try std.testing.expectEqualStrings("what", stripTrailingPunct("what?!"));
-}
-
-test "stripTrailingPunct: all punct" {
-    try std.testing.expectEqualStrings("", stripTrailingPunct("..."));
-}
-
-test "stripTrailingPunct: empty string" {
-    try std.testing.expectEqualStrings("", stripTrailingPunct(""));
-}
-
-test "stripTrailingPunct: mid-word punct preserved" {
-    try std.testing.expectEqualStrings("don't", stripTrailingPunct("don't"));
-}
-
-test "stripTrailingPunct: semicolon and colon" {
-    try std.testing.expectEqualStrings("note", stripTrailingPunct("note;"));
-    try std.testing.expectEqualStrings("step", stripTrailingPunct("step:"));
-}
-
-// --- wordsMatchForDedup tests ---
-
-test "wordsMatchForDedup: identical" {
-    try std.testing.expect(wordsMatchForDedup("loop", "loop"));
-}
-
-test "wordsMatchForDedup: punct difference" {
-    try std.testing.expect(wordsMatchForDedup("loop.", "loop"));
-    try std.testing.expect(wordsMatchForDedup("loop", "loop."));
-}
-
-test "wordsMatchForDedup: case difference" {
-    try std.testing.expect(wordsMatchForDedup("So", "so"));
-    try std.testing.expect(wordsMatchForDedup("AND", "and"));
-}
-
-test "wordsMatchForDedup: case and punct" {
-    try std.testing.expect(wordsMatchForDedup("So,", "so"));
-    try std.testing.expect(wordsMatchForDedup("Good.", "good"));
-}
-
-test "wordsMatchForDedup: different words" {
-    try std.testing.expect(!wordsMatchForDedup("loop", "look"));
-    try std.testing.expect(!wordsMatchForDedup("the", "they"));
-}
-
-test "wordsMatchForDedup: empty strings" {
-    try std.testing.expect(wordsMatchForDedup("", ""));
-    // All-punct matches empty
-    try std.testing.expect(wordsMatchForDedup("...", ""));
-}
-
-// --- findTimedStableCount tests ---
-
-test "findTimedStableCount: identical words" {
-    const words = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-        .{ .text_start = 4, .text_end = 7, .frame = 20 },
-        .{ .text_start = 8, .text_end = 11, .frame = 30 },
-    };
-    try std.testing.expectEqual(@as(usize, 3), findTimedStableCount(&words, &words, 0));
-}
-
-test "findTimedStableCount: within tolerance" {
-    const prev = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-        .{ .text_start = 4, .text_end = 7, .frame = 20 },
-    };
-    const curr = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 12 },
-        .{ .text_start = 4, .text_end = 7, .frame = 24 },
-    };
-    try std.testing.expectEqual(@as(usize, 2), findTimedStableCount(&prev, &curr, 5));
-}
-
-test "findTimedStableCount: outside tolerance" {
-    const prev = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-    };
-    const curr = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 20 },
-    };
-    try std.testing.expectEqual(@as(usize, 0), findTimedStableCount(&prev, &curr, 5));
-}
-
-test "findTimedStableCount: stops at first unstable" {
-    const prev = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-        .{ .text_start = 4, .text_end = 7, .frame = 100 },
-        .{ .text_start = 8, .text_end = 11, .frame = 30 },
-    };
-    const curr = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-        .{ .text_start = 4, .text_end = 7, .frame = 20 },
-        .{ .text_start = 8, .text_end = 11, .frame = 30 },
-    };
-    try std.testing.expectEqual(@as(usize, 1), findTimedStableCount(&prev, &curr, 5));
-}
-
-test "findTimedStableCount: empty prev" {
-    const curr = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-    };
-    try std.testing.expectEqual(@as(usize, 0), findTimedStableCount(&.{}, &curr, 5));
-}
-
-test "findTimedStableCount: empty curr" {
-    const prev = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-    };
-    try std.testing.expectEqual(@as(usize, 0), findTimedStableCount(&prev, &.{}, 5));
-}
-
-test "findTimedStableCount: tolerance zero requires exact match" {
-    const prev = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-    };
-    const curr_exact = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-    };
-    const curr_off = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 11 },
-    };
-    try std.testing.expectEqual(@as(usize, 1), findTimedStableCount(&prev, &curr_exact, 0));
-    try std.testing.expectEqual(@as(usize, 0), findTimedStableCount(&prev, &curr_off, 0));
-}
-
-test "findTimedStableCount: matches any prev word not just positional" {
-    // curr[0] at frame 50 matches prev[2] at frame 50 (not positional)
-    const prev = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 10 },
-        .{ .text_start = 4, .text_end = 7, .frame = 30 },
-        .{ .text_start = 8, .text_end = 11, .frame = 50 },
-    };
-    const curr = [_]TimedWord{
-        .{ .text_start = 0, .text_end = 3, .frame = 50 },
-        .{ .text_start = 4, .text_end = 7, .frame = 60 },
-    };
-    // curr[0] frame=50 matches prev[2] frame=50 → stable
-    // curr[1] frame=60 no match (closest is 50, diff=10 > 5) → unstable
-    try std.testing.expectEqual(@as(usize, 1), findTimedStableCount(&prev, &curr, 5));
 }
 
 // --- parseWavHeader tests ---

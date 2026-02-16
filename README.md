@@ -12,7 +12,7 @@ Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://g
 
 1. A single Zig binary grabs your keyboard via evdev, intercepts CapsLock as push-to-talk
 2. Audio is captured directly via PipeWire while the trigger key is held
-3. Incremental transcription runs on the GPU with VAD (Silero, on CPU) and word-level stability checking
+3. Incremental transcription runs on the GPU with VAD (Silero, on CPU) and token accumulation for consistency
 4. Transcribed text is injected as keystrokes via uinput into the focused window
 
 ## Requirements
@@ -165,7 +165,7 @@ Physical Keyboard ──evdev──→ capsper ──uinput──→ Virtual Key
                               │
                               ├─ Trigger key held → PipeWire audio capture
                               ├─ whisper.cpp (GPU) + Silero VAD (CPU)
-                              ├─ AlignAtt streaming + word-level stability
+                              ├─ AlignAtt streaming + token accumulation
                               └─ All other keys → forwarded transparently
 ```
 
@@ -175,11 +175,12 @@ A single self-contained binary (`src/`):
 |---|---|
 | `main.zig` | Entry point, argument parsing, model loading, warmup |
 | `input.zig` | evdev keyboard grab, uinput virtual keyboard, trigger key + text injection |
-| `server.zig` | Streaming state machine, word-level delta emission |
-| `pipeline.zig` | Low-level whisper.cpp integration, mel/encode/decode loop |
+| `server.zig` | Streaming state machine, VAD-driven state transitions, word delta emission |
+| `pipeline.zig` | Low-level whisper.cpp integration, two-tier token context, mel/encode/decode loop |
+| `mel.zig` | Incremental mel spectrogram (FFT, Hann window, mel filterbank with frame caching) |
 | `alignatt.zig` | Cross-attention analysis for streaming stop/rewind decisions |
 | `recorder.zig` | Per-utterance debug recording (WAV + diagnostic log capture) |
-| `utils.zig` | Pure utility functions (word counting, PCM conversion, delta tracking) |
+| `utils.zig` | Pure utility functions (PCM conversion, WAV parsing, buffer trimming, RMS analysis) |
 | `vad.zig` | Silero VAD wrapper for speech/silence detection |
 | `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream` |
 | `pw_detect.zig` | PipeWire device enumeration and interactive channel detection |
@@ -189,13 +190,15 @@ A single self-contained binary (`src/`):
 
 **Manual decode loop with cross-attention introspection** — Instead of using whisper.cpp's high-level `whisper_full()`, Capsper manually drives the mel spectrogram → encode → decode pipeline token by token. This gives per-token access to the decoder's cross-attention weights, which is how AlignAtt decides when to stop: it watches where each attention head is "looking" in the audio, and stops when attention drifts past the end of the buffer or jumps backwards (a sign of hallucination). The attention values go through z-score normalisation, median filtering, and head averaging before the stopping decision.
 
-**Frame-based word stability** — Each decoded word carries a frame position extracted from its cross-attention peak (which audio frame the model was attending to). Between decode cycles, Capsper compares words by both frame position (±200ms tolerance) and text (case-insensitive, trailing punctuation stripped). Only words that appear in two consecutive cycles at roughly the same temporal position are emitted. This hybrid approach handles Whisper's tendency to shift attention slightly between cycles — "so" at frame 100 might become "so," at frame 103 — without emitting duplicates or missing legitimate repetitions.
+**Token accumulation with two-tier context** — Rather than re-transcribing the entire audio buffer each cycle and diffing the output, Capsper commits confirmed tokens as a forced decoder prefix. Each cycle, the model is given previously emitted tokens after `[notimestamps]` as forced output — it processes them as its own previous output, building KV cache state, then continues generating from where it left off. This eliminates the instability that comes from re-decoding: the model always sees the same prefix, so it never contradicts what was already emitted.
+
+When the 15-second sliding window trims audio from the front, the corresponding tokens are demoted from forced output to conditioning context. Instead of being deleted (which caused misalignment and hallucination), they move to the `<|startofprev|>` section before `[sot]`, where the model treats them as a hint rather than a constraint. This two-tier approach — forced tokens for audio in the buffer, conditioning tokens for trimmed audio — is inspired by SimulStreaming's token management.
 
 **CPU-only VAD** — Silero voice activity detection runs on the CPU (2 threads, ~5ms per check) while whisper.cpp transcription runs on the GPU. This avoids GPU context switching overhead for the frequent VAD checks (every 0.5–1s) and means VAD has zero impact on transcription throughput.
 
 **Transparent keyboard forwarding** — Rather than intercepting specific keys, Capsper grabs all physical keyboards via `EVIOCGRAB` and creates a uinput virtual keyboard that forwards every event transparently. Only the trigger key (CapsLock) is consumed; all other keys pass through unchanged. This means the grab is invisible to applications while giving Capsper exclusive access to the trigger. The virtual keyboard also handles text injection — transcribed text is emitted as synthetic keystrokes with proper shift-state handling, which works on both X11 and Wayland without any external tools. A panic sequence (Enter+Backspace+Escape simultaneously) ungrab all keyboards as a safety net.
 
-**Sliding window with absolute frame tracking** — Audio is capped at a 15-second sliding window. When the buffer is trimmed, the trimmed byte count is accumulated and converted to a frame offset, so word frame positions remain globally unique across the entire utterance. This prevents re-emission of already-typed words after a buffer wrap.
+**Incremental mel spectrogram** — Rather than recomputing the full mel spectrogram from scratch each cycle, Capsper caches raw (pre-normalisation) mel frames and only computes FFT for new audio samples. The mel filterbank, Hann window, and FFT are implemented in pure Zig (`mel.zig`), giving full control over the caching boundary. Normalisation is still a full pass each cycle but takes under 1ms. The cache is reset on segment boundaries or buffer trims (clean slate).
 
 ## Server options
 
@@ -262,9 +265,10 @@ All commands go through the Bun-based task runner (`run.ts`), which bootstraps i
 On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
 
 - Model load: ~1.2s
-- Encode: ~85ms per chunk
+- Encode: ~113ms per cycle (80% of cycle time — full self-attention, not incrementalisable)
+- Mel spectrogram: ~15ms per cycle (incremental, only computes new frames)
 - Streaming latency: ~1s between word emissions
-- First transcription: ~1.4s total
+- Total cycle: ~140ms
 
 ## Troubleshooting
 

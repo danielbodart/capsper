@@ -13,7 +13,7 @@ Add unit tests for any pure functions (functions that don't depend on whisper.cp
 
 ## Property Tests
 
-For functions with tricky invariants (word matching, offset calculations, stability/delta logic), add property-based tests in `src/prop_tests.zig` using [minish](https://github.com/CogitatorTech/minish). Good candidates: functions that are idempotent, symmetric, have roundtrip relationships, or where edge cases around spaces/punctuation/empty strings matter. Property tests catch bugs that hand-written examples miss.
+For functions with tricky invariants (buffer trimming, PCM conversion, WAV roundtrips, attention analysis, input event generation), add property-based tests in `src/prop_tests.zig` using [minish](https://github.com/CogitatorTech/minish). Good candidates: functions that are idempotent, symmetric, have roundtrip relationships, or where edge cases matter. Property tests catch bugs that hand-written examples miss.
 
 ## Integration Tests
 
