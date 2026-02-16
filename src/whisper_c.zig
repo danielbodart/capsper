@@ -20,6 +20,7 @@ pub const whisper_free_state = cimport.whisper_free_state;
 
 // Processing
 pub const whisper_pcm_to_mel_with_state = cimport.whisper_pcm_to_mel_with_state;
+pub const whisper_set_mel_with_state = cimport.whisper_set_mel_with_state;
 pub const whisper_encode_with_state = cimport.whisper_encode_with_state;
 pub const whisper_decode_with_state_and_aheads = cimport.whisper_decode_with_state_and_aheads;
 pub const whisper_state_get_aheads_cross_qks = cimport.whisper_state_get_aheads_cross_qks;
@@ -35,6 +36,7 @@ pub const whisper_token_to_str = cimport.whisper_token_to_str;
 pub const whisper_lang_id = cimport.whisper_lang_id;
 pub const whisper_n_vocab = cimport.whisper_n_vocab;
 pub const whisper_n_len_from_state = cimport.whisper_n_len_from_state;
+pub const whisper_model_n_mels = cimport.whisper_model_n_mels;
 pub const whisper_token_prev = cimport.whisper_token_prev;
 pub const whisper_tokenize = cimport.whisper_tokenize;
 

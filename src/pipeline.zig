@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("whisper_c.zig");
 const alignatt = @import("alignatt.zig");
 const utils = @import("utils.zig");
+const mel = @import("mel.zig");
 
 pub const Timing = struct {
     state_init_ms: f64 = 0,
@@ -46,6 +47,10 @@ pub const Pipeline = struct {
     // Fed as forced prefix (context) in subsequent transcribe() calls for consistency.
     accumulated_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
 
+    // Incremental mel spectrogram cache. Persists across transcribe cycles within
+    // a VAD segment; reset on segment boundary or 15s buffer trim.
+    mel_buffer: mel.MelBuffer,
+
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: *c.whisper_context,
@@ -71,10 +76,12 @@ pub const Pipeline = struct {
             .eot = c.whisper_token_eot(ctx),
             .n_vocab = @intCast(c.whisper_n_vocab(ctx)),
             .prompt_tokens = prompt_tokens,
+            .mel_buffer = try mel.MelBuffer.init(allocator, @intCast(c.whisper_model_n_mels(ctx))),
         };
     }
 
     pub fn deinit(self: *Pipeline) void {
+        self.mel_buffer.deinit();
         self.accumulated_tokens.deinit(self.allocator);
         c.whisper_free_state(self.state);
     }
@@ -86,9 +93,10 @@ pub const Pipeline = struct {
         try self.accumulated_tokens.appendSlice(self.allocator, tokens);
     }
 
-    /// Clear accumulated tokens (on VAD segment boundary / flush).
+    /// Clear accumulated tokens and mel cache (on VAD segment boundary / flush / buffer trim).
     pub fn resetSegment(self: *Pipeline) void {
         self.accumulated_tokens.clearRetainingCapacity();
+        self.mel_buffer.reset();
     }
 
     fn msFromNs(start: i128) f64 {
@@ -133,23 +141,18 @@ pub const Pipeline = struct {
         self.state = c.whisper_init_state(self.ctx) orelse return error.StateInitFailed;
         timing.state_init_ms = msFromNs(t_state);
 
-        // Whisper expects 30-second (480000 sample) input. Short audio gets
-        // immediate EOT from the decoder because the encoder output is too short.
-        // Pad with silence (zeros) like whisper_full does internally.
-        const whisper_n_samples: usize = 480000; // 30 seconds at 16kHz
-        const padded = if (samples.len < whisper_n_samples) blk: {
-            const buf = try self.allocator.alloc(f32, whisper_n_samples);
-            @memcpy(buf[0..samples.len], samples);
-            @memset(buf[samples.len..], 0);
-            break :blk buf;
-        } else null;
-        defer if (padded) |p| self.allocator.free(p);
-
-        const mel_samples = padded orelse samples;
-
-        // Step 1: Mel spectrogram
+        // Step 1: Incremental mel spectrogram
+        // Only computes new frames since last cycle; caches previous frames.
         const t_mel = std.time.nanoTimestamp();
-        if (c.whisper_pcm_to_mel_with_state(self.ctx, self.state, mel_samples.ptr, @intCast(mel_samples.len), self.n_threads) != 0) {
+        _ = try self.mel_buffer.addSamples(samples);
+
+        // Export to whisper.cpp format: [n_mel * 3000] row-major by mel band, padded to 30s
+        const n_mel = self.mel_buffer.n_mel;
+        const mel_data = try self.allocator.alloc(f32, n_mel * mel.WHISPER_N_FRAMES);
+        defer self.allocator.free(mel_data);
+        self.mel_buffer.exportForWhisper(mel_data, mel.WHISPER_N_FRAMES);
+
+        if (c.whisper_set_mel_with_state(self.ctx, self.state, mel_data.ptr, @intCast(mel.WHISPER_N_FRAMES), @intCast(n_mel)) != 0) {
             return error.MelFailed;
         }
         timing.mel_ms = msFromNs(t_mel);
