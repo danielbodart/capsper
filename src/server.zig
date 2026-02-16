@@ -40,7 +40,7 @@ const transcribe_interval_bytes: usize = 32000; // 1s — re-transcribe cadence 
 const vad_window_bytes: usize = 16000; // 0.5s — VAD lookback window
 const idle_keep_bytes: usize = 128000; // 4s — audio retained while idle (gives first transcription more context)
 const silence_timeout_bytes: usize = 64000; // 2s — silence before utterance flush
-const max_buffer_bytes: usize = 480000; // 15s — sliding window cap
+const max_buffer_bytes: usize = 896000; // 28s — sliding window cap (must stay under 30s whisper limit)
 const min_transcribe_bytes: usize = 16000; // 0.5s — minimum audio worth transcribing
 
 const State = enum { idle, speaking, trailing_silence };

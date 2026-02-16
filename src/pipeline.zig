@@ -54,7 +54,7 @@ pub const Pipeline = struct {
     context_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
 
     // Incremental mel spectrogram cache. Persists across transcribe cycles within
-    // a VAD segment; reset on segment boundary or 15s buffer trim.
+    // a VAD segment; reset on segment boundary or 28s buffer trim.
     mel_buffer: mel.MelBuffer,
 
     pub fn init(

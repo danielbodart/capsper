@@ -79,7 +79,7 @@ pub const MelBuffer = struct {
         // Content frame count = (n_samples + 200) / HOP_LENGTH + 1
         // (frames where the window overlaps real audio, including reflective pad)
         const padded_len = n_samples + N_FFT / 2; // n_samples + 200
-        const total_content_frames = padded_len / HOP_LENGTH + 1;
+        const total_content_frames = @min(padded_len / HOP_LENGTH + 1, WHISPER_N_FRAMES);
 
         if (total_content_frames <= self.n_computed) return 0;
 
