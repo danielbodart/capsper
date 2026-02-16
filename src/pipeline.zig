@@ -93,10 +93,27 @@ pub const Pipeline = struct {
         try self.accumulated_tokens.appendSlice(self.allocator, tokens);
     }
 
-    /// Clear accumulated tokens and mel cache (on VAD segment boundary / flush / buffer trim).
+    /// Clear accumulated tokens and mel cache (on VAD segment boundary / flush).
     pub fn resetSegment(self: *Pipeline) void {
         self.accumulated_tokens.clearRetainingCapacity();
         self.mel_buffer.reset();
+    }
+
+    /// Drop tokens from the front proportional to the fraction of audio trimmed.
+    /// Called after trimBuffer removes audio from the front of the PCM buffer.
+    /// Keeps remaining tokens approximately aligned with the remaining audio.
+    pub fn trimAccumulatedTokens(self: *Pipeline, trimmed_bytes: usize, old_buffer_bytes: usize) void {
+        const n = self.accumulated_tokens.items.len;
+        if (n == 0 or trimmed_bytes == 0 or old_buffer_bytes == 0) return;
+        const drop = @min(n, n * trimmed_bytes / old_buffer_bytes);
+        if (drop == 0) return;
+        const remaining = n - drop;
+        std.mem.copyForwards(
+            c.whisper_token,
+            self.accumulated_tokens.items[0..remaining],
+            self.accumulated_tokens.items[drop..n],
+        );
+        self.accumulated_tokens.items.len = remaining;
     }
 
     fn msFromNs(start: i128) f64 {
@@ -334,7 +351,10 @@ pub const Pipeline = struct {
 
         // Step 5: Word boundary truncation (unless is_last)
         var n_tokens_to_use = generated.items.len;
-        if (!is_last and n_tokens_to_use > 0) {
+        // Truncate last (potentially incomplete) word — but only when there's no
+        // forced prefix. With accumulated tokens, the prefix already anchors prior
+        // words, and truncation of short continuations causes emission deadlocks.
+        if (!is_last and n_tokens_to_use > 0 and context_tokens.len == 0) {
             n_tokens_to_use = truncateLastWord(self.ctx, generated.items);
         }
         if (n_tokens_to_use == 0) return null;

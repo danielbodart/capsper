@@ -468,9 +468,13 @@ pub const Server = struct {
                     pcm_trim_total += trimmed;
                     // Keep silence_start_pos valid after trim
                     silence_start_pos -|= trimmed;
-                    // Reset mel cache — audio was trimmed so cached frames
-                    // no longer match the buffer. Clean slate is simplest.
-                    if (trimmed > 0) pipeline.mel_buffer.reset();
+                    if (trimmed > 0) {
+                        // Audio was trimmed from the front — mel cache is invalid.
+                        pipeline.mel_buffer.reset();
+                        // Drop accumulated tokens proportionally so forced prefix
+                        // stays aligned with the remaining audio buffer.
+                        pipeline.trimAccumulatedTokens(trimmed, old_len);
+                    }
                 }
             }
         }
