@@ -32,6 +32,7 @@ pub const whisper_token_eot = cimport.whisper_token_eot;
 pub const whisper_token_lang = cimport.whisper_token_lang;
 pub const whisper_token_transcribe = cimport.whisper_token_transcribe;
 pub const whisper_token_not = cimport.whisper_token_not;
+pub const whisper_token_beg = cimport.whisper_token_beg;
 pub const whisper_token_to_str = cimport.whisper_token_to_str;
 pub const whisper_lang_id = cimport.whisper_lang_id;
 pub const whisper_n_vocab = cimport.whisper_n_vocab;

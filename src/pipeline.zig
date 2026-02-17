@@ -38,6 +38,7 @@ pub const Pipeline = struct {
     tok_transcribe: c.whisper_token,
     notimestamps: c.whisper_token,
     eot: c.whisper_token,
+    token_beg: usize, // first timestamp token ID — all tokens >= this are timestamps
     n_vocab: usize,
 
     // Domain terms pre-tokenized (owned by caller, must outlive Pipeline)
@@ -80,6 +81,7 @@ pub const Pipeline = struct {
             .tok_transcribe = c.whisper_token_transcribe(ctx),
             .notimestamps = c.whisper_token_not(ctx),
             .eot = c.whisper_token_eot(ctx),
+            .token_beg = @intCast(c.whisper_token_beg(ctx)),
             .n_vocab = @intCast(c.whisper_n_vocab(ctx)),
             .prompt_tokens = prompt_tokens,
             .mel_buffer = try mel.MelBuffer.init(allocator, @intCast(c.whisper_model_n_mels(ctx))),
@@ -281,10 +283,17 @@ pub const Pipeline = struct {
             const logits = c.whisper_get_logits_from_state(self.state);
             if (logits == null) break;
 
+            // Suppress timestamp token logits — the low-level decode API doesn't
+            // do this automatically (unlike whisper_full). Without suppression,
+            // the model can sample [_TT_*] tokens near the buffer limit.
+            for (self.token_beg..self.n_vocab) |vi| {
+                logits[vi] = -std.math.inf(f32);
+            }
+
             // Greedy sample
             var best_token: c.whisper_token = 0;
             var best_logit: f32 = -std.math.inf(f32);
-            for (0..self.n_vocab) |vi| {
+            for (0..self.token_beg) |vi| {
                 if (logits[vi] > best_logit) {
                     best_logit = logits[vi];
                     best_token = @intCast(vi);
@@ -414,6 +423,9 @@ pub const Pipeline = struct {
         var word_frame: usize = 0;
 
         for (tokens_to_decode, 0..) |token, idx| {
+            // Safety net: skip any special/timestamp tokens that slipped through
+            if (@as(usize, @intCast(token)) >= self.token_beg) continue;
+
             const str = c.whisper_token_to_str(self.ctx, token);
             if (str == null) continue;
             const slice = std.mem.span(str);
