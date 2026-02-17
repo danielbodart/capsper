@@ -22,19 +22,21 @@ pub const Recorder = struct {
     dir: std.fs.Dir,
     keep: usize,
     seq: usize,
+    version: []const u8,
     diag_buf: std.ArrayListUnmanaged(u8),
     emit_buf: std.ArrayListUnmanaged(u8),
     rec_buf: std.ArrayListUnmanaged(u8),
     active: bool,
     utterance_start_ns: i128,
 
-    pub fn init(allocator: Allocator, dir_path: []const u8, keep: usize) !Recorder {
+    pub fn init(allocator: Allocator, dir_path: []const u8, keep: usize, version: []const u8) !Recorder {
         const dir = try std.fs.cwd().openDir(dir_path, .{});
         return .{
             .allocator = allocator,
             .dir = dir,
             .keep = keep,
             .seq = 0,
+            .version = version,
             .diag_buf = .{},
             .emit_buf = .{},
             .rec_buf = .{},
@@ -123,7 +125,7 @@ pub const Recorder = struct {
             defer log_buf.deinit(self.allocator);
             const w = log_buf.writer(self.allocator);
             const duration_ms = self.utteranceDurationMs();
-            std.fmt.format(w, "=== Capsper Recording {d:0>3} ===\n", .{self.seq - 1}) catch {};
+            std.fmt.format(w, "=== Capsper Recording {d:0>3} (v{s}) ===\n", .{ self.seq - 1, self.version }) catch {};
             std.fmt.format(w, "Duration: {d}.{d}s ({d} bytes)\n", .{
                 duration_ms / 1000, (duration_ms % 1000) / 100, self.rec_buf.items.len,
             }) catch {};

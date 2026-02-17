@@ -27,6 +27,13 @@ main() {
         date +%s > "$INSTALL_DIR/.update-applied-at"
     fi
 
+    # Clear debug recordings on version change
+    local recordings_dir="$INSTALL_DIR/recordings"
+    if [ -d "$recordings_dir" ]; then
+        echo "Clearing debug recordings (version change)..."
+        rm -f "$recordings_dir"/*.wav "$recordings_dir"/*.log 2>/dev/null || true
+    fi
+
     # Atomic symlink swap: ln creates new symlink, mv atomically replaces via rename(2)
     ln -sfn "releases/$pending" "$INSTALL_DIR/current.tmp"
     mv -T "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"

@@ -19,6 +19,7 @@ WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${W
 VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/${VAD_MODEL_NAME}"
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
+RECORDINGS_DIR="$INSTALL_DIR/recordings"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -206,12 +207,17 @@ install_service() {
     mkdir -p "$service_dir"
 
     local domain_terms="${7:-}"
+    local enable_recordings="${8:-false}"
 
     local exec_start="$binary --trigger capslock --pw-channel $channel"
     exec_start="$exec_start --model $model_dir/$WHISPER_MODEL_NAME"
     exec_start="$exec_start --vad-model $model_dir/$VAD_MODEL_NAME"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
     [ -n "$domain_terms" ] && exec_start="$exec_start --domain-terms $domain_terms"
+    if $enable_recordings; then
+        mkdir -p "$RECORDINGS_DIR"
+        exec_start="$exec_start --record-dir $RECORDINGS_DIR"
+    fi
 
     {
         echo "[Unit]"
@@ -340,6 +346,9 @@ extract_service_config() {
 
     SAVED_DOMAIN_TERMS=$(echo "$exec_start" | sed -n 's/.*--domain-terms \([^ ]*\).*/\1/p')
     SAVED_DOMAIN_TERMS="${SAVED_DOMAIN_TERMS:-}"
+
+    SAVED_RECORDINGS_ENABLED=false
+    echo "$exec_start" | grep -q -- '--record-dir' && SAVED_RECORDINGS_ENABLED=true
 }
 
 install_update_timer() {
@@ -537,7 +546,18 @@ cmd_install() {
                 fi
             fi
 
-            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET" false "$domain_terms"
+            # Debug recordings
+            local enable_recordings=false
+            echo ""
+            echo "=== Debug Recordings (optional) ==="
+            echo "Record audio snippets and transcription logs for troubleshooting."
+            echo "Keeps the last 50 utterances in: $RECORDINGS_DIR"
+            echo "Recordings are cleared automatically on version updates."
+            if confirm_default_no "Enable debug recordings?"; then
+                enable_recordings=true
+            fi
+
+            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET" false "$domain_terms" $enable_recordings
         fi
     else
         echo "=== Capsper Installer ==="
@@ -590,6 +610,17 @@ cmd_install() {
                 fi
             fi
 
+            # Debug recordings
+            local enable_recordings=false
+            echo ""
+            echo "=== Debug Recordings (optional) ==="
+            echo "Record audio snippets and transcription logs for troubleshooting."
+            echo "Keeps the last 50 utterances in: $RECORDINGS_DIR"
+            echo "Recordings are cleared automatically on version updates."
+            if confirm_default_no "Enable debug recordings?"; then
+                enable_recordings=true
+            fi
+
             # Auto-updates
             local enable_updates=true
             echo ""
@@ -597,7 +628,7 @@ cmd_install() {
                 enable_updates=false
             fi
 
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" $enable_updates "$domain_terms"
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" $enable_updates "$domain_terms" $enable_recordings
 
             if $enable_updates; then
                 install_update_timer
@@ -609,7 +640,7 @@ cmd_install() {
 
             if has_auto_update; then
                 # Auto-update already configured: keep it, just update paths
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" $SAVED_RECORDINGS_ENABLED
             else
                 # Pre-auto-update install: offer to enable
                 local enable_updates=true
@@ -618,7 +649,7 @@ cmd_install() {
                     enable_updates=false
                 fi
 
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" $SAVED_RECORDINGS_ENABLED
 
                 if $enable_updates; then
                     install_update_timer
