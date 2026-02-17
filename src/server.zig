@@ -239,11 +239,15 @@ pub const Server = struct {
                 continue;
             }
 
-            // Unpause transition: reset state for clean first transcription
+            // Unpause transition: reset state for clean first transcription.
+            // Clear pcm_buf to avoid utterance bleed — the 4s idle retention
+            // would contain audio from the previous utterance, causing the
+            // decoder to hallucinate/repeat previous text at the start.
             if (was_paused) {
                 var ts_buf2: [32]u8 = undefined;
                 const ts2 = formatElapsed(&ts_buf2, start_ns);
                 std.debug.print("[{s}s] UNPAUSED\n", .{ts2});
+                pcm_buf.clearRetainingCapacity();
                 state = .idle;
                 cycle_count = 0;
                 emitted_in_utterance = false;
