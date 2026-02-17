@@ -40,7 +40,7 @@ pub fn main() !void {
     var detect_duration: u32 = 5;
     var domain_terms_path: ?[:0]const u8 = null;
     var record_dir: ?[:0]const u8 = null;
-    var record_keep: usize = 50;
+    var record_keep: usize = 10;
     var transcribe_file: ?[:0]const u8 = null;
 
     var i: usize = 1;
@@ -126,7 +126,7 @@ pub fn main() !void {
             if (i < args.len) record_dir = args[i];
         } else if (std.mem.eql(u8, arg, "--record-keep")) {
             i += 1;
-            if (i < args.len) record_keep = std.fmt.parseInt(usize, args[i], 10) catch 50;
+            if (i < args.len) record_keep = std.fmt.parseInt(usize, args[i], 10) catch 10;
         } else if (std.mem.eql(u8, arg, "--transcribe")) {
             i += 1;
             if (i < args.len) transcribe_file = args[i];
