@@ -70,6 +70,15 @@ pub const Recorder = struct {
         self.rec_buf.appendSlice(self.allocator, data) catch {};
     }
 
+    /// Called for state transitions and PTT events.
+    pub fn logEvent(self: *Recorder, start_ns: i128, event: []const u8) void {
+        if (!self.active) return;
+        var ts_buf: [32]u8 = undefined;
+        const ts = formatElapsed(&ts_buf, start_ns);
+        const w = self.diag_buf.writer(self.allocator);
+        std.fmt.format(w, "[{s}s] {s}\n", .{ ts, event }) catch {};
+    }
+
     /// Called after each transcription cycle.
     pub fn logCycle(
         self: *Recorder,

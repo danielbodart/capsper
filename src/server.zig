@@ -176,7 +176,6 @@ pub const Server = struct {
         defer pcm_buf.deinit(self.allocator);
 
         var pcm_trim_total: usize = 0; // cumulative bytes trimmed (for absolute frame calc)
-        var emitted_in_utterance: bool = false; // whether we've emitted anything in current utterance
 
         var recv_buf: [32768]u8 = undefined;
         var state: State = .idle;
@@ -237,6 +236,7 @@ pub const Server = struct {
             // PTT release edge: let active speech drain via timeout, clear idle audio
             if (was_live and !live) {
                 was_live = false;
+                if (self.recorder) |rec| rec.logEvent(start_ns, "PTT released");
                 if (state == .idle) {
                     pcm_trim_total += pcm_buf.items.len;
                     pcm_buf.clearRetainingCapacity();
@@ -260,8 +260,8 @@ pub const Server = struct {
                 std.debug.print("[{s}s] LIVE\n", .{ts2});
                 state = .idle;
                 cycle_count = 0;
-                emitted_in_utterance = false;
                 was_live = true;
+                if (self.recorder) |rec| rec.logEvent(start_ns, "PTT pressed");
             }
 
             // Final flush on disconnect or read timeout — emit everything
@@ -279,8 +279,7 @@ pub const Server = struct {
                     };
                     if (flush_has_speech) {
                         cycle_count += 1;
-                        const te = try self.transcribeAndEmit(&pipeline, pcm_buf.items, true, emitted_in_utterance, output_fd, start_ns, type_cb, cycle_count, "FINAL");
-                        if (te.emitted) emitted_in_utterance = true;
+                        _ = try self.transcribeAndEmit(&pipeline, pcm_buf.items, true, output_fd, start_ns, type_cb, cycle_count, "FINAL");
                     }
                     const end_reason: EndReason = if (!live) .released else .timeout;
                     self.resetUtterance(&pipeline, &pcm_buf, &pcm_trim_total, end_reason);
@@ -289,7 +288,6 @@ pub const Server = struct {
                 // After timeout flush, go idle with clean buffer
                 pcm_trim_total += pcm_buf.items.len;
                 pcm_buf.clearRetainingCapacity();
-                emitted_in_utterance = false;
                 state = .idle;
                 cycle_count = 0;
                 continue;
@@ -322,7 +320,10 @@ pub const Server = struct {
                         std.debug.print("[{s}s] idle → speaking (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .speaking;
                         should_transcribe = true;
-                        if (self.recorder) |rec| rec.startUtterance(pcm_buf.items);
+                        if (self.recorder) |rec| {
+                            rec.startUtterance(pcm_buf.items);
+                            rec.logEvent(start_ns, "idle → speaking");
+                        }
                     } else {
                         const old_len = pcm_buf.items.len;
                         utils.trimBuffer(&pcm_buf, idle_keep_bytes);
@@ -335,6 +336,7 @@ pub const Server = struct {
                         const ts = formatElapsed(&ts_buf, start_ns);
                         std.debug.print("[{s}s] speaking → trailing_silence (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .{ .trailing_silence = .{ .silence_start_pos = pcm_buf.items.len, .transcribe_done = false } };
+                        if (self.recorder) |rec| rec.logEvent(start_ns, "speaking → trailing_silence");
                         // Transcribe before entering silence to capture trailing words
                         should_transcribe = true;
                     } else {
@@ -346,6 +348,7 @@ pub const Server = struct {
                         const ts = formatElapsed(&ts_buf, start_ns);
                         std.debug.print("[{s}s] trailing_silence → speaking (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .speaking;
+                        if (self.recorder) |rec| rec.logEvent(start_ns, "trailing_silence → speaking");
                         should_transcribe = true;
                     } else if (pcm_buf.items.len - ts_state.silence_start_pos >= silence_timeout_bytes) {
                         should_flush = true;
@@ -364,14 +367,12 @@ pub const Server = struct {
                     .speaking => "speaking",
                     .trailing_silence => "trailing",
                 };
-                const te = try self.transcribeAndEmit(&pipeline, pcm_buf.items, should_flush, emitted_in_utterance, output_fd, start_ns, type_cb, cycle_count, state_name);
-                if (te.emitted) emitted_in_utterance = true;
+                _ = try self.transcribeAndEmit(&pipeline, pcm_buf.items, should_flush, output_fd, start_ns, type_cb, cycle_count, state_name);
 
                 if (should_flush) {
                     self.resetUtterance(&pipeline, &pcm_buf, &pcm_trim_total, .flush);
                     const flush_ts = formatElapsed(&ts_buf, start_ns);
                     std.debug.print("[{s}s] flush → idle\n", .{flush_ts});
-                    emitted_in_utterance = false;
                     state = .idle;
                     cycle_count = 0;
                 } else {
@@ -407,7 +408,6 @@ pub const Server = struct {
         pipeline: *Pipeline,
         pcm_buf: []const u8,
         is_last: bool,
-        emitted_in_utterance: bool,
         output_fd: posix.fd_t,
         start_ns: i128,
         type_cb: ?TypeCallback,
@@ -447,16 +447,10 @@ pub const Server = struct {
         const buf_duration_ms = pcm_buf.len * 1000 / 32000;
         const t = result.timing;
 
-        // Build delta with space insertion between utterance segments
-        const delta = if (emitted_in_utterance and result.text[0] != ' ')
-            blk: {
-                const buf = try self.allocator.alloc(u8, result.text.len + 1);
-                buf[0] = ' ';
-                @memcpy(buf[1..], result.text);
-                break :blk buf;
-            }
-        else
-            try self.allocator.dupe(u8, result.text);
+        // Use result.text as-is: whisper BPE tokens include leading spaces for
+        // word-initial tokens. Continuation tokens (no space) should concatenate
+        // directly with the previous emission (e.g. "duplic" + "ation").
+        const delta = try self.allocator.dupe(u8, result.text);
         defer self.allocator.free(delta);
 
         emitDelta(output_fd, start_ns, delta, type_cb, self.recorder) catch return error.BrokenPipe;
