@@ -10,8 +10,9 @@ const posix = std.posix;
 const net = std.net;
 
 // Global live state (module-level so input handler can access it via setLive).
-// Default not live; main.zig calls setLive(true) when trigger key is pressed.
-pub var is_live = std.atomic.Value(bool).init(false);
+// Default live (TCP mode always processes audio). main.zig calls setLive(false)
+// at startup when --trigger is used, then trigger key toggles it.
+pub var is_live = std.atomic.Value(bool).init(true);
 
 // Global capture pointer — set by runLocal so setLive can toggle the PipeWire stream.
 // When non-null, setLive also activates/deactivates the stream so the desktop
