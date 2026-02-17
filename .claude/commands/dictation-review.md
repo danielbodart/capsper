@@ -4,7 +4,7 @@ Analyze captured debug recordings to find transcription issues and create regres
 
 ## Steps
 
-1. **Find recordings**: List all `.log`/`.wav` pairs in the record directory (default: `/tmp/capsper-debug/`). If no recordings exist, tell the user to enable recording with `--record-dir` and speak some utterances.
+1. **Find recordings**: List all `.log`/`.wav` pairs in the record directory (default: `~/.local/share/capsper/recordings/`). If no recordings exist, tell the user to enable recording with `--record-dir` and speak some utterances.
 
 2. **For each recording**:
    - Read the `.log` file and extract the "Emitted Text" section (what streaming mode produced)
