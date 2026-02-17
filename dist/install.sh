@@ -640,7 +640,7 @@ cmd_install() {
 
             if has_auto_update; then
                 # Auto-update already configured: keep it, just update paths
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" $SAVED_RECORDINGS_ENABLED
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED"
             else
                 # Pre-auto-update install: offer to enable
                 local enable_updates=true
@@ -649,7 +649,7 @@ cmd_install() {
                     enable_updates=false
                 fi
 
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" $SAVED_RECORDINGS_ENABLED
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED"
 
                 if $enable_updates; then
                     install_update_timer
