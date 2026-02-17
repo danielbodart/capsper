@@ -4,7 +4,9 @@ const Vad = @import("vad.zig").Vad;
 const Pipeline = @import("pipeline.zig").Pipeline;
 const AudioCapture = @import("audio_capture.zig").AudioCapture;
 const utils = @import("utils.zig");
-const Recorder = @import("recorder.zig").Recorder;
+const recorder_mod = @import("recorder.zig");
+const Recorder = recorder_mod.Recorder;
+const EndReason = recorder_mod.EndReason;
 
 const posix = std.posix;
 const net = std.net;
@@ -44,7 +46,14 @@ const silence_timeout_bytes: usize = 64000; // 2s — silence before utterance f
 const max_buffer_bytes: usize = 896000; // 28s — sliding window cap (must stay under 30s whisper limit)
 const min_transcribe_bytes: usize = 16000; // 0.5s — minimum audio worth transcribing
 
-const State = enum { idle, speaking, trailing_silence };
+const State = union(enum) {
+    idle,
+    speaking,
+    trailing_silence: struct {
+        silence_start_pos: usize,
+        transcribe_done: bool,
+    },
+};
 
 pub const InputMode = enum { tcp, local };
 
@@ -172,9 +181,7 @@ pub const Server = struct {
         var recv_buf: [32768]u8 = undefined;
         var state: State = .idle;
         var bytes_since_last_cycle: usize = 0;
-        var silence_start_pos: usize = 0;
         var cycle_count: usize = 0;
-        var trailing_transcribe_done: bool = false; // limit trailing_silence to 1 extra transcription
         var was_live: bool = is_live.load(.monotonic); // track previous live state for transition detection
 
         while (true) {
@@ -224,28 +231,33 @@ pub const Server = struct {
 
             bytes_since_last_cycle = 0;
 
-            // Not live (trigger released): discard audio and skip all processing
+            // Push-to-talk gating
             const live = is_live.load(.monotonic);
-            if (!live) {
-                if (was_live and (state == .speaking or state == .trailing_silence)) {
-                    pipeline.resetSegment();
-                    if (self.recorder) |rec| rec.endUtterance(.released) catch |err| {
-                        std.debug.print("[rec] write error: {}\n", .{err});
-                    };
+
+            // PTT release edge: let active speech drain via timeout, clear idle audio
+            if (was_live and !live) {
+                was_live = false;
+                if (state == .idle) {
+                    pcm_trim_total += pcm_buf.items.len;
+                    pcm_buf.clearRetainingCapacity();
+                    continue;
                 }
-                // Discard all audio — keeping stale audio causes utterance bleed
+                // speaking/trailing_silence: fall through — poll will time out,
+                // triggering the final flush path which handles transcribe + reset
+            }
+
+            // Not live and idle: discard accumulated audio, wait for key press
+            if (!live and state == .idle) {
                 pcm_trim_total += pcm_buf.items.len;
                 pcm_buf.clearRetainingCapacity();
-                was_live = false;
                 continue;
             }
 
-            // Went live (trigger pressed): reset state for clean first transcription
-            if (!was_live) {
+            // Going live: keep buffer (pre-trigger audio) for first transcription
+            if (!was_live and live) {
                 var ts_buf2: [32]u8 = undefined;
                 const ts2 = formatElapsed(&ts_buf2, start_ns);
                 std.debug.print("[{s}s] LIVE\n", .{ts2});
-                pcm_buf.clearRetainingCapacity();
                 state = .idle;
                 cycle_count = 0;
                 emitted_in_utterance = false;
@@ -255,44 +267,24 @@ pub const Server = struct {
             // Final flush on disconnect or read timeout — emit everything
             if (client_closed or timed_out) {
                 if (state == .speaking or state == .trailing_silence) {
-                    if (pcm_buf.items.len >= min_transcribe_bytes) {
-                        const samples = try utils.pcmToFloat(self.allocator, pcm_buf.items);
-                        defer self.allocator.free(samples);
-
-                        // is_last=true: no word truncation, emit all remaining words
-                        if (try pipeline.transcribe(samples, true)) |result| {
-                            defer self.allocator.free(result.text);
-                            defer self.allocator.free(result.words);
-                            defer self.allocator.free(result.tokens);
-                            if (result.text.len > 0) {
-                                if (self.verbose) {
-                                    var flush_ts_buf: [32]u8 = undefined;
-                                    const ts = formatElapsed(&flush_ts_buf, start_ns);
-                                    std.debug.print("    [{s}s] FINAL FLUSH words={d} timed_out={} closed={}\n", .{ ts, result.words.len, timed_out, client_closed });
-                                }
-                                const delta = if (emitted_in_utterance and result.text.len > 0 and result.text[0] != ' ')
-                                    blk: {
-                                        // Prepend space between previously emitted text and new text
-                                        const buf = try self.allocator.alloc(u8, result.text.len + 1);
-                                        buf[0] = ' ';
-                                        @memcpy(buf[1..], result.text);
-                                        break :blk buf;
-                                    }
-                                else
-                                    try self.allocator.dupe(u8, result.text);
-                                defer self.allocator.free(delta);
-                                emitDelta(output_fd, start_ns, delta, type_cb, self.recorder) catch {};
-                                if (self.recorder) |rec| {
-                                    rec.logCycle(start_ns, cycle_count, "FINAL", pcm_buf.items.len * 1000 / 32000, result.words.len, result.text);
-                                }
-                            }
-                        }
+                    // VAD gate: only transcribe if speech is present in the tail
+                    const flush_has_speech = blk: {
+                        const vad_start = if (pcm_buf.items.len > vad_window_bytes)
+                            (pcm_buf.items.len - vad_window_bytes) & ~@as(usize, 1)
+                        else
+                            0;
+                        const vad_samples = try utils.pcmToFloat(self.allocator, pcm_buf.items[vad_start..]);
+                        defer self.allocator.free(vad_samples);
+                        break :blk self.vad.hasSpeech(vad_samples);
+                    };
+                    if (flush_has_speech) {
+                        cycle_count += 1;
+                        const te = try self.transcribeAndEmit(&pipeline, pcm_buf.items, true, emitted_in_utterance, output_fd, start_ns, type_cb, cycle_count, "FINAL");
+                        if (te.emitted) emitted_in_utterance = true;
                     }
-                    pipeline.resetSegment();
+                    const end_reason: EndReason = if (!live) .released else .timeout;
+                    self.resetUtterance(&pipeline, &pcm_buf, &pcm_trim_total, end_reason);
                 }
-                if (self.recorder) |rec| rec.endUtterance(.timeout) catch |err| {
-                    std.debug.print("[rec] write error: {}\n", .{err});
-                };
                 if (client_closed) return;
                 // After timeout flush, go idle with clean buffer
                 pcm_trim_total += pcm_buf.items.len;
@@ -342,124 +334,43 @@ pub const Server = struct {
                     if (!has_speech) {
                         const ts = formatElapsed(&ts_buf, start_ns);
                         std.debug.print("[{s}s] speaking → trailing_silence (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
-                        state = .trailing_silence;
-                        silence_start_pos = pcm_buf.items.len;
-                        trailing_transcribe_done = false;
+                        state = .{ .trailing_silence = .{ .silence_start_pos = pcm_buf.items.len, .transcribe_done = false } };
                         // Transcribe before entering silence to capture trailing words
                         should_transcribe = true;
                     } else {
                         should_transcribe = true;
                     }
                 },
-                .trailing_silence => {
+                .trailing_silence => |*ts_state| {
                     if (has_speech) {
                         const ts = formatElapsed(&ts_buf, start_ns);
                         std.debug.print("[{s}s] trailing_silence → speaking (buf={d} vad={d:.1}ms)\n", .{ ts, pcm_buf.items.len, vad_ms });
                         state = .speaking;
                         should_transcribe = true;
-                    } else if (pcm_buf.items.len - silence_start_pos >= silence_timeout_bytes) {
+                    } else if (pcm_buf.items.len - ts_state.silence_start_pos >= silence_timeout_bytes) {
                         should_flush = true;
-                    } else if (!trailing_transcribe_done) {
+                    } else if (!ts_state.transcribe_done) {
                         should_transcribe = true;
-                        trailing_transcribe_done = true;
+                        ts_state.transcribe_done = true;
                     }
                 },
             }
 
             // Transcribe and emit delta
             if (should_transcribe or should_flush) {
-                if (pcm_buf.items.len >= min_transcribe_bytes) {
-                    cycle_count += 1;
-                    const t_cycle = std.time.nanoTimestamp();
-                    const buf_duration_ms = pcm_buf.items.len * 1000 / 32000;
-
-                    const all_samples = try utils.pcmToFloat(self.allocator, pcm_buf.items);
-                    defer self.allocator.free(all_samples);
-
-                    // Token accumulation: pipeline uses accumulated_tokens as forced prefix.
-                    // is_last=false during normal cycles → truncates last word (uncertain).
-                    // is_last=true on flush → no truncation, emits everything.
-                    const is_last = should_flush;
-                    if (try pipeline.transcribe(all_samples, is_last)) |result| {
-                        defer self.allocator.free(result.text);
-                        defer self.allocator.free(result.words);
-                        defer self.allocator.free(result.tokens);
-
-                        if (result.text.len > 0 and !result.was_rewind) {
-                            const t = result.timing;
-
-                            // Emit the new text from this cycle
-                            const delta = if (emitted_in_utterance and result.text.len > 0 and result.text[0] != ' ')
-                                blk: {
-                                    const buf = try self.allocator.alloc(u8, result.text.len + 1);
-                                    buf[0] = ' ';
-                                    @memcpy(buf[1..], result.text);
-                                    break :blk buf;
-                                }
-                            else
-                                try self.allocator.dupe(u8, result.text);
-                            defer self.allocator.free(delta);
-                            emitDelta(output_fd, start_ns, delta, type_cb, self.recorder) catch return;
-                            emitted_in_utterance = true;
-
-                            // Commit confirmed tokens as forced prefix for next cycle
-                            try pipeline.commitTokens(result.tokens);
-
-                            // Debug logging
-                            if (self.verbose) {
-                                const ts = formatElapsed(&ts_buf, start_ns);
-                                const cycle_ms = msFromNs(t_cycle);
-                                const accum = pipeline.accumulated_tokens.items.len;
-                                const ctx = pipeline.context_tokens.items.len;
-                                if (should_flush) {
-                                    std.debug.print("    [{s}s] cycle={d} FLUSH words={d} buf={d}ms | {s} state={d:.0}ms mel={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms\n", .{
-                                        ts, cycle_count, result.words.len, buf_duration_ms,
-                                        utils.textPreview(result.text), t.state_init_ms, t.mel_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
-                                    });
-                                } else {
-                                    std.debug.print("    [{s}s] cycle={d} words={d} accum={d} ctx={d} buf={d}ms | {s} state={d:.0}ms mel={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) cycle={d:.0}ms EMIT\n", .{
-                                        ts, cycle_count, result.words.len, accum, ctx, buf_duration_ms,
-                                        utils.textPreview(result.text), t.state_init_ms, t.mel_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, cycle_ms,
-                                    });
-                                }
-                            }
-
-                            // Recorder: log cycle after transcription
-                            if (self.recorder) |rec| {
-                                const state_name: []const u8 = switch (state) {
-                                    .speaking => "speaking",
-                                    .trailing_silence => "trailing",
-                                    .idle => "idle",
-                                };
-                                rec.logCycle(start_ns, cycle_count, state_name, buf_duration_ms, result.words.len, result.text);
-                            }
-                        } else if (self.verbose) {
-                            const ts = formatElapsed(&ts_buf, start_ns);
-                            const cycle_ms = msFromNs(t_cycle);
-                            std.debug.print("    [{s}s] cycle={d} {s} buf={d}ms cycle={d:.0}ms\n", .{
-                                ts, cycle_count, if (result.was_rewind) "REWIND" else "empty", buf_duration_ms, cycle_ms,
-                            });
-                        }
-                    } else if (self.verbose) {
-                        // Pipeline returned null — log it
-                        const ts = formatElapsed(&ts_buf, start_ns);
-                        const cycle_ms = msFromNs(t_cycle);
-                        std.debug.print("    [{s}s] cycle={d} NULL buf={d}ms cycle={d:.0}ms\n", .{
-                            ts, cycle_count, buf_duration_ms, cycle_ms,
-                        });
-                    }
-                }
+                cycle_count += 1;
+                const state_name: []const u8 = switch (state) {
+                    .idle => "idle",
+                    .speaking => "speaking",
+                    .trailing_silence => "trailing",
+                };
+                const te = try self.transcribeAndEmit(&pipeline, pcm_buf.items, should_flush, emitted_in_utterance, output_fd, start_ns, type_cb, cycle_count, state_name);
+                if (te.emitted) emitted_in_utterance = true;
 
                 if (should_flush) {
-                    pipeline.resetSegment();
-                    if (self.recorder) |rec| rec.endUtterance(.flush) catch |err| {
-                        std.debug.print("[rec] write error: {}\n", .{err});
-                    };
+                    self.resetUtterance(&pipeline, &pcm_buf, &pcm_trim_total, .flush);
                     const flush_ts = formatElapsed(&ts_buf, start_ns);
                     std.debug.print("[{s}s] flush → idle\n", .{flush_ts});
-                    // Clear buffer completely — stale audio causes utterance bleed
-                    pcm_trim_total += pcm_buf.items.len;
-                    pcm_buf.clearRetainingCapacity();
                     emitted_in_utterance = false;
                     state = .idle;
                     cycle_count = 0;
@@ -469,7 +380,12 @@ pub const Server = struct {
                     const trimmed = old_len - pcm_buf.items.len;
                     pcm_trim_total += trimmed;
                     // Keep silence_start_pos valid after trim
-                    silence_start_pos -|= trimmed;
+                    switch (state) {
+                        .trailing_silence => |*ts_state| {
+                            ts_state.silence_start_pos -|= trimmed;
+                        },
+                        else => {},
+                    }
                     if (trimmed > 0) {
                         // Audio was trimmed from the front — mel cache is invalid.
                         pipeline.mel_buffer.reset();
@@ -481,6 +397,102 @@ pub const Server = struct {
                 }
             }
         }
+    }
+    const TranscribeResult = struct {
+        emitted: bool,
+    };
+
+    fn transcribeAndEmit(
+        self: *Server,
+        pipeline: *Pipeline,
+        pcm_buf: []const u8,
+        is_last: bool,
+        emitted_in_utterance: bool,
+        output_fd: posix.fd_t,
+        start_ns: i128,
+        type_cb: ?TypeCallback,
+        cycle_count: usize,
+        state_name: []const u8,
+    ) !TranscribeResult {
+        if (pcm_buf.len < min_transcribe_bytes) return .{ .emitted = false };
+
+        const samples = try utils.pcmToFloat(self.allocator, pcm_buf);
+        defer self.allocator.free(samples);
+
+        const result = try pipeline.transcribe(samples, is_last) orelse {
+            if (self.verbose) {
+                var ts_buf: [32]u8 = undefined;
+                const ts = formatElapsed(&ts_buf, start_ns);
+                std.debug.print("    [{s}s] cycle={d} NULL buf={d}ms\n", .{
+                    ts, cycle_count, pcm_buf.len * 1000 / 32000,
+                });
+            }
+            return .{ .emitted = false };
+        };
+        defer self.allocator.free(result.text);
+        defer self.allocator.free(result.words);
+        defer self.allocator.free(result.tokens);
+
+        if (result.text.len == 0 or result.was_rewind) {
+            if (self.verbose) {
+                var ts_buf: [32]u8 = undefined;
+                const ts = formatElapsed(&ts_buf, start_ns);
+                std.debug.print("    [{s}s] cycle={d} {s} buf={d}ms\n", .{
+                    ts, cycle_count, if (result.was_rewind) "REWIND" else "empty", pcm_buf.len * 1000 / 32000,
+                });
+            }
+            return .{ .emitted = false };
+        }
+
+        const buf_duration_ms = pcm_buf.len * 1000 / 32000;
+        const t = result.timing;
+
+        // Build delta with space insertion between utterance segments
+        const delta = if (emitted_in_utterance and result.text[0] != ' ')
+            blk: {
+                const buf = try self.allocator.alloc(u8, result.text.len + 1);
+                buf[0] = ' ';
+                @memcpy(buf[1..], result.text);
+                break :blk buf;
+            }
+        else
+            try self.allocator.dupe(u8, result.text);
+        defer self.allocator.free(delta);
+
+        emitDelta(output_fd, start_ns, delta, type_cb, self.recorder) catch return error.BrokenPipe;
+        try pipeline.commitTokens(result.tokens);
+
+        if (self.verbose) {
+            var ts_buf: [32]u8 = undefined;
+            const ts = formatElapsed(&ts_buf, start_ns);
+            const accum = pipeline.accumulated_tokens.items.len;
+            const ctx = pipeline.context_tokens.items.len;
+            std.debug.print("    [{s}s] cycle={d} {s} words={d} accum={d} ctx={d} buf={d}ms | {s} state={d:.0}ms mel={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms EMIT\n", .{
+                ts, cycle_count, state_name, result.words.len, accum, ctx, buf_duration_ms,
+                utils.textPreview(result.text), t.state_init_ms, t.mel_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
+            });
+        }
+
+        if (self.recorder) |rec| {
+            rec.logCycle(start_ns, cycle_count, state_name, buf_duration_ms, result.words.len, result.text);
+        }
+
+        return .{ .emitted = true };
+    }
+
+    fn resetUtterance(
+        self: *Server,
+        pipeline: *Pipeline,
+        pcm_buf: *std.ArrayListUnmanaged(u8),
+        pcm_trim_total: *usize,
+        end_reason: EndReason,
+    ) void {
+        pipeline.resetSegment();
+        if (self.recorder) |rec| rec.endUtterance(end_reason) catch |err| {
+            std.debug.print("[rec] write error: {}\n", .{err});
+        };
+        pcm_trim_total.* += pcm_buf.items.len;
+        pcm_buf.clearRetainingCapacity();
     }
 };
 
