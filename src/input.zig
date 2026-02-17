@@ -398,7 +398,7 @@ pub const InputHandler = struct {
     trigger_key: u16,
     trigger_passthrough: bool,
     type_delay_us: u64,
-    pause_fn: *const fn (bool) void,
+    live_fn: *const fn (bool) void,
     thread: ?std.Thread = null,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     uinput_mutex: std.Thread.Mutex = .{},
@@ -412,7 +412,7 @@ pub const InputHandler = struct {
         trigger_key: u16 = ev.KEY_CAPSLOCK,
         trigger_passthrough: bool = false,
         type_delay_us: u64 = 12_000, // 12ms between keystrokes
-        pause_fn: *const fn (bool) void,
+        live_fn: *const fn (bool) void,
     };
 
     pub fn init(config: Config) !InputHandler {
@@ -420,7 +420,7 @@ pub const InputHandler = struct {
             .trigger_key = config.trigger_key,
             .trigger_passthrough = config.trigger_passthrough,
             .type_delay_us = config.type_delay_us,
-            .pause_fn = config.pause_fn,
+            .live_fn = config.live_fn,
         };
 
         // Create uinput virtual keyboard
@@ -525,8 +525,8 @@ pub const InputHandler = struct {
                 if (std.time.nanoTimestamp() - release_ns >= self.debounce_ns) {
                     if (self.trigger.debounceExpired()) {
                         self.release_time_ns = null;
-                        self.pause_fn(true);
-                        log.info("trigger released (after debounce) — paused", .{});
+                        self.live_fn(false);
+                        log.info("trigger released (after debounce)", .{});
                     }
                 }
             }
@@ -586,13 +586,13 @@ pub const InputHandler = struct {
             switch (action) {
                 .start_recording => {
                     self.release_time_ns = null;
-                    self.pause_fn(false);
-                    log.info("trigger pressed — recording", .{});
+                    self.live_fn(true);
+                    log.info("trigger pressed — live", .{});
                 },
                 .cancel_debounce => {
                     self.release_time_ns = null;
-                    self.pause_fn(false);
-                    log.info("trigger re-pressed — resuming", .{});
+                    self.live_fn(true);
+                    log.info("trigger re-pressed — live", .{});
                 },
                 .start_debounce => {
                     self.release_time_ns = std.time.nanoTimestamp();

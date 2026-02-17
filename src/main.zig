@@ -152,7 +152,7 @@ pub fn main() !void {
         return;
     }
 
-    // --trigger implies --input local (PipeWire capture) and starts paused (trigger key controls recording)
+    // --trigger implies --input local (PipeWire capture) and starts not-live (trigger key controls recording)
     if (trigger_key != null) {
         input_mode = .local;
     }
@@ -257,7 +257,7 @@ pub fn main() !void {
                 .trigger_key = tkey,
                 .trigger_passthrough = trigger_passthrough,
                 .type_delay_us = type_delay_us,
-                .pause_fn = &server_mod.setPaused,
+                .live_fn = &server_mod.setLive,
             }) catch |err| {
                 std.debug.print("Failed to init input handler: {}\n", .{err});
                 std.debug.print("Check: is user in 'input' group? Is /dev/uinput accessible?\n", .{});
@@ -269,9 +269,9 @@ pub fn main() !void {
             };
         }
 
-        // Start paused when using trigger key (evdev controls pause directly)
+        // Start not-live when using trigger key (trigger press goes live)
         if (trigger_key != null) {
-            server_mod.setPaused(true);
+            server_mod.setLive(false);
         }
     }
     defer {

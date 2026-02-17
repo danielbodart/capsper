@@ -6,13 +6,13 @@ const Allocator = std.mem.Allocator;
 pub const EndReason = enum {
     flush,
     timeout,
-    pause,
+    released,
 
     pub fn label(self: EndReason) []const u8 {
         return switch (self) {
             .flush => "flush",
             .timeout => "timeout",
-            .pause => "pause",
+            .released => "released",
         };
     }
 };

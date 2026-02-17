@@ -9,19 +9,19 @@ const Recorder = @import("recorder.zig").Recorder;
 const posix = std.posix;
 const net = std.net;
 
-// Global pause state (module-level so input handler can access it via setPaused).
-// Default unpaused; main.zig sets to paused when --trigger is used.
-pub var is_paused = std.atomic.Value(bool).init(false);
+// Global live state (module-level so input handler can access it via setLive).
+// Default not live; main.zig calls setLive(true) when trigger key is pressed.
+pub var is_live = std.atomic.Value(bool).init(false);
 
-// Global capture pointer — set by runLocal so setPaused can toggle the PipeWire stream.
-// When non-null, setPaused also activates/deactivates the stream so the desktop
+// Global capture pointer — set by runLocal so setLive can toggle the PipeWire stream.
+// When non-null, setLive also activates/deactivates the stream so the desktop
 // microphone indicator only appears during active recording.
 var capture_ptr = std.atomic.Value(?*AudioCapture).init(null);
 
-pub fn setPaused(paused: bool) void {
-    is_paused.store(paused, .monotonic);
+pub fn setLive(live: bool) void {
+    is_live.store(live, .monotonic);
     if (capture_ptr.load(.monotonic)) |cap| {
-        cap.setActive(!paused);
+        cap.setActive(live);
     }
 }
 
@@ -134,11 +134,11 @@ pub const Server = struct {
         };
         defer capture.deinit();
 
-        // Register capture so setPaused can toggle stream active state.
-        // If not starting paused (no --trigger), activate the stream immediately.
+        // Register capture so setLive can toggle stream active state.
+        // If already live (no --trigger), activate the stream immediately.
         capture_ptr.store(&capture, .monotonic);
         defer capture_ptr.store(null, .monotonic);
-        if (!is_paused.load(.monotonic)) {
+        if (is_live.load(.monotonic)) {
             capture.setActive(true);
         }
 
@@ -174,7 +174,7 @@ pub const Server = struct {
         var silence_start_pos: usize = 0;
         var cycle_count: usize = 0;
         var trailing_transcribe_done: bool = false; // limit trailing_silence to 1 extra transcription
-        var was_paused: bool = is_paused.load(.monotonic); // track previous pause state for transition detection
+        var was_live: bool = is_live.load(.monotonic); // track previous live state for transition detection
 
         while (true) {
             // Use poll for timeout support during active speech
@@ -223,35 +223,32 @@ pub const Server = struct {
 
             bytes_since_last_cycle = 0;
 
-            // Pause logic: when paused, drain audio and skip all processing
-            const paused = is_paused.load(.monotonic);
-            if (paused) {
-                if (!was_paused and (state == .speaking or state == .trailing_silence)) {
+            // Not live (trigger released): discard audio and skip all processing
+            const live = is_live.load(.monotonic);
+            if (!live) {
+                if (was_live and (state == .speaking or state == .trailing_silence)) {
                     pipeline.resetSegment();
-                    if (self.recorder) |rec| rec.endUtterance(.pause) catch |err| {
+                    if (self.recorder) |rec| rec.endUtterance(.released) catch |err| {
                         std.debug.print("[rec] write error: {}\n", .{err});
                     };
                 }
-                const old_len = pcm_buf.items.len;
-                utils.trimBuffer(&pcm_buf, idle_keep_bytes);
-                pcm_trim_total += old_len - pcm_buf.items.len;
-                was_paused = true;
+                // Discard all audio — keeping stale audio causes utterance bleed
+                pcm_trim_total += pcm_buf.items.len;
+                pcm_buf.clearRetainingCapacity();
+                was_live = false;
                 continue;
             }
 
-            // Unpause transition: reset state for clean first transcription.
-            // Clear pcm_buf to avoid utterance bleed — the 4s idle retention
-            // would contain audio from the previous utterance, causing the
-            // decoder to hallucinate/repeat previous text at the start.
-            if (was_paused) {
+            // Went live (trigger pressed): reset state for clean first transcription
+            if (!was_live) {
                 var ts_buf2: [32]u8 = undefined;
                 const ts2 = formatElapsed(&ts_buf2, start_ns);
-                std.debug.print("[{s}s] UNPAUSED\n", .{ts2});
+                std.debug.print("[{s}s] LIVE\n", .{ts2});
                 pcm_buf.clearRetainingCapacity();
                 state = .idle;
                 cycle_count = 0;
                 emitted_in_utterance = false;
-                was_paused = false;
+                was_live = true;
             }
 
             // Final flush on disconnect or read timeout — emit everything
@@ -296,10 +293,9 @@ pub const Server = struct {
                     std.debug.print("[rec] write error: {}\n", .{err});
                 };
                 if (client_closed) return;
-                // After timeout flush, go idle
-                const old_len = pcm_buf.items.len;
-                utils.trimBuffer(&pcm_buf, idle_keep_bytes);
-                pcm_trim_total += old_len - pcm_buf.items.len;
+                // After timeout flush, go idle with clean buffer
+                pcm_trim_total += pcm_buf.items.len;
+                pcm_buf.clearRetainingCapacity();
                 emitted_in_utterance = false;
                 state = .idle;
                 cycle_count = 0;
@@ -460,9 +456,9 @@ pub const Server = struct {
                     };
                     const flush_ts = formatElapsed(&ts_buf, start_ns);
                     std.debug.print("[{s}s] flush → idle\n", .{flush_ts});
-                    const old_len = pcm_buf.items.len;
-                    utils.trimBuffer(&pcm_buf, idle_keep_bytes);
-                    pcm_trim_total += old_len - pcm_buf.items.len;
+                    // Clear buffer completely — stale audio causes utterance bleed
+                    pcm_trim_total += pcm_buf.items.len;
+                    pcm_buf.clearRetainingCapacity();
                     emitted_in_utterance = false;
                     state = .idle;
                     cycle_count = 0;
