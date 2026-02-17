@@ -8,3 +8,4 @@ tools/
 CLAUDE.local.md
 capsper-linux-x86_64.tar.gz
 capsper-linux-x86_64.tar.gz.sha256
+.worktrees/
