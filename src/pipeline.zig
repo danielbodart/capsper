@@ -19,6 +19,7 @@ pub const TranscribeResult = struct {
     text: []const u8,
     words: []const utils.TimedWord,
     tokens: []const c.whisper_token,
+    token_frames: []const usize, // per-token audio frame from cross-attention
     was_rewind: bool,
     timing: Timing,
 };
@@ -48,6 +49,9 @@ pub const Pipeline = struct {
     // Fed as forced decoder output AFTER [notimestamps] for consistency.
     // These only correspond to audio currently in the buffer.
     accumulated_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
+    // Per-token audio frame (encoder frame at 50fps) from cross-attention.
+    // Parallel to accumulated_tokens — used for exact trim decisions.
+    accumulated_frames: std.ArrayListUnmanaged(usize) = .{},
 
     // Context tokens from audio that has been trimmed from the buffer.
     // Fed as conditioning BEFORE [sot] (in the <|startofprev|> section).
@@ -91,6 +95,7 @@ pub const Pipeline = struct {
     pub fn deinit(self: *Pipeline) void {
         self.mel_buffer.deinit();
         self.accumulated_tokens.deinit(self.allocator);
+        self.accumulated_frames.deinit(self.allocator);
         self.context_tokens.deinit(self.allocator);
         c.whisper_free_state(self.state);
     }
@@ -98,33 +103,44 @@ pub const Pipeline = struct {
     /// Append confirmed tokens to the accumulated context.
     /// Called by the server after emitting words — the confirmed tokens become
     /// forced prefix for subsequent decode cycles, ensuring consistency.
-    pub fn commitTokens(self: *Pipeline, tokens: []const c.whisper_token) !void {
+    pub fn commitTokens(self: *Pipeline, tokens: []const c.whisper_token, frames: []const usize) !void {
         try self.accumulated_tokens.appendSlice(self.allocator, tokens);
+        try self.accumulated_frames.appendSlice(self.allocator, frames);
     }
 
     /// Clear accumulated tokens, context tokens, and mel cache (on VAD segment boundary / flush).
     pub fn resetSegment(self: *Pipeline) void {
         self.accumulated_tokens.clearRetainingCapacity();
+        self.accumulated_frames.clearRetainingCapacity();
         self.context_tokens.clearRetainingCapacity();
         self.mel_buffer.reset();
     }
 
     /// Demote tokens from accumulated (forced) to context (conditioning) when audio
-    /// is trimmed from the front of the buffer. The trimmed audio's tokens move to
-    /// the <|startofprev|> section (before [sot]) where they serve as a hint to the
-    /// model without being forced as output. This avoids the misalignment that
-    /// proportional dropping caused (hallucination / EOT at buffer boundary).
-    pub fn demoteTokens(self: *Pipeline, trimmed_bytes: usize, old_buffer_bytes: usize) !void {
+    /// is trimmed from the front of the buffer. Uses per-token frame data from
+    /// cross-attention to split exactly: tokens attending trimmed-away audio get
+    /// demoted, others stay with adjusted frame offsets.
+    pub fn demoteTokens(self: *Pipeline, trimmed_bytes: usize) !void {
         const n = self.accumulated_tokens.items.len;
-        if (n == 0 or trimmed_bytes == 0 or old_buffer_bytes == 0) return;
-        // Ceiling division: always demote at least 1 token when audio was trimmed,
-        // otherwise integer truncation can leave tokens referencing trimmed-away audio.
-        const drop = @min(n, (n * trimmed_bytes + old_buffer_bytes - 1) / old_buffer_bytes);
+        if (n == 0 or trimmed_bytes == 0) return;
+
+        // Convert trimmed bytes to encoder frame threshold (50fps = 320 samples/frame * 2 bytes/sample = 640 bytes/frame)
+        const trim_frame = trimmed_bytes / 640;
+
+        // Find split point: first token whose frame >= trim_frame
+        var drop: usize = 0;
+        for (self.accumulated_frames.items[0..n]) |frame| {
+            if (frame >= trim_frame) break;
+            drop += 1;
+        }
+        // Always demote at least 1 token when audio was trimmed, to avoid
+        // tokens referencing trimmed-away audio when frame data is imprecise.
+        if (drop == 0) drop = 1;
 
         // Move front tokens to context (conditioning)
         try self.context_tokens.appendSlice(self.allocator, self.accumulated_tokens.items[0..drop]);
 
-        // Shift remaining tokens to front
+        // Shift remaining tokens and frames to front, adjusting frame offsets
         const remaining = n - drop;
         std.mem.copyForwards(
             c.whisper_token,
@@ -132,6 +148,12 @@ pub const Pipeline = struct {
             self.accumulated_tokens.items[drop..n],
         );
         self.accumulated_tokens.items.len = remaining;
+
+        // Adjust frame offsets: subtract trim_frame so they're relative to new buffer start
+        for (self.accumulated_frames.items[drop..n], 0..) |frame, i| {
+            self.accumulated_frames.items[i] = frame -| trim_frame;
+        }
+        self.accumulated_frames.items.len = remaining;
     }
 
     fn msFromNs(start: i128) f64 {
@@ -489,6 +511,7 @@ pub const Pipeline = struct {
             .text = try self.allocator.dupe(u8, text_buf.items),
             .words = try self.allocator.dupe(utils.TimedWord, words.items),
             .tokens = try self.allocator.dupe(c.whisper_token, tokens_to_decode),
+            .token_frames = try self.allocator.dupe(usize, frames_to_use),
             .was_rewind = was_rewind,
             .timing = timing,
         };

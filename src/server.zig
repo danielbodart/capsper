@@ -43,7 +43,7 @@ const transcribe_interval_bytes: usize = 32000; // 1s — re-transcribe cadence 
 const vad_window_bytes: usize = 16000; // 0.5s — VAD lookback window
 const idle_keep_bytes: usize = 128000; // 4s — audio retained while idle (gives first transcription more context)
 const silence_timeout_bytes: usize = 64000; // 2s — silence before utterance flush
-const max_buffer_bytes: usize = 480000; // 15s — sliding window cap
+const max_buffer_bytes: usize = 960000; // 30s — sliding window cap (matches whisper's full 30s window)
 const min_transcribe_bytes: usize = 16000; // 0.5s — minimum audio worth transcribing
 
 const State = union(enum) {
@@ -390,10 +390,9 @@ pub const Server = struct {
                     if (trimmed > 0) {
                         // Audio was trimmed from the front — mel cache is invalid.
                         pipeline.mel_buffer.reset();
-                        // Demote front tokens from forced (after [notimestamps]) to
-                        // conditioning (before [sot]). They no longer correspond to
-                        // audio in the buffer but still provide context to the model.
-                        try pipeline.demoteTokens(trimmed, old_len);
+                        // Demote tokens attending trimmed-away audio from forced
+                        // (after [notimestamps]) to conditioning (before [sot]).
+                        try pipeline.demoteTokens(trimmed);
                     }
                 }
             }
@@ -432,6 +431,7 @@ pub const Server = struct {
         defer self.allocator.free(result.text);
         defer self.allocator.free(result.words);
         defer self.allocator.free(result.tokens);
+        defer self.allocator.free(result.token_frames);
 
         if (result.text.len == 0 or result.was_rewind) {
             if (self.verbose) {
@@ -454,7 +454,7 @@ pub const Server = struct {
         defer self.allocator.free(delta);
 
         emitDelta(output_fd, start_ns, delta, type_cb, self.recorder) catch return error.BrokenPipe;
-        try pipeline.commitTokens(result.tokens);
+        try pipeline.commitTokens(result.tokens, result.token_frames);
 
         if (self.verbose) {
             var ts_buf: [32]u8 = undefined;
