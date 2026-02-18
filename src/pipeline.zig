@@ -117,8 +117,9 @@ pub const Pipeline = struct {
     pub fn demoteTokens(self: *Pipeline, trimmed_bytes: usize, old_buffer_bytes: usize) !void {
         const n = self.accumulated_tokens.items.len;
         if (n == 0 or trimmed_bytes == 0 or old_buffer_bytes == 0) return;
-        const drop = @min(n, n * trimmed_bytes / old_buffer_bytes);
-        if (drop == 0) return;
+        // Ceiling division: always demote at least 1 token when audio was trimmed,
+        // otherwise integer truncation can leave tokens referencing trimmed-away audio.
+        const drop = @min(n, (n * trimmed_bytes + old_buffer_bytes - 1) / old_buffer_bytes);
 
         // Move front tokens to context (conditioning)
         try self.context_tokens.appendSlice(self.allocator, self.accumulated_tokens.items[0..drop]);
@@ -278,6 +279,8 @@ pub const Pipeline = struct {
         const max_tokens: usize = 224;
         var last_attend_frame: ?usize = null;
         var was_rewind = false;
+        var prev_token: c.whisper_token = -1;
+        var repeat_count: usize = 0;
 
         for (0..max_tokens) |step| {
             const logits = c.whisper_get_logits_from_state(self.state);
@@ -304,6 +307,24 @@ pub const Pipeline = struct {
                 timing.stop_reason = "eot";
                 break;
             }
+
+            // Repetition guard: if the same token is sampled 3+ times in a row,
+            // the decoder is hallucinating. Break early to prevent runaway output.
+            if (best_token == prev_token) {
+                repeat_count += 1;
+                if (repeat_count >= 3) {
+                    // Discard the repeated tokens from generated output
+                    const discard = @min(repeat_count - 1, generated.items.len);
+                    generated.items.len -= discard;
+                    token_frames.items.len -= discard;
+                    timing.stop_reason = "repetition";
+                    std.debug.print("    [pipeline] repetition guard at step {d}\n", .{step});
+                    break;
+                }
+            } else {
+                repeat_count = 0;
+            }
+            prev_token = best_token;
 
             // Skip initial blank/punctuation-only tokens
             if (generated.items.len == 0) {
