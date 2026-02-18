@@ -11,7 +11,7 @@ http() { curl --progress-bar "$@" || wget -qO- "$@"; }
 
 [[ -f "$MISE_INSTALL_PATH" ]] || http https://mise.run | sh
 git -C "$SCRIPT_DIR" submodule update --init --recursive --quiet
-command -v git-lfs &>/dev/null && git lfs install --local
+command -v git-lfs &>/dev/null && git lfs install --local && git -C "$SCRIPT_DIR" lfs pull
 mise trust --quiet "$SCRIPT_DIR"
 mise install
 eval "$(mise env)"
