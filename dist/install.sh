@@ -20,6 +20,7 @@ VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/${VAD_MO
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 RECORDINGS_DIR="$INSTALL_DIR/recordings"
+NEEDS_REBOOT=false
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -63,7 +64,8 @@ check_permissions() {
         echo "The 'input' group is needed for keyboard grab and text injection."
         if confirm "Add current user to 'input' group? (requires sudo)"; then
             sudo usermod -aG input "$USER"
-            echo "Added to 'input' group. You may need to log out and back in."
+            NEEDS_REBOOT=true
+            echo "Added to 'input' group."
         fi
     fi
 
@@ -660,7 +662,13 @@ cmd_install() {
     fi
 
     echo ""
-    if run_dry_run; then
+    if $NEEDS_REBOOT; then
+        echo "=== Reboot Required ==="
+        echo "You were added to the 'input' group. This only takes effect after a reboot."
+        echo "The service is enabled and will start automatically on boot."
+        echo ""
+        echo "Reboot now, and capsper will be ready when you log back in."
+    elif run_dry_run; then
         if $is_upgrade && $was_active; then
             echo "Restarting service..."
             systemctl --user restart capsper.service
