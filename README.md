@@ -279,6 +279,8 @@ On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
 | Decoder | ~5ms | Autoregressive token generation |
 | **Total** | **~2,600ms** | |
 
+The table steps add up to ~1.5s, not 2.6s. The gap is because the first transcription cycle (after 1s of audio) almost always produces nothing — AlignAtt's cross-attention analysis isn't confident enough to emit tokens from just one second of speech. So the system waits for a second round of audio accumulation (~1s more), runs a second transcription cycle, and *that* one emits the first words. The ~2.6s floor is fundamental: Whisper needs roughly 2s of audio context before AlignAtt will commit to emitting.
+
 PipeWire stream setup and audio accumulation are the dominant costs. The stream is connected on each PTT press and disconnected on release so the desktop microphone indicator only appears while recording.
 
 ### `--low-latency` mode
