@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll } from "bun:test";
 import { $, spawn, file } from "bun";
-import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, trackProc } from "./helpers";
+import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, trackProc, saveLog } from "./helpers";
 
 const gpu = await hasGpu();
 
@@ -67,6 +67,7 @@ describe.skipIf(!gpu)("pw-stream", () => {
 
                 expect(wordCount).toBeGreaterThan(0);
             } finally {
+                saveLog(server.logFile, "pw-stream");
                 server.kill();
             }
         } finally {

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `bootstrap.sh` + mise.
 
 ```bash
-# Default: build + unit tests + quick integration smoke tests (stream + pw-stream)
+# Default: build + unit tests + short regressions + pw plumbing
 ./run.ts
 
 # Build only (no tests)
@@ -29,16 +29,13 @@ Requires an NVIDIA GPU with CUDA. Zig and Bun are installed automatically via `b
 # Unit + property tests (fast, no GPU required)
 ./run.ts test
 
-# All integration tests (requires GPU + built binary)
-./run.ts slow-test
+# Regression test groups (requires GPU + built binary)
+./run.ts short-test                    # 4 short files (<15s) via fast TCP
+./run.ts medium-test                   # 2 medium files (15-40s) via fast TCP
+./run.ts long-test                     # 3 long files (>60s) via fast TCP
 
-# Individual integration tests
-./run.ts slow-test stream              # TCP stream jfk.wav (~11s)
-./run.ts slow-test stream custom.wav   # TCP stream custom file
-./run.ts slow-test long-stream         # Loop jfk.wav 20x (~3.7 min)
-./run.ts slow-test compare             # Compare against reference transcript
-./run.ts slow-test compare dictation   # Compare with test/dictation.wav
-./run.ts slow-test pw-stream           # PipeWire loopback test
+# All integration tests (all groups + stability + pw plumbing)
+./run.ts slow-test
 ```
 
 ## Architecture

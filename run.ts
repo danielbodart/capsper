@@ -169,7 +169,7 @@ export async function setup() {
     await $`bash ${installSh}`;
 }
 
-/** Default target: build → lint → unit tests → quick integration tests (stream + pw-stream). */
+/** Default target: build → lint → unit tests → short regressions + pw plumbing. */
 export async function dev() {
     await build();
     console.log("Running static analysis...");
@@ -178,27 +178,34 @@ export async function dev() {
     console.log("Running unit + property tests...");
     await $`zig build test`;
     console.log("Running integration smoke tests...");
-    await $`bun test test/stream.test.ts test/pw-stream.test.ts`;
+    await $`bun test test/regression.test.ts test/pw-stream.test.ts`;
 }
 
 export async function test() {
     await $`zig build test`;
 }
 
-export async function slowTest(testName?: string, ...extra: string[]) {
+export async function shortTest() {
     ensureBinary();
-    if (extra.length > 0) {
-        if (testName === "stream" || testName === "pw-stream") {
-            process.env.TEST_WAV = extra[0];
-        } else if (testName === "compare") {
-            process.env.TEST_NAME = extra[0];
-        }
-    }
-    if (testName) {
-        await $`bun test test/${testName}.test.ts`;
-    } else {
-        await $`bun test test/`;
-    }
+    await $`bun test test/regression.test.ts`;
+}
+
+export async function mediumTest() {
+    ensureBinary();
+    process.env.TEST_GROUP = "medium";
+    await $`bun test test/regression.test.ts`;
+}
+
+export async function longTest() {
+    ensureBinary();
+    process.env.TEST_GROUP = "long";
+    await $`bun test test/regression.test.ts`;
+}
+
+export async function slowTest() {
+    ensureBinary();
+    process.env.SLOW_TESTS = "1";
+    await $`bun test test/`;
 }
 
 export async function dist() {
@@ -275,6 +282,9 @@ async function printVersion() {
 
 const commands: Record<string, Function> = {
     dev, build, clean, setup, test, lint, dist, ci, version: printVersion,
+    "short-test": shortTest,
+    "medium-test": mediumTest,
+    "long-test": longTest,
     "slow-test": slowTest,
     "rebuild-whisper": rebuildWhisper,
 };

@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll } from "bun:test";
-import { hasGpu, ensureBinary, ensureFile, startServer, readPcm, streamPcm } from "./helpers";
+import { hasGpu, ensureBinary, ensureFile, startServer, readPcm, streamPcmFast, saveLog } from "./helpers";
 
 const gpu = await hasGpu();
 
@@ -21,7 +21,7 @@ describe.skipIf(!gpu)("long-stream", () => {
             console.error(`Streaming ${LOOPS} loops = ${totalDuration}s to localhost:${server.port}`);
             console.error("---");
 
-            await streamPcm(server.port, pcm);
+            await streamPcmFast(server.port, pcm);
 
             console.error("---");
             console.error("Done.");
@@ -29,6 +29,7 @@ describe.skipIf(!gpu)("long-stream", () => {
             // Server should still be alive (not crashed)
             expect(server.proc.exitCode).toBeNull();
         } finally {
+            saveLog(server.logFile, "long-stream");
             server.kill();
         }
     }, 300_000);

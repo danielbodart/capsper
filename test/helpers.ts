@@ -1,5 +1,6 @@
 import { $, spawn, file } from "bun";
-import { existsSync, readFileSync, statSync } from "fs";
+import { expect } from "bun:test";
+import { existsSync, readFileSync, statSync, mkdirSync, copyFileSync } from "fs";
 import { createConnection } from "net";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -191,4 +192,213 @@ export function streamPcm(port: number, pcm: Buffer, bytesPerSec = 32000): Promi
         socket.on("end", () => resolve(Buffer.concat(chunks).toString()));
         socket.on("error", (err) => { clearTimeout(timer); reject(err); });
     });
+}
+
+/** Stream all PCM in one write + half-close. No real-time pacing.
+ *  Uses Bun.connect with explicit shutdown() for proper TCP half-close. */
+export function streamPcmFast(port: number, pcm: Buffer): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        let remaining: Buffer | null = null;
+        let shutdownPending = false;
+
+        Bun.connect({
+            hostname: "localhost",
+            port,
+            socket: {
+                open(socket) {
+                    const written = socket.write(pcm);
+                    if (written < pcm.length) {
+                        remaining = pcm.subarray(written);
+                    } else {
+                        socket.shutdown();
+                    }
+                },
+                drain(socket) {
+                    if (remaining) {
+                        const written = socket.write(remaining);
+                        if (written >= remaining.length) {
+                            remaining = null;
+                            socket.shutdown();
+                        } else {
+                            remaining = remaining.subarray(written);
+                        }
+                    }
+                },
+                data(_socket, data) {
+                    chunks.push(Buffer.from(data));
+                },
+                close() {
+                    resolve(Buffer.concat(chunks).toString());
+                },
+                connectError(_socket, err) {
+                    reject(err);
+                },
+                error(_socket, err) {
+                    reject(err);
+                },
+            },
+        });
+    });
+}
+
+export interface Emission {
+    time: number;
+    text: string;
+}
+
+/** Parse "timestamp\ttext\n" lines from server output. */
+export function parseEmissions(rawOutput: string): Emission[] {
+    return rawOutput.split("\n").filter(Boolean).map(line => {
+        const [ts, ...rest] = line.split("\t");
+        return { time: parseFloat(ts), text: rest.join("\t") };
+    });
+}
+
+/** Find the maximum gap between consecutive emissions. */
+export function analyzeGaps(emissions: Emission[]): { maxGapSec: number; maxGapAfterText: string } {
+    let maxGapSec = 0;
+    let maxGapAfterText = "";
+    for (let i = 1; i < emissions.length; i++) {
+        const gap = emissions[i].time - emissions[i - 1].time;
+        if (gap > maxGapSec) {
+            maxGapSec = gap;
+            maxGapAfterText = emissions[i].text.trim();
+        }
+    }
+    return { maxGapSec, maxGapAfterText };
+}
+
+/** Find consecutive repeated words. Returns occurrences with count >= threshold. */
+export function detectRepetitions(words: string[], threshold = 5): { word: string; count: number }[] {
+    const results: { word: string; count: number }[] = [];
+    let i = 0;
+    while (i < words.length) {
+        let count = 1;
+        while (i + count < words.length && words[i + count] === words[i]) count++;
+        if (count >= threshold) {
+            results.push({ word: words[i], count });
+        }
+        i += count;
+    }
+    return results;
+}
+
+export interface Thresholds {
+    minCoverage?: number;
+    maxMissed?: number;
+    maxExtras?: number;
+    maxGapSec?: number;
+    maxRepetitions?: number;
+}
+
+const DEFAULT_THRESHOLDS: Required<Thresholds> = {
+    minCoverage: 85,
+    maxMissed: 25,
+    maxExtras: 15,
+    maxGapSec: 10,
+    maxRepetitions: 5,
+};
+
+export interface TranscriptResult {
+    streamText: string;
+    streamWords: string[];
+    emissions: Emission[];
+    coverage?: number;
+    matched?: number;
+    total?: number;
+    missed?: string[];
+    extras?: number;
+    maxGapSec: number;
+    repetitions: { word: string; count: number }[];
+}
+
+/** Universal assertion function for transcript quality. */
+export function assertTranscript(
+    rawOutput: string,
+    refText: string | null,
+    thresholds: Thresholds | undefined,
+    label: string,
+): TranscriptResult {
+    const t = { ...DEFAULT_THRESHOLDS, ...thresholds };
+    const emissions = parseEmissions(rawOutput);
+    const streamText = emissions.map(e => e.text).join(" ").replace(/\s+/g, " ").trim();
+    const streamWords = normalize(streamText).split(" ").filter(Boolean);
+
+    // Gap analysis
+    const { maxGapSec, maxGapAfterText } = analyzeGaps(emissions);
+
+    // Repetition detection
+    const repetitions = detectRepetitions(streamWords, t.maxRepetitions);
+
+    const result: TranscriptResult = {
+        streamText, streamWords, emissions, maxGapSec, repetitions,
+    };
+
+    // Emission timeline
+    console.error(`\n=== ${label} ===`);
+    for (const e of emissions) {
+        console.error(`  ${e.time.toFixed(1)}s  ${e.text}`);
+    }
+
+    if (refText) {
+        const refWords = normalize(refText).split(" ").filter(Boolean);
+        const cmp = compareWords(streamWords, refWords);
+        const extras = streamWords.length - cmp.matched;
+        const coverage = parseFloat(cmp.coverage);
+
+        result.coverage = coverage;
+        result.matched = cmp.matched;
+        result.total = cmp.total;
+        result.missed = cmp.missed;
+        result.extras = extras;
+
+        console.error(`Coverage: ${cmp.coverage}% (${cmp.matched}/${cmp.total}), extras: ${extras}, gap: ${maxGapSec.toFixed(1)}s`);
+        if (cmp.missed.length > 0) {
+            console.error(`Missed: ${cmp.missed.join(", ")}`);
+        }
+        if (repetitions.length > 0) {
+            console.error(`Repetitions: ${repetitions.map(r => `"${r.word}" x${r.count}`).join(", ")}`);
+        }
+
+        // Assertions
+        expect(coverage).toBeGreaterThanOrEqual(t.minCoverage);
+        expect(cmp.missed.length).toBeLessThanOrEqual(t.maxMissed);
+        expect(extras).toBeLessThanOrEqual(t.maxExtras);
+    } else {
+        console.error(`Words: ${streamWords.length}, gap: ${maxGapSec.toFixed(1)}s`);
+        // Smoke test: must produce output
+        expect(streamWords.length).toBeGreaterThan(0);
+    }
+
+    // Gap + repetition assertions always apply
+    if (emissions.length > 1) {
+        expect(maxGapSec).toBeLessThanOrEqual(t.maxGapSec);
+    }
+    expect(repetitions.length).toBe(0);
+
+    return result;
+}
+
+/** Display word-level diff using git diff --word-diff. Display-only, not for assertions. */
+export async function wordDiff(streamText: string, refText: string): Promise<void> {
+    const streamFile = tmpFile("stream", ".txt");
+    const refFile = tmpFile("ref", ".txt");
+    await Bun.write(streamFile, normalize(streamText));
+    await Bun.write(refFile, normalize(refText));
+
+    const result = await $`git diff --word-diff --no-index ${refFile} ${streamFile}`.quiet().nothrow();
+    if (result.stdout.length > 0) {
+        console.error("\n=== Word Diff (ref → stream) ===");
+        console.error(result.stdout.toString());
+    }
+}
+
+/** Save server log to test/results/<name>.log */
+export function saveLog(logFile: string, name: string): void {
+    const dir = "test/results";
+    mkdirSync(dir, { recursive: true });
+    try {
+        copyFileSync(logFile, join(dir, `${name}.log`));
+    } catch {}
 }

@@ -301,7 +301,7 @@ pub fn main() !void {
         var pipeline = try Pipeline.init(allocator, ctx, .{}, 4, verbose, prompt_tokens);
         defer pipeline.deinit();
 
-        if (try pipeline.transcribe(samples, true)) |result| {
+        if (try pipeline.transcribe(samples, true, null)) |result| {
             std.debug.print("Warmup result: \"{s}\"\n", .{result.text});
             allocator.free(result.text);
             allocator.free(result.words);

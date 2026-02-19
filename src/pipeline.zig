@@ -180,12 +180,14 @@ pub const Pipeline = struct {
     /// Uses accumulated_tokens as forced prefix for decoder consistency.
     /// When flush=true, uses a tighter stopping threshold, skips word
     /// truncation, and resets all segment state before returning.
+    /// Optional flush_budget caps the decode token budget on flush (default 224).
     pub fn transcribe(
         self: *Pipeline,
         samples: []const f32,
         flush: bool,
+        flush_budget: ?usize,
     ) !?TranscribeResult {
-        const result = try self.transcribeInternal(samples, flush, self.accumulated_tokens.items);
+        const result = try self.transcribeInternal(samples, flush, self.accumulated_tokens.items, flush_budget);
         if (flush) self.resetSegment();
         return result;
     }
@@ -195,6 +197,7 @@ pub const Pipeline = struct {
         samples: []const f32,
         flush: bool,
         forced_tokens: []const c.whisper_token,
+        flush_budget: ?usize,
     ) !?TranscribeResult {
         const t_total = std.time.nanoTimestamp();
         var timing = Timing{};
@@ -305,7 +308,7 @@ pub const Pipeline = struct {
         defer token_frames.deinit(self.allocator);
 
         var n_past: c_int = @intCast(full_prompt.len);
-        const max_tokens: usize = 224;
+        const max_tokens: usize = if (flush) (flush_budget orelse 224) else 224;
         var was_rewind = false;
         var prev_token: c.whisper_token = -1;
         var repeat_count: usize = 0;
