@@ -310,8 +310,6 @@ pub const Pipeline = struct {
         var n_past: c_int = @intCast(full_prompt.len);
         const max_tokens: usize = if (flush) (flush_budget orelse 224) else 224;
         var was_rewind = false;
-        var prev_token: c.whisper_token = -1;
-        var repeat_count: usize = 0;
 
         for (0..max_tokens) |step| {
             const logits = c.whisper_get_logits_from_state(self.state);
@@ -339,24 +337,6 @@ pub const Pipeline = struct {
                 break;
             }
 
-            // Repetition guard: if the same token is sampled 3+ times in a row,
-            // the decoder is hallucinating. Break early to prevent runaway output.
-            if (best_token == prev_token) {
-                repeat_count += 1;
-                if (repeat_count >= 3) {
-                    // Discard the repeated tokens from generated output
-                    const discard = @min(repeat_count - 1, generated.items.len);
-                    generated.items.len -= discard;
-                    token_frames.items.len -= discard;
-                    timing.stop_reason = "repetition";
-                    std.debug.print("    [pipeline] repetition guard at step {d}\n", .{step});
-                    break;
-                }
-            } else {
-                repeat_count = 0;
-            }
-            prev_token = best_token;
-
             // Skip initial blank/punctuation-only tokens
             if (generated.items.len == 0) {
                 const str = c.whisper_token_to_str(self.ctx, best_token);
@@ -376,6 +356,17 @@ pub const Pipeline = struct {
             try generated.append(self.allocator, best_token);
             // Placeholder frame — updated below after attention analysis
             try token_frames.append(self.allocator, self.last_attend_frame orelse 0);
+
+            // N-gram repetition guard: detect repeating phrases (1-8 tokens).
+            // Catches both single-token loops (AAA) and phrase loops (ABABAB).
+            if (detectPhraseRepetition(generated.items, 3)) |pat_len| {
+                const discard = @min(pat_len * 2, generated.items.len);
+                generated.items.len -= discard;
+                token_frames.items.len -= discard;
+                timing.stop_reason = "repetition";
+                std.debug.print("    [pipeline] repetition guard: {d}-gram at step {d}\n", .{ pat_len, step });
+                break;
+            }
 
             // Decode this token
             var next = [_]c.whisper_token{best_token};
@@ -413,37 +404,37 @@ pub const Pipeline = struct {
             // Update the frame for this token
             token_frames.items[token_frames.items.len - 1] = most_attended;
 
-            // On flush, skip attention-based stopping entirely — let the model run
-            // to EOT. The forced prefix anchors output, and stopping early drops
-            // trailing words (the token that triggers attn_end gets stripped).
-            // SimulStreaming also skips rewind detection on flush for the same reason.
-            if (!flush) {
-                const decision = alignatt.checkStopping(
-                    most_attended, content_frames, self.last_attend_frame, flush, self.config,
-                );
+            // Attention-at-end check runs on BOTH streaming and flush paths
+            // (SimulStreaming uses threshold=4 on is_last, 25 on streaming).
+            // Rewind detection only runs during streaming — pass null on flush
+            // to suppress it (SimulStreaming also skips rewind on is_last).
+            const decision = alignatt.checkStopping(
+                most_attended, content_frames,
+                if (flush) null else self.last_attend_frame,
+                flush, self.config,
+            );
 
-                switch (decision) {
-                    .stop_attention_at_end => {
-                        // Strip the token that triggered the stop
-                        if (generated.items.len > 0) {
-                            _ = generated.pop();
-                            _ = token_frames.pop();
-                        }
-                        timing.stop_reason = "attn_end";
-                        break;
-                    },
-                    .rewind_detected => {
-                        std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
-                        // Clear partial tokens so no garbage is committed
-                        generated.clearRetainingCapacity();
-                        token_frames.clearRetainingCapacity();
-                        was_rewind = true;
-                        self.last_attend_frame = null;
-                        timing.stop_reason = "rewind";
-                        break;
-                    },
-                    .continue_decoding => {},
-                }
+            switch (decision) {
+                .stop_attention_at_end => {
+                    // Strip the token that triggered the stop
+                    if (generated.items.len > 0) {
+                        _ = generated.pop();
+                        _ = token_frames.pop();
+                    }
+                    timing.stop_reason = "attn_end";
+                    break;
+                },
+                .rewind_detected => {
+                    std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
+                    // Clear partial tokens so no garbage is committed
+                    generated.clearRetainingCapacity();
+                    token_frames.clearRetainingCapacity();
+                    was_rewind = true;
+                    self.last_attend_frame = null;
+                    timing.stop_reason = "rewind";
+                    break;
+                },
+                .continue_decoding => {},
             }
             // Persists across cycles for cross-cycle rewind detection.
             // On flush, transcribe() calls resetSegment() after we return.
@@ -561,4 +552,28 @@ fn truncateLastWord(ctx: *c.whisper_context, tokens: []const c.whisper_token) us
         return start;
     }
     return 0;
+}
+
+/// Detect repeating n-gram patterns in the token sequence.
+/// Returns the pattern length (1 for AAA, 2 for ABABAB, etc.) or null.
+/// Checks patterns from 1 to max_pattern tokens, requiring min_reps repetitions.
+fn detectPhraseRepetition(tokens: []const c.whisper_token, min_reps: usize) ?usize {
+    const max_pattern = 8;
+    for (1..max_pattern + 1) |pat_len| {
+        const needed = pat_len * min_reps;
+        if (tokens.len < needed) continue;
+
+        const tail = tokens[tokens.len - needed ..];
+        const pattern = tail[0..pat_len];
+
+        var all_match = true;
+        for (1..min_reps) |rep| {
+            if (!std.mem.eql(c.whisper_token, pattern, tail[rep * pat_len ..][0..pat_len])) {
+                all_match = false;
+                break;
+            }
+        }
+        if (all_match) return pat_len;
+    }
+    return null;
 }

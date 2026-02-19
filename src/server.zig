@@ -279,9 +279,7 @@ pub const Server = struct {
                     };
                     if (flush_has_speech) {
                         cycle_count += 1;
-                        // Budget: ~12 tokens/sec of unemitted audio, minimum 20
-                        const budget = @max(20, pcm_buf.items.len * 12 / 32000);
-                        _ = try self.transcribeAndEmit(&pipeline, pcm_buf.items, true, budget, output_fd, start_ns, type_cb, cycle_count, "FINAL");
+                        _ = try self.transcribeAndEmit(&pipeline, pcm_buf.items, true, output_fd, start_ns, type_cb, cycle_count, "FINAL");
                     }
                     const end_reason: EndReason = if (!live) .released else .timeout;
                     self.resetUtterance(&pipeline, &pcm_buf, &pcm_trim_total, end_reason);
@@ -369,8 +367,7 @@ pub const Server = struct {
                     .speaking => "speaking",
                     .trailing_silence => "trailing",
                 };
-                const budget: ?usize = if (should_flush) @max(20, pcm_buf.items.len * 12 / 32000) else null;
-                _ = try self.transcribeAndEmit(&pipeline, pcm_buf.items, should_flush, budget, output_fd, start_ns, type_cb, cycle_count, state_name);
+                _ = try self.transcribeAndEmit(&pipeline, pcm_buf.items, should_flush, output_fd, start_ns, type_cb, cycle_count, state_name);
 
                 if (should_flush) {
                     self.resetUtterance(&pipeline, &pcm_buf, &pcm_trim_total, .flush);
@@ -406,7 +403,6 @@ pub const Server = struct {
         pipeline: *Pipeline,
         pcm_buf: []const u8,
         flush: bool,
-        flush_budget: ?usize,
         output_fd: posix.fd_t,
         start_ns: i128,
         type_cb: ?TypeCallback,
@@ -418,7 +414,7 @@ pub const Server = struct {
         const samples = try utils.pcmToFloat(self.allocator, pcm_buf);
         defer self.allocator.free(samples);
 
-        const result = try pipeline.transcribe(samples, flush, flush_budget) orelse {
+        const result = try pipeline.transcribe(samples, flush, null) orelse {
             if (self.verbose) {
                 var ts_buf: [32]u8 = undefined;
                 const ts = formatElapsed(&ts_buf, start_ns);
