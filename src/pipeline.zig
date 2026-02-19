@@ -558,7 +558,7 @@ fn truncateLastWord(ctx: *c.whisper_context, tokens: []const c.whisper_token) us
 /// Returns the pattern length (1 for AAA, 2 for ABABAB, etc.) or null.
 /// Checks patterns from 1 to max_pattern tokens, requiring min_reps repetitions.
 fn detectPhraseRepetition(tokens: []const c.whisper_token, min_reps: usize) ?usize {
-    const max_pattern = 8;
+    const max_pattern = 64;
     for (1..max_pattern + 1) |pat_len| {
         const needed = pat_len * min_reps;
         if (tokens.len < needed) continue;
