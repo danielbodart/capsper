@@ -62,6 +62,11 @@ pub const Pipeline = struct {
     // a VAD segment; reset on segment boundary or 28s buffer trim.
     mel_buffer: mel.MelBuffer,
 
+    // Most-attended encoder frame from the last decode cycle's final token.
+    // Persists across transcribe() calls for cross-cycle rewind detection.
+    // Adjusted on trim; reset on segment boundary or rewind.
+    last_attend_frame: ?usize = null,
+
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: *c.whisper_context,
@@ -114,6 +119,7 @@ pub const Pipeline = struct {
         self.accumulated_frames.clearRetainingCapacity();
         self.context_tokens.clearRetainingCapacity();
         self.mel_buffer.reset();
+        self.last_attend_frame = null;
     }
 
     /// Demote tokens from accumulated (forced) to context (conditioning) when audio
@@ -126,6 +132,11 @@ pub const Pipeline = struct {
 
         // Convert trimmed bytes to encoder frame threshold (50fps = 320 samples/frame * 2 bytes/sample = 640 bytes/frame)
         const trim_frame = trimmed_bytes / 640;
+
+        // Adjust last_attend_frame: shift by trim offset, or null if it pointed at trimmed audio
+        if (self.last_attend_frame) |laf| {
+            self.last_attend_frame = if (laf >= trim_frame) laf - trim_frame else null;
+        }
 
         // Find split point: first token whose frame >= trim_frame
         var drop: usize = 0;
@@ -299,7 +310,6 @@ pub const Pipeline = struct {
 
         var n_past: c_int = @intCast(full_prompt.len);
         const max_tokens: usize = 224;
-        var last_attend_frame: ?usize = null;
         var was_rewind = false;
         var prev_token: c.whisper_token = -1;
         var repeat_count: usize = 0;
@@ -366,7 +376,7 @@ pub const Pipeline = struct {
 
             try generated.append(self.allocator, best_token);
             // Placeholder frame — updated below after attention analysis
-            try token_frames.append(self.allocator, last_attend_frame orelse 0);
+            try token_frames.append(self.allocator, self.last_attend_frame orelse 0);
 
             // Decode this token
             var next = [_]c.whisper_token{best_token};
@@ -403,7 +413,7 @@ pub const Pipeline = struct {
             // SimulStreaming also skips rewind detection on is_last for the same reason.
             if (!is_last) {
                 const decision = alignatt.checkStopping(
-                    most_attended, content_frames, last_attend_frame, is_last, self.config,
+                    most_attended, content_frames, self.last_attend_frame, is_last, self.config,
                 );
 
                 switch (decision) {
@@ -418,14 +428,20 @@ pub const Pipeline = struct {
                     },
                     .rewind_detected => {
                         std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
+                        // Clear partial tokens so no garbage is committed
+                        generated.clearRetainingCapacity();
+                        token_frames.clearRetainingCapacity();
                         was_rewind = true;
+                        self.last_attend_frame = null;
                         timing.stop_reason = "rewind";
                         break;
                     },
                     .continue_decoding => {},
                 }
             }
-            last_attend_frame = most_attended;
+            // Persists across cycles for cross-cycle rewind detection.
+            // On is_last=true, caller always follows with resetSegment().
+            self.last_attend_frame = most_attended;
         }
 
         timing.decode_ms = msFromNs(t_decode);
