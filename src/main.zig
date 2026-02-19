@@ -42,6 +42,7 @@ pub fn main() !void {
     var record_dir: ?[:0]const u8 = null;
     var record_keep: usize = 10;
     var transcribe_file: ?[:0]const u8 = null;
+    var low_latency: bool = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -130,6 +131,8 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--transcribe")) {
             i += 1;
             if (i < args.len) transcribe_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--low-latency")) {
+            low_latency = true;
         } else {
             printUsage();
             return;
@@ -335,7 +338,7 @@ pub fn main() !void {
     }
 
     // Start server
-    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, type_callback, prompt_tokens, recorder);
+    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, recorder);
     try server.run();
 }
 

@@ -210,6 +210,7 @@ install_service() {
 
     local domain_terms="${7:-}"
     local enable_recordings="${8:-false}"
+    local low_latency="${9:-false}"
 
     local exec_start="$binary --trigger capslock --pw-channel $channel"
     exec_start="$exec_start --model $model_dir/$WHISPER_MODEL_NAME"
@@ -219,6 +220,9 @@ install_service() {
     if $enable_recordings; then
         mkdir -p "$RECORDINGS_DIR"
         exec_start="$exec_start --record-dir $RECORDINGS_DIR"
+    fi
+    if $low_latency; then
+        exec_start="$exec_start --low-latency"
     fi
 
     {
@@ -351,6 +355,9 @@ extract_service_config() {
 
     SAVED_RECORDINGS_ENABLED=false
     echo "$exec_start" | grep -q -- '--record-dir' && SAVED_RECORDINGS_ENABLED=true
+
+    SAVED_LOW_LATENCY=false
+    echo "$exec_start" | grep -q -- '--low-latency' && SAVED_LOW_LATENCY=true
 }
 
 install_update_timer() {
@@ -559,7 +566,18 @@ cmd_install() {
                 enable_recordings=true
             fi
 
-            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET" false "$domain_terms" $enable_recordings
+            # Low-latency mode
+            local low_latency=false
+            echo ""
+            echo "=== Low-Latency Mode (optional) ==="
+            echo "Keeps the microphone stream open between presses, saving ~300ms on"
+            echo "first-emit latency. Trade-off: your desktop microphone indicator will"
+            echo "stay visible at all times, not just while speaking."
+            if confirm_default_no "Enable low-latency mode?"; then
+                low_latency=true
+            fi
+
+            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET" false "$domain_terms" $enable_recordings $low_latency
         fi
     else
         echo "=== Capsper Installer ==="
@@ -623,6 +641,17 @@ cmd_install() {
                 enable_recordings=true
             fi
 
+            # Low-latency mode
+            local low_latency=false
+            echo ""
+            echo "=== Low-Latency Mode (optional) ==="
+            echo "Keeps the microphone stream open between presses, saving ~300ms on"
+            echo "first-emit latency. Trade-off: your desktop microphone indicator will"
+            echo "stay visible at all times, not just while speaking."
+            if confirm_default_no "Enable low-latency mode?"; then
+                low_latency=true
+            fi
+
             # Auto-updates
             local enable_updates=true
             echo ""
@@ -630,7 +659,7 @@ cmd_install() {
                 enable_updates=false
             fi
 
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" $enable_updates "$domain_terms" $enable_recordings
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" $enable_updates "$domain_terms" $enable_recordings $low_latency
 
             if $enable_updates; then
                 install_update_timer
@@ -642,7 +671,7 @@ cmd_install() {
 
             if has_auto_update; then
                 # Auto-update already configured: keep it, just update paths
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY"
             else
                 # Pre-auto-update install: offer to enable
                 local enable_updates=true
@@ -651,7 +680,7 @@ cmd_install() {
                     enable_updates=false
                 fi
 
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY"
 
                 if $enable_updates; then
                     install_update_timer

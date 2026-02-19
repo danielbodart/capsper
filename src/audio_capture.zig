@@ -135,6 +135,15 @@ pub const AudioCapture = struct {
         }
     }
 
+    /// Cork or uncork the stream. The stream stays connected (mic indicator
+    /// remains visible) but audio delivery is paused/resumed. Much faster
+    /// than connect/disconnect (~2ms vs ~1300ms).
+    pub fn setCork(self: *AudioCapture, corked: bool) void {
+        pw.pw_thread_loop_lock(self.thread_loop);
+        defer pw.pw_thread_loop_unlock(self.thread_loop);
+        _ = pw.pw_stream_set_active(self.stream, !corked);
+    }
+
     pub fn getFd(self: *const AudioCapture) posix.fd_t {
         return self.pipe_read_fd;
     }

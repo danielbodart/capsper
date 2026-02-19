@@ -218,6 +218,7 @@ capsper [OPTIONS]
   --trigger KEY           Trigger key for push-to-talk (default: capslock)
   --trigger-passthrough   Forward trigger key to OS after interception
   --type-delay MS         Delay between injected keystrokes in ms (default: 12)
+  --low-latency           Keep PipeWire stream open (mic indicator always visible, ~300ms faster)
   --pw-target NODE        PipeWire capture target node name
   --pw-channel CHANNEL    PipeWire channel: MONO, FL, AUX0-AUX63 (default: FL)
   --domain-terms FILE     Text file of domain terms to bias transcription toward
@@ -265,11 +266,28 @@ All commands go through the Bun-based task runner (`run.ts`), which bootstraps i
 
 On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
 
-- Model load: ~1.2s
-- Encode: ~113ms per cycle (80% of cycle time — full self-attention, not incrementalisable)
-- Mel spectrogram: ~15ms per cycle (incremental, only computes new frames)
-- Streaming latency: ~1s between word emissions
-- Total cycle: ~140ms
+### First-emit latency (PTT press → first text appears): ~2.6s
+
+| Step | Time | Notes |
+|---|---|---|
+| Key press → PipeWire connect | ~2ms | `pw_stream_connect` request |
+| PipeWire stream setup | ~330ms | Format negotiation, source starts delivering buffers |
+| Audio accumulation | ~1,000ms | Waiting for 1s of audio (`transcribe_interval_bytes`) |
+| VAD speech detection | ~15ms | Silero VAD on last 0.5s window |
+| Mel spectrogram | ~15ms | Incremental, only computes new frames |
+| Encoder (self-attention) | ~100ms | Full self-attention, not incrementalisable |
+| Decoder | ~5ms | Autoregressive token generation |
+| **Total** | **~2,600ms** | |
+
+PipeWire stream setup and audio accumulation are the dominant costs. The stream is connected on each PTT press and disconnected on release so the desktop microphone indicator only appears while recording.
+
+### `--low-latency` mode
+
+Pass `--low-latency` to keep the PipeWire stream connected at all times, using cork/uncork instead of connect/disconnect. The microphone indicator stays visible permanently, but eliminates PipeWire stream setup on each press (~300ms saving, ~2.3s total). Subsequent presses in the same session are faster (~2.0s) since the stream is already warmed up.
+
+### Subsequent emissions: ~1s apart
+
+Once audio is flowing, new words appear every ~1s (the transcription interval). Each cycle takes ~130ms on the GPU — the rest is waiting for audio to accumulate.
 
 ## Troubleshooting
 

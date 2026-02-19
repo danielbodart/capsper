@@ -21,10 +21,24 @@ pub var is_live = std.atomic.Value(bool).init(true);
 // microphone indicator only appears during active recording.
 var capture_ptr = std.atomic.Value(?*AudioCapture).init(null);
 
+// Low-latency mode: cork/uncork stream instead of connect/disconnect.
+// Set once during init, read from input thread via setLive().
+var use_cork_mode = std.atomic.Value(bool).init(false);
+
+// PTT latency tracking — set by input thread via setLive(), read by server loop.
+var ptt_press_ns = std.atomic.Value(i128).init(0);
+var pw_connect_done_ns = std.atomic.Value(i128).init(0);
+
 pub fn setLive(live: bool) void {
+    if (live) ptt_press_ns.store(std.time.nanoTimestamp(), .monotonic);
     is_live.store(live, .monotonic);
     if (capture_ptr.load(.monotonic)) |cap| {
-        cap.setActive(live);
+        if (use_cork_mode.load(.monotonic)) {
+            cap.setCork(!live);
+        } else {
+            cap.setActive(live);
+        }
+        if (live) pw_connect_done_ns.store(std.time.nanoTimestamp(), .monotonic);
     }
 }
 
@@ -66,6 +80,7 @@ pub const Server = struct {
     pw_target: ?[:0]const u8,
     pw_channel: u32,
     verbose: bool,
+    low_latency: bool,
     type_callback: ?TypeCallback,
     prompt_tokens: []const c.whisper_token,
     recorder: ?*Recorder,
@@ -79,6 +94,7 @@ pub const Server = struct {
         pw_target: ?[:0]const u8,
         pw_channel: u32,
         verbose: bool,
+        low_latency: bool,
         type_callback: ?TypeCallback,
         prompt_tokens: []const c.whisper_token,
         recorder: ?*Recorder,
@@ -92,6 +108,7 @@ pub const Server = struct {
             .pw_target = pw_target,
             .pw_channel = pw_channel,
             .verbose = verbose,
+            .low_latency = low_latency,
             .type_callback = type_callback,
             .prompt_tokens = prompt_tokens,
             .recorder = recorder,
@@ -145,10 +162,20 @@ pub const Server = struct {
         defer capture.deinit();
 
         // Register capture so setLive can toggle stream active state.
-        // If already live (no --trigger), activate the stream immediately.
         capture_ptr.store(&capture, .monotonic);
         defer capture_ptr.store(null, .monotonic);
-        if (is_live.load(.monotonic)) {
+
+        if (self.low_latency) {
+            // Low-latency mode: connect stream once at startup, use cork/uncork for PTT.
+            // Mic indicator stays visible, but avoids ~1.3s PipeWire reconnect on each press.
+            use_cork_mode.store(true, .monotonic);
+            capture.setActive(true);
+            if (!is_live.load(.monotonic)) {
+                capture.setCork(true);
+            }
+            std.debug.print("Low-latency mode: stream stays connected, using cork/uncork\n", .{});
+        } else if (is_live.load(.monotonic)) {
+            // Normal mode: connect now (no --trigger, always live).
             capture.setActive(true);
         }
 
@@ -182,6 +209,7 @@ pub const Server = struct {
         var bytes_since_last_cycle: usize = 0;
         var cycle_count: usize = 0;
         var was_live: bool = is_live.load(.monotonic); // track previous live state for transition detection
+        var ptt_tracking_press_ns: i128 = 0; // non-zero = tracking first emission after PTT press
 
         while (true) {
             // Use poll for timeout support during active speech
@@ -236,6 +264,7 @@ pub const Server = struct {
             // PTT release edge: let active speech drain via timeout, clear idle audio
             if (was_live and !live) {
                 was_live = false;
+                ptt_tracking_press_ns = 0;
                 if (self.recorder) |rec| rec.logEvent(start_ns, "PTT released");
                 if (state == .idle) {
                     pcm_trim_total += pcm_buf.items.len;
@@ -255,9 +284,19 @@ pub const Server = struct {
 
             // Going live: keep buffer (pre-trigger audio) for first transcription
             if (!was_live and live) {
+                const live_detected_ns = std.time.nanoTimestamp();
                 var ts_buf2: [32]u8 = undefined;
                 const ts2 = formatElapsed(&ts_buf2, start_ns);
-                std.debug.print("[{s}s] LIVE\n", .{ts2});
+                const press = ptt_press_ns.load(.monotonic);
+                const connect = pw_connect_done_ns.load(.monotonic);
+                if (press > 0 and connect > 0) {
+                    ptt_tracking_press_ns = press;
+                    std.debug.print("[{s}s] LIVE (press→connect={d:.0}ms connect→audio={d:.0}ms)\n", .{
+                        ts2, nsToF64Ms(connect - press), nsToF64Ms(live_detected_ns - connect),
+                    });
+                } else {
+                    std.debug.print("[{s}s] LIVE\n", .{ts2});
+                }
                 state = .idle;
                 cycle_count = 0;
                 was_live = true;
@@ -279,7 +318,11 @@ pub const Server = struct {
                     };
                     if (flush_has_speech) {
                         cycle_count += 1;
-                        _ = try self.transcribeAndEmit(&pipeline, pcm_buf.items, true, output_fd, start_ns, type_cb, cycle_count, "FINAL");
+                        const flush_emit = try self.transcribeAndEmit(&pipeline, pcm_buf.items, true, output_fd, start_ns, type_cb, cycle_count, "FINAL");
+                        if (flush_emit.emitted and ptt_tracking_press_ns != 0) {
+                            std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
+                            ptt_tracking_press_ns = 0;
+                        }
                     }
                     const end_reason: EndReason = if (!live) .released else .timeout;
                     self.resetUtterance(&pipeline, &pcm_buf, &pcm_trim_total, end_reason);
@@ -367,7 +410,11 @@ pub const Server = struct {
                     .speaking => "speaking",
                     .trailing_silence => "trailing",
                 };
-                _ = try self.transcribeAndEmit(&pipeline, pcm_buf.items, should_flush, output_fd, start_ns, type_cb, cycle_count, state_name);
+                const emit_result = try self.transcribeAndEmit(&pipeline, pcm_buf.items, should_flush, output_fd, start_ns, type_cb, cycle_count, state_name);
+                if (emit_result.emitted and ptt_tracking_press_ns != 0) {
+                    std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
+                    ptt_tracking_press_ns = 0;
+                }
 
                 if (should_flush) {
                     self.resetUtterance(&pipeline, &pcm_buf, &pcm_trim_total, .flush);
@@ -485,6 +532,10 @@ pub const Server = struct {
         pcm_buf.clearRetainingCapacity();
     }
 };
+
+fn nsToF64Ms(ns: i128) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
 
 fn msFromNs(start: i128) f64 {
     const elapsed: i128 = std.time.nanoTimestamp() - start;
