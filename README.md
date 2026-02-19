@@ -112,7 +112,7 @@ mkdir /tmp/capsper-debug
 capsper --trigger capslock --pw-channel FL --record-dir /tmp/capsper-debug
 ```
 
-Each utterance produces a pair of files (`000.wav`/`000.log`, `001.wav`/`001.log`, etc.) in a ring buffer — old files are overwritten after `--record-keep` pairs (default 50). The WAV contains the full utterance audio and the log contains emitted text plus a per-cycle diagnostic trace.
+Each utterance produces a pair of files (`000.wav`/`000.log`, `001.wav`/`001.log`, etc.) in a ring buffer — old files are overwritten after `--record-keep` pairs (default 10). The WAV contains the full utterance audio and the log contains emitted text plus a per-cycle diagnostic trace.
 
 Batch-transcribe a captured WAV to compare streaming vs non-streaming results:
 
@@ -188,11 +188,13 @@ A single self-contained binary (`src/`):
 
 ### Technical highlights
 
-**Manual decode loop with cross-attention introspection** — Instead of using whisper.cpp's high-level `whisper_full()`, Capsper manually drives the mel spectrogram → encode → decode pipeline token by token. This gives per-token access to the decoder's cross-attention weights, which is how AlignAtt decides when to stop: it watches where each attention head is "looking" in the audio, and stops when attention drifts past the end of the buffer or jumps backwards (a sign of hallucination). The attention values go through z-score normalisation, median filtering, and head averaging before the stopping decision.
+**Manual decode loop with cross-attention introspection** — Instead of using whisper.cpp's high-level `whisper_full()`, Capsper manually drives the mel spectrogram → encode → decode pipeline token by token. This gives per-token access to the decoder's cross-attention weights, which is how AlignAtt decides when to stop: it watches where each attention head is "looking" in the audio, and stops when attention drifts past the end of the buffer or jumps backwards (a sign of hallucination). The attention values go through z-score normalisation, median filtering, and head averaging before the stopping decision. Cross-attention also provides per-token audio frame positions, which are used for exact token-audio alignment when the sliding window trims audio from the front — instead of estimating how many tokens to demote, the pipeline knows precisely which tokens correspond to trimmed audio. The most-attended frame persists across decode cycles, so backward attention jumps between cycles (not just within a single decode) are also caught as rewind signals.
+
+**N-gram repetition guard** — The decode loop monitors for repeating token patterns (1 to 64 tokens long). If any n-gram repeats 3 times consecutively, the repeated tokens are discarded and decoding stops. This catches both single-token hallucination loops ("the the the...") and longer phrase repetitions that the attention-based stopping might miss.
 
 **Token accumulation with two-tier context** — Rather than re-transcribing the entire audio buffer each cycle and diffing the output, Capsper commits confirmed tokens as a forced decoder prefix. Each cycle, the model is given previously emitted tokens after `[notimestamps]` as forced output — it processes them as its own previous output, building KV cache state, then continues generating from where it left off. This eliminates the instability that comes from re-decoding: the model always sees the same prefix, so it never contradicts what was already emitted.
 
-When the 28-second sliding window trims audio from the front, the corresponding tokens are demoted from forced output to conditioning context. Instead of being deleted (which caused misalignment and hallucination), they move to the `<|startofprev|>` section before `[sot]`, where the model treats them as a hint rather than a constraint. This two-tier approach — forced tokens for audio in the buffer, conditioning tokens for trimmed audio — is inspired by SimulStreaming's token management.
+When the 30-second sliding window trims audio from the front, the corresponding tokens are demoted from forced output to conditioning context. Instead of being deleted (which caused misalignment and hallucination), they move to the `<|startofprev|>` section before `[sot]`, where the model treats them as a hint rather than a constraint. This two-tier approach — forced tokens for audio in the buffer, conditioning tokens for trimmed audio — is inspired by SimulStreaming's token management.
 
 **CPU-only VAD** — Silero voice activity detection runs on the CPU (2 threads, ~5ms per check) while whisper.cpp transcription runs on the GPU. This avoids GPU context switching overhead for the frequent VAD checks (every 0.5–1s) and means VAD has zero impact on transcription throughput.
 
@@ -220,7 +222,7 @@ capsper [OPTIONS]
   --pw-channel CHANNEL    PipeWire channel: MONO, FL, AUX0-AUX63 (default: FL)
   --domain-terms FILE     Text file of domain terms to bias transcription toward
   --record-dir DIR        Record each utterance to DIR (WAV + diagnostic log)
-  --record-keep N         Number of recording pairs to keep (default: 50, ring buffer)
+  --record-keep N         Number of recording pairs to keep (default: 10, ring buffer)
   --transcribe FILE       Batch-transcribe a WAV file (non-streaming) and exit
   --pw-list               List available PipeWire audio sources
   --pw-detect             Interactive channel detection (record silence + speech)
@@ -243,14 +245,13 @@ All commands go through the Bun-based task runner (`run.ts`), which bootstraps i
 # Unit + property tests (no GPU required)
 ./run.ts test
 
-# All integration tests (requires GPU + built binary)
-./run.ts slow-test
+# Regression test groups (requires GPU + built binary)
+./run.ts short-test               # Short files (<15s) via fast-forward TCP
+./run.ts medium-test              # Medium files (15-40s) via fast-forward TCP
+./run.ts long-test                # Long files (>60s) via fast-forward TCP
 
-# Individual integration tests
-./run.ts slow-test stream         # TCP stream jfk.wav
-./run.ts slow-test pw-stream      # PipeWire loopback test
-./run.ts slow-test compare        # Compare against reference transcript
-./run.ts slow-test long-stream    # jfk.wav × 20 loops (~3.7 min)
+# All integration tests (all groups + PipeWire plumbing)
+./run.ts slow-test
 ```
 
 ## Environment variables
