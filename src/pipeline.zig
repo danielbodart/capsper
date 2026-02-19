@@ -122,13 +122,17 @@ pub const Pipeline = struct {
         self.last_attend_frame = null;
     }
 
-    /// Demote tokens from accumulated (forced) to context (conditioning) when audio
-    /// is trimmed from the front of the buffer. Uses per-token frame data from
-    /// cross-attention to split exactly: tokens attending trimmed-away audio get
-    /// demoted, others stay with adjusted frame offsets.
-    pub fn demoteTokens(self: *Pipeline, trimmed_bytes: usize) !void {
+    /// Handle audio trimmed from the front of the buffer: invalidate mel cache,
+    /// adjust last_attend_frame, and demote tokens whose audio was trimmed from
+    /// forced (after [notimestamps]) to conditioning (before [sot]).
+    pub fn handleTrim(self: *Pipeline, trimmed_bytes: usize) !void {
+        if (trimmed_bytes == 0) return;
+
+        // Mel cache is relative to buffer start — invalidate after front trim.
+        self.mel_buffer.reset();
+
         const n = self.accumulated_tokens.items.len;
-        if (n == 0 or trimmed_bytes == 0) return;
+        if (n == 0) return;
 
         // Convert trimmed bytes to encoder frame threshold (50fps = 320 samples/frame * 2 bytes/sample = 640 bytes/frame)
         const trim_frame = trimmed_bytes / 640;
@@ -173,31 +177,23 @@ pub const Pipeline = struct {
     }
 
     /// Transcribe audio samples using AlignAtt streaming policy.
-    /// Uses accumulated_tokens (from previous commitTokens calls) as forced prefix
-    /// for decoder consistency. is_last=true uses a tighter stopping threshold and
-    /// skips word truncation.
+    /// Uses accumulated_tokens as forced prefix for decoder consistency.
+    /// When flush=true, uses a tighter stopping threshold, skips word
+    /// truncation, and resets all segment state before returning.
     pub fn transcribe(
         self: *Pipeline,
         samples: []const f32,
-        is_last: bool,
+        flush: bool,
     ) !?TranscribeResult {
-        return self.transcribeInternal(samples, is_last, self.accumulated_tokens.items);
-    }
-
-    /// Transcribe with explicit forced tokens (for testing or direct control).
-    pub fn transcribeWithContext(
-        self: *Pipeline,
-        samples: []const f32,
-        is_last: bool,
-        forced_tokens: []const c.whisper_token,
-    ) !?TranscribeResult {
-        return self.transcribeInternal(samples, is_last, forced_tokens);
+        const result = try self.transcribeInternal(samples, flush, self.accumulated_tokens.items);
+        if (flush) self.resetSegment();
+        return result;
     }
 
     fn transcribeInternal(
         self: *Pipeline,
         samples: []const f32,
-        is_last: bool,
+        flush: bool,
         forced_tokens: []const c.whisper_token,
     ) !?TranscribeResult {
         const t_total = std.time.nanoTimestamp();
@@ -392,7 +388,14 @@ pub const Pipeline = struct {
             const attn_data = c.whisper_state_get_aheads_cross_qks(
                 self.state, &n_tok, &n_actx, &n_hd,
             );
-            if (attn_data == null) continue;
+            if (attn_data == null) {
+                // No attention data — can't verify where decoder is attending.
+                // Pop the unverified token and stop decoding.
+                _ = generated.pop();
+                _ = token_frames.pop();
+                timing.stop_reason = "no_attn";
+                break;
+            }
 
             const attention = try alignatt.analyzeAttention(
                 self.allocator, attn_data,
@@ -407,13 +410,13 @@ pub const Pipeline = struct {
             // Update the frame for this token
             token_frames.items[token_frames.items.len - 1] = most_attended;
 
-            // On flush (is_last), skip attention-based stopping entirely — let the
-            // model run to EOT. The forced prefix anchors output, and stopping early
-            // drops trailing words (the token that triggers attn_end gets stripped).
-            // SimulStreaming also skips rewind detection on is_last for the same reason.
-            if (!is_last) {
+            // On flush, skip attention-based stopping entirely — let the model run
+            // to EOT. The forced prefix anchors output, and stopping early drops
+            // trailing words (the token that triggers attn_end gets stripped).
+            // SimulStreaming also skips rewind detection on flush for the same reason.
+            if (!flush) {
                 const decision = alignatt.checkStopping(
-                    most_attended, content_frames, self.last_attend_frame, is_last, self.config,
+                    most_attended, content_frames, self.last_attend_frame, flush, self.config,
                 );
 
                 switch (decision) {
@@ -440,7 +443,7 @@ pub const Pipeline = struct {
                 }
             }
             // Persists across cycles for cross-cycle rewind detection.
-            // On is_last=true, caller always follows with resetSegment().
+            // On flush, transcribe() calls resetSegment() after we return.
             self.last_attend_frame = most_attended;
         }
 
@@ -458,12 +461,12 @@ pub const Pipeline = struct {
             return null;
         }
 
-        // Step 5: Word boundary truncation (unless is_last)
+        // Step 5: Word boundary truncation (unless flush)
         var n_tokens_to_use = generated.items.len;
         // Truncate last (potentially incomplete) word — but only when there's no
         // forced prefix. With accumulated tokens, the prefix already anchors prior
         // words, and truncation of short continuations causes emission deadlocks.
-        if (!is_last and n_tokens_to_use > 0 and forced_tokens.len == 0) {
+        if (!flush and n_tokens_to_use > 0 and forced_tokens.len == 0) {
             n_tokens_to_use = truncateLastWord(self.ctx, generated.items);
         }
         if (n_tokens_to_use == 0) return null;

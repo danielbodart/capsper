@@ -273,9 +273,9 @@ fn prop_checkStopping_exhaustive(n: usize) !void {
     const content_frames = prng.random().intRangeAtMost(usize, 0, 1500);
     const has_last = prng.random().boolean();
     const last_attend: ?usize = if (has_last) prng.random().intRangeAtMost(usize, 0, 1500) else null;
-    const is_last = prng.random().boolean();
+    const flush = prng.random().boolean();
 
-    const decision = alignatt.checkStopping(most_attended, content_frames, last_attend, is_last, .{});
+    const decision = alignatt.checkStopping(most_attended, content_frames, last_attend, flush, .{});
 
     // Verify the decision is consistent with the inputs
     switch (decision) {
@@ -288,7 +288,7 @@ fn prop_checkStopping_exhaustive(n: usize) !void {
         },
         .stop_attention_at_end => {
             // Stop requires content_frames - most_attended <= threshold
-            const threshold: usize = if (is_last) 4 else 25;
+            const threshold: usize = if (flush) 4 else 25;
             try std.testing.expect(content_frames > most_attended);
             try std.testing.expect(content_frames - most_attended <= threshold);
         },
@@ -305,36 +305,36 @@ fn prop_checkStopping_rewind_priority(n: usize) !void {
     // Set up conditions where both rewind AND stop could trigger
     const last_attend = most_attended + 201 + prng.random().intRangeAtMost(usize, 0, 500);
     const content_frames = most_attended + prng.random().intRangeAtMost(usize, 1, 25);
-    const is_last = prng.random().boolean();
+    const flush = prng.random().boolean();
 
-    const decision = alignatt.checkStopping(most_attended, content_frames, last_attend, is_last, .{});
+    const decision = alignatt.checkStopping(most_attended, content_frames, last_attend, flush, .{});
     // Rewind should take priority
     try std.testing.expectEqual(alignatt.Decision.rewind_detected, decision);
 }
 
-// is_last=true uses a tighter threshold than is_last=false
-fn prop_checkStopping_is_last_tighter(n: usize) !void {
+// flush=true uses a tighter threshold than flush=false
+fn prop_checkStopping_flush_tighter(n: usize) !void {
     var prng = std.Random.DefaultPrng.init(@intCast(n));
-    // Pick a gap between 5 and 25 — should stop with !is_last but continue with is_last
+    // Pick a gap between 5 and 25 — should stop streaming but continue on flush
     const gap = 5 + prng.random().intRangeAtMost(usize, 0, 20);
     const most_attended = 100 + prng.random().intRangeAtMost(usize, 0, 500);
     const content_frames = most_attended + gap;
 
-    const not_last = alignatt.checkStopping(most_attended, content_frames, null, false, .{});
-    const yes_last = alignatt.checkStopping(most_attended, content_frames, null, true, .{});
+    const streaming = alignatt.checkStopping(most_attended, content_frames, null, false, .{});
+    const flushing = alignatt.checkStopping(most_attended, content_frames, null, true, .{});
 
     if (gap <= 4) {
         // Both should stop
-        try std.testing.expectEqual(alignatt.Decision.stop_attention_at_end, not_last);
-        try std.testing.expectEqual(alignatt.Decision.stop_attention_at_end, yes_last);
+        try std.testing.expectEqual(alignatt.Decision.stop_attention_at_end, streaming);
+        try std.testing.expectEqual(alignatt.Decision.stop_attention_at_end, flushing);
     } else if (gap <= 25) {
-        // Only not_last should stop; is_last should continue
-        try std.testing.expectEqual(alignatt.Decision.stop_attention_at_end, not_last);
-        try std.testing.expectEqual(alignatt.Decision.continue_decoding, yes_last);
+        // Only streaming should stop; flush should continue
+        try std.testing.expectEqual(alignatt.Decision.stop_attention_at_end, streaming);
+        try std.testing.expectEqual(alignatt.Decision.continue_decoding, flushing);
     } else {
         // Neither should stop
-        try std.testing.expectEqual(alignatt.Decision.continue_decoding, not_last);
-        try std.testing.expectEqual(alignatt.Decision.continue_decoding, yes_last);
+        try std.testing.expectEqual(alignatt.Decision.continue_decoding, streaming);
+        try std.testing.expectEqual(alignatt.Decision.continue_decoding, flushing);
     }
 }
 
@@ -627,8 +627,8 @@ pub fn main() !void {
     try minish.check(allocator, frame_gen, prop_checkStopping_exhaustive, .{ .num_runs = runs });
     std.debug.print("prop: checkStopping rewind priority... ", .{});
     try minish.check(allocator, frame_gen, prop_checkStopping_rewind_priority, .{ .num_runs = runs });
-    std.debug.print("prop: checkStopping is_last tighter threshold... ", .{});
-    try minish.check(allocator, frame_gen, prop_checkStopping_is_last_tighter, .{ .num_runs = runs });
+    std.debug.print("prop: checkStopping flush tighter threshold... ", .{});
+    try minish.check(allocator, frame_gen, prop_checkStopping_flush_tighter, .{ .num_runs = runs });
 
     // analyzeAttention
     std.debug.print("prop: analyzeAttention output length... ", .{});

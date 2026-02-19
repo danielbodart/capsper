@@ -23,7 +23,7 @@ pub const Decision = enum {
 ///
 /// attn_data layout: [n_heads][n_audio_ctx][n_tokens] (C-contiguous)
 /// content_frames: number of actual audio frames (excluding padding)
-/// last_attend_frame: the previous token's most-attended frame (-1 if first token)
+/// last_attend_frame: the previous token's most-attended frame (null if first token)
 ///
 /// Returns the most attended frame for the last token (after z-score + median + avg heads).
 pub fn analyzeAttention(
@@ -135,7 +135,7 @@ pub fn checkStopping(
     most_attended_frame: usize,
     content_frames: usize,
     last_attend_frame: ?usize,
-    is_last: bool,
+    flush: bool,
     config: Config,
 ) Decision {
     // Rewind detection: attention jumped backwards too far
@@ -146,7 +146,7 @@ pub fn checkStopping(
     }
 
     // Stopping rule: attention is close to end of audio
-    const threshold = if (is_last) 4 else config.frame_threshold;
+    const threshold = if (flush) 4 else config.frame_threshold;
     if (content_frames > most_attended_frame and
         content_frames - most_attended_frame <= threshold)
     {
@@ -185,19 +185,19 @@ test "checkStopping: continue when attention far from end" {
     try std.testing.expectEqual(Decision.continue_decoding, result);
 }
 
-test "checkStopping: stop when attention near end (not is_last)" {
+test "checkStopping: stop when attention near end (streaming)" {
     // content_frames=100, most_attended=80, threshold=25 → 100-80=20 <= 25 → stop
     const result = checkStopping(80, 100, null, false, .{});
     try std.testing.expectEqual(Decision.stop_attention_at_end, result);
 }
 
-test "checkStopping: is_last uses threshold=4" {
+test "checkStopping: flush uses threshold=4" {
     // content_frames=100, most_attended=80, threshold=4 → 100-80=20 > 4 → continue
     const result = checkStopping(80, 100, null, true, .{});
     try std.testing.expectEqual(Decision.continue_decoding, result);
 }
 
-test "checkStopping: is_last stops when very close to end" {
+test "checkStopping: flush stops when very close to end" {
     // content_frames=100, most_attended=97, threshold=4 → 100-97=3 <= 4 → stop
     const result = checkStopping(97, 100, null, true, .{});
     try std.testing.expectEqual(Decision.stop_attention_at_end, result);

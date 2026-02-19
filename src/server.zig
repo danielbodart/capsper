@@ -388,11 +388,7 @@ pub const Server = struct {
                         else => {},
                     }
                     if (trimmed > 0) {
-                        // Audio was trimmed from the front — mel cache is invalid.
-                        pipeline.mel_buffer.reset();
-                        // Demote tokens attending trimmed-away audio from forced
-                        // (after [notimestamps]) to conditioning (before [sot]).
-                        try pipeline.demoteTokens(trimmed);
+                        try pipeline.handleTrim(trimmed);
                     }
                 }
             }
@@ -406,7 +402,7 @@ pub const Server = struct {
         self: *Server,
         pipeline: *Pipeline,
         pcm_buf: []const u8,
-        is_last: bool,
+        flush: bool,
         output_fd: posix.fd_t,
         start_ns: i128,
         type_cb: ?TypeCallback,
@@ -418,7 +414,7 @@ pub const Server = struct {
         const samples = try utils.pcmToFloat(self.allocator, pcm_buf);
         defer self.allocator.free(samples);
 
-        const result = try pipeline.transcribe(samples, is_last) orelse {
+        const result = try pipeline.transcribe(samples, flush) orelse {
             if (self.verbose) {
                 var ts_buf: [32]u8 = undefined;
                 const ts = formatElapsed(&ts_buf, start_ns);

@@ -306,6 +306,7 @@ pub fn main() !void {
             allocator.free(result.text);
             allocator.free(result.words);
             allocator.free(result.tokens);
+            allocator.free(result.token_frames);
         }
         const warmup_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - warmup_start, 1_000_000));
         std.debug.print("Warmup complete ({d}.{d:0>1}s)\n", .{ warmup_ms / 1000, (warmup_ms % 1000) / 100 });
