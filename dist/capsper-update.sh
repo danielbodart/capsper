@@ -56,11 +56,11 @@ main() {
     TMP_DIR=$(mktemp -d)
 
     curl -fSL -o "$TMP_DIR/$ASSET" \
-        "https://github.com/$REPO/releases/latest/download/$ASSET"
+        "https://github.com/$REPO/releases/download/$latest_tag/$ASSET"
 
     # Verify SHA256 checksum
     if curl -fSL -o "$TMP_DIR/$ASSET.sha256" \
-        "https://github.com/$REPO/releases/latest/download/$ASSET.sha256" 2>/dev/null; then
+        "https://github.com/$REPO/releases/download/$latest_tag/$ASSET.sha256" 2>/dev/null; then
         (cd "$TMP_DIR" && sha256sum -c "$ASSET.sha256") || die "SHA256 verification failed"
         echo "SHA256 verified."
     fi
