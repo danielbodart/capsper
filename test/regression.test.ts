@@ -1,9 +1,9 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { file } from "bun";
 import {
-    hasGpu, ensureBinary, ensureFile, wavDuration,
+    hasGpu, ensureBinary, ensureFile,
     startServer, readPcm, streamPcmFast, assertTranscript,
-    printScorecard, saveLog, type Thresholds, type TranscriptResult,
+    printScorecard, saveLog, saveScoring, type Thresholds, type TranscriptResult,
 } from "./helpers";
 
 const gpu = await hasGpu();
@@ -63,6 +63,7 @@ function runGroup(
 
         afterAll(() => {
             if (results.length > 0) {
+                saveScoring(results, groupName);
                 printScorecard(results);
             }
             if (server) {
@@ -73,9 +74,6 @@ function runGroup(
 
         for (const tc of cases) {
             test(tc.name, async () => {
-                const duration = wavDuration(tc.wav);
-                console.error(`\nStreaming ${tc.wav} (${duration}s) to localhost:${server.port}...`);
-
                 const pcm = readPcm(tc.wav);
                 const output = await streamPcmFast(server.port, pcm);
                 expect(output.length).toBeGreaterThan(0);

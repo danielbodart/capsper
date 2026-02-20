@@ -54,13 +54,13 @@ Each group shares a single server instance (saves GPU warmup time):
 ./run.ts slow-test      # ALL groups + long-stream stability + pw plumbing
 ```
 
-### Debug logs
+### Test output
 
-After any test run, server stderr is saved to `test/results/<group>.log` (e.g. `test/results/short.log`). These contain:
-- VAD decisions (speech/silence transitions)
-- Transcription cycle details (buffer size, token counts, timing)
-- Pipeline events (rewind, repetition guard, attention stopping)
-- Emission timeline
+Tests automatically save all logs to `test/results/`:
+- **`<group>.log`** — Server log (VAD decisions, transcription cycles, pipeline events, timing)
+- **`<group>-scoring.log`** — Scoring detail per test (emission timeline, coverage/WER metrics, inline word diff)
+
+Console output shows only the scorecard summary table. For detailed diagnostics, read the files above.
 
 ### Assertions (`assertTranscript` in `test/helpers.ts`)
 

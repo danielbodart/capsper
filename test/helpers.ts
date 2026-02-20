@@ -1,6 +1,6 @@
 import { $, spawn, file } from "bun";
 import { expect } from "bun:test";
-import { existsSync, readFileSync, statSync, mkdirSync, copyFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, copyFileSync } from "fs";
 import { createConnection } from "net";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -397,6 +397,7 @@ export interface TranscriptResult {
     repetitions: { word: string; count: number }[];
     passed: boolean;
     error?: unknown;
+    log: string;
 }
 
 /** Universal assertion function for transcript quality.
@@ -420,14 +421,17 @@ export function assertTranscript(
     // Repetition detection
     const repetitions = detectRepetitions(streamWords, t.maxRepetitions);
 
+    const lines: string[] = [];
+    const log = (s: string) => lines.push(s);
+
     const result: TranscriptResult = {
-        name: label, streamText, streamWords, emissions, maxGapSec, repetitions, passed: true,
+        name: label, streamText, streamWords, emissions, maxGapSec, repetitions, passed: true, log: "",
     };
 
     // Emission timeline
-    console.error(`\n=== ${label} ===`);
+    log(`\n=== ${label} ===`);
     for (const e of emissions) {
-        console.error(`  ${e.time.toFixed(1)}s  ${e.text}`);
+        log(`  ${e.time.toFixed(1)}s  ${e.text}`);
     }
 
     // Collect first assertion failure, throw after result is fully populated
@@ -451,20 +455,18 @@ export function assertTranscript(
         result.deletions = edit.deletions;
         result.total = total;
 
-        console.error(`Coverage: ${result.coverage}% (${edit.matches}/${total})  WER: ${result.wer}%  [S:${edit.substitutions} I:${edit.insertions} D:${edit.deletions}]  Gap: ${maxGapSec.toFixed(1)}s`);
+        log(`Coverage: ${result.coverage}% (${edit.matches}/${total})  WER: ${result.wer}%  [S:${edit.substitutions} I:${edit.insertions} D:${edit.deletions}]  Gap: ${maxGapSec.toFixed(1)}s`);
 
         if (repetitions.length > 0) {
-            console.error(`Repetitions: ${repetitions.map(r => `"${r.word}" x${r.count}`).join(", ")}`);
+            log(`Repetitions: ${repetitions.map(r => `"${r.word}" x${r.count}`).join(", ")}`);
         }
 
-        // Inline diff
-        const diffStr = formatAlignment(edit);
-        console.error(`\n--- Diff (ref vs stream) ---\n${diffStr}\n`);
+        log(`\n--- Diff (ref vs stream) ---\n${formatAlignment(edit)}\n`);
 
         check(() => expect(result.coverage!).toBeGreaterThanOrEqual(t.minCoverage));
         check(() => expect(result.wer!).toBeLessThanOrEqual(t.maxWer));
     } else {
-        console.error(`Words: ${streamWords.length}, gap: ${maxGapSec.toFixed(1)}s`);
+        log(`Words: ${streamWords.length}, gap: ${maxGapSec.toFixed(1)}s`);
         check(() => expect(streamWords.length).toBeGreaterThan(0));
     }
 
@@ -474,6 +476,7 @@ export function assertTranscript(
     }
     check(() => expect(repetitions.length).toBe(0));
 
+    result.log = lines.join("\n");
     result.error = firstError;
     return result;
 }
@@ -527,7 +530,8 @@ export function printScorecard(results: TranscriptResult[]): void {
         console.error(`  ${pad(r.name, w.name)}  ${pad(r.cov, w.cov)}  ${padR(r.wer, w.wer)}  ${padR(r.subs, w.subs)}  ${padR(r.ins, w.ins)}  ${padR(r.del, w.del)}  ${padR(r.gap, w.gap)}  ${r.status}`);
     }
 
-    console.error(sep + "\n");
+    console.error(sep);
+    console.error("  Logs: test/results/\n");
 }
 
 /** Save server log to test/results/<name>.log */
@@ -537,4 +541,12 @@ export function saveLog(logFile: string, name: string): void {
     try {
         copyFileSync(logFile, join(dir, `${name}.log`));
     } catch {}
+}
+
+/** Save scoring detail (emission timelines, diffs, metrics) to test/results/<name>-scoring.log */
+export function saveScoring(results: TranscriptResult[], name: string): void {
+    const dir = "test/results";
+    mkdirSync(dir, { recursive: true });
+    const content = results.map(r => r.log).join("\n\n");
+    writeFileSync(join(dir, `${name}-scoring.log`), content);
 }
