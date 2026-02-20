@@ -117,27 +117,111 @@ export function normalize(text: string): string {
     return text.toLowerCase().replace(/[^a-z0-9' ]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-export function compareWords(streamWords: string[], refWords: string[]): { matched: number; total: number; coverage: string; missed: string[] } {
-    let matched = 0;
-    let streamIdx = 0;
-    const missed: string[] = [];
+export type EditOp = "match" | "sub" | "ins" | "del";
 
-    for (let r = 0; r < refWords.length; r++) {
-        let found = false;
-        for (let look = 0; look < 5 && streamIdx + look < streamWords.length; look++) {
-            if (refWords[r] === streamWords[streamIdx + look]) {
-                matched++;
-                streamIdx = streamIdx + look + 1;
-                found = true;
-                break;
+export interface EditResult {
+    ops: EditOp[];
+    refAlign: (string | null)[];   // null for insertions
+    streamAlign: (string | null)[]; // null for deletions
+    matches: number;
+    substitutions: number;
+    insertions: number;
+    deletions: number;
+}
+
+/** Wagner-Fischer word-level edit distance with backtrace.
+ *  Returns optimal alignment with distinct match/sub/ins/del counts.
+ *  Follows standard WER convention: ins = extra stream word, del = missing ref word. */
+export function wordEditDistance(refWords: string[], streamWords: string[]): EditResult {
+    const m = refWords.length;
+    const n = streamWords.length;
+
+    // dp[i][j] = min edits to align ref[0..i) with stream[0..j)
+    const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1));
+    dp[0][0] = 0;
+    for (let i = 1; i <= m; i++) dp[i][0] = i;  // delete all ref words
+    for (let j = 1; j <= n; j++) dp[0][j] = j;  // insert all stream words
+
+    for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+            if (refWords[i - 1] === streamWords[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1]; // match (free)
+            } else {
+                dp[i][j] = Math.min(
+                    dp[i - 1][j - 1] + 1, // substitution
+                    dp[i][j - 1] + 1,      // insertion (extra stream word)
+                    dp[i - 1][j] + 1,      // deletion (missed ref word)
+                );
             }
         }
-        if (!found) missed.push(refWords[r]);
     }
 
-    const total = refWords.length;
-    const coverage = total > 0 ? (matched * 100 / total).toFixed(1) : "0";
-    return { matched, total, coverage, missed };
+    // Backtrace to build alignment
+    const ops: EditOp[] = [];
+    const refAlign: (string | null)[] = [];
+    const streamAlign: (string | null)[] = [];
+    let i = m, j = n;
+
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && refWords[i - 1] === streamWords[j - 1]) {
+            ops.push("match");
+            refAlign.push(refWords[i - 1]);
+            streamAlign.push(streamWords[j - 1]);
+            i--; j--;
+        } else if (i > 0 && j > 0 && dp[i][j] === dp[i - 1][j - 1] + 1) {
+            ops.push("sub");
+            refAlign.push(refWords[i - 1]);
+            streamAlign.push(streamWords[j - 1]);
+            i--; j--;
+        } else if (j > 0 && dp[i][j] === dp[i][j - 1] + 1) {
+            ops.push("ins");
+            refAlign.push(null);
+            streamAlign.push(streamWords[j - 1]);
+            j--;
+        } else {
+            ops.push("del");
+            refAlign.push(refWords[i - 1]);
+            streamAlign.push(null);
+            i--;
+        }
+    }
+
+    ops.reverse();
+    refAlign.reverse();
+    streamAlign.reverse();
+
+    let matches = 0, substitutions = 0, insertions = 0, deletions = 0;
+    for (const op of ops) {
+        if (op === "match") matches++;
+        else if (op === "sub") substitutions++;
+        else if (op === "ins") insertions++;
+        else deletions++;
+    }
+
+    return { ops, refAlign, streamAlign, matches, substitutions, insertions, deletions };
+}
+
+/** Render inline diff from edit alignment.
+ *  Matched words shown as-is, [-deleted-], {+inserted+}, [~ref→stream~] */
+export function formatAlignment(edit: EditResult): string {
+    const parts: string[] = [];
+    for (let i = 0; i < edit.ops.length; i++) {
+        switch (edit.ops[i]) {
+            case "match":
+                parts.push(edit.refAlign[i]!);
+                break;
+            case "sub":
+                parts.push(`[~${edit.refAlign[i]}→${edit.streamAlign[i]}~]`);
+                break;
+            case "ins":
+                parts.push(`{+${edit.streamAlign[i]}+}`);
+                break;
+            case "del":
+                parts.push(`[-${edit.refAlign[i]}-]`);
+                break;
+        }
+    }
+    return parts.join(" ");
 }
 
 export function ensureFile(path: string, label?: string): void {
@@ -200,7 +284,6 @@ export function streamPcmFast(port: number, pcm: Buffer): Promise<string> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let remaining: Buffer | null = null;
-        let shutdownPending = false;
 
         Bun.connect({
             hostname: "localhost",
@@ -286,34 +369,40 @@ export function detectRepetitions(words: string[], threshold = 5): { word: strin
 
 export interface Thresholds {
     minCoverage?: number;
-    maxMissed?: number;
-    maxExtras?: number;
+    maxWer?: number;
     maxGapSec?: number;
     maxRepetitions?: number;
 }
 
 const DEFAULT_THRESHOLDS: Required<Thresholds> = {
     minCoverage: 85,
-    maxMissed: 25,
-    maxExtras: 15,
+    maxWer: 30,
     maxGapSec: 10,
     maxRepetitions: 5,
 };
 
 export interface TranscriptResult {
+    name: string;
     streamText: string;
     streamWords: string[];
     emissions: Emission[];
     coverage?: number;
-    matched?: number;
+    wer?: number;
+    matches?: number;
+    substitutions?: number;
+    insertions?: number;
+    deletions?: number;
     total?: number;
-    missed?: string[];
-    extras?: number;
     maxGapSec: number;
     repetitions: { word: string; count: number }[];
+    passed: boolean;
+    error?: unknown;
 }
 
-/** Universal assertion function for transcript quality. */
+/** Universal assertion function for transcript quality.
+ *  Always populates and returns the result, even on assertion failure.
+ *  Collects the first assertion error and throws it after returning the result
+ *  via the caller's finally block. */
 export function assertTranscript(
     rawOutput: string,
     refText: string | null,
@@ -326,13 +415,13 @@ export function assertTranscript(
     const streamWords = normalize(streamText).split(" ").filter(Boolean);
 
     // Gap analysis
-    const { maxGapSec, maxGapAfterText } = analyzeGaps(emissions);
+    const { maxGapSec } = analyzeGaps(emissions);
 
     // Repetition detection
     const repetitions = detectRepetitions(streamWords, t.maxRepetitions);
 
     const result: TranscriptResult = {
-        streamText, streamWords, emissions, maxGapSec, repetitions,
+        name: label, streamText, streamWords, emissions, maxGapSec, repetitions, passed: true,
     };
 
     // Emission timeline
@@ -341,57 +430,104 @@ export function assertTranscript(
         console.error(`  ${e.time.toFixed(1)}s  ${e.text}`);
     }
 
+    // Collect first assertion failure, throw after result is fully populated
+    let firstError: unknown;
+    const check = (fn: () => void) => {
+        try { fn(); } catch (e) { result.passed = false; firstError ??= e; }
+    };
+
     if (refText) {
         const refWords = normalize(refText).split(" ").filter(Boolean);
-        const cmp = compareWords(streamWords, refWords);
-        const extras = streamWords.length - cmp.matched;
-        const coverage = parseFloat(cmp.coverage);
+        const edit = wordEditDistance(refWords, streamWords);
+        const total = refWords.length;
+        const coverage = total > 0 ? edit.matches * 100 / total : 0;
+        const wer = total > 0 ? (edit.substitutions + edit.insertions + edit.deletions) * 100 / total : 0;
 
-        result.coverage = coverage;
-        result.matched = cmp.matched;
-        result.total = cmp.total;
-        result.missed = cmp.missed;
-        result.extras = extras;
+        result.coverage = Math.round(coverage * 10) / 10;
+        result.wer = Math.round(wer * 10) / 10;
+        result.matches = edit.matches;
+        result.substitutions = edit.substitutions;
+        result.insertions = edit.insertions;
+        result.deletions = edit.deletions;
+        result.total = total;
 
-        console.error(`Coverage: ${cmp.coverage}% (${cmp.matched}/${cmp.total}), extras: ${extras}, gap: ${maxGapSec.toFixed(1)}s`);
-        if (cmp.missed.length > 0) {
-            console.error(`Missed: ${cmp.missed.join(", ")}`);
-        }
+        console.error(`Coverage: ${result.coverage}% (${edit.matches}/${total})  WER: ${result.wer}%  [S:${edit.substitutions} I:${edit.insertions} D:${edit.deletions}]  Gap: ${maxGapSec.toFixed(1)}s`);
+
         if (repetitions.length > 0) {
             console.error(`Repetitions: ${repetitions.map(r => `"${r.word}" x${r.count}`).join(", ")}`);
         }
 
-        // Assertions
-        expect(coverage).toBeGreaterThanOrEqual(t.minCoverage);
-        expect(cmp.missed.length).toBeLessThanOrEqual(t.maxMissed);
-        expect(extras).toBeLessThanOrEqual(t.maxExtras);
+        // Inline diff
+        const diffStr = formatAlignment(edit);
+        console.error(`\n--- Diff (ref vs stream) ---\n${diffStr}\n`);
+
+        check(() => expect(result.coverage!).toBeGreaterThanOrEqual(t.minCoverage));
+        check(() => expect(result.wer!).toBeLessThanOrEqual(t.maxWer));
     } else {
         console.error(`Words: ${streamWords.length}, gap: ${maxGapSec.toFixed(1)}s`);
-        // Smoke test: must produce output
-        expect(streamWords.length).toBeGreaterThan(0);
+        check(() => expect(streamWords.length).toBeGreaterThan(0));
     }
 
     // Gap + repetition assertions always apply
     if (emissions.length > 1) {
-        expect(maxGapSec).toBeLessThanOrEqual(t.maxGapSec);
+        check(() => expect(maxGapSec).toBeLessThanOrEqual(t.maxGapSec));
     }
-    expect(repetitions.length).toBe(0);
+    check(() => expect(repetitions.length).toBe(0));
 
+    result.error = firstError;
     return result;
 }
 
-/** Display word-level diff using git diff --word-diff. Display-only, not for assertions. */
-export async function wordDiff(streamText: string, refText: string): Promise<void> {
-    const streamFile = tmpFile("stream", ".txt");
-    const refFile = tmpFile("ref", ".txt");
-    await Bun.write(streamFile, normalize(streamText));
-    await Bun.write(refFile, normalize(refText));
+/** Print a scorecard table summarizing all test results in a group. */
+export function printScorecard(results: TranscriptResult[]): void {
+    if (results.length === 0) return;
 
-    const result = await $`git diff --word-diff --no-index ${refFile} ${streamFile}`.quiet().nothrow();
-    if (result.stdout.length > 0) {
-        console.error("\n=== Word Diff (ref → stream) ===");
-        console.error(result.stdout.toString());
+    const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - s.length));
+    const padR = (s: string, w: number) => " ".repeat(Math.max(0, w - s.length)) + s;
+
+    // Build data rows first to compute column widths
+    const rows = results.map(r => {
+        if (r.total != null) {
+            return {
+                name: r.name,
+                cov: `${r.coverage}% (${r.matches}/${r.total})`,
+                wer: `${r.wer}%`,
+                subs: String(r.substitutions ?? 0),
+                ins: String(r.insertions ?? 0),
+                del: String(r.deletions ?? 0),
+                gap: `${r.maxGapSec.toFixed(1)}s`,
+                status: r.passed ? "Pass" : "FAIL",
+            };
+        }
+        return {
+            name: r.name, cov: "-", wer: "-", subs: "-", ins: "-", del: "-",
+            gap: `${r.maxGapSec.toFixed(1)}s`, status: r.passed ? "Pass" : "FAIL",
+        };
+    });
+
+    const w = {
+        name: Math.max(4, ...rows.map(r => r.name.length)),
+        cov: Math.max(8, ...rows.map(r => r.cov.length)),
+        wer: Math.max(3, ...rows.map(r => r.wer.length)),
+        subs: Math.max(4, ...rows.map(r => r.subs.length)),
+        ins: Math.max(3, ...rows.map(r => r.ins.length)),
+        del: Math.max(3, ...rows.map(r => r.del.length)),
+        gap: Math.max(3, ...rows.map(r => r.gap.length)),
+        stat: 6,
+    };
+
+    const header = `  ${pad("Test", w.name)}  ${pad("Coverage", w.cov)}  ${padR("WER", w.wer)}  ${padR("Subs", w.subs)}  ${padR("Ins", w.ins)}  ${padR("Del", w.del)}  ${padR("Gap", w.gap)}  ${pad("Status", w.stat)}`;
+    const sep = "  " + "-".repeat(header.length - 2);
+
+    console.error("\n" + sep);
+    console.error(header);
+    console.error(sep);
+
+    for (const r of rows) {
+        console.error(`  ${pad(r.name, w.name)}  ${pad(r.cov, w.cov)}  ${padR(r.wer, w.wer)}  ${padR(r.subs, w.subs)}  ${padR(r.ins, w.ins)}  ${padR(r.del, w.del)}  ${padR(r.gap, w.gap)}  ${r.status}`);
     }
+
+    console.error(sep + "\n");
 }
 
 /** Save server log to test/results/<name>.log */

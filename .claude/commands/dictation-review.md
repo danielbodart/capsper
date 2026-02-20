@@ -30,8 +30,8 @@ Analyze captured debug recordings to find transcription issues and create regres
      - **Medium** (`mediumCases`): 15-40s — runs in `./run.ts medium-test`
      - **Long** (`longCases`): > 60s — runs in `./run.ts long-test`
    - Use the `TestCase` interface: `{ name: "<name>", wav: "test/<name>.wav", ref: "test/<name>.txt" }`
-   - Add custom `thresholds` only if needed (defaults: `minCoverage: 85, maxMissed: 25, maxExtras: 15, maxGapSec: 10, maxRepetitions: 5`)
-   - Known issue: files > 60s degrade significantly with fast-forward TCP streaming due to phrase-level repetition overwhelming the 30s buffer. Set loose thresholds (minCoverage: 20, maxExtras: 400+) for long files.
+   - Add custom `thresholds` only if needed (defaults: `minCoverage: 85, maxWer: 30, maxGapSec: 10, maxRepetitions: 5`)
+   - Known issue: files > 60s degrade significantly with fast-forward TCP streaming due to phrase-level repetition overwhelming the 30s buffer. Set loose thresholds (minCoverage: 20, maxWer: 500) for long files.
    - If the recording has domain-specific vocabulary, consider adding a `test/<name>-terms.txt` file and note that the long group server already passes `--domain-terms test/dictation-terms.txt`
    - Run the appropriate test to get a baseline: `./run.ts short-test`, `./run.ts medium-test`, or `./run.ts long-test`
    - Report the baseline coverage so future improvements can be measured
@@ -64,10 +64,12 @@ After any test run, server stderr is saved to `test/results/<group>.log` (e.g. `
 
 ### Assertions (`assertTranscript` in `test/helpers.ts`)
 
-Every test gets these checks:
-- **Coverage**: percentage of reference words found in stream output
-- **Missed words**: reference words not found in stream
-- **Extras**: stream words beyond matched count (duplicates/hallucinations)
+Every test gets these checks (using Wagner-Fischer word edit distance):
+- **Coverage**: percentage of reference words correctly matched in stream output
+- **WER** (Word Error Rate): `(substitutions + insertions + deletions) / reference_words * 100`
+- **Substitutions**: reference words replaced by different words
+- **Insertions**: extra words in stream not in reference (hallucinations)
+- **Deletions**: reference words missing from stream
 - **Gap detection**: maximum time between consecutive emissions
 - **Repetition detection**: consecutive identical words (threshold configurable)
 

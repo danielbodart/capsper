@@ -3,7 +3,7 @@ import { file } from "bun";
 import {
     hasGpu, ensureBinary, ensureFile, wavDuration,
     startServer, readPcm, streamPcmFast, assertTranscript,
-    wordDiff, saveLog, type Thresholds,
+    printScorecard, saveLog, type Thresholds, type TranscriptResult,
 } from "./helpers";
 
 const gpu = await hasGpu();
@@ -24,15 +24,15 @@ const shortCases: TestCase[] = [
 
 const mediumCases: TestCase[] = [
     { name: "long-pause", wav: "test/long-pause.wav", ref: "test/long-pause.txt", thresholds: { minCoverage: 75, maxGapSec: 4 } },
-    { name: "repetition-loop", wav: "test/repetition-loop.wav", ref: "test/repetition-loop.txt", thresholds: { maxExtras: 30 } },
+    { name: "repetition-loop", wav: "test/repetition-loop.wav", ref: "test/repetition-loop.txt", thresholds: { maxWer: 50 } },
 ];
 
 const longCases: TestCase[] = [
     { name: "dictation", wav: "test/dictation.wav", ref: "test/dictation.txt" },
     // Fast-forward overwhelms 30s buffer on 100+s files — phrase-level repetition during
     // streaming degrades quality. Track with loose thresholds, tighten as we improve.
-    { name: "long-recording", wav: "test/long-recording.wav", ref: "test/long-recording.txt", thresholds: { minCoverage: 20, maxExtras: 400, maxMissed: 180 } },
-    { name: "repetition-loop-long", wav: "test/repetition-loop-long.wav", ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 20, maxExtras: 500, maxMissed: 200 } },
+    { name: "long-recording", wav: "test/long-recording.wav", ref: "test/long-recording.txt", thresholds: { minCoverage: 20, maxWer: 500 } },
+    { name: "repetition-loop-long", wav: "test/repetition-loop-long.wav", ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 20, maxWer: 500 } },
 ];
 
 // Gating: which groups to run
@@ -50,6 +50,7 @@ function runGroup(
 ) {
     describe.skipIf(!gpu || !shouldRun)(`${groupName} regressions`, () => {
         let server: Awaited<ReturnType<typeof startServer>>;
+        const results: TranscriptResult[] = [];
 
         beforeAll(async () => {
             ensureBinary();
@@ -61,6 +62,9 @@ function runGroup(
         });
 
         afterAll(() => {
+            if (results.length > 0) {
+                printScorecard(results);
+            }
             if (server) {
                 saveLog(server.logFile, groupName);
                 server.kill();
@@ -78,10 +82,8 @@ function runGroup(
 
                 const refText = tc.ref ? await file(tc.ref).text() : null;
                 const result = assertTranscript(output, refText, tc.thresholds, tc.name);
-
-                if (refText) {
-                    await wordDiff(result.streamText, refText);
-                }
+                results.push(result);
+                if (result.error) throw result.error;
             }, timeoutMs);
         }
     });
