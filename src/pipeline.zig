@@ -404,6 +404,31 @@ pub const Pipeline = struct {
             // Update the frame for this token
             token_frames.items[token_frames.items.len - 1] = most_attended;
 
+            // Frame regression guard: detect when generated tokens are
+            // collectively attending to audio well behind the frontier
+            // (already-transcribed territory). Averages over a window to
+            // smooth per-token jitter that defeats single-token checks.
+            // Only active when we have committed tokens (frontier exists).
+            const regression_window: usize = 8;
+            const regression_threshold: usize = 75; // ~1.5s at 50fps
+            if (!flush and self.accumulated_frames.items.len > 0 and token_frames.items.len >= regression_window) {
+                const frontier = self.accumulated_frames.items[self.accumulated_frames.items.len - 1];
+                const window_start = token_frames.items.len - regression_window;
+                var frame_sum: usize = 0;
+                for (token_frames.items[window_start..]) |f| {
+                    frame_sum += f;
+                }
+                const avg_frame = frame_sum / regression_window;
+                if (frontier > avg_frame and frontier - avg_frame > regression_threshold) {
+                    const discard = @min(regression_window, generated.items.len);
+                    generated.items.len -= discard;
+                    token_frames.items.len -= discard;
+                    timing.stop_reason = "frame_regress";
+                    std.debug.print("    [pipeline] frame regression: avg={d} frontier={d} gap={d} at step {d}\n", .{ avg_frame, frontier, frontier - avg_frame, step });
+                    break;
+                }
+            }
+
             // Attention-at-end check runs on BOTH streaming and flush paths
             // (SimulStreaming uses threshold=4 on is_last, 25 on streaming).
             // Rewind detection only runs during streaming — pass null on flush
