@@ -570,6 +570,174 @@ fn prop_eventsForText_count(text: []const u8) !void {
 }
 
 // ============================================================================
+// avgRawPeak properties
+// ============================================================================
+
+// avgRawPeak is always non-negative (softmax values are non-negative)
+fn prop_avgRawPeak_non_negative(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const n_tokens: usize = 1 + (n % 4); // 1..4
+    const n_audio_ctx: usize = 2 + (n % 10); // 2..11
+    const n_heads: usize = 1 + (n % 3); // 1..3
+    const frame_limit: usize = 1 + (n % n_audio_ctx);
+    const total = n_heads * n_audio_ctx * n_tokens;
+
+    const attn = try allocator.alloc(f32, total);
+    defer allocator.free(attn);
+    // Fill with non-negative values (simulating softmax output)
+    for (attn) |*v| {
+        v.* = @as(f32, @floatFromInt(prng.random().intRangeAtMost(u16, 0, 1000))) / 1000.0;
+    }
+
+    const result = alignatt.avgRawPeak(attn.ptr, n_tokens, n_audio_ctx, n_heads, frame_limit);
+    try std.testing.expect(result >= 0);
+}
+
+// avgRawPeak <= max value in the attention data
+fn prop_avgRawPeak_bounded_by_max(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const n_tokens: usize = 1 + (n % 4);
+    const n_audio_ctx: usize = 2 + (n % 10);
+    const n_heads: usize = 1 + (n % 3);
+    const frame_limit: usize = 1 + (n % n_audio_ctx);
+    const total = n_heads * n_audio_ctx * n_tokens;
+
+    const attn = try allocator.alloc(f32, total);
+    defer allocator.free(attn);
+    var global_max: f32 = 0;
+    for (attn) |*v| {
+        v.* = @as(f32, @floatFromInt(prng.random().intRangeAtMost(u16, 0, 1000))) / 1000.0;
+        if (v.* > global_max) global_max = v.*;
+    }
+
+    const result = alignatt.avgRawPeak(attn.ptr, n_tokens, n_audio_ctx, n_heads, frame_limit);
+    // Average of per-head peaks can't exceed the global max
+    try std.testing.expect(result <= global_max + 1e-6);
+}
+
+// avgRawPeak with uniform attention equals the uniform value
+fn prop_avgRawPeak_uniform(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const n_tokens: usize = 1 + (n % 4);
+    const n_audio_ctx: usize = 2 + (n % 10);
+    const n_heads: usize = 1 + (n % 3);
+    const total = n_heads * n_audio_ctx * n_tokens;
+    const uniform_val: f32 = @as(f32, @floatFromInt(1 + n % 100)) / 100.0;
+
+    const attn = try allocator.alloc(f32, total);
+    defer allocator.free(attn);
+    @memset(attn, uniform_val);
+
+    const result = alignatt.avgRawPeak(attn.ptr, n_tokens, n_audio_ctx, n_heads, n_audio_ctx);
+    try std.testing.expectApproxEqAbs(uniform_val, result, 1e-5);
+}
+
+// ============================================================================
+// detectFrameRegression properties
+// ============================================================================
+
+// detectFrameRegression: null when frames.len < window
+fn prop_detectFrameRegression_short_null(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const window: usize = 8;
+    const len = n % window; // 0..7 — always < window
+    const frames = try allocator.alloc(usize, len);
+    defer allocator.free(frames);
+    @memset(frames, 50);
+
+    try std.testing.expectEqual(@as(?usize, null), alignatt.detectFrameRegression(frames, 500, window, 75));
+}
+
+// detectFrameRegression: frames at frontier never regress
+fn prop_detectFrameRegression_at_frontier_ok(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const window: usize = 8;
+    const frontier = 100 + (n % 500);
+    const frames = try allocator.alloc(usize, window);
+    defer allocator.free(frames);
+    // All frames at or near frontier
+    for (frames) |*f| {
+        f.* = frontier;
+    }
+
+    try std.testing.expectEqual(@as(?usize, null), alignatt.detectFrameRegression(frames, frontier, window, 75));
+}
+
+// detectFrameRegression: if triggered, discard count == window
+fn prop_detectFrameRegression_discard_equals_window(n: usize) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const window: usize = 4 + (n % 8); // 4..11
+    const frames = try allocator.alloc(usize, window);
+    defer allocator.free(frames);
+    @memset(frames, 10); // far behind frontier
+
+    const result = alignatt.detectFrameRegression(frames, 500, window, 75);
+    if (result) |discard| {
+        try std.testing.expectEqual(window, discard);
+    }
+}
+
+// ============================================================================
+// checkLowConfidence properties
+// ============================================================================
+
+// checkLowConfidence: established segment always returns continue with streak=0
+fn prop_checkLowConfidence_established_bypasses(n: usize) !void {
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const avg_raw_peak = @as(f32, @floatFromInt(prng.random().intRangeAtMost(u16, 0, 100))) / 1000.0;
+    const segment_max = @as(f32, @floatFromInt(prng.random().intRangeAtMost(u16, 120, 500))) / 1000.0;
+    const current_streak = prng.random().intRangeAtMost(usize, 0, 100);
+
+    const r = alignatt.checkLowConfidence(avg_raw_peak, segment_max, current_streak, 0.12, 0.10, 2);
+    try std.testing.expectEqual(alignatt.ConfidenceAction.continue_decoding, r.action);
+    try std.testing.expectEqual(@as(usize, 0), r.streak);
+}
+
+// checkLowConfidence: streak monotonically increases with consecutive low peaks
+fn prop_checkLowConfidence_streak_monotonic(n: usize) !void {
+    const segment_max: f32 = 0.05; // below established threshold
+    const low_peak: f32 = 0.03; // below confidence threshold
+    var streak: usize = 0;
+    const steps = 1 + (n % 10);
+    for (0..steps) |_| {
+        const r = alignatt.checkLowConfidence(low_peak, segment_max, streak, 0.12, 0.10, 100);
+        try std.testing.expect(r.streak > streak);
+        streak = r.streak;
+    }
+}
+
+// checkLowConfidence: good peak always resets streak to 0
+fn prop_checkLowConfidence_good_peak_resets(n: usize) !void {
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const segment_max: f32 = 0.08; // below established threshold
+    const good_peak = 0.10 + @as(f32, @floatFromInt(prng.random().intRangeAtMost(u16, 0, 300))) / 1000.0;
+    const current_streak = prng.random().intRangeAtMost(usize, 0, 50);
+
+    const r = alignatt.checkLowConfidence(good_peak, segment_max, current_streak, 0.12, 0.10, 2);
+    try std.testing.expectEqual(@as(usize, 0), r.streak);
+}
+
+// ============================================================================
 // Runner
 // ============================================================================
 
@@ -674,5 +842,29 @@ pub fn main() !void {
     std.debug.print("prop: rmsToDb unity... ", .{});
     try minish.check(allocator, pcm_byte_gen, prop_rmsToDb_unity, .{ .num_runs = runs });
 
-    std.debug.print("\nAll 30 property tests passed!\n", .{});
+    // avgRawPeak
+    std.debug.print("prop: avgRawPeak non-negative... ", .{});
+    try minish.check(allocator, frame_gen, prop_avgRawPeak_non_negative, .{ .num_runs = runs });
+    std.debug.print("prop: avgRawPeak bounded by max... ", .{});
+    try minish.check(allocator, frame_gen, prop_avgRawPeak_bounded_by_max, .{ .num_runs = runs });
+    std.debug.print("prop: avgRawPeak uniform equals value... ", .{});
+    try minish.check(allocator, small_frame_gen, prop_avgRawPeak_uniform, .{ .num_runs = runs });
+
+    // detectFrameRegression
+    std.debug.print("prop: detectFrameRegression short null... ", .{});
+    try minish.check(allocator, frame_gen, prop_detectFrameRegression_short_null, .{ .num_runs = runs });
+    std.debug.print("prop: detectFrameRegression at frontier ok... ", .{});
+    try minish.check(allocator, frame_gen, prop_detectFrameRegression_at_frontier_ok, .{ .num_runs = runs });
+    std.debug.print("prop: detectFrameRegression discard equals window... ", .{});
+    try minish.check(allocator, frame_gen, prop_detectFrameRegression_discard_equals_window, .{ .num_runs = runs });
+
+    // checkLowConfidence
+    std.debug.print("prop: checkLowConfidence established bypasses... ", .{});
+    try minish.check(allocator, frame_gen, prop_checkLowConfidence_established_bypasses, .{ .num_runs = runs });
+    std.debug.print("prop: checkLowConfidence streak monotonic... ", .{});
+    try minish.check(allocator, frame_gen, prop_checkLowConfidence_streak_monotonic, .{ .num_runs = runs });
+    std.debug.print("prop: checkLowConfidence good peak resets... ", .{});
+    try minish.check(allocator, frame_gen, prop_checkLowConfidence_good_peak_resets, .{ .num_runs = runs });
+
+    std.debug.print("\nAll 39 property tests passed!\n", .{});
 }

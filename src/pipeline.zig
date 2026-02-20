@@ -67,6 +67,13 @@ pub const Pipeline = struct {
     // Adjusted on trim; reset on segment boundary or rewind.
     last_attend_frame: ?usize = null,
 
+    // Maximum raw softmax attention peak seen in this VAD segment.
+    // Tracks the strongest per-head-averaged peak across all decode cycles.
+    // Used to adapt the hallucination confidence threshold: segments that
+    // have established strong attention (real speech) get a pass, while
+    // segments that never exceed a low baseline are flagged.
+    segment_max_raw_peak: f32 = 0,
+
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: *c.whisper_context,
@@ -120,6 +127,7 @@ pub const Pipeline = struct {
         self.context_tokens.clearRetainingCapacity();
         self.mel_buffer.reset();
         self.last_attend_frame = null;
+        self.segment_max_raw_peak = 0;
     }
 
     /// Handle audio trimmed from the front of the buffer: invalidate mel cache,
@@ -310,6 +318,7 @@ pub const Pipeline = struct {
         var n_past: c_int = @intCast(full_prompt.len);
         const max_tokens: usize = if (flush) (flush_budget orelse 224) else 224;
         var was_rewind = false;
+        var low_confidence_streak: usize = 0;
 
         for (0..max_tokens) |step| {
             const logits = c.whisper_get_logits_from_state(self.state);
@@ -404,27 +413,54 @@ pub const Pipeline = struct {
             // Update the frame for this token
             token_frames.items[token_frames.items.len - 1] = most_attended;
 
-            // Frame regression guard: detect when generated tokens are
-            // collectively attending to audio well behind the frontier
-            // (already-transcribed territory). Averages over a window to
-            // smooth per-token jitter that defeats single-token checks.
-            // Only active when we have committed tokens (frontier exists).
+            // Adaptive attention confidence check (raw softmax peaks).
+            // Thresholds: once any token in the segment reaches a strong
+            // peak, trust subsequent tokens (real speech established).
+            const confidence_established: f32 = 0.12; // segment has real speech
+            const confidence_threshold: f32 = 0.10; // per-token minimum
+            const confidence_streak_len: usize = 2; // consecutive low tokens to trigger
+            if (!flush and frame_limit > 0) {
+                const avg_raw_peak = alignatt.avgRawPeak(
+                    attn_data,
+                    @intCast(n_tok),
+                    @intCast(n_actx),
+                    @intCast(n_hd),
+                    frame_limit,
+                );
+                if (avg_raw_peak > self.segment_max_raw_peak) {
+                    self.segment_max_raw_peak = avg_raw_peak;
+                }
+
+                const conf = alignatt.checkLowConfidence(
+                    avg_raw_peak, self.segment_max_raw_peak,
+                    low_confidence_streak,
+                    confidence_established, confidence_threshold, confidence_streak_len,
+                );
+                low_confidence_streak = conf.streak;
+                if (conf.action == .stop_low_confidence) {
+                    generated.clearRetainingCapacity();
+                    token_frames.clearRetainingCapacity();
+                    timing.stop_reason = "low_confidence";
+                    std.debug.print("    [pipeline] low confidence: raw_peak={d:.4} seg_max={d:.4} streak={d} at step {d}\n", .{ avg_raw_peak, self.segment_max_raw_peak, low_confidence_streak, step });
+                    break;
+                }
+            }
+
+            // Frame regression guard.
             const regression_window: usize = 8;
             const regression_threshold: usize = 75; // ~1.5s at 50fps
-            if (!flush and self.accumulated_frames.items.len > 0 and token_frames.items.len >= regression_window) {
+            if (!flush and self.accumulated_frames.items.len > 0) {
                 const frontier = self.accumulated_frames.items[self.accumulated_frames.items.len - 1];
-                const window_start = token_frames.items.len - regression_window;
-                var frame_sum: usize = 0;
-                for (token_frames.items[window_start..]) |f| {
-                    frame_sum += f;
-                }
-                const avg_frame = frame_sum / regression_window;
-                if (frontier > avg_frame and frontier - avg_frame > regression_threshold) {
-                    const discard = @min(regression_window, generated.items.len);
+                if (alignatt.detectFrameRegression(token_frames.items, frontier, regression_window, regression_threshold)) |discard_window| {
+                    const discard = @min(discard_window, generated.items.len);
                     generated.items.len -= discard;
                     token_frames.items.len -= discard;
                     timing.stop_reason = "frame_regress";
-                    std.debug.print("    [pipeline] frame regression: avg={d} frontier={d} gap={d} at step {d}\n", .{ avg_frame, frontier, frontier - avg_frame, step });
+                    const ws = token_frames.items.len -| regression_window;
+                    var fsum: usize = 0;
+                    for (token_frames.items[ws..]) |f| fsum += f;
+                    const avg = if (token_frames.items.len > 0) fsum / @min(regression_window, token_frames.items.len) else 0;
+                    std.debug.print("    [pipeline] frame regression: avg={d} frontier={d} gap={d} at step {d}\n", .{ avg, frontier, frontier -| avg, step });
                     break;
                 }
             }

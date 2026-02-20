@@ -156,6 +156,108 @@ pub fn checkStopping(
     return .continue_decoding;
 }
 
+/// Average per-head maximum raw softmax attention for the last token.
+///
+/// For each head, finds the max raw attention value over `frame_limit`
+/// content frames, then averages across heads. Real speech produces
+/// sharp peaks (0.10–0.40); hallucination spreads attention uniformly
+/// (peak < 0.08).
+///
+/// attn_data layout: [n_heads][n_audio_ctx][n_tokens] (C-contiguous, raw softmax)
+pub fn avgRawPeak(
+    attn_data: [*]const f32,
+    n_tokens: usize,
+    n_audio_ctx: usize,
+    n_heads: usize,
+    frame_limit: usize,
+) f32 {
+    if (n_heads == 0 or frame_limit == 0 or n_tokens == 0) return 0;
+    const effective_limit = @min(frame_limit, n_audio_ctx);
+    const last_tok_idx = n_tokens - 1;
+    var head_peak_sum: f32 = 0;
+    for (0..n_heads) |head| {
+        const head_off = head * n_audio_ctx * n_tokens;
+        var peak: f32 = 0;
+        for (0..effective_limit) |frame| {
+            const val = attn_data[head_off + frame * n_tokens + last_tok_idx];
+            if (val > peak) peak = val;
+        }
+        head_peak_sum += peak;
+    }
+    return head_peak_sum / @as(f32, @floatFromInt(n_heads));
+}
+
+/// Detect frame regression: tokens collectively attending to audio well
+/// behind the frontier (already-transcribed territory).
+///
+/// Averages the last `window` entries of `token_frames` and compares
+/// against `frontier`. Returns the number of tokens to discard if
+/// regression is detected, null otherwise.
+pub fn detectFrameRegression(
+    token_frames: []const usize,
+    frontier: usize,
+    window: usize,
+    threshold: usize,
+) ?usize {
+    if (token_frames.len < window) return null;
+    const window_start = token_frames.len - window;
+    var frame_sum: usize = 0;
+    for (token_frames[window_start..]) |f| {
+        frame_sum += f;
+    }
+    const avg_frame = frame_sum / window;
+    if (frontier > avg_frame and frontier - avg_frame > threshold) {
+        return window;
+    }
+    return null;
+}
+
+/// Result of the adaptive low-confidence check.
+pub const ConfidenceAction = enum {
+    /// Continue decoding; streak updated.
+    continue_decoding,
+    /// Low-confidence streak exceeded threshold; discard tokens.
+    stop_low_confidence,
+};
+
+/// Adaptive low-confidence check result with updated streak counter.
+pub const ConfidenceResult = struct {
+    action: ConfidenceAction,
+    streak: usize,
+};
+
+/// Check whether the current token's raw attention peak indicates
+/// hallucination. Adaptive: once a segment has established strong
+/// attention (`segment_max_peak >= established_threshold`), the check
+/// is bypassed entirely — the model has locked onto real audio.
+pub fn checkLowConfidence(
+    avg_raw_peak: f32,
+    segment_max_peak: f32,
+    current_streak: usize,
+    established_threshold: f32,
+    confidence_threshold: f32,
+    streak_len: usize,
+) ConfidenceResult {
+    // Segment has established strong attention — trust subsequent tokens.
+    if (segment_max_peak >= established_threshold) {
+        return .{ .action = .continue_decoding, .streak = 0 };
+    }
+
+    // Below established threshold — check individual token confidence.
+    var streak = current_streak;
+    if (avg_raw_peak < confidence_threshold) {
+        streak += 1;
+    } else {
+        streak = 0;
+    }
+
+    if (streak >= streak_len) {
+        return .{ .action = .stop_low_confidence, .streak = streak };
+    }
+
+    return .{ .action = .continue_decoding, .streak = streak };
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -270,4 +372,169 @@ test "analyzeAttention: two heads averaged" {
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 1), argmax(result));
+}
+
+// ============================================================
+// avgRawPeak tests
+// ============================================================
+
+test "avgRawPeak: single head sharp peak" {
+    const n_tokens: usize = 2;
+    const n_audio_ctx: usize = 5;
+    const n_heads: usize = 1;
+    var attn_data: [n_heads * n_audio_ctx * n_tokens]f32 = undefined;
+    @memset(&attn_data, 0);
+    // Last token (idx=1): peak of 0.30 at frame 2
+    attn_data[2 * n_tokens + 1] = 0.30;
+    attn_data[0 * n_tokens + 1] = 0.05;
+    attn_data[1 * n_tokens + 1] = 0.10;
+    attn_data[3 * n_tokens + 1] = 0.05;
+    attn_data[4 * n_tokens + 1] = 0.02;
+
+    const result = avgRawPeak(&attn_data, n_tokens, n_audio_ctx, n_heads, 5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.30), result, 1e-6);
+}
+
+test "avgRawPeak: two heads averaged" {
+    const n_tokens: usize = 2;
+    const n_audio_ctx: usize = 3;
+    const n_heads: usize = 2;
+    var attn_data: [n_heads * n_audio_ctx * n_tokens]f32 = undefined;
+    @memset(&attn_data, 0);
+    // Head 0: peak 0.40 at frame 0 for last token
+    attn_data[0 * n_audio_ctx * n_tokens + 0 * n_tokens + 1] = 0.40;
+    // Head 1: peak 0.20 at frame 1 for last token
+    attn_data[1 * n_audio_ctx * n_tokens + 1 * n_tokens + 1] = 0.20;
+
+    const result = avgRawPeak(&attn_data, n_tokens, n_audio_ctx, n_heads, 3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.30), result, 1e-6);
+}
+
+test "avgRawPeak: frame_limit restricts search" {
+    const n_tokens: usize = 1;
+    const n_audio_ctx: usize = 5;
+    const n_heads: usize = 1;
+    var attn_data: [n_heads * n_audio_ctx * n_tokens]f32 = undefined;
+    @memset(&attn_data, 0);
+    // Peak at frame 4 (outside frame_limit=3)
+    attn_data[4 * n_tokens + 0] = 0.50;
+    // Smaller peak at frame 1 (inside frame_limit=3)
+    attn_data[1 * n_tokens + 0] = 0.15;
+
+    const result = avgRawPeak(&attn_data, n_tokens, n_audio_ctx, n_heads, 3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.15), result, 1e-6);
+}
+
+test "avgRawPeak: zero heads returns 0" {
+    var attn_data = [_]f32{0.5};
+    try std.testing.expectApproxEqAbs(@as(f32, 0), avgRawPeak(&attn_data, 1, 1, 0, 1), 1e-6);
+}
+
+test "avgRawPeak: zero frame_limit returns 0" {
+    var attn_data = [_]f32{0.5};
+    try std.testing.expectApproxEqAbs(@as(f32, 0), avgRawPeak(&attn_data, 1, 1, 1, 0), 1e-6);
+}
+
+test "avgRawPeak: zero n_tokens returns 0" {
+    var attn_data = [_]f32{0.5};
+    try std.testing.expectApproxEqAbs(@as(f32, 0), avgRawPeak(&attn_data, 0, 1, 1, 1), 1e-6);
+}
+
+test "avgRawPeak: frame_limit clamped to n_audio_ctx" {
+    const n_tokens: usize = 1;
+    const n_audio_ctx: usize = 3;
+    const n_heads: usize = 1;
+    var attn_data: [n_heads * n_audio_ctx * n_tokens]f32 = undefined;
+    @memset(&attn_data, 0);
+    attn_data[1 * n_tokens + 0] = 0.25; // peak at frame 1
+    // frame_limit=10 exceeds n_audio_ctx=3, should clamp and not read OOB
+    const result = avgRawPeak(&attn_data, n_tokens, n_audio_ctx, n_heads, 10);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), result, 1e-6);
+}
+
+// ============================================================
+// detectFrameRegression tests
+// ============================================================
+
+test "detectFrameRegression: no regression when close to frontier" {
+    const frames = [_]usize{ 100, 105, 110, 108, 112, 115, 118, 120 };
+    try std.testing.expectEqual(@as(?usize, null), detectFrameRegression(&frames, 125, 8, 75));
+}
+
+test "detectFrameRegression: detects regression behind frontier" {
+    // Average of window = (10+12+15+11+13+14+10+15)/8 = 12.5 → 12
+    // Frontier = 200, gap = 188 > 75 → regression
+    const frames = [_]usize{ 10, 12, 15, 11, 13, 14, 10, 15 };
+    try std.testing.expectEqual(@as(?usize, 8), detectFrameRegression(&frames, 200, 8, 75));
+}
+
+test "detectFrameRegression: insufficient frames returns null" {
+    const frames = [_]usize{ 10, 20, 30 };
+    try std.testing.expectEqual(@as(?usize, null), detectFrameRegression(&frames, 500, 8, 75));
+}
+
+test "detectFrameRegression: frontier behind average is not regression" {
+    const frames = [_]usize{ 100, 110, 120, 130, 140, 150, 160, 170 };
+    // avg = 135, frontier = 50 → frontier < avg → no regression
+    try std.testing.expectEqual(@as(?usize, null), detectFrameRegression(&frames, 50, 8, 75));
+}
+
+test "detectFrameRegression: gap exactly at threshold is not regression" {
+    // avg = 100, frontier = 175, gap = 75 → not > 75 → no regression
+    const frames = [_]usize{ 100, 100, 100, 100, 100, 100, 100, 100 };
+    try std.testing.expectEqual(@as(?usize, null), detectFrameRegression(&frames, 175, 8, 75));
+}
+
+test "detectFrameRegression: gap one past threshold triggers" {
+    // avg = 100, frontier = 176, gap = 76 > 75 → regression
+    const frames = [_]usize{ 100, 100, 100, 100, 100, 100, 100, 100 };
+    try std.testing.expectEqual(@as(?usize, 8), detectFrameRegression(&frames, 176, 8, 75));
+}
+
+test "detectFrameRegression: uses only tail window" {
+    // First frames are far back, but window only looks at last 4
+    // Window avg = (190+195+200+205)/4 = 197
+    // Frontier = 210, gap = 13 < 75 → no regression
+    const frames = [_]usize{ 10, 10, 10, 10, 190, 195, 200, 205 };
+    try std.testing.expectEqual(@as(?usize, null), detectFrameRegression(&frames, 210, 4, 75));
+}
+
+// ============================================================
+// checkLowConfidence tests
+// ============================================================
+
+test "checkLowConfidence: established segment bypasses check" {
+    const r = checkLowConfidence(0.03, 0.15, 5, 0.12, 0.10, 2);
+    try std.testing.expectEqual(ConfidenceAction.continue_decoding, r.action);
+    try std.testing.expectEqual(@as(usize, 0), r.streak);
+}
+
+test "checkLowConfidence: low peak increments streak" {
+    const r = checkLowConfidence(0.05, 0.08, 0, 0.12, 0.10, 2);
+    try std.testing.expectEqual(ConfidenceAction.continue_decoding, r.action);
+    try std.testing.expectEqual(@as(usize, 1), r.streak);
+}
+
+test "checkLowConfidence: streak reaches threshold triggers stop" {
+    const r = checkLowConfidence(0.04, 0.07, 1, 0.12, 0.10, 2);
+    try std.testing.expectEqual(ConfidenceAction.stop_low_confidence, r.action);
+    try std.testing.expectEqual(@as(usize, 2), r.streak);
+}
+
+test "checkLowConfidence: good peak resets streak" {
+    const r = checkLowConfidence(0.11, 0.08, 3, 0.12, 0.10, 2);
+    try std.testing.expectEqual(ConfidenceAction.continue_decoding, r.action);
+    try std.testing.expectEqual(@as(usize, 0), r.streak);
+}
+
+test "checkLowConfidence: segment_max exactly at established threshold bypasses" {
+    const r = checkLowConfidence(0.03, 0.12, 5, 0.12, 0.10, 2);
+    try std.testing.expectEqual(ConfidenceAction.continue_decoding, r.action);
+    try std.testing.expectEqual(@as(usize, 0), r.streak);
+}
+
+test "checkLowConfidence: peak exactly at confidence threshold resets streak" {
+    const r = checkLowConfidence(0.10, 0.08, 1, 0.12, 0.10, 2);
+    try std.testing.expectEqual(ConfidenceAction.continue_decoding, r.action);
+    try std.testing.expectEqual(@as(usize, 0), r.streak);
 }
