@@ -29,8 +29,8 @@ const mediumCases: TestCase[] = [
 
 const longCases: TestCase[] = [
     { name: "dictation", wav: "test/dictation.wav", ref: "test/dictation.txt" },
-    // Fast-forward overwhelms 30s buffer on 100+s files — phrase-level repetition during
-    // streaming degrades quality. Track with loose thresholds, tighten as we improve.
+    // Primary quality target: long continuous speech exceeds whisper's 30s encoder window,
+    // triggering sliding window trims that degrade context. Tighten thresholds as we improve.
     { name: "long-recording", wav: "test/long-recording.wav", ref: "test/long-recording.txt", thresholds: { minCoverage: 20, maxWer: 500 } },
     { name: "repetition-loop-long", wav: "test/repetition-loop-long.wav", ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 20, maxWer: 500 } },
 ];

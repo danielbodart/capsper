@@ -90,7 +90,7 @@ Do NOT manually download CI artifacts or stage releases by hand — the update s
 
 ## Workflow
 
-**Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test. Use `./run.ts slow-test compare` to get a baseline before and after changes — it gives concrete word coverage numbers to measure improvement.
+**Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test. Run `./run.ts slow-test` before and after changes — the scorecard shows Coverage, WER (Word Error Rate), and per-error-type breakdown (Subs/Ins/Del) to measure improvement.
 
 ## Conventions
 

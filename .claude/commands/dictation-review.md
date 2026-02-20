@@ -31,7 +31,7 @@ Analyze captured debug recordings to find transcription issues and create regres
      - **Long** (`longCases`): > 60s — runs in `./run.ts long-test`
    - Use the `TestCase` interface: `{ name: "<name>", wav: "test/<name>.wav", ref: "test/<name>.txt" }`
    - Add custom `thresholds` only if needed (defaults: `minCoverage: 85, maxWer: 30, maxGapSec: 10, maxRepetitions: 5`)
-   - Known issue: files > 60s degrade significantly with fast-forward TCP streaming due to phrase-level repetition overwhelming the 30s buffer. Set loose thresholds (minCoverage: 20, maxWer: 500) for long files.
+   - Primary quality target: files > 60s with long continuous speech degrade as whisper's 30s sliding window trims old audio and context is lost. Set loose thresholds (minCoverage: 20, maxWer: 500) for long files and tighten as we improve.
    - If the recording has domain-specific vocabulary, consider adding a `test/<name>-terms.txt` file and note that the long group server already passes `--domain-terms test/dictation-terms.txt`
    - Run the appropriate test to get a baseline: `./run.ts short-test`, `./run.ts medium-test`, or `./run.ts long-test`
    - Report the baseline coverage so future improvements can be measured
