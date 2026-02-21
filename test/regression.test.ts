@@ -33,6 +33,8 @@ const longCases: TestCase[] = [
     // long-recording has 20s silences causing hallucination in the second half.
     { name: "long-recording", wav: "test/long-recording.wav", ref: "test/long-recording.txt", thresholds: { minCoverage: 35, maxWer: 70 } },
     { name: "repetition-loop-long", wav: "test/repetition-loop-long.wav", ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 70, maxWer: 35 } },
+    // 2min recording with silences. Streaming hallucinates ~85-word duplication after trailing silence at ~5min mark.
+    { name: "silence-hallucination", wav: "test/silence-hallucination.wav", ref: "test/silence-hallucination.txt", thresholds: { minCoverage: 20, maxWer: 500, maxGapSec: 15 } },
 ];
 
 // Gating: which groups to run
