@@ -52,11 +52,12 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 - **`pipeline.zig`** — Low-level whisper.cpp integration. Manually drives mel spectrogram, encode, and autoregressive decode loop (no `whisper_full`). Implements AlignAtt streaming policy via cross-attention analysis to decide when to stop decoding. Supports domain term prompting via `<|startofprev|>` token prefix.
 - **`alignatt.zig`** — AlignAtt attention analysis: z-score normalization, median filtering, head averaging, stopping/rewind detection.
 - **`utils.zig`** — Pure utility functions (no C deps): PCM-to-float conversion, buffer trimming, WAV parsing/writing, per-channel RMS analysis, text preview. Independently unit-tested.
-- **`audio_capture.zig`** — PipeWire audio capture via `pw_thread_loop` + `pw_stream`.
-- **`pw_detect.zig`** — PipeWire device enumeration (`--pw-list`) and interactive channel detection (`--pw-detect`). Records silence/speech, compares per-channel RMS to recommend the best `--pw-channel`.
+- **`audio_capture.zig`** — PipeWire audio capture via `pw_thread_loop` + `pw_stream`. Supports software gain via `setGain()`.
+- **`pw_detect.zig`** — Interactive PipeWire setup wizard (`--pw-detect`). Enumerates devices, lets user pick, records silence/speech, detects best channel, calibrates auto-gain — all in one flow. Outputs `CHANNEL=`/`GAIN=` to stdout for `install.sh`.
+- **`auto_gain.zig`** — Pure-math auto-gain controller. Measures speech RMS and computes PipeWire software gain to reach target level. Capped at 10x (PipeWire ceiling). Used at runtime by `server.zig` and for calibration by `pw_detect.zig`.
 - **`vad.zig`** — Thin wrapper around whisper.cpp's Silero VAD.
 - **`whisper_c.zig`** / **`pipewire_c.zig`** — C import bridges for whisper.cpp and PipeWire.
-- **`pw_helpers.c`** — C helpers for PipeWire SPA pod building, `pw_stream_connect`, and PipeWire source enumeration (variadic C calls and SPA macros that Zig can't handle).
+- **`pw_helpers.c`** — C helpers for PipeWire SPA pod building, `pw_stream_connect`, `pw_set_stream_gain`, and PipeWire source enumeration (variadic C calls and SPA macros that Zig can't handle).
 
 ### Scripts & Task Runner
 

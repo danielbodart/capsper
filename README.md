@@ -85,23 +85,25 @@ Example `my-terms.txt`:
 Kubernetes, kubectl, Terraform, Ansible, gRPC, PostgreSQL
 ```
 
-### PipeWire channel selection
+### PipeWire setup
 
-For multi-channel audio interfaces, first list available sources:
-
-```bash
-capsper --pw-list
-```
-
-Then run interactive channel detection to find which channel carries your microphone signal:
+Run the interactive setup wizard to detect your microphone channel and calibrate gain:
 
 ```bash
 capsper --pw-detect
-# Or target a specific device:
-capsper --pw-detect --pw-target alsa_input.usb-Focusrite_Vocaster...
 ```
 
-This records silence and speech, then shows per-channel signal levels and recommends the correct `--pw-channel` flag.
+This walks you through everything in one flow: lists available audio sources, lets you pick a device, records silence and speech to detect the best channel, then calibrates software gain — all without interruption. At the end it prints the recommended flags:
+
+```
+  --pw-channel FL --pw-gain 3.2
+```
+
+If you already know your device, skip the selection step:
+
+```bash
+capsper --pw-detect --pw-target alsa_input.usb-Focusrite_Vocaster...
+```
 
 ### Debug recording
 
@@ -182,9 +184,10 @@ A single self-contained binary (`src/`):
 | `recorder.zig` | Per-utterance debug recording (WAV + diagnostic log capture) |
 | `utils.zig` | Pure utility functions (PCM conversion, WAV parsing, buffer trimming, RMS analysis) |
 | `vad.zig` | Silero VAD wrapper for speech/silence detection |
-| `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream` |
-| `pw_detect.zig` | PipeWire device enumeration and interactive channel detection |
-| `pw_helpers.c` | C helpers for PipeWire SPA pod building and source enumeration |
+| `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream`, software gain |
+| `pw_detect.zig` | Interactive PipeWire setup wizard (device selection, channel detection, gain calibration) |
+| `auto_gain.zig` | Pure-math auto-gain controller (runtime + calibration), capped at PipeWire's 10x ceiling |
+| `pw_helpers.c` | C helpers for PipeWire SPA pod building, stream gain, and source enumeration |
 
 ### Technical highlights
 
@@ -220,13 +223,13 @@ capsper [OPTIONS]
   --type-delay MS         Delay between injected keystrokes in ms (default: 12)
   --low-latency           Keep PipeWire stream open (mic indicator always visible, ~300ms faster)
   --pw-target NODE        PipeWire capture target node name
-  --pw-channel CHANNEL    PipeWire channel: MONO, FL, AUX0-AUX63 (default: FL)
+  --pw-channel CHANNEL    PipeWire channel: MONO, FL, FR, AUX0-AUX63 (default: FL)
+  --pw-gain FACTOR        PipeWire software gain multiplier (default: 1.0, max: 10.0)
   --domain-terms FILE     Text file of domain terms to bias transcription toward
   --record-dir DIR        Record each utterance to DIR (WAV + diagnostic log)
   --record-keep N         Number of recording pairs to keep (default: 10, ring buffer)
   --transcribe FILE       Batch-transcribe a WAV file (non-streaming) and exit
-  --pw-list               List available PipeWire audio sources
-  --pw-detect             Interactive channel detection (record silence + speech)
+  --pw-detect             Interactive setup wizard (device selection, channel detection, gain calibration)
   --detect-duration SECS  Duration per detection phase (default: 5)
   --verbose               Enable verbose logging
   --dry-run               Load models, run warmup, then exit (validates setup)
@@ -314,6 +317,6 @@ git submodule update --init --recursive
 git lfs pull
 ```
 
-**PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). Use `capsper --pw-list` to see available sources, and `capsper --pw-detect` to find the correct channel for multi-channel devices.
+**PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). Run `capsper --pw-detect` to list available sources, select your device, and detect the correct channel.
 
-**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `capsper --pw-detect` and set `--pw-channel` accordingly.
+**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `capsper --pw-detect` to detect the best channel and calibrate gain. Use the recommended `--pw-channel` and `--pw-gain` flags.
