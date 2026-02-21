@@ -3,6 +3,7 @@ const c = @import("whisper_c.zig");
 const Vad = @import("vad.zig").Vad;
 const Pipeline = @import("pipeline.zig").Pipeline;
 const AudioCapture = @import("audio_capture.zig").AudioCapture;
+const AutoGain = @import("auto_gain.zig").AutoGain;
 const utils = @import("utils.zig");
 const recorder_mod = @import("recorder.zig");
 const Recorder = recorder_mod.Recorder;
@@ -84,6 +85,7 @@ pub const Server = struct {
     type_callback: ?TypeCallback,
     prompt_tokens: []const c.whisper_token,
     recorder: ?*Recorder,
+    initial_gain: f32,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -98,6 +100,7 @@ pub const Server = struct {
         type_callback: ?TypeCallback,
         prompt_tokens: []const c.whisper_token,
         recorder: ?*Recorder,
+        initial_gain: f32,
     ) Server {
         return .{
             .allocator = allocator,
@@ -112,6 +115,7 @@ pub const Server = struct {
             .type_callback = type_callback,
             .prompt_tokens = prompt_tokens,
             .recorder = recorder,
+            .initial_gain = initial_gain,
         };
     }
 
@@ -165,6 +169,12 @@ pub const Server = struct {
         capture_ptr.store(&capture, .monotonic);
         defer capture_ptr.store(null, .monotonic);
 
+        // Apply calibrated initial gain (from --pw-gain) before first audio arrives
+        if (self.initial_gain > 1.01) {
+            capture.setGain(self.initial_gain);
+            std.debug.print("Auto-gain starting at {d:.1}x\n", .{self.initial_gain});
+        }
+
         if (self.low_latency) {
             // Low-latency mode: connect stream once at startup, use cork/uncork for PTT.
             // Mic indicator stays visible, but avoids ~1.3s PipeWire reconnect on each press.
@@ -195,6 +205,8 @@ pub const Server = struct {
     fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
         var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4, self.verbose, self.prompt_tokens);
         defer pipeline.deinit();
+
+        var auto_gain = AutoGain{ .current_gain = self.initial_gain };
 
         const start_ns = std.time.nanoTimestamp();
 
@@ -383,6 +395,18 @@ pub const Server = struct {
                         // Transcribe before entering silence to capture trailing words
                         should_transcribe = true;
                     } else {
+                        // Auto-gain: measure speech level during confirmed speech
+                        if (n > 0) {
+                            const rms = utils.channelRms(recv_buf[0..n], 1, 0);
+                            if (auto_gain.update(rms)) |new_gain| {
+                                if (capture_ptr.load(.monotonic)) |cap| {
+                                    cap.setGain(new_gain);
+                                }
+                                if (self.verbose) {
+                                    std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
+                                }
+                            }
+                        }
                         should_transcribe = true;
                     }
                 },

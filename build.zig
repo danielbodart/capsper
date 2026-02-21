@@ -98,6 +98,16 @@ pub fn build(b: *std.Build) void {
     const run_mel_tests = b.addRunArtifact(mel_tests);
     test_step.dependOn(&run_mel_tests.step);
 
+    const auto_gain_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/auto_gain.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_auto_gain_tests = b.addRunArtifact(auto_gain_tests);
+    test_step.dependOn(&run_auto_gain_tests.step);
+
     // input.zig tests need libc for @cImport of linux/input-event-codes.h
     const input_tests = b.addTest(.{
         .root_module = b.createModule(.{

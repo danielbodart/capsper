@@ -35,7 +35,6 @@ pub fn main() !void {
     var trigger_passthrough: bool = false;
     var type_delay_us: u64 = 12_000; // 12ms
     var dry_run: bool = false;
-    var do_pw_list: bool = false;
     var do_pw_detect: bool = false;
     var detect_duration: u32 = 5;
     var domain_terms_path: ?[:0]const u8 = null;
@@ -43,6 +42,7 @@ pub fn main() !void {
     var record_keep: usize = 10;
     var transcribe_file: ?[:0]const u8 = null;
     var low_latency: bool = false;
+    var pw_gain: f32 = 1.0;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -92,7 +92,7 @@ pub fn main() !void {
             if (i < args.len) {
                 pw_channel = parseChannelName(args[i]) orelse {
                     std.debug.print("Invalid --pw-channel value '{s}'\n", .{args[i]});
-                    std.debug.print("Expected: MONO, FL, AUX0-AUX63\n", .{});
+                    std.debug.print("Expected: MONO, FL, FR, AUX0-AUX63\n", .{});
                     return;
                 };
             }
@@ -110,8 +110,6 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--type-delay")) {
             i += 1;
             if (i < args.len) type_delay_us = std.fmt.parseInt(u64, args[i], 10) catch 12_000;
-        } else if (std.mem.eql(u8, arg, "--pw-list")) {
-            do_pw_list = true;
         } else if (std.mem.eql(u8, arg, "--pw-detect")) {
             do_pw_detect = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
@@ -131,6 +129,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--transcribe")) {
             i += 1;
             if (i < args.len) transcribe_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--pw-gain")) {
+            i += 1;
+            if (i < args.len) pw_gain = std.fmt.parseFloat(f32, args[i]) catch 1.0;
         } else if (std.mem.eql(u8, arg, "--low-latency")) {
             low_latency = true;
         } else {
@@ -146,10 +147,6 @@ pub fn main() !void {
     }
 
     // PipeWire utility commands (early exit, no model loading needed)
-    if (do_pw_list) {
-        pw_detect.listSources();
-        return;
-    }
     if (do_pw_detect) {
         pw_detect.detectChannel(allocator, pw_target, detect_duration);
         return;
@@ -338,7 +335,7 @@ pub fn main() !void {
     }
 
     // Start server
-    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, recorder);
+    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, recorder, pw_gain);
     try server.run();
 }
 
@@ -347,6 +344,7 @@ pub fn main() !void {
 fn parseChannelName(name: []const u8) ?u32 {
     if (std.ascii.eqlIgnoreCase(name, "MONO")) return pw.SPA_AUDIO_CHANNEL_MONO;
     if (std.ascii.eqlIgnoreCase(name, "FL")) return pw.SPA_AUDIO_CHANNEL_FL;
+    if (std.ascii.eqlIgnoreCase(name, "FR")) return pw.SPA_AUDIO_CHANNEL_FR;
     // Parse AUXn (case-insensitive prefix, numeric suffix)
     if (name.len >= 4 and std.ascii.eqlIgnoreCase(name[0..3], "AUX")) {
         const n = std.fmt.parseInt(u32, name[3..], 10) catch return null;
@@ -382,7 +380,8 @@ fn printUsage() void {
     std.debug.print("       [--domain-terms FILE]\n", .{});
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
     std.debug.print("       [--transcribe FILE]\n", .{});
-    std.debug.print("       [--pw-list] [--pw-detect [--detect-duration SECS]]\n", .{});
+    std.debug.print("       [--pw-gain FACTOR]\n", .{});
+    std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
 }
 

@@ -124,75 +124,14 @@ download_models() {
     echo "Models downloaded."
 }
 
-# ─── PipeWire Device Selection & Channel Detection ───────────────────────────
+# ─── PipeWire Channel Detection & Gain Calibration ───────────────────────────
 
-# Show numbered list of PipeWire sources, let user pick by number.
-# Sets PW_TARGET to the selected device name (empty = default).
-select_device() {
-    local binary="$1"
-    PW_TARGET=""
-
-    # Capture --pw-list output (goes to stderr)
-    local list_output
-    list_output=$("$binary" --pw-list 2>&1) || true
-
-    # Extract device lines: lines after the separator that aren't blank or the footer
-    local -a device_names=()
-    local -a device_lines=()
-    local past_separator=false
-    while IFS= read -r line; do
-        if [[ "$line" == *"--------"* ]]; then
-            past_separator=true
-            continue
-        fi
-        if $past_separator; then
-            # Stop at blank lines or footer
-            [[ -z "${line// /}" ]] && break
-            [[ "$line" == *"Use --pw-target"* ]] && break
-            # Extract device name (first field after leading whitespace)
-            local name
-            name=$(echo "$line" | awk '{print $1}')
-            if [ -n "$name" ]; then
-                device_names+=("$name")
-                # shellcheck disable=SC2001
-                device_lines+=("$(echo "$line" | sed 's/^  //')")
-            fi
-        fi
-    done <<< "$list_output"
-
-    if [ ${#device_names[@]} -eq 0 ]; then
-        echo "No PipeWire audio sources found."
-        return
-    fi
-
-    echo ""
-    echo "Available audio sources:"
-    echo ""
-    for i in "${!device_names[@]}"; do
-        printf "  %d) %s\n" "$((i + 1))" "${device_lines[$i]}"
-    done
-    echo ""
-    printf "Select a device [1-%d] (Enter = default): " "${#device_names[@]}"
-    read -r choice
-
-    if [ -n "$choice" ]; then
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#device_names[@]}" ]; then
-            PW_TARGET="${device_names[$((choice - 1))]}"
-            echo "Selected: $PW_TARGET"
-        else
-            echo "Invalid choice. Using default device."
-        fi
-    else
-        echo "Using default device."
-    fi
-}
-
+# Run the interactive setup wizard. Device selection, channel detection, and
+# gain calibration all happen inside the binary. Parseable output (CHANNEL=,
+# GAIN=) goes to stdout; interactive prompts go to stderr.
 pw_detect() {
     local binary="$1"
-    local target="${2:-}"
-    local detect_args=(--pw-detect)
-    [ -n "$target" ] && detect_args+=(--pw-target "$target")
-    "$binary" "${detect_args[@]}"
+    "$binary" --pw-detect
 }
 
 # ─── Systemd Service ─────────────────────────────────────────────────────────
@@ -211,8 +150,12 @@ install_service() {
     local domain_terms="${7:-}"
     local enable_recordings="${8:-false}"
     local low_latency="${9:-false}"
+    local gain="${10:-1.0}"
 
     local exec_start="$binary --trigger capslock --pw-channel $channel"
+    if [ -n "$gain" ] && [ "$gain" != "1.0" ] && [ "$gain" != "1" ]; then
+        exec_start="$exec_start --pw-gain $gain"
+    fi
     exec_start="$exec_start --model $model_dir/$WHISPER_MODEL_NAME"
     exec_start="$exec_start --vad-model $model_dir/$VAD_MODEL_NAME"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
@@ -358,6 +301,9 @@ extract_service_config() {
 
     SAVED_LOW_LATENCY=false
     echo "$exec_start" | grep -q -- '--low-latency' && SAVED_LOW_LATENCY=true
+
+    SAVED_GAIN=$(echo "$exec_start" | sed -n 's/.*--pw-gain \([^ ]*\).*/\1/p')
+    SAVED_GAIN="${SAVED_GAIN:-1.0}"
 }
 
 install_update_timer() {
@@ -525,20 +471,18 @@ cmd_install() {
 
         if ! $is_upgrade || $update_config; then
             local channel="FL"
-            PW_TARGET=""
+            local gain="1.0"
             echo ""
             echo "=== Audio Configuration ==="
-            if confirm "Select audio device?"; then
-                select_device "$SCRIPT_DIR/bin/capsper"
-            fi
-            if confirm "Run microphone channel detection? (No = use default FL)"; then
+            if confirm "Run microphone channel detection? (No = use default FL, no gain boost)"; then
                 local detect_output
-                detect_output=$(pw_detect "$SCRIPT_DIR/bin/capsper" "$PW_TARGET")
-                echo "$detect_output"
+                detect_output=$(pw_detect "$SCRIPT_DIR/bin/capsper")
                 channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
+                gain=$(echo "$detect_output" | grep '^GAIN=' | tail -1 | cut -d= -f2)
                 [ -z "$channel" ] && channel="FL"
+                [ -z "$gain" ] && gain="1.0"
             else
-                echo "Using default channel: FL"
+                echo "Using default channel: FL, gain: 1.0"
             fi
 
             # Domain terms
@@ -577,7 +521,7 @@ cmd_install() {
                 low_latency=true
             fi
 
-            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "$PW_TARGET" false "$domain_terms" $enable_recordings $low_latency
+            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "" false "$domain_terms" $enable_recordings $low_latency "$gain"
         fi
     else
         echo "=== Capsper Installer ==="
@@ -600,20 +544,18 @@ cmd_install() {
         if ! $is_upgrade || $update_config; then
             # Audio configuration
             local channel="FL"
-            PW_TARGET=""
+            local gain="1.0"
             echo ""
             echo "=== Audio Configuration ==="
-            if confirm "Select audio device?"; then
-                select_device "$INSTALL_DIR/current/bin/capsper"
-            fi
-            if confirm "Run microphone channel detection? (No = use default FL)"; then
+            if confirm "Run microphone channel detection? (No = use default FL, no gain boost)"; then
                 local detect_output
-                detect_output=$(pw_detect "$INSTALL_DIR/current/bin/capsper" "$PW_TARGET")
-                echo "$detect_output"
+                detect_output=$(pw_detect "$INSTALL_DIR/current/bin/capsper")
                 channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
+                gain=$(echo "$detect_output" | grep '^GAIN=' | tail -1 | cut -d= -f2)
                 [ -z "$channel" ] && channel="FL"
+                [ -z "$gain" ] && gain="1.0"
             else
-                echo "Using default channel: FL"
+                echo "Using default channel: FL, gain: 1.0"
             fi
 
             # Domain terms
@@ -659,7 +601,7 @@ cmd_install() {
                 enable_updates=false
             fi
 
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$PW_TARGET" $enable_updates "$domain_terms" $enable_recordings $low_latency
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "" $enable_updates "$domain_terms" $enable_recordings $low_latency "$gain"
 
             if $enable_updates; then
                 install_update_timer
@@ -671,7 +613,7 @@ cmd_install() {
 
             if has_auto_update; then
                 # Auto-update already configured: keep it, just update paths
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
             else
                 # Pre-auto-update install: offer to enable
                 local enable_updates=true
@@ -680,7 +622,7 @@ cmd_install() {
                     enable_updates=false
                 fi
 
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
 
                 if $enable_updates; then
                     install_update_timer
@@ -727,6 +669,6 @@ cmd_install() {
 
 case "${1:-install}" in
     install)    cmd_install ;;
-    pw-detect)  shift; pw_detect "$SCRIPT_DIR/bin/capsper" "$@" ;;
+    pw-detect)  pw_detect "$SCRIPT_DIR/bin/capsper" ;;
     *)          die "Unknown command: $1. Usage: install.sh [install|pw-detect]" ;;
 esac
