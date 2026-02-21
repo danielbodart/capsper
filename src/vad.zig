@@ -241,7 +241,7 @@ pub const Vad = struct {
 
 // ============================================================
 // VadFilter unit tests (processChunkProb only — no C FFI needed)
-// Thresholds: threshold=0.1 (on), threshold_off=0.05 (off)
+// Thresholds: threshold=0.03 (on), threshold_off=0.01 (off)
 // ============================================================
 
 test "processChunkProb: not triggered, below threshold → stays not-triggered" {
@@ -249,7 +249,7 @@ test "processChunkProb: not triggered, below threshold → stays not-triggered" 
         .vad = undefined,
         .allocator = std.testing.allocator,
     };
-    try std.testing.expect(!filter.processChunkProb(0.05));
+    try std.testing.expect(!filter.processChunkProb(0.02));
     try std.testing.expect(!filter.triggered);
 }
 
@@ -268,7 +268,7 @@ test "processChunkProb: not triggered, exact threshold boundary → triggers" {
         .vad = undefined,
         .allocator = std.testing.allocator,
     };
-    try std.testing.expect(filter.processChunkProb(0.1));
+    try std.testing.expect(filter.processChunkProb(0.03));
     try std.testing.expect(filter.triggered);
 }
 
@@ -292,7 +292,7 @@ test "processChunkProb: triggered, below threshold_off, short silence → bridge
         .silence_bytes = 0,
     };
     // One chunk of silence (1024 bytes) — well below min_silence_bytes (16000)
-    try std.testing.expect(filter.processChunkProb(0.02));
+    try std.testing.expect(filter.processChunkProb(0.005));
     try std.testing.expect(filter.triggered);
     try std.testing.expectEqual(VadFilter.chunk_pcm_bytes, filter.silence_bytes);
 }
@@ -305,7 +305,7 @@ test "processChunkProb: triggered, sustained silence → un-triggers" {
         .silence_bytes = VadFilter.min_silence_bytes - VadFilter.chunk_pcm_bytes,
     };
     // This chunk pushes silence_bytes past min_silence_bytes
-    try std.testing.expect(!filter.processChunkProb(0.02));
+    try std.testing.expect(!filter.processChunkProb(0.005));
     try std.testing.expect(!filter.triggered);
 }
 
@@ -328,7 +328,7 @@ test "processChunkProb: exact threshold_off boundary keeps triggered" {
         .triggered = true,
         .silence_bytes = 4096,
     };
-    try std.testing.expect(filter.processChunkProb(0.05));
+    try std.testing.expect(filter.processChunkProb(0.01));
     try std.testing.expect(filter.triggered);
     try std.testing.expectEqual(@as(usize, 0), filter.silence_bytes);
 }
