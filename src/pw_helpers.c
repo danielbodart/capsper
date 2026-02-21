@@ -2,6 +2,7 @@
 #include <pipewire/stream.h>
 #include <pipewire/core.h>
 #include <spa/param/audio/format-utils.h>
+#include <spa/param/props.h>
 #include <spa/pod/builder.h>
 #include <spa/utils/result.h>
 #include <string.h>
@@ -75,6 +76,18 @@ pw_connect_capture_multi(struct pw_stream *stream,
         PW_ID_ANY,
         PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
         &pod, 1);
+}
+
+/* Set software gain on a PipeWire capture stream via SPA_PROP_channelVolumes.
+   Must be in C because pw_stream_set_control uses varargs. */
+int
+pw_set_stream_gain(struct pw_stream *stream, float gain, uint32_t n_channels)
+{
+    float vol[64]; /* SPA_AUDIO_MAX_CHANNELS */
+    if (n_channels > 64) n_channels = 64;
+    for (uint32_t i = 0; i < n_channels; i++)
+        vol[i] = gain;
+    return pw_stream_set_control(stream, SPA_PROP_channelVolumes, n_channels, vol, 0);
 }
 
 /* ─── PipeWire source enumeration ────────────────────────────────────────── */

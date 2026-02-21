@@ -1,6 +1,7 @@
 const std = @import("std");
 const pw = @import("pipewire_c.zig");
 const utils = @import("utils.zig");
+const AutoGain = @import("auto_gain.zig").AutoGain;
 const posix = std.posix;
 
 const log = std.log.scoped(.pw_detect);
@@ -138,23 +139,40 @@ pub fn detectChannel(allocator: std.mem.Allocator, target: ?[:0]const u8, durati
     const best_name = channelName(best_ch, num_channels);
     const sp_db = utils.rmsToDb(utils.channelRms(speech_pcm, nc, @intCast(best_ch)));
 
+    var chosen_name: []const u8 = undefined;
     if (best_delta < 3) {
         std.debug.print("WARNING: No channel showed significant speech activity (delta < 3dB).\n", .{});
         std.debug.print("Make sure you spoke during the speech recording phase.\n", .{});
         std.debug.print("Falling back to FL.\n", .{});
         std.debug.print("\n  --pw-channel FL\n", .{});
+        chosen_name = "FL";
+        best_ch = 0;
         // CHANNEL= line goes to stdout so install.sh can parse it
         _ = posix.write(posix.STDOUT_FILENO, "\nCHANNEL=FL\n") catch {};
     } else {
         std.debug.print("Recommended channel: {s} (speech: {d:.1} dB, delta: {d:.1} dB)\n", .{ best_name, sp_db, best_delta });
         std.debug.print("\n  --pw-channel {s}\n", .{best_name});
+        chosen_name = best_name;
         if (sp_db < -30) {
             std.debug.print("\nNote: Signal is quiet ({d:.1} dB). Check your hardware gain settings.\n", .{sp_db});
         }
         // CHANNEL= line goes to stdout so install.sh can parse it
         var chan_buf: [32]u8 = undefined;
-        const chan_line = std.fmt.bufPrint(&chan_buf, "\nCHANNEL={s}\n", .{best_name}) catch "\nCHANNEL=FL\n";
+        const chan_line = std.fmt.bufPrint(&chan_buf, "\nCHANNEL={s}\n", .{chosen_name}) catch "\nCHANNEL=FL\n";
         _ = posix.write(posix.STDOUT_FILENO, chan_line) catch {};
+    }
+
+    // Auto-gain calibration
+    const channel_pos = channelPositionFromIndex(best_ch, num_channels);
+    std.debug.print("\n=== Auto-Gain Calibration ===\n\n", .{});
+    std.debug.print("Speak again — calibrating auto-gain ({d}s)...\n", .{duration});
+    const cal = calibrateGain(target, channel_pos, duration) catch |err| {
+        std.debug.print("Gain calibration failed: {}\n", .{err});
+        return;
+    };
+    std.debug.print("Auto-gain: {d:.1}x (speech: {d:.0} dB, target: -15 dB)\n", .{ cal.gain, cal.speech_db });
+    if (cal.gain <= 1.01) {
+        std.debug.print("Level OK — no gain boost needed.\n", .{});
     }
 }
 
@@ -172,6 +190,126 @@ fn channelName(ch: anytype, total: anytype) []const u8 {
 fn waitForEnter() void {
     var buf: [64]u8 = undefined;
     _ = posix.read(posix.STDIN_FILENO, &buf) catch {};
+}
+
+/// Map a channel index to a PipeWire SPA channel position.
+fn channelPositionFromIndex(ch: u32, total: u32) u32 {
+    if (total <= 2) return if (ch == 0) pw.SPA_AUDIO_CHANNEL_FL else pw.SPA_AUDIO_CHANNEL_FR;
+    return pw.spaAudioChannelAux(ch);
+}
+
+const CalibrationResult = struct {
+    gain: f32,
+    speech_db: f64,
+};
+
+/// Capture mono audio on the selected channel and run auto-gain to convergence.
+fn calibrateGain(target: ?[:0]const u8, channel_position: u32, duration_secs: u32) !CalibrationResult {
+    const sample_rate: u32 = 16000;
+    const expected_bytes: usize = sample_rate * 2 * duration_secs; // mono S16_LE
+
+    const pipe_fds = try posix.pipe();
+    // zwanzig-disable: store-violations-engine
+    errdefer {
+        posix.close(pipe_fds[0]);
+        posix.close(pipe_fds[1]);
+    }
+    // zwanzig-enable: store-violations-engine
+
+    pw.pw_init(null, null);
+
+    const stream_data = try std.heap.page_allocator.create(StreamData);
+    stream_data.* = .{ .pipe_write_fd = pipe_fds[1] };
+
+    const thread_loop = pw.pw_thread_loop_new("pw-gain-cal", null) orelse
+        return error.PipeWireInitFailed;
+
+    const loop = pw.pw_thread_loop_get_loop(thread_loop);
+
+    const stream_events = pw.pw_stream_events{
+        .version = 2,
+        .process = onProcess,
+        .destroy = null,
+        .state_changed = null,
+        .control_info = null,
+        .io_changed = null,
+        .param_changed = null,
+        .add_buffer = null,
+        .remove_buffer = null,
+        .drained = null,
+        .command = null,
+        .trigger_done = null,
+    };
+
+    const props = if (target) |t|
+        pw.pw_properties_new(
+            pw.PW_KEY_MEDIA_TYPE,     "Audio",
+            pw.PW_KEY_MEDIA_CATEGORY, "Capture",
+            pw.PW_KEY_MEDIA_ROLE,     "Communication",
+            pw.PW_KEY_TARGET_OBJECT,  t.ptr,
+            @as(?[*]const u8, null),
+        )
+    else
+        pw.pw_properties_new(
+            pw.PW_KEY_MEDIA_TYPE,     "Audio",
+            pw.PW_KEY_MEDIA_CATEGORY, "Capture",
+            pw.PW_KEY_MEDIA_ROLE,     "Communication",
+            @as(?[*]const u8, null),
+        );
+
+    if (props == null) return error.PipeWireInitFailed;
+
+    const stream = pw.pw_stream_new_simple(loop, "pw-gain-cal", props, &stream_events, stream_data) orelse
+        return error.PipeWireInitFailed;
+
+    stream_data.stream = stream;
+
+    const connect_result = pw.pw_connect_capture(stream, sample_rate, channel_position);
+    if (connect_result < 0) return error.PipeWireConnectFailed;
+
+    const start_result = pw.pw_thread_loop_start(thread_loop);
+    if (start_result < 0) return error.PipeWireInitFailed;
+
+    // Read audio and run auto-gain
+    var auto_gain = AutoGain{};
+    var recv_buf: [4096]u8 = undefined;
+    var total_read: usize = 0;
+    var last_speech_db: f64 = -100;
+
+    const deadline_ns: i128 = std.time.nanoTimestamp() + @as(i128, duration_secs) * std.time.ns_per_s;
+
+    while (total_read < expected_bytes) {
+        if (std.time.nanoTimestamp() >= deadline_ns) break;
+
+        const n = posix.read(pipe_fds[0], &recv_buf) catch |err| {
+            if (err == error.WouldBlock) continue;
+            break;
+        };
+        if (n == 0) break;
+        total_read += n;
+
+        const rms = utils.channelRms(recv_buf[0..n], 1, 0);
+        const db = utils.rmsToDb(rms);
+        if (db > -50) last_speech_db = db;
+
+        if (auto_gain.update(rms)) |new_gain| {
+            pw.pw_thread_loop_lock(thread_loop);
+            _ = pw.pw_set_stream_gain(stream, new_gain, 1);
+            pw.pw_thread_loop_unlock(thread_loop);
+        }
+    }
+
+    // Cleanup
+    pw.pw_thread_loop_stop(thread_loop);
+    pw.pw_stream_destroy(stream);
+    pw.pw_thread_loop_destroy(thread_loop);
+    posix.close(pipe_fds[0]);
+    // zwanzig-disable-next-line: store-violations-engine
+    posix.close(pipe_fds[1]);
+    std.heap.page_allocator.destroy(stream_data);
+    pw.pw_deinit();
+
+    return .{ .gain = auto_gain.current_gain, .speech_db = last_speech_db };
 }
 
 // ─── Multi-channel capture ──────────────────────────────────────────────────

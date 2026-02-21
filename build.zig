@@ -98,6 +98,36 @@ pub fn build(b: *std.Build) void {
     const run_mel_tests = b.addRunArtifact(mel_tests);
     test_step.dependOn(&run_mel_tests.step);
 
+    const auto_gain_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/auto_gain.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_auto_gain_tests = b.addRunArtifact(auto_gain_tests);
+    test_step.dependOn(&run_auto_gain_tests.step);
+
+    // vad.zig tests need whisper libs for the module import (tests themselves are pure)
+    const vad_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vad.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    vad_tests.root_module.addIncludePath(b.path("whisper.cpp/include"));
+    vad_tests.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
+    vad_tests.root_module.addLibraryPath(b.path("dist/lib"));
+    vad_tests.linkSystemLibrary("whisper");
+    vad_tests.linkSystemLibrary("ggml");
+    vad_tests.linkSystemLibrary("ggml-base");
+    vad_tests.linkSystemLibrary("ggml-cpu");
+    vad_tests.linkSystemLibrary("ggml-cuda");
+    vad_tests.linkLibC();
+    const run_vad_tests = b.addRunArtifact(vad_tests);
+    test_step.dependOn(&run_vad_tests.step);
+
     // input.zig tests need libc for @cImport of linux/input-event-codes.h
     const input_tests = b.addTest(.{
         .root_module = b.createModule(.{

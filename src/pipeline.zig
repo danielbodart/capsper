@@ -318,11 +318,9 @@ pub const Pipeline = struct {
         var n_past: c_int = @intCast(full_prompt.len);
         const max_tokens: usize = if (flush) (flush_budget orelse 224) else 224;
         var was_rewind = false;
-        var low_confidence_streak: usize = 0;
-        // Track peak in a local variable — only commit to self.segment_max_raw_peak
-        // when tokens are successfully produced. This prevents null cycles from
-        // ratcheting up the peak and eventually bypassing the hallucination guard.
-        var cycle_max_peak: f32 = self.segment_max_raw_peak;
+        // Note: segment_max_raw_peak is no longer used for gating (the low_confidence
+        // check was removed as it was a mitigation strategy, not principled). It could
+        // be removed entirely, but keeping the field for now as diagnostic logging.
 
         for (0..max_tokens) |step| {
             const logits = c.whisper_get_logits_from_state(self.state);
@@ -417,39 +415,6 @@ pub const Pipeline = struct {
             // Update the frame for this token
             token_frames.items[token_frames.items.len - 1] = most_attended;
 
-            // Adaptive attention confidence check (raw softmax peaks).
-            // Thresholds: once any token in the segment reaches a strong
-            // peak, trust subsequent tokens (real speech established).
-            const confidence_established: f32 = 0.12; // segment has real speech
-            const confidence_threshold: f32 = 0.10; // per-token minimum
-            const confidence_streak_len: usize = 3; // consecutive low tokens to trigger
-            if (!flush and frame_limit > 0) {
-                const avg_raw_peak = alignatt.avgRawPeak(
-                    attn_data,
-                    @intCast(n_tok),
-                    @intCast(n_actx),
-                    @intCast(n_hd),
-                    frame_limit,
-                );
-                if (avg_raw_peak > cycle_max_peak) {
-                    cycle_max_peak = avg_raw_peak;
-                }
-
-                const conf = alignatt.checkLowConfidence(
-                    avg_raw_peak, cycle_max_peak,
-                    low_confidence_streak,
-                    confidence_established, confidence_threshold, confidence_streak_len,
-                );
-                low_confidence_streak = conf.streak;
-                if (conf.action == .stop_low_confidence) {
-                    generated.clearRetainingCapacity();
-                    token_frames.clearRetainingCapacity();
-                    timing.stop_reason = "low_confidence";
-                    std.debug.print("    [pipeline] low confidence: raw_peak={d:.4} seg_max={d:.4} streak={d} at step {d}\n", .{ avg_raw_peak, self.segment_max_raw_peak, low_confidence_streak, step });
-                    break;
-                }
-            }
-
             // Frame regression guard.
             const regression_window: usize = 8;
             const regression_threshold: usize = 75; // ~1.5s at 50fps
@@ -517,14 +482,8 @@ pub const Pipeline = struct {
                     timing.stop_reason, timing.state_init_ms, timing.mel_ms, timing.encode_ms, timing.decode_ms, timing.total_ms,
                 });
             }
-            // Don't commit cycle_max_peak — null cycles should not affect
-            // the segment's confidence baseline for future cycles.
             return null;
         }
-
-        // Successful cycle — commit peak so future cycles benefit from
-        // established confidence.
-        self.segment_max_raw_peak = cycle_max_peak;
 
         // Step 5: Word boundary truncation (unless flush)
         var n_tokens_to_use = generated.items.len;
