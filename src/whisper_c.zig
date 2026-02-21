@@ -65,10 +65,6 @@ pub const whisper_vad_segments_get_segment_t1 = cimport.whisper_vad_segments_get
 pub const whisper_vad_free_segments = cimport.whisper_vad_free_segments;
 pub const whisper_vad_free = cimport.whisper_vad_free;
 
-// Logging
-pub const whisper_log_set = cimport.whisper_log_set;
-pub const ggml_log_level = cimport.ggml_log_level;
-
 // ggml backend device enumeration
 pub const ggml_backend_dev_count = cimport.ggml_backend_dev_count;
 pub const ggml_backend_dev_get = cimport.ggml_backend_dev_get;

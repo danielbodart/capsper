@@ -65,20 +65,12 @@ pub extern fn pw_connect_capture(
 // SPA audio channel positions
 pub const SPA_AUDIO_CHANNEL_MONO: u32 = pw.SPA_AUDIO_CHANNEL_MONO;
 pub const SPA_AUDIO_CHANNEL_FL: u32 = pw.SPA_AUDIO_CHANNEL_FL;
-pub const SPA_AUDIO_CHANNEL_FR: u32 = pw.SPA_AUDIO_CHANNEL_FR;
 // AUX channels are sequential: AUX0 = 0x1000, AUX1 = 0x1001, ..., AUX63 = 0x103F
 pub const SPA_AUDIO_CHANNEL_START_AUX: u32 = pw.SPA_AUDIO_CHANNEL_START_Aux; // 0x1000
 
 pub fn spaAudioChannelAux(n: u32) u32 {
     return SPA_AUDIO_CHANNEL_START_AUX + n;
 }
-
-// C helper to set software gain on a PipeWire capture stream via SPA_PROP_channelVolumes.
-pub extern fn pw_set_stream_gain(
-    stream: *pw_stream,
-    gain: f32,
-    n_channels: u32,
-) c_int;
 
 // C helper to connect a capture stream for multi-channel recording (channel detection).
 pub extern fn pw_connect_capture_multi(

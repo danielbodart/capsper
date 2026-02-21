@@ -88,28 +88,9 @@ systemctl --user restart capsper             # apply-update.sh runs as ExecStart
 
 Do NOT manually download CI artifacts or stage releases by hand — the update script handles everything.
 
-## Worktrees
-
-Worktrees live in `.worktrees/` (gitignored). When creating a new worktree:
-
-1. Create the worktree: `git worktree add .worktrees/<name> -b feature/<name>`
-2. Symlink models (they're gitignored and large — don't re-download):
-   ```bash
-   ln -s $PWD/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin .worktrees/<name>/whisper.cpp/models/
-   ln -s $PWD/whisper.cpp/models/ggml-silero-v5.1.2.bin .worktrees/<name>/whisper.cpp/models/
-   ```
-3. Build and verify: `cd .worktrees/<name> && ./run.ts`
-
 ## Workflow
 
 **Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test. Run `./run.ts slow-test` before and after changes — the scorecard shows Coverage, WER (Word Error Rate), and per-error-type breakdown (Subs/Ins/Del) to measure improvement.
-
-## Reference Codebases
-
-When unsure about implementation approach, always check these codebases for inspiration in this order:
-
-1. **SimulStreaming** (`/home/dan/Projects/SimulStreaming/`) — the Python streaming transcription system capsper's architecture is ported from. The VAC (Voice Activity Controller) online processor, AlignAtt policy, and streaming decode loop are the reference implementations. Check here first for architectural questions.
-2. **whisper.cpp** (`whisper.cpp/` submodule) — the C library capsper links against. Check here for API usage, mel computation, VAD internals, and understanding what the model expects.
 
 ## Conventions
 

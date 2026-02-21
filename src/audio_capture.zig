@@ -135,13 +135,6 @@ pub const AudioCapture = struct {
         }
     }
 
-    /// Set software gain on the PipeWire capture stream (1.0 = unity, 4.0 = ~12 dB boost).
-    pub fn setGain(self: *AudioCapture, gain: f32) void {
-        pw.pw_thread_loop_lock(self.thread_loop);
-        defer pw.pw_thread_loop_unlock(self.thread_loop);
-        _ = pw.pw_set_stream_gain(self.stream, gain, 1);
-    }
-
     /// Cork or uncork the stream. The stream stays connected (mic indicator
     /// remains visible) but audio delivery is paused/resumed. Much faster
     /// than connect/disconnect (~2ms vs ~1300ms).

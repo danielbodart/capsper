@@ -2,9 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const c = @import("whisper_c.zig");
 const pw = @import("pipewire_c.zig");
-const vad_mod = @import("vad.zig");
-const Vad = vad_mod.Vad;
-const VadFilter = vad_mod.VadFilter;
+const Vad = @import("vad.zig").Vad;
 const Pipeline = @import("pipeline.zig").Pipeline;
 const server_mod = @import("server.zig");
 const Server = server_mod.Server;
@@ -44,7 +42,6 @@ pub fn main() !void {
     var record_dir: ?[:0]const u8 = null;
     var record_keep: usize = 10;
     var transcribe_file: ?[:0]const u8 = null;
-    var vad_filter_file: ?[:0]const u8 = null;
     var low_latency: bool = false;
 
     var i: usize = 1;
@@ -134,9 +131,6 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--transcribe")) {
             i += 1;
             if (i < args.len) transcribe_file = args[i];
-        } else if (std.mem.eql(u8, arg, "--vad-filter")) {
-            i += 1;
-            if (i < args.len) vad_filter_file = args[i];
         } else if (std.mem.eql(u8, arg, "--low-latency")) {
             low_latency = true;
         } else {
@@ -220,97 +214,6 @@ pub fn main() !void {
     }
     // zwanzig-disable-next-line: store-violations-engine
     defer if (prompt_tokens.len > 0) allocator.free(prompt_tokens);
-
-    // --vad-filter: pass WAV through VadFilter, write filtered WAV to stdout
-    if (vad_filter_file) |vfile| {
-        const file_data = std.fs.cwd().readFileAlloc(allocator, vfile, 100 * 1024 * 1024) catch |err| {
-            std.debug.print("Failed to load WAV file '{s}': {}\n", .{ vfile, err });
-            return;
-        };
-        defer allocator.free(file_data);
-
-        const header = utils.parseWavHeader(file_data) catch |err| {
-            std.debug.print("Invalid WAV file: {}\n", .{err});
-            return;
-        };
-
-        const pcm_data = file_data[header.data_start .. header.data_start + header.data_size];
-
-        var vad_filter = VadFilter.init(allocator, &vad);
-        defer vad_filter.deinit();
-
-        // First pass: collect per-chunk probabilities for diagnostics
-        const chunk_bytes = VadFilter.chunk_pcm_bytes;
-        const n_chunks = pcm_data.len / chunk_bytes;
-        var prob_sum: f64 = 0;
-        var prob_max: f32 = 0;
-        var prob_min: f32 = 1.0;
-        var above_50: usize = 0;
-        var above_30: usize = 0;
-        var above_20: usize = 0;
-        var above_10: usize = 0;
-
-        for (0..n_chunks) |ci| {
-            const chunk = pcm_data[ci * chunk_bytes ..][0..chunk_bytes];
-            const prob = vad_filter.chunkProb(chunk);
-            prob_sum += prob;
-            if (prob > prob_max) prob_max = prob;
-            if (prob < prob_min) prob_min = prob;
-            if (prob >= 0.5) above_50 += 1;
-            if (prob >= 0.3) above_30 += 1;
-            if (prob >= 0.2) above_20 += 1;
-            if (prob >= 0.1) above_10 += 1;
-        }
-
-        std.debug.print("VAD probabilities ({d} chunks, {d}ms each):\n", .{ n_chunks, chunk_bytes * 1000 / 32000 });
-        std.debug.print("  min={d:.3} max={d:.3} avg={d:.3}\n", .{
-            prob_min, prob_max, if (n_chunks > 0) @as(f32, @floatCast(prob_sum / @as(f64, @floatFromInt(n_chunks)))) else 0,
-        });
-        std.debug.print("  >=0.1: {d}/{d} ({d}%)  >=0.2: {d}/{d} ({d}%)  >=0.3: {d}/{d} ({d}%)  >=0.5: {d}/{d} ({d}%)\n", .{
-            above_10, n_chunks, if (n_chunks > 0) above_10 * 100 / n_chunks else 0,
-            above_20, n_chunks, if (n_chunks > 0) above_20 * 100 / n_chunks else 0,
-            above_30, n_chunks, if (n_chunks > 0) above_30 * 100 / n_chunks else 0,
-            above_50, n_chunks, if (n_chunks > 0) above_50 * 100 / n_chunks else 0,
-        });
-
-        // Second pass: actual filtering
-        vad_filter.reset();
-        var filtered_buf = std.ArrayListUnmanaged(u8){};
-        defer filtered_buf.deinit(allocator);
-
-        var pos: usize = 0;
-        const recv_chunk_size: usize = 32768;
-        while (pos < pcm_data.len) {
-            const end = @min(pos + recv_chunk_size, pcm_data.len);
-            const speech = vad_filter.filterAudio(pcm_data[pos..end]);
-            if (speech.len > 0) {
-                filtered_buf.appendSlice(allocator, speech) catch {};
-            }
-            pos = end;
-        }
-
-        const in_ms = pcm_data.len * 1000 / 32000;
-        const out_ms = filtered_buf.items.len * 1000 / 32000;
-        std.debug.print("VAD filter: {d}ms → {d}ms ({d}% kept)\n", .{
-            in_ms, out_ms, if (in_ms > 0) out_ms * 100 / in_ms else 0,
-        });
-
-        // Write filtered WAV to stdout using an allocated buffer
-        const wav_size = 44 + filtered_buf.items.len;
-        const wav_out = allocator.alloc(u8, wav_size) catch {
-            std.debug.print("Failed to allocate WAV output buffer\n", .{});
-            return;
-        };
-        defer allocator.free(wav_out);
-        var fbs = std.io.fixedBufferStream(wav_out);
-        utils.writeWav(fbs.writer(), filtered_buf.items) catch |err| {
-            std.debug.print("Failed to write WAV: {}\n", .{err});
-            return;
-        };
-        _ = std.posix.write(1, fbs.getWritten()) catch {};
-
-        return;
-    }
 
     // --transcribe: batch transcription using whisper_full (non-streaming) and exit
     if (transcribe_file) |tfile| {
