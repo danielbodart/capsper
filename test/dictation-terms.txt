@@ -1,1 +1,1 @@
-xdotool, ydotool, arecord, nc, Silero, AlignAtt, Zig, whisper.cpp, F24, V3 Turbo, VAD, TCP, Wayland, push-to-talk
+xdotool, ydotool, arecord, nc, Silero, AlignAtt, Zig, whisper.cpp, F24, V3 Turbo, VAD, TCP, Wayland, push-to-talk, mise, TypeScript, NVMRC, Bun, yarn

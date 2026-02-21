@@ -23,16 +23,16 @@ const shortCases: TestCase[] = [
 ];
 
 const mediumCases: TestCase[] = [
-    { name: "long-pause", wav: "test/long-pause.wav", ref: "test/long-pause.txt", thresholds: { minCoverage: 75, maxGapSec: 4 } },
-    { name: "repetition-loop", wav: "test/repetition-loop.wav", ref: "test/repetition-loop.txt", thresholds: { maxWer: 50 } },
+    { name: "long-pause", wav: "test/long-pause.wav", ref: "test/long-pause.txt", thresholds: { maxGapSec: 4 } },
+    { name: "repetition-loop", wav: "test/repetition-loop.wav", ref: "test/repetition-loop.txt" },
 ];
 
 const longCases: TestCase[] = [
     { name: "dictation", wav: "test/dictation.wav", ref: "test/dictation.txt" },
-    // Primary quality target: long continuous speech exceeds whisper's 30s encoder window,
-    // triggering sliding window trims that degrade context. Tighten thresholds as we improve.
-    { name: "long-recording", wav: "test/long-recording.wav", ref: "test/long-recording.txt", thresholds: { minCoverage: 20, maxWer: 500 } },
-    { name: "repetition-loop-long", wav: "test/repetition-loop-long.wav", ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 20, maxWer: 500 } },
+    // Long recordings with pauses: sliding window trims degrade context beyond 30s.
+    // long-recording has 20s silences causing hallucination in the second half.
+    { name: "long-recording", wav: "test/long-recording.wav", ref: "test/long-recording.txt", thresholds: { minCoverage: 35, maxWer: 70 } },
+    { name: "repetition-loop-long", wav: "test/repetition-loop-long.wav", ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 70, maxWer: 35 } },
 ];
 
 // Gating: which groups to run

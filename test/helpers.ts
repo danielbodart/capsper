@@ -375,7 +375,7 @@ export interface Thresholds {
 }
 
 const DEFAULT_THRESHOLDS: Required<Thresholds> = {
-    minCoverage: 85,
+    minCoverage: 90,
     maxWer: 30,
     maxGapSec: 10,
     maxRepetitions: 5,
