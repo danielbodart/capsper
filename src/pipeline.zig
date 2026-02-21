@@ -319,6 +319,10 @@ pub const Pipeline = struct {
         const max_tokens: usize = if (flush) (flush_budget orelse 224) else 224;
         var was_rewind = false;
         var low_confidence_streak: usize = 0;
+        // Track peak in a local variable — only commit to self.segment_max_raw_peak
+        // when tokens are successfully produced. This prevents null cycles from
+        // ratcheting up the peak and eventually bypassing the hallucination guard.
+        var cycle_max_peak: f32 = self.segment_max_raw_peak;
 
         for (0..max_tokens) |step| {
             const logits = c.whisper_get_logits_from_state(self.state);
@@ -418,7 +422,7 @@ pub const Pipeline = struct {
             // peak, trust subsequent tokens (real speech established).
             const confidence_established: f32 = 0.12; // segment has real speech
             const confidence_threshold: f32 = 0.10; // per-token minimum
-            const confidence_streak_len: usize = 2; // consecutive low tokens to trigger
+            const confidence_streak_len: usize = 3; // consecutive low tokens to trigger
             if (!flush and frame_limit > 0) {
                 const avg_raw_peak = alignatt.avgRawPeak(
                     attn_data,
@@ -427,12 +431,12 @@ pub const Pipeline = struct {
                     @intCast(n_hd),
                     frame_limit,
                 );
-                if (avg_raw_peak > self.segment_max_raw_peak) {
-                    self.segment_max_raw_peak = avg_raw_peak;
+                if (avg_raw_peak > cycle_max_peak) {
+                    cycle_max_peak = avg_raw_peak;
                 }
 
                 const conf = alignatt.checkLowConfidence(
-                    avg_raw_peak, self.segment_max_raw_peak,
+                    avg_raw_peak, cycle_max_peak,
                     low_confidence_streak,
                     confidence_established, confidence_threshold, confidence_streak_len,
                 );
@@ -513,8 +517,14 @@ pub const Pipeline = struct {
                     timing.stop_reason, timing.state_init_ms, timing.mel_ms, timing.encode_ms, timing.decode_ms, timing.total_ms,
                 });
             }
+            // Don't commit cycle_max_peak — null cycles should not affect
+            // the segment's confidence baseline for future cycles.
             return null;
         }
+
+        // Successful cycle — commit peak so future cycles benefit from
+        // established confidence.
+        self.segment_max_raw_peak = cycle_max_peak;
 
         // Step 5: Word boundary truncation (unless flush)
         var n_tokens_to_use = generated.items.len;

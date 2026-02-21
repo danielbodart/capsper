@@ -9,7 +9,7 @@
  * Usage: bun test/split-experiment.ts
  */
 import { execSync, spawnSync } from "child_process";
-import { mkdirSync, writeFileSync, readFileSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, copyFileSync } from "fs";
 import { join } from "path";
 import {
     BINARY, startServer, readPcm, streamPcmFast,
@@ -242,7 +242,31 @@ async function main() {
             allScores.push(score);
             console.error(`  ${score.label}: coverage=${score.coverage}% wer=${score.wer}%`);
         }
+
+        // Step 5b: Test segments split at silence START (mimics what server reads after flush)
+        // After flush, server reads from the start of the silence gap. This tests whether
+        // having leading silence in a fresh connection matters.
+        console.error("\n--- Segments split at silence starts via streaming TCP ---");
+        const silenceStartSplits = [
+            0,
+            ...silences.map(s => s.start & ~1),
+            fullPcm.length,
+        ];
+        for (let i = 0; i < silenceStartSplits.length - 1; i++) {
+            const segPcm = fullPcm.subarray(silenceStartSplits[i], silenceStartSplits[i + 1]);
+            const durSec = (segPcm.length / BYTES_PER_SEC).toFixed(1);
+            const output = await streamPcmFast(server.port, segPcm);
+            const emissions = parseEmissions(output);
+            const streamText = emissions.map(e => e.text).join(" ").replace(/\s+/g, " ").trim();
+            const score = scoreTranscript(streamText, segmentRefs[i], `seg-${i}-silstart (${durSec}s)`);
+            allScores.push(score);
+            console.error(`  ${score.label}: coverage=${score.coverage}% wer=${score.wer}%`);
+        }
     } finally {
+        // Save server log for analysis
+        const logDest = join(CHUNK_DIR, "server.log");
+        try { copyFileSync(server.logFile, logDest); } catch {}
+        console.error(`\nServer log saved to ${logDest}`);
         server.kill();
     }
 
