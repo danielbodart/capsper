@@ -2,7 +2,9 @@ const std = @import("std");
 const build_options = @import("build_options");
 const c = @import("whisper_c.zig");
 const pw = @import("pipewire_c.zig");
-const Vad = @import("vad.zig").Vad;
+const vad_mod = @import("vad.zig");
+const Vad = vad_mod.Vad;
+const VadFilter = vad_mod.VadFilter;
 const Pipeline = @import("pipeline.zig").Pipeline;
 const server_mod = @import("server.zig");
 const Server = server_mod.Server;
@@ -43,6 +45,9 @@ pub fn main() !void {
     var transcribe_file: ?[:0]const u8 = null;
     var low_latency: bool = false;
     var pw_gain: f32 = 1.0;
+    var vad_threshold: f32 = VadFilter.default_threshold;
+    var vad_threshold_off: f32 = VadFilter.default_threshold_off;
+    var min_silence_ms: u32 = 1000;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -134,6 +139,15 @@ pub fn main() !void {
             if (i < args.len) pw_gain = std.fmt.parseFloat(f32, args[i]) catch 1.0;
         } else if (std.mem.eql(u8, arg, "--low-latency")) {
             low_latency = true;
+        } else if (std.mem.eql(u8, arg, "--vad-threshold")) {
+            i += 1;
+            if (i < args.len) vad_threshold = std.fmt.parseFloat(f32, args[i]) catch VadFilter.default_threshold;
+        } else if (std.mem.eql(u8, arg, "--vad-threshold-off")) {
+            i += 1;
+            if (i < args.len) vad_threshold_off = std.fmt.parseFloat(f32, args[i]) catch VadFilter.default_threshold_off;
+        } else if (std.mem.eql(u8, arg, "--min-silence-ms")) {
+            i += 1;
+            if (i < args.len) min_silence_ms = std.fmt.parseInt(u32, args[i], 10) catch 1000;
         } else {
             printUsage();
             return;
@@ -335,7 +349,8 @@ pub fn main() !void {
     }
 
     // Start server
-    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, recorder, pw_gain);
+    const min_silence_bytes: usize = @as(usize, min_silence_ms) * 32000 / 1000;
+    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, recorder, pw_gain, vad_threshold, vad_threshold_off, min_silence_bytes);
     try server.run();
 }
 
@@ -381,6 +396,7 @@ fn printUsage() void {
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
     std.debug.print("       [--transcribe FILE]\n", .{});
     std.debug.print("       [--pw-gain FACTOR]\n", .{});
+    std.debug.print("       [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
     std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
 }

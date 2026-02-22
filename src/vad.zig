@@ -7,10 +7,15 @@ pub const Segment = struct {
 };
 
 pub const VadFilter = struct {
-    pub const threshold: f32 = 0.3; // onset: confident speech detection (audio is normalized via auto-gain)
-    pub const threshold_off: f32 = 0.1; // offset hysteresis: stay triggered through brief dips
-    pub const min_silence_bytes: usize = 32000; // 1000ms at 32000 bytes/sec
+    pub const default_threshold: f32 = 0.3; // onset: confident speech detection (audio is normalized via auto-gain)
+    pub const default_threshold_off: f32 = 0.1; // offset hysteresis: stay triggered through brief dips
+    pub const default_min_silence_bytes: usize = 32000; // 1000ms at 32000 bytes/sec
     pub const chunk_pcm_bytes: usize = 1024; // 512 samples * 2 bytes (one Silero chunk)
+
+    // Configurable thresholds (instance fields with defaults)
+    threshold: f32 = default_threshold,
+    threshold_off: f32 = default_threshold_off,
+    min_silence_bytes: usize = default_min_silence_bytes,
 
     vad: *Vad,
     allocator: std.mem.Allocator,
@@ -21,10 +26,19 @@ pub const VadFilter = struct {
     pcm_partial_len: usize = 0,
     output_buf: std.ArrayListUnmanaged(u8) = .{},
 
-    pub fn init(allocator: std.mem.Allocator, vad: *Vad) VadFilter {
+    pub const Options = struct {
+        threshold: f32 = default_threshold,
+        threshold_off: f32 = default_threshold_off,
+        min_silence_bytes: usize = default_min_silence_bytes,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, vad: *Vad, opts: Options) VadFilter {
         return .{
             .vad = vad,
             .allocator = allocator,
+            .threshold = opts.threshold,
+            .threshold_off = opts.threshold_off,
+            .min_silence_bytes = opts.min_silence_bytes,
         };
     }
 
@@ -36,7 +50,7 @@ pub const VadFilter = struct {
     /// Returns true if the chunk should be forwarded (speech or bridging silence).
     pub fn processChunkProb(self: *VadFilter, prob: f32) bool {
         if (!self.triggered) {
-            if (prob >= threshold) {
+            if (prob >= self.threshold) {
                 self.triggered = true;
                 self.silence_bytes = 0;
                 return true;
@@ -45,14 +59,14 @@ pub const VadFilter = struct {
         }
 
         // Currently triggered
-        if (prob >= threshold_off) {
+        if (prob >= self.threshold_off) {
             self.silence_bytes = 0;
             return true;
         }
 
         // Below threshold_off — accumulate silence
         self.silence_bytes += chunk_pcm_bytes;
-        if (self.silence_bytes >= min_silence_bytes) {
+        if (self.silence_bytes >= self.min_silence_bytes) {
             self.triggered = false;
             return false;
         }
@@ -265,7 +279,7 @@ test "processChunkProb: not triggered, exact threshold boundary -> triggers" {
         .vad = undefined,
         .allocator = std.testing.allocator,
     };
-    try std.testing.expect(filter.processChunkProb(VadFilter.threshold));
+    try std.testing.expect(filter.processChunkProb(VadFilter.default_threshold));
     try std.testing.expect(filter.triggered);
 }
 
@@ -299,7 +313,7 @@ test "processChunkProb: triggered, sustained silence -> un-triggers" {
         .vad = undefined,
         .allocator = std.testing.allocator,
         .triggered = true,
-        .silence_bytes = VadFilter.min_silence_bytes - VadFilter.chunk_pcm_bytes,
+        .silence_bytes = VadFilter.default_min_silence_bytes - VadFilter.chunk_pcm_bytes,
     };
     // This chunk pushes silence_bytes past min_silence_bytes
     try std.testing.expect(!filter.processChunkProb(0.05));
@@ -325,7 +339,7 @@ test "processChunkProb: exact threshold_off boundary keeps triggered" {
         .triggered = true,
         .silence_bytes = 4096,
     };
-    try std.testing.expect(filter.processChunkProb(VadFilter.threshold_off));
+    try std.testing.expect(filter.processChunkProb(VadFilter.default_threshold_off));
     try std.testing.expect(filter.triggered);
     try std.testing.expectEqual(@as(usize, 0), filter.silence_bytes);
 }

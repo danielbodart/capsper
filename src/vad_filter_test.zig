@@ -53,8 +53,8 @@ fn parseArgs() Args {
 
     var input_path: ?[]const u8 = null;
     var output_dir: ?[]const u8 = null;
-    var threshold_val: f32 = VadFilter.threshold;
-    var threshold_off_val: f32 = VadFilter.threshold_off;
+    var threshold_val: f32 = VadFilter.default_threshold;
+    var threshold_off_val: f32 = VadFilter.default_threshold_off;
     var min_silence_ms: u32 = 1000;
     var vad_model: []const u8 = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
 
@@ -111,7 +111,7 @@ fn printUsage() void {
         \\  --min-silence-ms <ms>    Min silence to split segments (default: 1000)
         \\  --vad-model <path>       Silero VAD model path
         \\
-    , .{ VadFilter.threshold, VadFilter.threshold_off });
+    , .{ VadFilter.default_threshold, VadFilter.default_threshold_off });
 }
 
 /// Compute RMS for a chunk of S16_LE PCM bytes

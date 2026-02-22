@@ -47,32 +47,11 @@ pub const Pipeline = struct {
 
     // Accumulated tokens from previous decode cycles within the current VAD segment.
     // Fed as forced decoder output AFTER [notimestamps] for consistency.
-    // These only correspond to audio currently in the buffer.
     accumulated_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
-    // Per-token audio frame (encoder frame at 50fps) from cross-attention.
-    // Parallel to accumulated_tokens — used for exact trim decisions.
-    accumulated_frames: std.ArrayListUnmanaged(usize) = .{},
-
-    // Context tokens from audio that has been trimmed from the buffer.
-    // Fed as conditioning BEFORE [sot] (in the <|startofprev|> section).
-    // The model uses these as a hint but isn't forced to reproduce them.
-    context_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
 
     // Incremental mel spectrogram cache. Persists across transcribe cycles within
-    // a VAD segment; reset on segment boundary or 28s buffer trim.
+    // a VAD segment; reset on segment boundary.
     mel_buffer: mel.MelBuffer,
-
-    // Most-attended encoder frame from the last decode cycle's final token.
-    // Persists across transcribe() calls for cross-cycle rewind detection.
-    // Adjusted on trim; reset on segment boundary or rewind.
-    last_attend_frame: ?usize = null,
-
-    // Maximum raw softmax attention peak seen in this VAD segment.
-    // Tracks the strongest per-head-averaged peak across all decode cycles.
-    // Used to adapt the hallucination confidence threshold: segments that
-    // have established strong attention (real speech) get a pass, while
-    // segments that never exceed a low baseline are flagged.
-    segment_max_raw_peak: f32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -107,76 +86,20 @@ pub const Pipeline = struct {
     pub fn deinit(self: *Pipeline) void {
         self.mel_buffer.deinit();
         self.accumulated_tokens.deinit(self.allocator);
-        self.accumulated_frames.deinit(self.allocator);
-        self.context_tokens.deinit(self.allocator);
         c.whisper_free_state(self.state);
     }
 
     /// Append confirmed tokens to the accumulated context.
     /// Called by the server after emitting words — the confirmed tokens become
     /// forced prefix for subsequent decode cycles, ensuring consistency.
-    pub fn commitTokens(self: *Pipeline, tokens: []const c.whisper_token, frames: []const usize) !void {
+    pub fn commitTokens(self: *Pipeline, tokens: []const c.whisper_token) !void {
         try self.accumulated_tokens.appendSlice(self.allocator, tokens);
-        try self.accumulated_frames.appendSlice(self.allocator, frames);
     }
 
-    /// Clear accumulated tokens, context tokens, and mel cache (on VAD segment boundary / flush).
+    /// Clear accumulated tokens and mel cache (on VAD segment boundary / flush).
     pub fn resetSegment(self: *Pipeline) void {
         self.accumulated_tokens.clearRetainingCapacity();
-        self.accumulated_frames.clearRetainingCapacity();
-        self.context_tokens.clearRetainingCapacity();
         self.mel_buffer.reset();
-        self.last_attend_frame = null;
-        self.segment_max_raw_peak = 0;
-    }
-
-    /// Handle audio trimmed from the front of the buffer: invalidate mel cache,
-    /// adjust last_attend_frame, and demote tokens whose audio was trimmed from
-    /// forced (after [notimestamps]) to conditioning (before [sot]).
-    pub fn handleTrim(self: *Pipeline, trimmed_bytes: usize) !void {
-        if (trimmed_bytes == 0) return;
-
-        // Mel cache is relative to buffer start — invalidate after front trim.
-        self.mel_buffer.reset();
-
-        const n = self.accumulated_tokens.items.len;
-        if (n == 0) return;
-
-        // Convert trimmed bytes to encoder frame threshold (50fps = 320 samples/frame * 2 bytes/sample = 640 bytes/frame)
-        const trim_frame = trimmed_bytes / 640;
-
-        // Adjust last_attend_frame: shift by trim offset, or null if it pointed at trimmed audio
-        if (self.last_attend_frame) |laf| {
-            self.last_attend_frame = if (laf >= trim_frame) laf - trim_frame else null;
-        }
-
-        // Find split point: first token whose frame >= trim_frame
-        var drop: usize = 0;
-        for (self.accumulated_frames.items[0..n]) |frame| {
-            if (frame >= trim_frame) break;
-            drop += 1;
-        }
-        // Always demote at least 1 token when audio was trimmed, to avoid
-        // tokens referencing trimmed-away audio when frame data is imprecise.
-        if (drop == 0) drop = 1;
-
-        // Move front tokens to context (conditioning)
-        try self.context_tokens.appendSlice(self.allocator, self.accumulated_tokens.items[0..drop]);
-
-        // Shift remaining tokens and frames to front, adjusting frame offsets
-        const remaining = n - drop;
-        std.mem.copyForwards(
-            c.whisper_token,
-            self.accumulated_tokens.items[0..remaining],
-            self.accumulated_tokens.items[drop..n],
-        );
-        self.accumulated_tokens.items.len = remaining;
-
-        // Adjust frame offsets: subtract trim_frame so they're relative to new buffer start
-        for (self.accumulated_frames.items[drop..n], 0..) |frame, i| {
-            self.accumulated_frames.items[i] = frame -| trim_frame;
-        }
-        self.accumulated_frames.items.len = remaining;
     }
 
     fn msFromNs(start: i128) f64 {
@@ -188,7 +111,6 @@ pub const Pipeline = struct {
     /// Uses accumulated_tokens as forced prefix for decoder consistency.
     /// When flush=true, uses a tighter stopping threshold, skips word
     /// truncation, and resets all segment state before returning.
-    /// Optional flush_budget caps the decode token budget on flush (default 224).
     pub fn transcribe(
         self: *Pipeline,
         samples: []const f32,
@@ -217,7 +139,6 @@ pub const Pipeline = struct {
         timing.state_init_ms = msFromNs(t_state);
 
         // Step 1: Incremental mel spectrogram
-        // Only computes new FFT frames since last cycle; caches previous frames.
         const t_mel = std.time.nanoTimestamp();
         _ = try self.mel_buffer.addSamples(samples);
         const mel_data = self.mel_buffer.exportForWhisper();
@@ -237,32 +158,20 @@ pub const Pipeline = struct {
         }
         timing.encode_ms = msFromNs(t_encode);
 
-        // Step 3: Build prompt — two-tier token system:
-        //   [sot_prev] [domain_terms...] [context_tokens...] [sot] [lang] [transcribe] [notimestamps] [forced_tokens...]
-        //
-        // Before [sot] (<|startofprev|> section) = conditioning:
-        //   - domain_terms: fixed vocabulary hints (protected from trimming)
-        //   - context_tokens: tokens from audio that was trimmed from the buffer;
-        //     the model uses these as a hint but isn't forced to reproduce them
-        //
-        // After [notimestamps] = forced decoder output:
-        //   - forced_tokens: tokens corresponding to audio still in the buffer;
-        //     the model processes these as its own previous output, building KV cache
-        //     state, so autoregressive generation continues from where it left off
+        // Step 3: Build prompt
+        //   [sot_prev] [domain_terms...] [sot] [lang] [transcribe] [notimestamps] [forced_tokens...]
+        // Or without domain terms or forced tokens:
+        //   [sot] [lang] [transcribe] [notimestamps]
         const sot_seq = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
         const max_decode: usize = 224;
-        const total_budget: usize = 448 - sot_seq.len - max_decode; // tokens available for prefix sections
+        const total_budget: usize = 448 - sot_seq.len - max_decode;
 
-        // Allocate budget: domain terms first (protected), then context, then forced
         const domain_len = @min(self.prompt_tokens.len, total_budget);
-        const context_budget = total_budget - domain_len;
-        const ctx_len = @min(self.context_tokens.items.len, context_budget);
-        const forced_budget = context_budget - ctx_len;
+        const forced_budget = total_budget - domain_len;
         const forced_len = @min(forced_tokens.len, forced_budget);
 
-        // Need [sot_prev] prefix if we have any conditioning tokens (domain or context)
-        const has_conditioning = domain_len > 0 or ctx_len > 0;
-        const prefix_len: usize = if (has_conditioning) 1 + domain_len + ctx_len else 0;
+        const has_conditioning = domain_len > 0;
+        const prefix_len: usize = if (has_conditioning) 1 + domain_len else 0;
 
         const full_prompt = try self.allocator.alloc(c.whisper_token, prefix_len + sot_seq.len + forced_len);
         defer self.allocator.free(full_prompt);
@@ -270,15 +179,8 @@ pub const Pipeline = struct {
         if (has_conditioning) {
             full_prompt[pos] = self.sot_prev;
             pos += 1;
-            if (domain_len > 0) {
-                @memcpy(full_prompt[pos..][0..domain_len], self.prompt_tokens[0..domain_len]);
-                pos += domain_len;
-            }
-            if (ctx_len > 0) {
-                // Use most recent context tokens (trim from front when budget exceeded)
-                @memcpy(full_prompt[pos..][0..ctx_len], self.context_tokens.items[self.context_tokens.items.len - ctx_len ..]);
-                pos += ctx_len;
-            }
+            @memcpy(full_prompt[pos..][0..domain_len], self.prompt_tokens[0..domain_len]);
+            pos += domain_len;
         }
         @memcpy(full_prompt[pos..][0..sot_seq.len], &sot_seq);
         pos += sot_seq.len;
@@ -289,7 +191,6 @@ pub const Pipeline = struct {
         // Decode prompt in two parts: batch the first N-1 tokens, then decode the
         // last token separately. whisper.cpp only populates logits for the last token
         // in a batch, but whisper_get_logits_from_state always reads from offset 0.
-        // Decoding the last token alone ensures logits[0..n_vocab] is correct.
         const t_prompt = std.time.nanoTimestamp();
         if (full_prompt.len > 1) {
             if (c.whisper_decode_with_state_and_aheads(
@@ -311,26 +212,17 @@ pub const Pipeline = struct {
         var generated = std.ArrayListUnmanaged(c.whisper_token){};
         defer generated.deinit(self.allocator);
 
-        // Parallel array: audio frame for each generated token (from cross-attention)
         var token_frames = std.ArrayListUnmanaged(usize){};
         defer token_frames.deinit(self.allocator);
 
         var n_past: c_int = @intCast(full_prompt.len);
         const max_tokens: usize = if (flush) (flush_budget orelse 224) else 224;
-        var was_rewind = false;
-        var low_confidence_streak: usize = 0;
-        // Track peak in a local variable — only commit to self.segment_max_raw_peak
-        // when tokens are successfully produced. This prevents null cycles from
-        // ratcheting up the peak and eventually bypassing the hallucination guard.
-        var cycle_max_peak: f32 = self.segment_max_raw_peak;
 
-        for (0..max_tokens) |step| {
+        for (0..max_tokens) |_| {
             const logits = c.whisper_get_logits_from_state(self.state);
             if (logits == null) break;
 
-            // Suppress timestamp token logits — the low-level decode API doesn't
-            // do this automatically (unlike whisper_full). Without suppression,
-            // the model can sample [_TT_*] tokens near the buffer limit.
+            // Suppress timestamp token logits
             for (self.token_beg..self.n_vocab) |vi| {
                 logits[vi] = -std.math.inf(f32);
             }
@@ -367,19 +259,7 @@ pub const Pipeline = struct {
             }
 
             try generated.append(self.allocator, best_token);
-            // Placeholder frame — updated below after attention analysis
-            try token_frames.append(self.allocator, self.last_attend_frame orelse 0);
-
-            // N-gram repetition guard: detect repeating phrases (1-8 tokens).
-            // Catches both single-token loops (AAA) and phrase loops (ABABAB).
-            if (detectPhraseRepetition(generated.items, 3)) |pat_len| {
-                const discard = @min(pat_len * 2, generated.items.len);
-                generated.items.len -= discard;
-                token_frames.items.len -= discard;
-                timing.stop_reason = "repetition";
-                std.debug.print("    [pipeline] repetition guard: {d}-gram at step {d}\n", .{ pat_len, step });
-                break;
-            }
+            try token_frames.append(self.allocator, 0); // placeholder — updated after attention
 
             // Decode this token
             var next = [_]c.whisper_token{best_token};
@@ -396,8 +276,6 @@ pub const Pipeline = struct {
                 self.state, &n_tok, &n_actx, &n_hd,
             );
             if (attn_data == null) {
-                // No attention data — can't verify where decoder is attending.
-                // Pop the unverified token and stop decoding.
                 _ = generated.pop();
                 _ = token_frames.pop();
                 timing.stop_reason = "no_attn";
@@ -417,71 +295,15 @@ pub const Pipeline = struct {
             // Update the frame for this token
             token_frames.items[token_frames.items.len - 1] = most_attended;
 
-            // Adaptive attention confidence check (raw softmax peaks).
-            // Thresholds: once any token in the segment reaches a strong
-            // peak, trust subsequent tokens (real speech established).
-            const confidence_established: f32 = 0.12; // segment has real speech
-            const confidence_threshold: f32 = 0.10; // per-token minimum
-            const confidence_streak_len: usize = 3; // consecutive low tokens to trigger
-            if (!flush and frame_limit > 0) {
-                const avg_raw_peak = alignatt.avgRawPeak(
-                    attn_data,
-                    @intCast(n_tok),
-                    @intCast(n_actx),
-                    @intCast(n_hd),
-                    frame_limit,
-                );
-                if (avg_raw_peak > cycle_max_peak) {
-                    cycle_max_peak = avg_raw_peak;
-                }
-
-                const conf = alignatt.checkLowConfidence(
-                    avg_raw_peak, cycle_max_peak,
-                    low_confidence_streak,
-                    confidence_established, confidence_threshold, confidence_streak_len,
-                );
-                low_confidence_streak = conf.streak;
-                if (conf.action == .stop_low_confidence) {
-                    generated.clearRetainingCapacity();
-                    token_frames.clearRetainingCapacity();
-                    timing.stop_reason = "low_confidence";
-                    std.debug.print("    [pipeline] low confidence: raw_peak={d:.4} seg_max={d:.4} streak={d} at step {d}\n", .{ avg_raw_peak, self.segment_max_raw_peak, low_confidence_streak, step });
-                    break;
-                }
-            }
-
-            // Frame regression guard.
-            const regression_window: usize = 8;
-            const regression_threshold: usize = 75; // ~1.5s at 50fps
-            if (!flush and self.accumulated_frames.items.len > 0) {
-                const frontier = self.accumulated_frames.items[self.accumulated_frames.items.len - 1];
-                if (alignatt.detectFrameRegression(token_frames.items, frontier, regression_window, regression_threshold)) |discard_window| {
-                    const discard = @min(discard_window, generated.items.len);
-                    generated.items.len -= discard;
-                    token_frames.items.len -= discard;
-                    timing.stop_reason = "frame_regress";
-                    const ws = token_frames.items.len -| regression_window;
-                    var fsum: usize = 0;
-                    for (token_frames.items[ws..]) |f| fsum += f;
-                    const avg = if (token_frames.items.len > 0) fsum / @min(regression_window, token_frames.items.len) else 0;
-                    std.debug.print("    [pipeline] frame regression: avg={d} frontier={d} gap={d} at step {d}\n", .{ avg, frontier, frontier -| avg, step });
-                    break;
-                }
-            }
-
-            // Attention-at-end check runs on BOTH streaming and flush paths
-            // (SimulStreaming uses threshold=4 on is_last, 25 on streaming).
-            // Rewind detection only runs during streaming — pass null on flush
-            // to suppress it (SimulStreaming also skips rewind on is_last).
+            // AlignAtt stopping check (no rewind — pass null for last_attend_frame)
             const decision = alignatt.checkStopping(
                 most_attended, content_frames,
-                if (flush) null else self.last_attend_frame,
+                null, // no cross-cycle rewind detection
                 flush, self.config,
             );
 
             switch (decision) {
                 .stop_attention_at_end => {
-                    // Strip the token that triggered the stop
                     if (generated.items.len > 0) {
                         _ = generated.pop();
                         _ = token_frames.pop();
@@ -490,20 +312,14 @@ pub const Pipeline = struct {
                     break;
                 },
                 .rewind_detected => {
-                    std.debug.print("    [rewind] at step {d}, frame {d}\n", .{ step, most_attended });
-                    // Clear partial tokens so no garbage is committed
+                    // Should not happen with null last_attend_frame, but handle gracefully
                     generated.clearRetainingCapacity();
                     token_frames.clearRetainingCapacity();
-                    was_rewind = true;
-                    self.last_attend_frame = null;
                     timing.stop_reason = "rewind";
                     break;
                 },
                 .continue_decoding => {},
             }
-            // Persists across cycles for cross-cycle rewind detection.
-            // On flush, transcribe() calls resetSegment() after we return.
-            self.last_attend_frame = most_attended;
         }
 
         timing.decode_ms = msFromNs(t_decode);
@@ -517,20 +333,13 @@ pub const Pipeline = struct {
                     timing.stop_reason, timing.state_init_ms, timing.mel_ms, timing.encode_ms, timing.decode_ms, timing.total_ms,
                 });
             }
-            // Don't commit cycle_max_peak — null cycles should not affect
-            // the segment's confidence baseline for future cycles.
             return null;
         }
 
-        // Successful cycle — commit peak so future cycles benefit from
-        // established confidence.
-        self.segment_max_raw_peak = cycle_max_peak;
-
         // Step 5: Word boundary truncation (unless flush)
+        // Skip truncation when there's a forced prefix — the prefix already anchors
+        // prior words, and truncation of short continuations causes emission deadlocks.
         var n_tokens_to_use = generated.items.len;
-        // Truncate last (potentially incomplete) word — but only when there's no
-        // forced prefix. With accumulated tokens, the prefix already anchors prior
-        // words, and truncation of short continuations causes emission deadlocks.
         if (!flush and n_tokens_to_use > 0 and forced_tokens.len == 0) {
             n_tokens_to_use = truncateLastWord(self.ctx, generated.items);
         }
@@ -550,7 +359,6 @@ pub const Pipeline = struct {
         var word_frame: usize = 0;
 
         for (tokens_to_decode, 0..) |token, idx| {
-            // Safety net: skip any special/timestamp tokens that slipped through
             if (@as(usize, @intCast(token)) >= self.token_beg) continue;
 
             const str = c.whisper_token_to_str(self.ctx, token);
@@ -558,7 +366,6 @@ pub const Pipeline = struct {
             const slice = std.mem.span(str);
 
             if (slice.len > 0 and slice[0] == ' ') {
-                // Close previous word if any
                 if (word_start) |ws| {
                     if (text_buf.items.len > ws) {
                         try words.append(self.allocator, .{
@@ -568,11 +375,9 @@ pub const Pipeline = struct {
                         });
                     }
                 }
-                // New word starts after the space
                 word_start = text_buf.items.len + 1;
                 word_frame = frames_to_use[idx];
             } else if (word_start == null) {
-                // First token doesn't start with space
                 word_start = text_buf.items.len;
                 word_frame = frames_to_use[idx];
             }
@@ -580,7 +385,6 @@ pub const Pipeline = struct {
             try text_buf.appendSlice(self.allocator, slice);
         }
 
-        // Close last word
         if (word_start) |ws| {
             if (text_buf.items.len > ws) {
                 try words.append(self.allocator, .{
@@ -591,12 +395,14 @@ pub const Pipeline = struct {
             }
         }
 
+        if (flush) self.resetSegment();
+
         return .{
             .text = try self.allocator.dupe(u8, text_buf.items),
             .words = try self.allocator.dupe(utils.TimedWord, words.items),
             .tokens = try self.allocator.dupe(c.whisper_token, tokens_to_decode),
             .token_frames = try self.allocator.dupe(usize, frames_to_use),
-            .was_rewind = was_rewind,
+            .was_rewind = false,
             .timing = timing,
         };
     }
@@ -623,28 +429,4 @@ fn truncateLastWord(ctx: *c.whisper_context, tokens: []const c.whisper_token) us
         return start;
     }
     return 0;
-}
-
-/// Detect repeating n-gram patterns in the token sequence.
-/// Returns the pattern length (1 for AAA, 2 for ABABAB, etc.) or null.
-/// Checks patterns from 1 to max_pattern tokens, requiring min_reps repetitions.
-fn detectPhraseRepetition(tokens: []const c.whisper_token, min_reps: usize) ?usize {
-    const max_pattern = 64;
-    for (1..max_pattern + 1) |pat_len| {
-        const needed = pat_len * min_reps;
-        if (tokens.len < needed) continue;
-
-        const tail = tokens[tokens.len - needed ..];
-        const pattern = tail[0..pat_len];
-
-        var all_match = true;
-        for (1..min_reps) |rep| {
-            if (!std.mem.eql(c.whisper_token, pattern, tail[rep * pat_len ..][0..pat_len])) {
-                all_match = false;
-                break;
-            }
-        }
-        if (all_match) return pat_len;
-    }
-    return null;
 }
