@@ -525,13 +525,13 @@ fn prop_panic_release_disarms(code: u16) !void {
     }
 }
 
-// TriggerState: press-release-press always produces start/debounce/cancel
+// TriggerState: press-release-press always produces start/stop/start
 fn prop_trigger_press_release_press(n: usize) !void {
     _ = n;
     var ts = input.TriggerState{};
     try std.testing.expectEqual(input.TriggerAction.start_recording, ts.keyEvent(1));
-    try std.testing.expectEqual(input.TriggerAction.start_debounce, ts.keyEvent(0));
-    try std.testing.expectEqual(input.TriggerAction.cancel_debounce, ts.keyEvent(1));
+    try std.testing.expectEqual(input.TriggerAction.stop_recording, ts.keyEvent(0));
+    try std.testing.expectEqual(input.TriggerAction.start_recording, ts.keyEvent(1));
 }
 
 // hasKeyBit: setting a bit and checking it roundtrips

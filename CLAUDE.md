@@ -48,7 +48,7 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 
 - **`main.zig`** — Entry point. Loads whisper + VAD models, warmup, wires input handler to server.
 - **`server.zig`** — Streaming 2-state machine (`idle` → `speaking`). Accepts PCM from PipeWire (local mode) or TCP socket. VadFilter edge detection drives state transitions. `speech_buf` only contains speech audio (never silence). Emits word-level deltas. Supports `TypeCallback` for uinput text injection.
-- **`input.zig`** — evdev/uinput input handling. Grabs physical keyboards, forwards all keys through virtual uinput keyboard, intercepts trigger key for push-to-talk, injects transcribed text as keystrokes. Includes hotplug (inotify) and panic sequence (Enter+Backspace+Escape = ungrab).
+- **`input.zig`** — evdev/uinput input handling. Grabs physical keyboards, forwards all keys through virtual uinput keyboard, intercepts trigger key for push-to-talk, injects transcribed text as keystrokes. Includes hotplug (inotify), panic sequence (Enter+Backspace+Escape = ungrab), EVIOCGKEY polling safety net (catches lost key release events every 200ms), and typing cancel (interrupts text injection on PTT release).
 - **`pipeline.zig`** — Low-level whisper.cpp integration. Manually drives mel spectrogram, encode, and autoregressive decode loop (no `whisper_full`). Implements AlignAtt streaming policy via cross-attention analysis for stopping and rewind detection. Two-tier token system: forced tokens (after `[notimestamps]`) for audio in buffer, context tokens (before `[sot]`) for trimmed audio. Supports domain term prompting via `<|startofprev|>` token prefix.
 - **`alignatt.zig`** — AlignAtt attention analysis: z-score normalization, median filtering, head averaging, stopping/rewind detection.
 - **`utils.zig`** — Pure utility functions (no C deps): PCM-to-float conversion, buffer trimming, WAV parsing/writing, per-channel RMS analysis, text preview. Independently unit-tested.
@@ -91,7 +91,9 @@ Do NOT manually download CI artifacts or stage releases by hand — the update s
 
 ## Workflow
 
-**Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test. Run `./run.ts slow-test` before and after changes — the scorecard shows Coverage, WER (Word Error Rate), and per-error-type breakdown (Subs/Ins/Del) to measure improvement.
+**Always run tests before fixing bugs.** Reproduce the issue first with a test, verify the fix with the same test.
+
+**Don't run redundant test commands.** `./run.ts` (no args) already does build + unit tests + property tests + short regressions + PipeWire plumbing — that's the standard verify step. Do NOT run `./run.ts build`, `./run.ts test`, and `./run.ts short-test` separately — that just repeats work. Only run `./run.ts slow-test` when you specifically need medium/long regression results (e.g. measuring WER improvement on long files).
 
 ## Conventions
 

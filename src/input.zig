@@ -270,15 +270,13 @@ pub const PanicDetector = struct {
 pub const TriggerAction = enum {
     none,
     start_recording, // trigger pressed — begin capture
-    start_debounce, // trigger released — begin debounce timer
-    cancel_debounce, // trigger re-pressed during debounce — cancel timer, resume
+    stop_recording, // trigger released — stop capture immediately
 };
 
-/// Pure state machine for trigger key press/release/debounce.
-/// Timing logic stays external; this only tracks the state transitions.
+/// Pure state machine for trigger key press/release.
+/// No debounce — release fires immediately for instant PTT cutoff.
 pub const TriggerState = struct {
     held: bool = false,
-    debounce_pending: bool = false,
 
     /// Process a key event (value: 1=press, 0=release, 2=repeat).
     pub fn keyEvent(self: *TriggerState, value: i32) TriggerAction {
@@ -290,29 +288,19 @@ pub const TriggerState = struct {
     }
 
     fn keyPress(self: *TriggerState) TriggerAction {
-        const was_debouncing = self.debounce_pending;
-        self.debounce_pending = false;
         if (!self.held) {
             self.held = true;
-            return if (was_debouncing) .cancel_debounce else .start_recording;
+            return .start_recording;
         }
         return .none;
     }
 
     fn keyRelease(self: *TriggerState) TriggerAction {
-        self.held = false;
-        self.debounce_pending = true;
-        return .start_debounce;
-    }
-
-    /// Check if debounce timer has expired. Returns true if should pause.
-    /// Call this when the external timer fires.
-    pub fn debounceExpired(self: *TriggerState) bool {
-        if (self.debounce_pending and !self.held) {
-            self.debounce_pending = false;
-            return true;
+        if (self.held) {
+            self.held = false;
+            return .stop_recording;
         }
-        return false;
+        return .none;
     }
 };
 
@@ -405,8 +393,7 @@ pub const InputHandler = struct {
 
     panic: PanicDetector = .{},
     trigger: TriggerState = .{},
-    release_time_ns: ?i128 = null,
-    debounce_ns: i128 = 1_000_000_000, // 1 second
+    typing_cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub const Config = struct {
         trigger_key: u16 = ev.KEY_CAPSLOCK,
@@ -463,11 +450,17 @@ pub const InputHandler = struct {
     }
 
     /// Inject text as keystrokes via uinput. Thread-safe.
+    /// Checks typing_cancel per character — if PTT is released mid-injection,
+    /// stops immediately instead of typing remaining characters.
     pub fn typeText(self: *InputHandler, text: []const u8) void {
         self.uinput_mutex.lock();
         defer self.uinput_mutex.unlock();
 
-        for (text) |ch| {
+        for (text, 0..) |ch, i| {
+            if (self.typing_cancel.load(.monotonic)) {
+                log.info("typing cancelled ({d} chars remaining)", .{text.len - i});
+                break;
+            }
             const char_ev = eventsForChar(ch);
             for (char_ev.slice()) |event| {
                 self.writeEvent(event);
@@ -511,24 +504,19 @@ pub const InputHandler = struct {
             fds[nfds] = .{ .fd = self.inotify_fd, .events = posix.POLL.IN, .revents = 0 };
             nfds += 1;
 
-            // Poll timeout: short when debounce pending, longer otherwise
-            const timeout_ms: i32 = if (self.release_time_ns != null) 50 else 200;
-
-            const ready = posix.poll(fds[0..nfds], timeout_ms) catch |err| {
+            const ready = posix.poll(fds[0..nfds], 200) catch |err| {
                 if (err == error.Interrupted) continue;
                 log.err("poll failed: {}", .{err});
                 break;
             };
 
-            // Check debounce timeout
-            if (self.release_time_ns) |release_ns| {
-                if (std.time.nanoTimestamp() - release_ns >= self.debounce_ns) {
-                    if (self.trigger.debounceExpired()) {
-                        self.release_time_ns = null;
-                        self.live_fn(false);
-                        log.info("trigger released (after debounce)", .{});
-                    }
-                }
+            // EVIOCGKEY safety net: verify trigger key is still physically held.
+            // Catches lost evdev release events (the PTT-stuck bug).
+            if (self.trigger.held and !self.isTriggerPhysicallyHeld()) {
+                self.trigger.held = false;
+                self.typing_cancel.store(true, .monotonic);
+                self.live_fn(false);
+                log.warn("trigger key not physically held — forcing release", .{});
             }
 
             if (ready == 0) continue;
@@ -585,17 +573,14 @@ pub const InputHandler = struct {
             const action = self.trigger.keyEvent(event.value);
             switch (action) {
                 .start_recording => {
-                    self.release_time_ns = null;
+                    self.typing_cancel.store(false, .monotonic);
                     self.live_fn(true);
                     log.info("trigger pressed — live", .{});
                 },
-                .cancel_debounce => {
-                    self.release_time_ns = null;
-                    self.live_fn(true);
-                    log.info("trigger re-pressed — live", .{});
-                },
-                .start_debounce => {
-                    self.release_time_ns = std.time.nanoTimestamp();
+                .stop_recording => {
+                    self.typing_cancel.store(true, .monotonic);
+                    self.live_fn(false);
+                    log.info("trigger released — stopping", .{});
                 },
                 .none => {},
             }
@@ -707,7 +692,29 @@ pub const InputHandler = struct {
             if (dev.grabbed) doIoctl(dev.fd, EVIOCGRAB, 0) catch {};
             posix.close(dev.fd);
             self.devices[idx] = null;
+
+            // If trigger was held on removed device, check remaining devices
+            if (self.trigger.held and !self.isTriggerPhysicallyHeld()) {
+                self.trigger.held = false;
+                self.typing_cancel.store(true, .monotonic);
+                self.live_fn(false);
+                log.warn("trigger device removed — forcing release", .{});
+            }
         }
+    }
+
+    /// Check if the trigger key is physically held on any grabbed device
+    /// using the EVIOCGKEY ioctl (reads kernel key state, not event stream).
+    fn isTriggerPhysicallyHeld(self: *InputHandler) bool {
+        const state_size = (KEY_MAX + 7) / 8 + 1;
+        for (self.devices) |maybe_dev| {
+            if (maybe_dev) |dev| {
+                var state: [state_size]u8 = std.mem.zeroes([state_size]u8);
+                doIoctl(dev.fd, EVIOCGKEY(state_size), @intFromPtr(&state)) catch continue;
+                if (hasKeyBit(&state, self.trigger_key)) return true;
+            }
+        }
+        return false;
     }
 
     fn ungrabAll(self: *InputHandler) void {
@@ -1004,21 +1011,11 @@ test "TriggerState: press starts recording" {
     try std.testing.expect(ts.held);
 }
 
-test "TriggerState: release starts debounce" {
+test "TriggerState: release stops recording immediately" {
     var ts = TriggerState{};
     _ = ts.keyEvent(1); // press
-    try std.testing.expectEqual(TriggerAction.start_debounce, ts.keyEvent(0));
+    try std.testing.expectEqual(TriggerAction.stop_recording, ts.keyEvent(0));
     try std.testing.expect(!ts.held);
-    try std.testing.expect(ts.debounce_pending);
-}
-
-test "TriggerState: re-press during debounce cancels it" {
-    var ts = TriggerState{};
-    _ = ts.keyEvent(1); // press
-    _ = ts.keyEvent(0); // release (debounce starts)
-    try std.testing.expectEqual(TriggerAction.cancel_debounce, ts.keyEvent(1));
-    try std.testing.expect(ts.held);
-    try std.testing.expect(!ts.debounce_pending);
 }
 
 test "TriggerState: repeat ignored" {
@@ -1034,32 +1031,19 @@ test "TriggerState: double press is idempotent" {
     try std.testing.expectEqual(TriggerAction.none, ts.keyEvent(1)); // already held
 }
 
-test "TriggerState: debounceExpired after release" {
+test "TriggerState: double release is idempotent" {
     var ts = TriggerState{};
     _ = ts.keyEvent(1); // press
-    _ = ts.keyEvent(0); // release
-    try std.testing.expect(ts.debounceExpired());
-    try std.testing.expect(!ts.debounce_pending);
+    try std.testing.expectEqual(TriggerAction.stop_recording, ts.keyEvent(0));
+    try std.testing.expectEqual(TriggerAction.none, ts.keyEvent(0)); // already released
 }
 
-test "TriggerState: debounceExpired false when re-pressed" {
+test "TriggerState: full press-release-press cycle" {
     var ts = TriggerState{};
-    _ = ts.keyEvent(1); // press
-    _ = ts.keyEvent(0); // release
-    _ = ts.keyEvent(1); // re-press
-    try std.testing.expect(!ts.debounceExpired());
-}
-
-test "TriggerState: full cycle" {
-    var ts = TriggerState{};
-    // Press → recording
     try std.testing.expectEqual(TriggerAction.start_recording, ts.keyEvent(1));
-    // Release → debounce
-    try std.testing.expectEqual(TriggerAction.start_debounce, ts.keyEvent(0));
-    // Debounce expires → should pause
-    try std.testing.expect(ts.debounceExpired());
-    // Press again → new recording
+    try std.testing.expectEqual(TriggerAction.stop_recording, ts.keyEvent(0));
     try std.testing.expectEqual(TriggerAction.start_recording, ts.keyEvent(1));
+    try std.testing.expect(ts.held);
 }
 
 // ──── eventsForChar tests ────
