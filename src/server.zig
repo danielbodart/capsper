@@ -416,7 +416,7 @@ pub const Server = struct {
                 const trimmed = old_len - pcm_buf.items.len;
                 pcm_trim_total += trimmed;
                 if (trimmed > 0) {
-                    pipeline.resetSegment(); // mel cache is relative to buffer start
+                    pipeline.handleTrim(trimmed);
                 }
             }
         }
@@ -477,7 +477,7 @@ pub const Server = struct {
         defer self.allocator.free(delta);
 
         emitDelta(output_fd, start_ns, delta, type_cb, self.recorder) catch return error.BrokenPipe;
-        try pipeline.commitTokens(result.tokens);
+        try pipeline.commitTokens(result.tokens, result.token_frames);
 
         if (self.verbose) {
             var ts_buf: [32]u8 = undefined;

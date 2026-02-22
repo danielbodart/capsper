@@ -48,6 +48,9 @@ pub const Pipeline = struct {
     // Accumulated tokens from previous decode cycles within the current VAD segment.
     // Fed as forced decoder output AFTER [notimestamps] for consistency.
     accumulated_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
+    // Per-token audio frame (encoder frame at 50fps) from cross-attention.
+    // Parallel to accumulated_tokens — used for exact trim decisions.
+    accumulated_frames: std.ArrayListUnmanaged(usize) = .{},
 
     // Incremental mel spectrogram cache. Persists across transcribe cycles within
     // a VAD segment; reset on segment boundary.
@@ -86,20 +89,63 @@ pub const Pipeline = struct {
     pub fn deinit(self: *Pipeline) void {
         self.mel_buffer.deinit();
         self.accumulated_tokens.deinit(self.allocator);
+        self.accumulated_frames.deinit(self.allocator);
         c.whisper_free_state(self.state);
     }
 
     /// Append confirmed tokens to the accumulated context.
     /// Called by the server after emitting words — the confirmed tokens become
     /// forced prefix for subsequent decode cycles, ensuring consistency.
-    pub fn commitTokens(self: *Pipeline, tokens: []const c.whisper_token) !void {
+    pub fn commitTokens(self: *Pipeline, tokens: []const c.whisper_token, frames: []const usize) !void {
         try self.accumulated_tokens.appendSlice(self.allocator, tokens);
+        try self.accumulated_frames.appendSlice(self.allocator, frames);
     }
 
-    /// Clear accumulated tokens and mel cache (on VAD segment boundary / flush).
+    /// Clear accumulated tokens/frames and mel cache (on VAD segment boundary / flush).
     pub fn resetSegment(self: *Pipeline) void {
         self.accumulated_tokens.clearRetainingCapacity();
+        self.accumulated_frames.clearRetainingCapacity();
         self.mel_buffer.reset();
+    }
+
+    /// Handle audio trimmed from the front of the buffer: invalidate mel cache
+    /// and drop tokens whose audio was trimmed, adjusting remaining frame offsets.
+    pub fn handleTrim(self: *Pipeline, trimmed_bytes: usize) void {
+        if (trimmed_bytes == 0) return;
+
+        // Mel cache is relative to buffer start — invalidate after front trim.
+        self.mel_buffer.reset();
+
+        const n = self.accumulated_tokens.items.len;
+        if (n == 0) return;
+
+        // Convert trimmed bytes to encoder frame threshold (50fps = 320 samples/frame * 2 bytes/sample = 640 bytes/frame)
+        const trim_frame = trimmed_bytes / 640;
+
+        // Find split point: first token whose frame >= trim_frame
+        var drop: usize = 0;
+        for (self.accumulated_frames.items[0..n]) |frame| {
+            if (frame >= trim_frame) break;
+            drop += 1;
+        }
+        // Always drop at least 1 token when audio was trimmed, to avoid
+        // tokens referencing trimmed-away audio when frame data is imprecise.
+        if (drop == 0) drop = 1;
+
+        // Shift remaining tokens and frames to front
+        const remaining = n - drop;
+        std.mem.copyForwards(
+            c.whisper_token,
+            self.accumulated_tokens.items[0..remaining],
+            self.accumulated_tokens.items[drop..n],
+        );
+        self.accumulated_tokens.items.len = remaining;
+
+        // Adjust frame offsets: subtract trim_frame so they're relative to new buffer start
+        for (self.accumulated_frames.items[drop..n], 0..) |frame, i| {
+            self.accumulated_frames.items[i] = frame -| trim_frame;
+        }
+        self.accumulated_frames.items.len = remaining;
     }
 
     fn msFromNs(start: i128) f64 {
