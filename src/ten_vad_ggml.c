@@ -5,9 +5,9 @@
  *   Pre-emphasis → STFT (Hann768, FFT1024) → Power spectrum → Mel filterbank
  *   → Log → Z-normalize → Context stack [3][41] → GGML inference
  *
- * Model architecture:
- *   SepConv2D(1→16) → SepConv1D(16→16) → SepConv1D(16→16) → MaxPool → Flatten(80)
- *   → LSTM(80→64) → LSTM(64→64) → Concat(128) → Dense(128→32) → Dense(32→1) → Sigmoid
+ * Model architecture (from ONNX graph):
+ *   SepConv2D(1→16, VALID) → MaxPool → SepConv1D(16→16) → SepConv1D(16→16) → Flatten(80)
+ *   → LSTM(80→64) → LSTM(64→64) → Concat(h1,h0→128) → Dense(128→32) → Dense(32→1) → Sigmoid
  */
 
 #include "ten_vad_ggml.h"
@@ -822,8 +822,8 @@ static struct ggml_cgraph * tv_build_graph(ten_vad_ctx * ctx) {
     struct ggml_tensor * h1_in = ggml_reshape_2d(ctx0, h0, 1, TV_HIDDEN_DIM);
     struct ggml_tensor * h1 = tv_build_lstm_layer(ctx0, ctx, 1, h1_in, gf);
 
-    /* Concat h0 + h1 → [128] */
-    struct ggml_tensor * concat = ggml_concat(ctx0, h0, h1, 0);
+    /* Concat h1 + h0 → [128] (ONNX model concatenates LSTM1 output first) */
+    struct ggml_tensor * concat = ggml_concat(ctx0, h1, h0, 0);
 
     /* Dense 0: [128] → [32] + ReLU */
     struct ggml_tensor * d0 = ggml_mul_mat(ctx0, ctx->model.dense_weight[0], concat);
@@ -856,16 +856,16 @@ static struct ggml_cgraph * tv_build_graph(ten_vad_ctx * ctx) {
  * Run all 3 separable conv layers + maxpool + flatten on the feature stack.
  * Input: features[TV_CONTEXT_LEN][TV_FEA_LEN] = [3][41]
  * Output: flat[80]
+ *
+ * ONNX pipeline (verified against onnxruntime intermediate outputs):
+ *   Layer 0: dw(1,1,3,3) VALID pad → [1,1,1,39], pw(16,1,1,1)+ReLU → [1,16,1,39]
+ *   MaxPool(1,3) stride(1,2) → [1,16,1,19]
+ *   Layer 1: dw(16,1,1,3) stride(2,2) pad[0,1,0,1] → [1,16,1,10], pw+ReLU → [1,16,1,10]
+ *   Layer 2: dw(16,1,1,3) stride(2,2) pad[0,0,0,1] → [1,16,1,5], pw+ReLU → [1,16,1,5]
+ *   Transpose [16,5]→[5,16], flatten → [80]
  */
 static void tv_run_convs(ten_vad_ctx * ctx, const float * features, float * out80) {
     tv_model * m = &ctx->model;
-
-    /* We need to read weight data from ggml tensors */
-    /* Conv layer sizes: after reshape, input is [1, 1, 3, 41] */
-    /* Layer 0: dw(1,1,3,3) pw(16,1,1,1) → output [1,16,1,41] then maxpool → [1,16,1,20] */
-    /* Layer 1: dw(16,1,1,3) pw(16,16,1,1) stride=2 → [1,16,1,10] */
-    /* Layer 2: dw(16,1,1,3) pw(16,16,1,1) stride=2 → [1,16,1,5] */
-    /* Flatten: 16*5 = 80 */
 
     /* Read all weights into local buffers */
     float dw0[9], pw0[16], b0[16];
@@ -883,107 +883,88 @@ static void tv_run_convs(ten_vad_ctx * ctx, const float * features, float * out8
     ggml_backend_tensor_get(m->sep_conv_bias[2], b2, 0, sizeof(b2));
 
     /* ── Layer 0: SeparableConv2D on [1,1,3,41] ── */
-    /* Depthwise conv: kernel (3,3), 1 input channel, padding=same → output [1,1,3,41] */
-    float dw0_out[3 * 41];
-    memset(dw0_out, 0, sizeof(dw0_out));
-    /* dw0 kernel is [1,1,3,3] in ONNX = 3×3 spatial */
-    for (int h = 0; h < 3; h++) {
-        for (int w = 0; w < 41; w++) {
-            float sum = 0.0f;
-            for (int kh = 0; kh < 3; kh++) {
-                for (int kw = 0; kw < 3; kw++) {
-                    int ih = h + kh - 1;
-                    int iw = w + kw - 1;
-                    if (ih >= 0 && ih < 3 && iw >= 0 && iw < 41) {
-                        sum += features[ih * 41 + iw] * dw0[kh * 3 + kw];
-                    }
-                }
+    /* Depthwise conv: kernel(3,3), VALID padding, group=1 → output [1,1,1,39] */
+    /* H: 3-3+1=1, W: 41-3+1=39 */
+    float dw0_out[39];
+    for (int w = 0; w < 39; w++) {
+        float sum = 0.0f;
+        for (int kh = 0; kh < 3; kh++) {
+            for (int kw = 0; kw < 3; kw++) {
+                sum += features[kh * TV_FEA_LEN + (w + kw)] * dw0[kh * 3 + kw];
             }
-            dw0_out[h * 41 + w] = sum;
         }
+        dw0_out[w] = sum;
     }
 
-    /* Pointwise conv: (16,1,1,1) = 16 output channels, each is a scalar multiply */
-    /* + bias + ReLU → output [16, 3, 41] */
-    float pw0_out[16 * 3 * 41];
+    /* Pointwise conv: (16,1,1,1) + bias + ReLU → [16, 1, 39] */
+    float pw0_out[16 * 39];
     for (int oc = 0; oc < 16; oc++) {
-        for (int i = 0; i < 3 * 41; i++) {
+        for (int i = 0; i < 39; i++) {
             float val = dw0_out[i] * pw0[oc] + b0[oc];
-            pw0_out[oc * 3 * 41 + i] = val > 0.0f ? val : 0.0f; /* ReLU */
+            pw0_out[oc * 39 + i] = val > 0.0f ? val : 0.0f;
         }
     }
 
-    /* MaxPool: kernel(1,3), stride(1,2), no padding → output [16, 3, 20] */
-    /* Pool along W dimension: for each (oc,h), pool w with kernel=3, stride=2 */
-    float pool_out[16 * 3 * 20];
+    /* MaxPool: kernel(1,3), stride(1,2) → [16, 1, 19] */
+    /* W: floor((39-3)/2) + 1 = 19 */
+    float pool_out[16 * 19];
     for (int oc = 0; oc < 16; oc++) {
-        for (int h = 0; h < 3; h++) {
-            for (int ow = 0; ow < 20; ow++) {
-                int w_start = ow * 2;
-                float mx = -1e30f;
-                for (int k = 0; k < 3; k++) {
-                    int iw = w_start + k;
-                    if (iw < 41) {
-                        float v = pw0_out[oc * 3 * 41 + h * 41 + iw];
-                        if (v > mx) mx = v;
-                    }
+        for (int ow = 0; ow < 19; ow++) {
+            int w_start = ow * 2;
+            float mx = -1e30f;
+            for (int k = 0; k < 3; k++) {
+                int iw = w_start + k;
+                if (iw < 39) {
+                    float v = pw0_out[oc * 39 + iw];
+                    if (v > mx) mx = v;
                 }
-                pool_out[oc * 3 * 20 + h * 20 + ow] = mx;
             }
+            pool_out[oc * 19 + ow] = mx;
         }
     }
 
-    /* ── Layer 1: SeparableConv1D on [16, 3, 20] ── */
-    /* The ONNX graph does: unsqueeze → conv2d(dw) with kernel(1,3) stride(2,2) → conv2d(pw) → squeeze */
-    /* With stride=(2,2) on [3,20]: output H = ceil(3/2)=2, output W = ceil(20/2)=10 */
-    /* But ONNX has padding [0,0,0,1] = pad_h_begin=0, pad_h_end=0, pad_w_begin=0, pad_w_end=1 */
-    /* Depthwise: each of 16 channels independently */
-    float dw1_out[16 * 2 * 10];
-    memset(dw1_out, 0, sizeof(dw1_out));
+    /* ── Layer 1: SeparableConv1D on [16, 1, 19] ── */
+    /* DW conv: kernel(1,3), stride(2,2), pads=[0,1,0,1] (symmetric W pad), group=16 */
+    /* Padded W: 19+1+1=21, output W: floor((21-3)/2)+1 = 10 */
+    float dw1_out[16 * 10];
     for (int ch = 0; ch < 16; ch++) {
-        /* dw1 kernel for this channel: [1, 1, 1, 3] → just 3 weights along W */
         const float * kw = dw1 + ch * 3;
-        for (int oh = 0; oh < 2; oh++) {
-            for (int ow = 0; ow < 10; ow++) {
-                int ih = oh * 2;
-                float sum = 0.0f;
-                for (int k = 0; k < 3; k++) {
-                    int iw = ow * 2 + k;
-                    if (ih < 3 && iw < 20) {
-                        sum += pool_out[ch * 3 * 20 + ih * 20 + iw] * kw[k];
-                    }
+        for (int ow = 0; ow < 10; ow++) {
+            float sum = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                int iw = ow * 2 + k - 1;  /* -1 for pad_w_begin=1 */
+                if (iw >= 0 && iw < 19) {
+                    sum += pool_out[ch * 19 + iw] * kw[k];
                 }
-                dw1_out[ch * 2 * 10 + oh * 10 + ow] = sum;
             }
+            dw1_out[ch * 10 + ow] = sum;
         }
     }
 
     /* Pointwise + bias + ReLU */
-    float pw1_out[16 * 2 * 10];
+    float pw1_out[16 * 10];
     for (int oc = 0; oc < 16; oc++) {
-        for (int i = 0; i < 2 * 10; i++) {
+        for (int i = 0; i < 10; i++) {
             float sum = b1[oc];
             for (int ic = 0; ic < 16; ic++) {
-                sum += dw1_out[ic * 2 * 10 + i] * pw1[oc * 16 + ic];
+                sum += dw1_out[ic * 10 + i] * pw1[oc * 16 + ic];
             }
-            pw1_out[oc * 2 * 10 + i] = sum > 0.0f ? sum : 0.0f;
+            pw1_out[oc * 10 + i] = sum > 0.0f ? sum : 0.0f;
         }
     }
 
-    /* ── Layer 2: SeparableConv1D on [16, 2, 10] ── */
-    /* Same structure: stride(2,2), kernel(1,3), pad [0,0,0,1] */
-    /* Output: H = ceil(2/2)=1, W = ceil(10/2)=5 → [16, 1, 5] */
-    float dw2_out[16 * 1 * 5];
-    memset(dw2_out, 0, sizeof(dw2_out));
+    /* ── Layer 2: SeparableConv1D on [16, 1, 10] ── */
+    /* DW conv: kernel(1,3), stride(2,2), pads=[0,0,0,1] (pad W end only), group=16 */
+    /* Padded W: 10+0+1=11, output W: floor((11-3)/2)+1 = 5 */
+    float dw2_out[16 * 5];
     for (int ch = 0; ch < 16; ch++) {
         const float * kw = dw2 + ch * 3;
         for (int ow = 0; ow < 5; ow++) {
-            int ih = 0;
             float sum = 0.0f;
             for (int k = 0; k < 3; k++) {
-                int iw = ow * 2 + k;
+                int iw = ow * 2 + k;  /* no pad_w_begin */
                 if (iw < 10) {
-                    sum += pw1_out[ch * 2 * 10 + ih * 10 + iw] * kw[k];
+                    sum += pw1_out[ch * 10 + iw] * kw[k];
                 }
             }
             dw2_out[ch * 5 + ow] = sum;
@@ -1003,9 +984,7 @@ static void tv_run_convs(ten_vad_ctx * ctx, const float * features, float * out8
     }
 
     /* ── Flatten: [16, 1, 5] → [80] ── */
-    /* The ONNX graph does: transpose(perm=[0,2,1]) then reshape to [seq, batch, 80] */
-    /* After layer 2 squeeze we have [16, 5] → transpose → [5, 16] → flatten → [80] */
-    /* But we just interleave: out[w*16+ch] = pw2_out[ch*5+w] */
+    /* Transpose [16,5] → [5,16] then flatten: out[w*16+ch] = pw2_out[ch*5+w] */
     for (int w = 0; w < 5; w++) {
         for (int ch = 0; ch < 16; ch++) {
             out80[w * 16 + ch] = pw2_out[ch * 5 + w];
@@ -1033,7 +1012,7 @@ float ten_vad_ggml_process(ten_vad_ctx * ctx, const int16_t * samples, int n_sam
     ggml_backend_tensor_set(input, conv_out, 0, sizeof(conv_out));
 
     /* 4. Compute graph (reuse without reset — LSTM state carries over) */
-    if (!ggml_backend_sched_graph_compute(ctx->sched, ctx->gf)) {
+    if (ggml_backend_sched_graph_compute(ctx->sched, ctx->gf) != GGML_STATUS_SUCCESS) {
         return 0.0f;
     }
 
