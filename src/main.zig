@@ -3,7 +3,10 @@ const build_options = @import("build_options");
 const c = @import("whisper_c.zig");
 const pw = @import("pipewire_c.zig");
 const vad_mod = @import("vad.zig");
-const Vad = vad_mod.Vad;
+const SileroVad = vad_mod.SileroVad;
+const TenVadGgml = vad_mod.TenVadGgml;
+const TenVad = vad_mod.TenVad;
+const VadBackend = vad_mod.VadBackend;
 const VadFilter = vad_mod.VadFilter;
 const Pipeline = @import("pipeline.zig").Pipeline;
 const server_mod = @import("server.zig");
@@ -26,6 +29,8 @@ pub fn main() !void {
 
     var model_path: [:0]const u8 = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
     var vad_model_path: [:0]const u8 = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
+    var use_ten_vad: bool = false;
+    var use_ten_vad_ggml: bool = false;
     var port: u16 = 43007;
     var warmup_file: ?[:0]const u8 = "jfk.wav";
     var warmup_file_is_default = true;
@@ -45,9 +50,9 @@ pub fn main() !void {
     var transcribe_file: ?[:0]const u8 = null;
     var low_latency: bool = false;
     var pw_gain: f32 = 1.0;
-    var vad_threshold: f32 = VadFilter.default_threshold;
-    var vad_threshold_off: f32 = VadFilter.default_threshold_off;
-    var min_silence_ms: u32 = 1000;
+    var vad_threshold: ?f32 = null;
+    var vad_threshold_off: ?f32 = null;
+    var min_silence_ms: ?u32 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -141,13 +146,17 @@ pub fn main() !void {
             low_latency = true;
         } else if (std.mem.eql(u8, arg, "--vad-threshold")) {
             i += 1;
-            if (i < args.len) vad_threshold = std.fmt.parseFloat(f32, args[i]) catch VadFilter.default_threshold;
+            if (i < args.len) vad_threshold = std.fmt.parseFloat(f32, args[i]) catch null;
         } else if (std.mem.eql(u8, arg, "--vad-threshold-off")) {
             i += 1;
-            if (i < args.len) vad_threshold_off = std.fmt.parseFloat(f32, args[i]) catch VadFilter.default_threshold_off;
+            if (i < args.len) vad_threshold_off = std.fmt.parseFloat(f32, args[i]) catch null;
         } else if (std.mem.eql(u8, arg, "--min-silence-ms")) {
             i += 1;
-            if (i < args.len) min_silence_ms = std.fmt.parseInt(u32, args[i], 10) catch 1000;
+            if (i < args.len) min_silence_ms = std.fmt.parseInt(u32, args[i], 10) catch null;
+        } else if (std.mem.eql(u8, arg, "--ten-vad")) {
+            use_ten_vad = true;
+        } else if (std.mem.eql(u8, arg, "--ten-vad-ggml")) {
+            use_ten_vad_ggml = true;
         } else {
             printUsage();
             return;
@@ -187,13 +196,43 @@ pub fn main() !void {
 
     if (!requireGpu()) std.process.exit(1);
 
-    // Load VAD model
-    std.debug.print("Loading VAD model: {s}\n", .{vad_model_path});
-    var vad = Vad.init(vad_model_path) catch |err| {
-        std.debug.print("Failed to init VAD: {}\n", .{err});
-        return;
-    };
-    defer vad.deinit();
+    // Load VAD backend
+    var silero_vad: SileroVad = undefined;
+    var ten_vad_ggml: TenVadGgml = undefined;
+    var ten_vad: TenVad = undefined;
+    var vad_backend: VadBackend = undefined;
+
+    if (use_ten_vad) {
+        std.debug.print("Loading VAD (ten-vad)\n", .{});
+        ten_vad = TenVad.init() catch |err| {
+            std.debug.print("Failed to init TEN-VAD: {}\n", .{err});
+            return;
+        };
+        vad_backend = .{ .ten_vad = &ten_vad };
+    } else if (use_ten_vad_ggml) {
+        const ten_vad_model: [:0]const u8 = if (std.mem.eql(u8, vad_model_path, "whisper.cpp/models/ggml-silero-v5.1.2.bin"))
+            "whisper.cpp/models/ten-vad-ggml.bin"
+        else
+            vad_model_path;
+        std.debug.print("Loading VAD model (ten-vad-ggml): {s}\n", .{ten_vad_model});
+        ten_vad_ggml = TenVadGgml.init(ten_vad_model) catch |err| {
+            std.debug.print("Failed to init TEN-VAD GGML: {}\n", .{err});
+            return;
+        };
+        vad_backend = .{ .ten_vad_ggml = &ten_vad_ggml };
+    } else {
+        std.debug.print("Loading VAD model (silero): {s}\n", .{vad_model_path});
+        silero_vad = SileroVad.init(vad_model_path) catch |err| {
+            std.debug.print("Failed to init Silero VAD: {}\n", .{err});
+            return;
+        };
+        vad_backend = .{ .silero = &silero_vad };
+    }
+    defer {
+        if (use_ten_vad) ten_vad.deinit()
+        else if (use_ten_vad_ggml) ten_vad_ggml.deinit()
+        else silero_vad.deinit();
+    }
 
     // Tokenize domain terms (requires whisper context)
     var prompt_tokens: []c.whisper_token = &.{};
@@ -348,9 +387,16 @@ pub fn main() !void {
         try input_handler.?.start();
     }
 
-    // Start server
-    const min_silence_bytes: usize = @as(usize, min_silence_ms) * 32000 / 1000;
-    var server = Server.init(allocator, ctx, vad, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, recorder, pw_gain, vad_threshold, vad_threshold_off, min_silence_bytes);
+    // Start server — resolve VAD thresholds from backend defaults if not explicitly set
+    const defaults = vad_backend.defaultThresholds();
+    const resolved_threshold = vad_threshold orelse defaults.onset;
+    const resolved_threshold_off = vad_threshold_off orelse defaults.offset;
+    const resolved_min_silence_ms = min_silence_ms orelse defaults.min_silence_ms;
+    const resolved_min_silence_bytes: usize = @as(usize, resolved_min_silence_ms) * 32000 / 1000;
+    std.debug.print("VAD: backend={s}  onset={d:.2}  offset={d:.2}  min_silence={d}ms\n", .{
+        vad_backend.name(), resolved_threshold, resolved_threshold_off, resolved_min_silence_ms,
+    });
+    var server = Server.init(allocator, ctx, vad_backend, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, recorder, pw_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes);
     try server.run();
 }
 
@@ -396,7 +442,7 @@ fn printUsage() void {
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
     std.debug.print("       [--transcribe FILE]\n", .{});
     std.debug.print("       [--pw-gain FACTOR]\n", .{});
-    std.debug.print("       [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
+    std.debug.print("       [--ten-vad | --ten-vad-ggml] [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
     std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
 }

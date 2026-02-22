@@ -1,10 +1,12 @@
 const std = @import("std");
 const vad = @import("vad.zig");
 const utils = @import("utils.zig");
-const c = @import("whisper_c.zig");
 
 const VadFilter = vad.VadFilter;
-const Vad = vad.Vad;
+const VadBackend = vad.VadBackend;
+const SileroVad = vad.SileroVad;
+const TenVadGgml = vad.TenVadGgml;
+const TenVad = vad.TenVad;
 
 const sample_rate: u32 = 16000;
 const bytes_per_sec: u32 = sample_rate * 2; // S16_LE
@@ -45,6 +47,8 @@ const Args = struct {
     threshold_off: f32,
     min_silence_ms: u32,
     vad_model: []const u8,
+    use_ten_vad: bool,
+    use_ten_vad_ggml: bool,
 };
 
 fn parseArgs() Args {
@@ -57,6 +61,8 @@ fn parseArgs() Args {
     var threshold_off_val: f32 = VadFilter.default_threshold_off;
     var min_silence_ms: u32 = 1000;
     var vad_model: []const u8 = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
+    var use_ten_vad: bool = false;
+    var use_ten_vad_ggml: bool = false;
 
     while (iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--output-dir")) {
@@ -72,6 +78,10 @@ fn parseArgs() Args {
             min_silence_ms = std.fmt.parseInt(u32, val, 10) catch fatal("invalid --min-silence-ms value");
         } else if (std.mem.eql(u8, arg, "--vad-model")) {
             vad_model = iter.next() orelse fatal("--vad-model requires a value");
+        } else if (std.mem.eql(u8, arg, "--ten-vad")) {
+            use_ten_vad = true;
+        } else if (std.mem.eql(u8, arg, "--ten-vad-ggml")) {
+            use_ten_vad_ggml = true;
         } else if (arg[0] != '-') {
             input_path = arg;
         } else {
@@ -92,6 +102,8 @@ fn parseArgs() Args {
         .threshold_off = threshold_off_val,
         .min_silence_ms = min_silence_ms,
         .vad_model = vad_model,
+        .use_ten_vad = use_ten_vad,
+        .use_ten_vad_ggml = use_ten_vad_ggml,
     };
 }
 
@@ -109,7 +121,9 @@ fn printUsage() void {
         \\  --threshold <f32>        Onset threshold (default: {d:.3})
         \\  --threshold-off <f32>    Offset threshold (default: {d:.3})
         \\  --min-silence-ms <ms>    Min silence to split segments (default: 1000)
-        \\  --vad-model <path>       Silero VAD model path
+        \\  --vad-model <path>       VAD model path
+        \\  --ten-vad                Use TEN-VAD native backend (default: Silero)
+        \\  --ten-vad-ggml           Use TEN-VAD GGML backend (experimental)
         \\
     , .{ VadFilter.default_threshold, VadFilter.default_threshold_off });
 }
@@ -199,15 +213,44 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Initialize VAD
-    const vad_model_z: [:0]const u8 = try allocator.dupeZ(u8, args.vad_model);
-    defer allocator.free(vad_model_z);
+    // Initialize VAD backend
+    var silero_vad: SileroVad = undefined;
+    var ten_vad_ggml_ctx: TenVadGgml = undefined;
+    var ten_vad: TenVad = undefined;
+    var backend: VadBackend = undefined;
 
-    var vad_ctx = Vad.init(vad_model_z) catch |err| {
-        std.debug.print("Error loading VAD model {s}: {}\n", .{ args.vad_model, err });
-        std.process.exit(1);
-    };
-    defer vad_ctx.deinit();
+    if (args.use_ten_vad) {
+        ten_vad = TenVad.init() catch |err| {
+            std.debug.print("Error initializing TEN-VAD: {}\n", .{err});
+            std.process.exit(1);
+        };
+        backend = .{ .ten_vad = &ten_vad };
+    } else if (args.use_ten_vad_ggml) {
+        const model: []const u8 = if (std.mem.eql(u8, args.vad_model, "whisper.cpp/models/ggml-silero-v5.1.2.bin"))
+            "whisper.cpp/models/ten-vad-ggml.bin"
+        else
+            args.vad_model;
+        const model_z: [:0]const u8 = try allocator.dupeZ(u8, model);
+        defer allocator.free(model_z);
+        ten_vad_ggml_ctx = TenVadGgml.init(model_z) catch |err| {
+            std.debug.print("Error loading TEN-VAD GGML model {s}: {}\n", .{ model, err });
+            std.process.exit(1);
+        };
+        backend = .{ .ten_vad_ggml = &ten_vad_ggml_ctx };
+    } else {
+        const vad_model_z: [:0]const u8 = try allocator.dupeZ(u8, args.vad_model);
+        defer allocator.free(vad_model_z);
+        silero_vad = SileroVad.init(vad_model_z) catch |err| {
+            std.debug.print("Error loading Silero VAD model {s}: {}\n", .{ args.vad_model, err });
+            std.process.exit(1);
+        };
+        backend = .{ .silero = &silero_vad };
+    }
+    defer {
+        if (args.use_ten_vad) ten_vad.deinit()
+        else if (args.use_ten_vad_ggml) ten_vad_ggml_ctx.deinit()
+        else silero_vad.deinit();
+    }
 
     // Process audio chunk-by-chunk, collecting metadata
     const chunk_size = VadFilter.chunk_pcm_bytes;
@@ -228,30 +271,8 @@ pub fn main() !void {
     while (pos + chunk_size <= pcm_data.len) {
         const chunk = pcm_data[pos..][0..chunk_size];
 
-        // Get probability via the Vad context
-        const n_samples = chunk_size / 2;
-        var float_buf: [n_samples]f32 = undefined;
-        for (&float_buf, 0..) |*sample, si| {
-            const offset = si * 2;
-            const raw = std.mem.readInt(i16, chunk[offset..][0..2], .little);
-            sample.* = @as(f32, @floatFromInt(raw)) / 32768.0;
-        }
-
-        const ok = c.whisper_vad_detect_speech(vad_ctx.vctx, &float_buf, n_samples);
-        var prob: f32 = 0;
-        if (ok) {
-            const n_probs = c.whisper_vad_n_probs(vad_ctx.vctx);
-            if (n_probs > 0) {
-                if (c.whisper_vad_probs(vad_ctx.vctx)) |probs| {
-                    const n: usize = @intCast(n_probs);
-                    var max_prob: f32 = 0.0;
-                    for (probs[0..n]) |p| {
-                        if (p > max_prob) max_prob = p;
-                    }
-                    prob = max_prob;
-                }
-            }
-        }
+        // Get probability via the VadBackend
+        const prob = backend.chunkProb(chunk);
 
         const rms = chunkRms(chunk);
 

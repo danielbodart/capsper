@@ -12,6 +12,16 @@ const gpu = await hasGpu();
 const wavDir = process.env.TEST_WAV_DIR ?? "test";
 const wav = (name: string) => `${wavDir}/${name}.wav`;
 
+// VAD_BACKEND: pass extra server args (e.g. VAD_BACKEND=ten-vad or VAD_BACKEND=ten-vad-ggml)
+// VAD_THRESHOLD / VAD_THRESHOLD_OFF / VAD_MIN_SILENCE_MS: override thresholds
+const vadBackend = process.env.VAD_BACKEND;
+const extraServerArgs: string[] = [
+    ...(vadBackend === "ten-vad" ? ["--ten-vad"] : vadBackend === "ten-vad-ggml" ? ["--ten-vad-ggml"] : []),
+    ...(process.env.VAD_THRESHOLD ? ["--vad-threshold", process.env.VAD_THRESHOLD] : []),
+    ...(process.env.VAD_THRESHOLD_OFF ? ["--vad-threshold-off", process.env.VAD_THRESHOLD_OFF] : []),
+    ...(process.env.VAD_MIN_SILENCE_MS ? ["--min-silence-ms", process.env.VAD_MIN_SILENCE_MS] : []),
+];
+
 interface TestCase {
     name: string;
     wav: string;
@@ -95,6 +105,6 @@ function runGroup(
     });
 }
 
-runGroup("short", shortCases, runShort, [], 120_000);
-runGroup("medium", mediumCases, runMedium, [], 180_000);
-runGroup("long", longCases, runLong, ["--domain-terms", "test/dictation-terms.txt"], 300_000);
+runGroup("short", shortCases, runShort, [...extraServerArgs], 120_000);
+runGroup("medium", mediumCases, runMedium, [...extraServerArgs], 180_000);
+runGroup("long", longCases, runLong, ["--domain-terms", "test/dictation-terms.txt", ...extraServerArgs], 300_000);

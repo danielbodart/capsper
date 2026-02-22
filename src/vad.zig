@@ -1,27 +1,215 @@
 const std = @import("std");
 const c = @import("whisper_c.zig");
 
-pub const Segment = struct {
-    start_s: f32,
-    end_s: f32,
+const ten_vad_ggml_c = @cImport({
+    @cInclude("ten_vad_ggml.h");
+});
+
+const ten_vad_c = @cImport({
+    @cInclude("ten_vad.h");
+});
+
+// ============================================================
+// VAD Backends
+// ============================================================
+
+pub const VadBackend = union(enum) {
+    silero: *SileroVad,
+    ten_vad_ggml: *TenVadGgml,
+    ten_vad: *TenVad,
+
+    /// Get speech probability for a chunk of S16_LE PCM bytes.
+    /// Each backend handles its own format conversion internally.
+    pub fn chunkProb(self: VadBackend, chunk: *const [VadFilter.chunk_pcm_bytes]u8) f32 {
+        return switch (self) {
+            .silero => |vad| vad.chunkProbS16(chunk),
+            .ten_vad_ggml => |tv| tv.chunkProbS16(chunk),
+            .ten_vad => |tv| tv.chunkProbS16(chunk),
+        };
+    }
+
+    pub fn reset(self: VadBackend) void {
+        switch (self) {
+            .silero => {},
+            .ten_vad_ggml => |tv| tv.reset(),
+            .ten_vad => |tv| tv.reset(),
+        }
+    }
+
+    pub fn name(self: VadBackend) []const u8 {
+        return switch (self) {
+            .silero => "silero",
+            .ten_vad_ggml => "ten-vad-ggml",
+            .ten_vad => "ten-vad",
+        };
+    }
+
+    pub const Thresholds = struct {
+        onset: f32,
+        offset: f32,
+        min_silence_ms: u32,
+    };
+
+    /// Per-backend default thresholds tuned for each model's probability distribution.
+    pub fn defaultThresholds(self: VadBackend) Thresholds {
+        return switch (self) {
+            .silero => .{ .onset = 0.3, .offset = 0.1, .min_silence_ms = 1000 },
+            .ten_vad_ggml, .ten_vad => .{ .onset = 0.6, .offset = 0.5, .min_silence_ms = 1000 },
+        };
+    }
 };
 
-pub const VadFilter = struct {
-    pub const default_threshold: f32 = 0.3; // onset: confident speech detection (audio is normalized via auto-gain)
-    pub const default_threshold_off: f32 = 0.1; // offset hysteresis: stay triggered through brief dips
-    pub const default_min_silence_bytes: usize = 32000; // 1000ms at 32000 bytes/sec
-    pub const chunk_pcm_bytes: usize = 1024; // 512 samples * 2 bytes (one Silero chunk)
+pub const SileroVad = struct {
+    vctx: *c.whisper_vad_context,
 
-    // Configurable thresholds (instance fields with defaults)
+    pub fn init(model_path: [:0]const u8) !SileroVad {
+        c.whisper_log_set(&sileroLogFilter, null);
+
+        var ctx_params = c.whisper_vad_default_context_params();
+        ctx_params.use_gpu = false;
+        ctx_params.n_threads = 2;
+
+        const vctx = c.whisper_vad_init_from_file_with_params(model_path.ptr, ctx_params);
+        if (vctx == null) return error.VadInitFailed;
+
+        return .{ .vctx = vctx.? };
+    }
+
+    fn sileroLogFilter(_: c.ggml_log_level, text: [*c]const u8, _: ?*anyopaque) callconv(.c) void {
+        if (text == null) return;
+        const msg = std.mem.span(text);
+        if (std.mem.startsWith(u8, msg, "whisper_vad_detect_speech:")) return;
+        std.debug.print("{s}", .{msg});
+    }
+
+    pub fn deinit(self: *SileroVad) void {
+        c.whisper_vad_free(self.vctx);
+    }
+
+    /// Get speech probability from S16_LE PCM. Converts to f32 for Silero.
+    pub fn chunkProbS16(self: *SileroVad, chunk: *const [VadFilter.chunk_pcm_bytes]u8) f32 {
+        const n_samples = VadFilter.chunk_pcm_bytes / 2;
+        var float_buf: [n_samples]f32 = undefined;
+        for (&float_buf, 0..) |*sample, i| {
+            const offset = i * 2;
+            const raw = std.mem.readInt(i16, chunk[offset..][0..2], .little);
+            sample.* = @as(f32, @floatFromInt(raw)) / 32768.0;
+        }
+
+        const ok = c.whisper_vad_detect_speech(self.vctx, &float_buf, n_samples);
+        if (!ok) return 0;
+
+        const n_probs = c.whisper_vad_n_probs(self.vctx);
+        if (n_probs <= 0) return 0;
+
+        const probs: [*]const f32 = c.whisper_vad_probs(self.vctx) orelse return 0;
+        const n: usize = @intCast(n_probs);
+        var max_prob: f32 = 0.0;
+        for (probs[0..n]) |p| {
+            if (p > max_prob) max_prob = p;
+        }
+        return max_prob;
+    }
+};
+
+pub const TenVadGgml = struct {
+    ctx: *ten_vad_ggml_c.ten_vad_ctx,
+
+    pub fn init(model_path: [:0]const u8) !TenVadGgml {
+        const ctx = ten_vad_ggml_c.ten_vad_ggml_init(model_path.ptr) orelse return error.TenVadInitFailed;
+        return .{ .ctx = ctx };
+    }
+
+    pub fn deinit(self: *TenVadGgml) void {
+        ten_vad_ggml_c.ten_vad_ggml_free(self.ctx);
+    }
+
+    /// Get speech probability from S16_LE PCM.
+    /// Processes 256-sample hops (ten-VAD's native size), returns max prob.
+    pub fn chunkProbS16(self: *TenVadGgml, chunk: *const [VadFilter.chunk_pcm_bytes]u8) f32 {
+        const hop_samples = 256;
+        const hop_bytes = hop_samples * 2;
+        var max_prob: f32 = 0;
+        var offset: usize = 0;
+        while (offset + hop_bytes <= VadFilter.chunk_pcm_bytes) {
+            var i16_buf: [hop_samples]i16 = undefined;
+            for (&i16_buf, 0..) |*out, i| {
+                out.* = std.mem.readInt(i16, chunk[offset + i * 2 ..][0..2], .little);
+            }
+            const prob = ten_vad_ggml_c.ten_vad_ggml_process(self.ctx, &i16_buf, hop_samples);
+            if (prob > max_prob) max_prob = prob;
+            offset += hop_bytes;
+        }
+        return max_prob;
+    }
+
+    pub fn reset(self: *TenVadGgml) void {
+        ten_vad_ggml_c.ten_vad_ggml_reset(self.ctx);
+    }
+};
+
+pub const TenVad = struct {
+    handle: ten_vad_c.ten_vad_handle_t,
+
+    pub fn init() !TenVad {
+        var handle: ten_vad_c.ten_vad_handle_t = null;
+        const rc = ten_vad_c.ten_vad_create(&handle, 256, 0.5);
+        if (rc != 0 or handle == null) return error.TenVadInitFailed;
+        return .{ .handle = handle };
+    }
+
+    pub fn deinit(self: *TenVad) void {
+        _ = ten_vad_c.ten_vad_destroy(&self.handle);
+    }
+
+    /// Get speech probability from S16_LE PCM via the native library.
+    /// Processes 256-sample hops, returns max prob.
+    pub fn chunkProbS16(self: *TenVad, chunk: *const [VadFilter.chunk_pcm_bytes]u8) f32 {
+        const hop_samples = 256;
+        const hop_bytes = hop_samples * 2;
+        var max_prob: f32 = 0;
+        var offset: usize = 0;
+        while (offset + hop_bytes <= VadFilter.chunk_pcm_bytes) {
+            var i16_buf: [hop_samples]i16 = undefined;
+            for (&i16_buf, 0..) |*out, i| {
+                out.* = std.mem.readInt(i16, chunk[offset + i * 2 ..][0..2], .little);
+            }
+            var prob: f32 = 0;
+            var flag: c_int = 0;
+            _ = ten_vad_c.ten_vad_process(self.handle, &i16_buf, hop_samples, &prob, &flag);
+            if (prob > max_prob) max_prob = prob;
+            offset += hop_bytes;
+        }
+        return max_prob;
+    }
+
+    pub fn reset(self: *TenVad) void {
+        // Native library has no reset — destroy and recreate
+        _ = ten_vad_c.ten_vad_destroy(&self.handle);
+        self.handle = null;
+        _ = ten_vad_c.ten_vad_create(&self.handle, 256, 0.5);
+    }
+};
+
+// ============================================================
+// VadFilter — backend-agnostic state machine
+// ============================================================
+
+pub const VadFilter = struct {
+    pub const default_threshold: f32 = 0.3;
+    pub const default_threshold_off: f32 = 0.1;
+    pub const default_min_silence_bytes: usize = 32000; // 1000ms at 32000 bytes/sec
+    pub const chunk_pcm_bytes: usize = 1024; // 512 samples * 2 bytes
+
     threshold: f32 = default_threshold,
     threshold_off: f32 = default_threshold_off,
     min_silence_bytes: usize = default_min_silence_bytes,
 
-    vad: *Vad,
+    backend: VadBackend,
     allocator: std.mem.Allocator,
     triggered: bool = false,
     silence_bytes: usize = 0,
-    last_prob: f32 = 0, // probability from most recent processOneChunk call
+    last_prob: f32 = 0,
     pcm_partial: [chunk_pcm_bytes]u8 = undefined,
     pcm_partial_len: usize = 0,
     output_buf: std.ArrayListUnmanaged(u8) = .{},
@@ -32,9 +220,9 @@ pub const VadFilter = struct {
         min_silence_bytes: usize = default_min_silence_bytes,
     };
 
-    pub fn init(allocator: std.mem.Allocator, vad: *Vad, opts: Options) VadFilter {
+    pub fn init(allocator: std.mem.Allocator, backend: VadBackend, opts: Options) VadFilter {
         return .{
-            .vad = vad,
+            .backend = backend,
             .allocator = allocator,
             .threshold = opts.threshold,
             .threshold_off = opts.threshold_off,
@@ -128,33 +316,8 @@ pub const VadFilter = struct {
         return self.output_buf.items;
     }
 
-    /// Get raw VAD probability for a chunk without updating state.
-    pub fn chunkProb(self: *VadFilter, chunk: *const [chunk_pcm_bytes]u8) f32 {
-        const n_samples = chunk_pcm_bytes / 2;
-        var float_buf: [n_samples]f32 = undefined;
-        for (&float_buf, 0..) |*sample, i| {
-            const offset = i * 2;
-            const raw = std.mem.readInt(i16, chunk[offset..][0..2], .little);
-            sample.* = @as(f32, @floatFromInt(raw)) / 32768.0;
-        }
-
-        const ok = c.whisper_vad_detect_speech(self.vad.vctx, &float_buf, n_samples);
-        if (!ok) return 0;
-
-        const n_probs = c.whisper_vad_n_probs(self.vad.vctx);
-        if (n_probs <= 0) return 0;
-
-        const probs: [*]const f32 = c.whisper_vad_probs(self.vad.vctx) orelse return 0;
-        const n: usize = @intCast(n_probs);
-        var max_prob: f32 = 0.0;
-        for (probs[0..n]) |p| {
-            if (p > max_prob) max_prob = p;
-        }
-        return max_prob;
-    }
-
     pub fn processOneChunk(self: *VadFilter, chunk: *const [chunk_pcm_bytes]u8) bool {
-        const prob = self.chunkProb(chunk);
+        const prob = self.backend.chunkProb(chunk);
         self.last_prob = prob;
         return self.processChunkProb(prob);
     }
@@ -164,90 +327,7 @@ pub const VadFilter = struct {
         self.silence_bytes = 0;
         self.pcm_partial_len = 0;
         self.last_prob = 0;
-    }
-};
-
-pub const Vad = struct {
-    vctx: *c.whisper_vad_context,
-    params: c.whisper_vad_params,
-
-    pub fn init(model_path: [:0]const u8) !Vad {
-        // Suppress verbose whisper_vad_detect_speech debug logging.
-        c.whisper_log_set(&vadLogFilter, null);
-
-        var ctx_params = c.whisper_vad_default_context_params();
-        ctx_params.use_gpu = false; // VAD is tiny, CPU is fine
-        ctx_params.n_threads = 2;
-
-        const vctx = c.whisper_vad_init_from_file_with_params(model_path.ptr, ctx_params);
-        if (vctx == null) return error.VadInitFailed;
-
-        var params = c.whisper_vad_default_params();
-        params.threshold = 0.2; // Default 0.5 is too aggressive for quiet mics
-        return .{
-            .vctx = vctx.?,
-            .params = params,
-        };
-    }
-
-    /// Log callback that suppresses verbose per-chunk VAD messages.
-    fn vadLogFilter(_: c.ggml_log_level, text: [*c]const u8, _: ?*anyopaque) callconv(.c) void {
-        if (text == null) return;
-        const msg = std.mem.span(text);
-        // Suppress repetitive VAD debug messages (fired per 32ms chunk)
-        if (std.mem.startsWith(u8, msg, "whisper_vad_detect_speech:")) return;
-        std.debug.print("{s}", .{msg});
-    }
-
-    pub fn deinit(self: *Vad) void {
-        c.whisper_vad_free(self.vctx);
-    }
-
-    /// Detect whether audio contains speech.
-    /// whisper_vad_detect_speech returns a success bool, not a speech indicator.
-    /// We must read the per-chunk probabilities it computes and check the threshold.
-    pub fn hasSpeech(self: *Vad, samples: []const f32) bool {
-        const ok = c.whisper_vad_detect_speech(self.vctx, samples.ptr, @intCast(samples.len));
-        if (!ok) return false;
-
-        const n_probs = c.whisper_vad_n_probs(self.vctx);
-        if (n_probs <= 0) return false;
-
-        const probs: [*]const f32 = c.whisper_vad_probs(self.vctx) orelse return false;
-        const n: usize = @intCast(n_probs);
-        var max_prob: f32 = 0.0;
-        for (probs[0..n]) |p| {
-            if (p > max_prob) max_prob = p;
-        }
-        return max_prob >= self.params.threshold;
-    }
-
-    /// Get speech segments from audio samples.
-    /// Caller must call freeSegments on the result.
-    pub fn getSegments(self: *Vad, samples: []const f32) ![]Segment {
-        const segs = c.whisper_vad_segments_from_samples(
-            self.vctx,
-            self.params,
-            samples.ptr,
-            @intCast(samples.len),
-        );
-        if (segs == null) return error.VadSegmentsFailed;
-        defer c.whisper_vad_free_segments(segs);
-
-        const n: usize = @intCast(c.whisper_vad_segments_n_segments(segs));
-        if (n == 0) return &.{};
-
-        // Copy segments — the C data is freed when we return
-        // API returns centiseconds (int64 cast to float), convert to seconds
-        const allocator = std.heap.page_allocator;
-        const result = try allocator.alloc(Segment, n);
-        for (0..n) |i| {
-            result[i] = .{
-                .start_s = c.whisper_vad_segments_get_segment_t0(segs, @intCast(i)) / 100.0,
-                .end_s = c.whisper_vad_segments_get_segment_t1(segs, @intCast(i)) / 100.0,
-            };
-        }
-        return result;
+        self.backend.reset();
     }
 };
 
@@ -257,7 +337,7 @@ pub const Vad = struct {
 
 test "processChunkProb: not triggered, below threshold -> stays not-triggered" {
     var filter = VadFilter{
-        .vad = undefined,
+        .backend = undefined,
         .allocator = std.testing.allocator,
     };
     try std.testing.expect(!filter.processChunkProb(0.2));
@@ -266,7 +346,7 @@ test "processChunkProb: not triggered, below threshold -> stays not-triggered" {
 
 test "processChunkProb: not triggered, above threshold -> triggers" {
     var filter = VadFilter{
-        .vad = undefined,
+        .backend = undefined,
         .allocator = std.testing.allocator,
     };
     try std.testing.expect(filter.processChunkProb(0.5));
@@ -276,7 +356,7 @@ test "processChunkProb: not triggered, above threshold -> triggers" {
 
 test "processChunkProb: not triggered, exact threshold boundary -> triggers" {
     var filter = VadFilter{
-        .vad = undefined,
+        .backend = undefined,
         .allocator = std.testing.allocator,
     };
     try std.testing.expect(filter.processChunkProb(VadFilter.default_threshold));
@@ -285,7 +365,7 @@ test "processChunkProb: not triggered, exact threshold boundary -> triggers" {
 
 test "processChunkProb: triggered, above threshold_off -> resets silence counter" {
     var filter = VadFilter{
-        .vad = undefined,
+        .backend = undefined,
         .allocator = std.testing.allocator,
         .triggered = true,
         .silence_bytes = 4096,
@@ -297,7 +377,7 @@ test "processChunkProb: triggered, above threshold_off -> resets silence counter
 
 test "processChunkProb: triggered, below threshold_off, short silence -> bridges" {
     var filter = VadFilter{
-        .vad = undefined,
+        .backend = undefined,
         .allocator = std.testing.allocator,
         .triggered = true,
         .silence_bytes = 0,
@@ -310,7 +390,7 @@ test "processChunkProb: triggered, below threshold_off, short silence -> bridges
 
 test "processChunkProb: triggered, sustained silence -> un-triggers" {
     var filter = VadFilter{
-        .vad = undefined,
+        .backend = undefined,
         .allocator = std.testing.allocator,
         .triggered = true,
         .silence_bytes = VadFilter.default_min_silence_bytes - VadFilter.chunk_pcm_bytes,
@@ -322,7 +402,7 @@ test "processChunkProb: triggered, sustained silence -> un-triggers" {
 
 test "processChunkProb: speech during bridging -> resets silence counter" {
     var filter = VadFilter{
-        .vad = undefined,
+        .backend = undefined,
         .allocator = std.testing.allocator,
         .triggered = true,
         .silence_bytes = 16000, // mid-bridge
@@ -334,7 +414,7 @@ test "processChunkProb: speech during bridging -> resets silence counter" {
 
 test "processChunkProb: exact threshold_off boundary keeps triggered" {
     var filter = VadFilter{
-        .vad = undefined,
+        .backend = undefined,
         .allocator = std.testing.allocator,
         .triggered = true,
         .silence_bytes = 4096,

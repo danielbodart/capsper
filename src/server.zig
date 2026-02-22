@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("whisper_c.zig");
 const vad_mod = @import("vad.zig");
-const Vad = vad_mod.Vad;
+const VadBackend = vad_mod.VadBackend;
 const VadFilter = vad_mod.VadFilter;
 const Pipeline = @import("pipeline.zig").Pipeline;
 const AudioCapture = @import("audio_capture.zig").AudioCapture;
@@ -102,7 +102,7 @@ pub const InputMode = enum { tcp, local };
 pub const Server = struct {
     allocator: std.mem.Allocator,
     ctx: *c.whisper_context,
-    vad: Vad,
+    vad_backend: VadBackend,
     port: u16,
     input_mode: InputMode,
     pw_target: ?[:0]const u8,
@@ -120,7 +120,7 @@ pub const Server = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         ctx: *c.whisper_context,
-        vad: Vad,
+        vad_backend: VadBackend,
         port: u16,
         input_mode: InputMode,
         pw_target: ?[:0]const u8,
@@ -138,7 +138,7 @@ pub const Server = struct {
         return .{
             .allocator = allocator,
             .ctx = ctx,
-            .vad = vad,
+            .vad_backend = vad_backend,
             .port = port,
             .input_mode = input_mode,
             .pw_target = pw_target,
@@ -244,7 +244,7 @@ pub const Server = struct {
 
         var auto_gain = AutoGain{ .current_gain = self.initial_gain };
 
-        var vad_filter = VadFilter.init(self.allocator, &self.vad, .{
+        var vad_filter = VadFilter.init(self.allocator, self.vad_backend, .{
             .threshold = self.vad_threshold,
             .threshold_off = self.vad_threshold_off,
             .min_silence_bytes = self.min_silence_bytes,

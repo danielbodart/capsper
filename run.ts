@@ -57,9 +57,9 @@ async function ensureDeps(opts?: { cuda?: boolean }) {
 }
 
 async function ensureSubmodule() {
-    // Check if whisper.cpp is populated
-    if (!existsSync("whisper.cpp/CMakeLists.txt")) {
-        console.log("Initializing whisper.cpp submodule...");
+    // Check if submodules are populated
+    if (!existsSync("whisper.cpp/CMakeLists.txt") || !existsSync("ten-vad/include/ten_vad.h")) {
+        console.log("Initializing submodules...");
         await $`git submodule update --init --recursive`;
     }
 }
@@ -139,6 +139,17 @@ export async function build() {
     await ensureSubmodule();
     await ensureLfs();
     if (!process.env.CI) await ensureModels();
+
+    // Copy ten-vad native library to dist/lib/ (from submodule)
+    const tenVadSrc = "ten-vad/lib/Linux/x64/libten_vad.so";
+    const tenVadDst = "dist/lib/libten_vad.so";
+    if (existsSync(tenVadSrc)) {
+        await $`cp ${tenVadSrc} ${tenVadDst}`;
+    } else {
+        console.error(`ERROR: ${tenVadSrc} not found — run: git submodule update --init`);
+        process.exit(1);
+    }
+
     const ver = await version();
     console.log(`Building v${ver}...`);
     await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
@@ -226,6 +237,14 @@ export async function dist() {
         console.error("ERROR: dist/lib/ contains non-ELF files (likely LFS pointers):");
         bad.forEach(l => console.error(`  ${l}`));
         console.error("Run: git lfs pull");
+        process.exit(1);
+    }
+
+    // Validate libten_vad.so (unversioned — not matched by *.so.*.*.*)
+    const { stdout: tenVadOut } = await $`file dist/lib/libten_vad.so`.quiet().nothrow();
+    if (!tenVadOut.toString().includes("ELF")) {
+        console.error("ERROR: dist/lib/libten_vad.so is not a valid ELF binary");
+        console.error("Run: ./run.ts build  (copies from ten-vad submodule)");
         process.exit(1);
     }
 

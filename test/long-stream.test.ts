@@ -2,6 +2,10 @@ import { describe, test, expect, beforeAll } from "bun:test";
 import { hasGpu, ensureBinary, ensureFile, startServer, readPcm, streamPcmFast, saveLog } from "./helpers";
 
 const gpu = await hasGpu();
+const vadBackend = process.env.VAD_BACKEND;
+const extraServerArgs: string[] = vadBackend === "ten-vad" ? ["--ten-vad"]
+    : vadBackend === "ten-vad-ggml" ? ["--ten-vad-ggml"]
+    : [];
 
 describe.skipIf(!gpu)("long-stream", () => {
     beforeAll(() => {
@@ -15,7 +19,7 @@ describe.skipIf(!gpu)("long-stream", () => {
         const pcm = Buffer.concat(Array.from({ length: LOOPS }, () => pcmOnce));
         const totalDuration = (pcm.length / 32000).toFixed(1);
 
-        const server = await startServer(["--port", "0", "--verbose"]);
+        const server = await startServer(["--port", "0", "--verbose", ...extraServerArgs]);
 
         try {
             console.error(`Streaming ${LOOPS} loops = ${totalDuration}s to localhost:${server.port}`);

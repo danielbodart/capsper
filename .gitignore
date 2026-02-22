@@ -1,4 +1,5 @@
 dist/bin/
+dist/lib/libten_vad.so
 dist/models/
 dist/VERSION
 .zig-cache/
