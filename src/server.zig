@@ -55,6 +55,40 @@ pub const TypeCallback = struct {
     }
 };
 
+/// S16_LE-aligned reader. Wraps a raw fd and ensures every read returns
+/// an even number of bytes (complete S16 samples). Stashes a trailing
+/// odd byte between reads so the stream stays aligned.
+const AlignedReader = struct {
+    fd: posix.fd_t,
+    buf: [32769]u8 = undefined, // +1 for carry prepend
+    carry: ?u8 = null,
+
+    fn init(fd: posix.fd_t) AlignedReader {
+        return .{ .fd = fd };
+    }
+
+    /// Read S16-aligned audio. Returns a slice of complete samples,
+    /// or empty slice on EOF. Caller does not own the returned memory.
+    fn read(self: *AlignedReader) ![]u8 {
+        const start: usize = if (self.carry != null) 1 else 0;
+        var n = posix.read(self.fd, self.buf[start..]) catch |err| switch (err) {
+            error.ConnectionResetByPeer => return &.{},
+            else => return err,
+        };
+        if (n == 0) return &.{};
+        if (self.carry) |cb| {
+            self.buf[0] = cb;
+            n += 1;
+            self.carry = null;
+        }
+        if (n % 2 != 0) {
+            n -= 1;
+            self.carry = self.buf[n];
+        }
+        return self.buf[0..n];
+    }
+};
+
 // Streaming constants (byte counts for S16_LE at 16kHz = 32000 bytes/sec)
 const transcribe_interval_bytes: usize = 32000; // 1s — re-transcribe cadence during speech
 const max_buffer_bytes: usize = 960000; // 30s — sliding window cap (matches whisper's full 30s window)
@@ -226,9 +260,7 @@ pub const Server = struct {
 
         var speech_trim_total: usize = 0; // cumulative bytes trimmed (for absolute frame calc)
 
-        var recv_buf: [32768]u8 = undefined;
-        var recv_carry: u8 = undefined; // holds odd trailing byte between reads
-        var have_carry: bool = false;
+        var reader = AlignedReader.init(audio_fd);
         var vad_state: VadState = .idle;
         var bytes_since_last_cycle: usize = 0;
         var cycle_count: usize = 0;
@@ -245,72 +277,44 @@ pub const Server = struct {
             const poll_timeout: i32 = if (vad_state == .speaking) 100 else -1;
             const poll_ready = try posix.poll(&fds, poll_timeout);
 
-            var n: usize = 0;
             var timed_out = false;
+            var audio: []u8 = &.{};
             if (poll_ready == 0) {
                 timed_out = true;
             } else {
-                // Leave slot 0 free when there's a carry byte to prepend
-                const start: usize = if (have_carry) 1 else 0;
-                n = posix.read(audio_fd, recv_buf[start..]) catch |err| switch (err) {
-                    error.ConnectionResetByPeer => return,
-                    else => return err,
-                };
-                if (n > 0 and have_carry) {
-                    recv_buf[0] = recv_carry;
-                    n += 1;
-                    have_carry = false;
-                }
-                // Stash trailing odd byte for next read
-                if (n > 0 and n % 2 != 0) {
-                    n -= 1;
-                    recv_carry = recv_buf[n];
-                    have_carry = true;
-                }
+                audio = try reader.read();
             }
+            const n = audio.len;
 
             // --- Audio input processing ---
             if (n > 0) {
-                if (self.recorder) |rec| rec.recordPcm(recv_buf[0..n]);
+                if (self.recorder) |rec| rec.recordPcm(audio);
 
-                // VadFilter: run on all raw bytes (handles odd sizes via pcm_partial)
+                // VadFilter: run on raw audio for edge detection (handles any size via pcm_partial)
                 const was_triggered = vad_filter.triggered;
-                _ = vad_filter.filterAudio(recv_buf[0..n]);
+                _ = vad_filter.filterAudio(audio);
 
                 // VadFilter onset edge: idle → speaking
                 if (!was_triggered and vad_filter.triggered and vad_state == .idle) {
                     vad_state = .speaking;
                     pipeline.resetSegment();
-                    // Buffer the onset chunk — this is the first speech audio
-                    try speech_buf.appendSlice(self.allocator, recv_buf[0..n]);
-                    bytes_since_last_cycle += n;
+                    try speech_buf.appendSlice(self.allocator, audio);
+                    bytes_since_last_cycle += audio.len;
                     var ts_buf: [32]u8 = undefined;
-                    const onset_rms = utils.channelRms(recv_buf[0..n], 1, 0);
-                    // Log first 5 raw S16 samples of the onset chunk
-                    var onset_s16: [5]i16 = undefined;
-                    const onset_n = @min(5, n / 2);
-                    for (0..onset_n) |si| {
-                        onset_s16[si] = std.mem.readInt(i16, recv_buf[si * 2 ..][0..2], .little);
-                    }
-                    std.debug.print("[{s}s] idle → speaking (buf={d} recv_n={d} onset_rms={d:.4} vad_prob={d:.3} s16={{ ", .{ formatElapsed(&ts_buf, start_ns), speech_buf.items.len, n, onset_rms, vad_filter.last_prob });
-                    for (0..onset_n) |si| {
-                        std.debug.print("{d} ", .{onset_s16[si]});
-                    }
-                    std.debug.print("}})\n", .{});
+                    std.debug.print("[{s}s] idle → speaking (buf={d})\n", .{ formatElapsed(&ts_buf, start_ns), speech_buf.items.len });
                     if (self.recorder) |rec| {
                         rec.startUtterance(speech_buf.items);
                         rec.logEvent(start_ns, "idle → speaking");
                     }
                 } else if (vad_state == .speaking) {
-                    // Only buffer audio while speaking
-                    try speech_buf.appendSlice(self.allocator, recv_buf[0..n]);
-                    bytes_since_last_cycle += n;
+                    try speech_buf.appendSlice(self.allocator, audio);
+                    bytes_since_last_cycle += audio.len;
                 }
 
-                // Auto-gain: only in PipeWire mode (measures recv_buf, adjusts capture gain)
+                // Auto-gain: only in PipeWire mode (measures capture audio, adjusts gain)
                 if (vad_state == .speaking) {
                     if (capture_ptr.load(.monotonic)) |cap| {
-                        const rms = utils.channelRms(recv_buf[0..n], 1, 0);
+                        const rms = utils.channelRms(audio, 1, 0);
                         if (auto_gain.update(rms)) |new_gain| {
                             cap.setGain(new_gain);
                             if (self.verbose) {
@@ -472,35 +476,8 @@ pub const Server = struct {
         const samples = try utils.pcmToFloat(self.allocator, speech_buf);
         defer self.allocator.free(samples);
 
-        // Diagnostic: log audio characteristics and pipeline state
-        if (self.verbose) {
-            const front_len = @min(samples.len, 8000); // first 0.5s
-            const back_start = if (samples.len > 8000) samples.len - 8000 else 0;
-            var front_sum: f64 = 0;
-            for (samples[0..front_len]) |s| front_sum += @as(f64, s) * @as(f64, s);
-            var back_sum: f64 = 0;
-            for (samples[back_start..]) |s| back_sum += @as(f64, s) * @as(f64, s);
-            const front_rms = @sqrt(front_sum / @as(f64, @floatFromInt(front_len)));
-            const back_rms = @sqrt(back_sum / @as(f64, @floatFromInt(samples.len - back_start)));
-            // Dump first 5 raw S16 samples from speech_buf for byte-level comparison
-            var s16_preview: [5]i16 = undefined;
-            const n_preview = @min(5, speech_buf.len / 2);
-            for (0..n_preview) |si| {
-                s16_preview[si] = std.mem.readInt(i16, speech_buf[si * 2 ..][0..2], .little);
-            }
-            var ts_buf: [32]u8 = undefined;
-            std.debug.print("    [{s}s] transcribe: buf={d}ms accum={d}tok mel_computed={d} front_rms={d:.4} back_rms={d:.4} flush={} s16[0..{d}]={{ ", .{
-                formatElapsed(&ts_buf, start_ns),
-                speech_buf.len * 1000 / 32000,
-                pipeline.accumulated_tokens.items.len,
-                pipeline.mel_buffer.n_computed,
-                front_rms, back_rms, flush, n_preview,
-            });
-            for (0..n_preview) |si| {
-                std.debug.print("{d} ", .{s16_preview[si]});
-            }
-            std.debug.print("}}\n", .{});
-        }
+
+
 
         const result = try pipeline.transcribe(samples, flush, null) orelse {
             if (self.verbose) {
@@ -564,12 +541,6 @@ pub const Server = struct {
         vad_filter: *VadFilter,
         end_reason: EndReason,
     ) void {
-        std.debug.print("    [reset] accum={d}tok mel_computed={d} speech_buf={d} reason={s}\n", .{
-            pipeline.accumulated_tokens.items.len,
-            pipeline.mel_buffer.n_computed,
-            speech_buf.items.len,
-            @tagName(end_reason),
-        });
         pipeline.resetSegment();
         vad_filter.reset();
         if (self.recorder) |rec| rec.endUtterance(end_reason) catch |err| {
