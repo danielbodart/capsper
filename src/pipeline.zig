@@ -240,12 +240,14 @@ pub const Pipeline = struct {
         const max_decode: usize = 224;
         const total_budget: usize = 448 - sot_seq.len - max_decode;
 
-        // Allocate budget: domain terms first (protected), then context, then forced
+        // Allocate budget: domain terms first (protected), then forced, then context.
+        // Forced tokens are the model's memory of what it already generated — they must
+        // never be dropped. Context is expendable conditioning (matches SimulStreaming).
         const domain_len = @min(self.prompt_tokens.len, total_budget);
-        const context_budget = total_budget - domain_len;
+        const after_domain = total_budget - domain_len;
+        const forced_len = @min(forced_tokens.len, after_domain);
+        const context_budget = after_domain - forced_len;
         const ctx_len = @min(self.context_tokens.items.len, context_budget);
-        const forced_budget = context_budget - ctx_len;
-        const forced_len = @min(forced_tokens.len, forced_budget);
 
         // Need [sot_prev] prefix if we have any conditioning tokens (domain or context)
         const has_conditioning = domain_len > 0 or ctx_len > 0;
