@@ -6,8 +6,7 @@ import { join } from "path";
 process.env.FORCE_COLOR = "1";
 
 const BINARY = "./dist/bin/capsper";
-const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
-const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
+const MODEL = "dist/models/ggml-large-v3-turbo-q5_0.bin";
 const SCRIPT_DIR = import.meta.dir;
 const TARBALL = "capsper-linux-x86_64.tar.gz";
 
@@ -58,7 +57,7 @@ async function ensureDeps(opts?: { cuda?: boolean }) {
 
 async function ensureSubmodule() {
     // Check if submodules are populated
-    if (!existsSync("whisper.cpp/CMakeLists.txt") || !existsSync("ten-vad/include/ten_vad.h")) {
+    if (!existsSync("whisper.cpp/CMakeLists.txt")) {
         console.log("Initializing submodules...");
         await $`git submodule update --init --recursive`;
     }
@@ -89,28 +88,17 @@ async function confirm(message: string): Promise<boolean> {
 }
 
 async function ensureModels() {
-    const missing: string[] = [];
-    if (!existsSync(MODEL)) missing.push(`Whisper model (large-v3-turbo-q5_0, ~574 MB)`);
-    if (!existsSync(VAD_MODEL)) missing.push(`VAD model (silero-v5.1.2, ~2 MB)`);
+    if (existsSync(MODEL)) return;
 
-    if (missing.length === 0) return;
-
-    console.log(`Missing models:\n${missing.map(m => `  - ${m}`).join("\n")}`);
+    console.log("Missing model: Whisper large-v3-turbo-q5_0 (~574 MB)");
     if (!await confirm("Download now?")) {
-        console.error("Models required. Download manually:");
-        console.error("  cd whisper.cpp/models && ./download-ggml-model.sh large-v3-turbo-q5_0");
-        console.error("  cd whisper.cpp/models && ./download-vad-model.sh silero-v5.1.2");
+        console.error("Model required. Download manually:");
+        console.error("  curl -L -o dist/models/ggml-large-v3-turbo-q5_0.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin");
         process.exit(1);
     }
 
-    if (!existsSync(MODEL)) {
-        console.log("Downloading Whisper model...");
-        await $`cd whisper.cpp/models && ./download-ggml-model.sh large-v3-turbo-q5_0`;
-    }
-    if (!existsSync(VAD_MODEL)) {
-        console.log("Downloading VAD model...");
-        await $`cd whisper.cpp/models && ./download-vad-model.sh silero-v5.1.2`;
-    }
+    console.log("Downloading Whisper model...");
+    await $`curl -L --progress-bar -o ${MODEL} https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin`;
 }
 
 function ensureBinary() {
@@ -134,23 +122,11 @@ async function version(): Promise<string> {
 
 // ─── Commands ──────────────────────────────────────────────────────────────
 
-async function ensureTenVadLib() {
-    const tenVadSrc = "ten-vad/lib/Linux/x64/libten_vad.so";
-    const tenVadDst = "dist/lib/libten_vad.so";
-    if (existsSync(tenVadSrc)) {
-        await $`cp ${tenVadSrc} ${tenVadDst}`;
-    } else {
-        console.error(`ERROR: ${tenVadSrc} not found — run: git submodule update --init`);
-        process.exit(1);
-    }
-}
-
 export async function build() {
     await ensureDeps();
     await ensureSubmodule();
     await ensureLfs();
     if (!process.env.CI) await ensureModels();
-    await ensureTenVadLib();
     const ver = await version();
     console.log(`Building v${ver}...`);
     await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
@@ -241,14 +217,6 @@ export async function dist() {
         process.exit(1);
     }
 
-    // Validate libten_vad.so (unversioned — not matched by *.so.*.*.*)
-    const { stdout: tenVadOut } = await $`file dist/lib/libten_vad.so`.quiet().nothrow();
-    if (!tenVadOut.toString().includes("ELF")) {
-        console.error("ERROR: dist/lib/libten_vad.so is not a valid ELF binary");
-        console.error("Run: ./run.ts build  (copies from ten-vad submodule)");
-        process.exit(1);
-    }
-
     // Validate no shared lib has a hardcoded absolute RUNPATH (must be $ORIGIN or empty)
     const { stdout: rpathOut } = await $`readelf -d dist/lib/*.so.*.*.* 2>/dev/null`.quiet();
     const rpathLines = rpathOut.toString().split("\n").filter(l => l.includes("RUNPATH") || l.includes("RPATH"));
@@ -271,7 +239,7 @@ export async function dist() {
 
     const ver = await version();
     await Bun.write("dist/VERSION", ver);
-    await $`tar -czf ${TARBALL} -C dist bin/ lib/ install.sh capsper-update.sh capsper-apply-update.sh capsper-rollback.sh VERSION`;
+    await $`tar -czf ${TARBALL} -C dist --exclude='models/ggml-large-v3-turbo-q5_0.bin' bin/ lib/ models/ install.sh capsper-update.sh capsper-apply-update.sh capsper-rollback.sh VERSION`;
     await $`sha256sum ${TARBALL} > ${TARBALL}.sha256`;
     console.log(`Tarball: ${TARBALL} (v${ver})`);
 }
@@ -284,7 +252,6 @@ export async function lint() {
 export async function ci() {
     await ensureSubmodule();
     await ensureLfs();
-    await ensureTenVadLib();
     const ver = await version();
     console.log("Running static analysis...");
     await $`zig build analyze`;

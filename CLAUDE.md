@@ -55,7 +55,7 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 - **`audio_capture.zig`** — PipeWire audio capture via `pw_thread_loop` + `pw_stream`. Supports software gain via `setGain()`.
 - **`pw_detect.zig`** — Interactive PipeWire setup wizard (`--pw-detect`). Enumerates devices, lets user pick, records silence/speech, detects best channel, calibrates auto-gain — all in one flow. Outputs `CHANNEL=`/`GAIN=` to stdout for `install.sh`.
 - **`auto_gain.zig`** — Pure-math auto-gain controller. Measures speech RMS and computes PipeWire software gain to reach target level. Capped at 10x (PipeWire ceiling). Used at runtime by `server.zig` and for calibration by `pw_detect.zig`.
-- **`vad.zig`** — Multi-backend VAD with state machine. Supports Silero (default, via whisper.cpp), TEN-VAD native (`--ten-vad`, via `libten_vad.so`), and TEN-VAD GGML (`--ten-vad-ggml`, experimental). Each backend has tuned default thresholds. `VadFilter` is the backend-agnostic state machine; `VadBackend` is the tagged union dispatch.
+- **`vad.zig`** — Multi-backend VAD with state machine. Supports TEN-VAD GGML (default, `--vad ten`) and Silero (`--vad silero`, via whisper.cpp). Each backend has tuned default thresholds. `VadFilter` is the backend-agnostic state machine; `VadBackend` is the tagged union dispatch.
 - **`whisper_c.zig`** / **`pipewire_c.zig`** — C import bridges for whisper.cpp and PipeWire.
 - **`pw_helpers.c`** — C helpers for PipeWire SPA pod building, `pw_stream_connect`, `pw_set_stream_gain`, and PipeWire source enumeration (variadic C calls and SPA macros that Zig can't handle).
 
@@ -66,7 +66,7 @@ Single binary handles everything: keyboard grab, audio capture, transcription, t
 
 ### Build System & `dist/` Layout
 
-Pre-built whisper.cpp shared libraries are committed in `dist/lib/` via Git LFS (~43 MB). The Zig build links against these directly — no CMake step needed for normal builds. `libten_vad.so` is copied from the `ten-vad` submodule during `build()` (not committed via LFS).
+Pre-built whisper.cpp shared libraries are committed in `dist/lib/` via Git LFS (~43 MB). The Zig build links against these directly — no CMake step needed for normal builds.
 
 ```
 dist/
@@ -74,8 +74,11 @@ dist/
 ├── lib/                     (pre-built .so files — committed via LFS)
 │   ├── libwhisper.so.1.8.3, libwhisper.so.1, libwhisper.so
 │   ├── libggml-cuda.so.0.9.6, libggml-cuda.so.0, libggml-cuda.so
-│   ├── (libggml, libggml-base, libggml-cpu — same pattern)
-│   └── libten_vad.so        (copied from ten-vad submodule during build — gitignored)
+│   └── (libggml, libggml-base, libggml-cpu — same pattern)
+├── models/
+│   ├── ten-vad-ggml.bin             (296 KB, committed via LFS)
+│   ├── ggml-silero-v5.1.2.bin       (865 KB, committed)
+│   └── ggml-large-v3-turbo-q5_0.bin (574 MB, gitignored — downloaded on first run)
 └── install.sh               (committed)
 ```
 
@@ -100,7 +103,7 @@ Do NOT manually download CI artifacts or stage releases by hand — the update s
 
 - Zig 0.15 API: `b.createModule(...)` for executables, `file.reader(&buf)` takes a buffer arg, use `readToEndAlloc` instead of `readBytesNoEof`
 - whisper.cpp is a git submodule pinned to commit `0a4d85cf`
-- ten-vad is a git submodule pinned to commit `22a3bcd` (TEN-framework/ten-vad, native VAD library, requires libc++ at runtime)
+- ten-vad is a git submodule pinned to commit `22a3bcd` (TEN-framework/ten-vad, ONNX model source for GGML converter)
 - Model: `ggml-large-v3-turbo-q5_0.bin` (573 MB, q5_0 quantization)
 - Audio format: 16kHz mono S16_LE PCM (32000 bytes/sec)
 - Default server port: 43007

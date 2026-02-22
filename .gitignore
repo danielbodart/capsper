@@ -1,6 +1,5 @@
 dist/bin/
-dist/lib/libten_vad.so
-dist/models/
+dist/models/ggml-large-v3-turbo-q5_0.bin
 dist/VERSION
 .zig-cache/
 whisper.cpp/build-zig/

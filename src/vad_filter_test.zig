@@ -6,7 +6,6 @@ const VadFilter = vad.VadFilter;
 const VadBackend = vad.VadBackend;
 const SileroVad = vad.SileroVad;
 const TenVadGgml = vad.TenVadGgml;
-const TenVad = vad.TenVad;
 
 const sample_rate: u32 = 16000;
 const bytes_per_sec: u32 = sample_rate * 2; // S16_LE
@@ -40,15 +39,15 @@ const SpeechSegment = struct {
 const tail_pad_ms: u32 = 200; // keep 200ms of trailing audio after last speech chunk
 const tail_pad_bytes: usize = tail_pad_ms * bytes_per_sec / 1000;
 
+const VadChoice = enum { ten, silero };
+
 const Args = struct {
     input_path: []const u8,
     output_dir: ?[]const u8,
     threshold: f32,
     threshold_off: f32,
     min_silence_ms: u32,
-    vad_model: []const u8,
-    use_ten_vad: bool,
-    use_ten_vad_ggml: bool,
+    vad_choice: VadChoice,
 };
 
 fn parseArgs() Args {
@@ -60,9 +59,7 @@ fn parseArgs() Args {
     var threshold_val: f32 = VadFilter.default_threshold;
     var threshold_off_val: f32 = VadFilter.default_threshold_off;
     var min_silence_ms: u32 = 1000;
-    var vad_model: []const u8 = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
-    var use_ten_vad: bool = false;
-    var use_ten_vad_ggml: bool = false;
+    var vad_choice: VadChoice = .ten;
 
     while (iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--output-dir")) {
@@ -76,12 +73,15 @@ fn parseArgs() Args {
         } else if (std.mem.eql(u8, arg, "--min-silence-ms")) {
             const val = iter.next() orelse fatal("--min-silence-ms requires a value");
             min_silence_ms = std.fmt.parseInt(u32, val, 10) catch fatal("invalid --min-silence-ms value");
-        } else if (std.mem.eql(u8, arg, "--vad-model")) {
-            vad_model = iter.next() orelse fatal("--vad-model requires a value");
-        } else if (std.mem.eql(u8, arg, "--ten-vad")) {
-            use_ten_vad = true;
-        } else if (std.mem.eql(u8, arg, "--ten-vad-ggml")) {
-            use_ten_vad_ggml = true;
+        } else if (std.mem.eql(u8, arg, "--vad")) {
+            const val = iter.next() orelse fatal("--vad requires a value (ten or silero)");
+            if (std.mem.eql(u8, val, "ten")) {
+                vad_choice = .ten;
+            } else if (std.mem.eql(u8, val, "silero")) {
+                vad_choice = .silero;
+            } else {
+                fatal("invalid --vad value, expected 'ten' or 'silero'");
+            }
         } else if (arg[0] != '-') {
             input_path = arg;
         } else {
@@ -101,9 +101,7 @@ fn parseArgs() Args {
         .threshold = threshold_val,
         .threshold_off = threshold_off_val,
         .min_silence_ms = min_silence_ms,
-        .vad_model = vad_model,
-        .use_ten_vad = use_ten_vad,
-        .use_ten_vad_ggml = use_ten_vad_ggml,
+        .vad_choice = vad_choice,
     };
 }
 
@@ -121,9 +119,7 @@ fn printUsage() void {
         \\  --threshold <f32>        Onset threshold (default: {d:.3})
         \\  --threshold-off <f32>    Offset threshold (default: {d:.3})
         \\  --min-silence-ms <ms>    Min silence to split segments (default: 1000)
-        \\  --vad-model <path>       VAD model path
-        \\  --ten-vad                Use TEN-VAD native backend (default: Silero)
-        \\  --ten-vad-ggml           Use TEN-VAD GGML backend (experimental)
+        \\  --vad ten|silero         VAD backend (default: ten)
         \\
     , .{ VadFilter.default_threshold, VadFilter.default_threshold_off });
 }
@@ -216,41 +212,30 @@ pub fn main() !void {
     // Initialize VAD backend
     var silero_vad: SileroVad = undefined;
     var ten_vad_ggml_ctx: TenVadGgml = undefined;
-    var ten_vad: TenVad = undefined;
     var backend: VadBackend = undefined;
 
-    if (args.use_ten_vad) {
-        ten_vad = TenVad.init() catch |err| {
-            std.debug.print("Error initializing TEN-VAD: {}\n", .{err});
-            std.process.exit(1);
-        };
-        backend = .{ .ten_vad = &ten_vad };
-    } else if (args.use_ten_vad_ggml) {
-        const model: []const u8 = if (std.mem.eql(u8, args.vad_model, "whisper.cpp/models/ggml-silero-v5.1.2.bin"))
-            "whisper.cpp/models/ten-vad-ggml.bin"
-        else
-            args.vad_model;
-        const model_z: [:0]const u8 = try allocator.dupeZ(u8, model);
-        defer allocator.free(model_z);
-        ten_vad_ggml_ctx = TenVadGgml.init(model_z) catch |err| {
-            std.debug.print("Error loading TEN-VAD GGML model {s}: {}\n", .{ model, err });
-            std.process.exit(1);
-        };
-        backend = .{ .ten_vad_ggml = &ten_vad_ggml_ctx };
-    } else {
-        const vad_model_z: [:0]const u8 = try allocator.dupeZ(u8, args.vad_model);
-        defer allocator.free(vad_model_z);
-        silero_vad = SileroVad.init(vad_model_z) catch |err| {
-            std.debug.print("Error loading Silero VAD model {s}: {}\n", .{ args.vad_model, err });
-            std.process.exit(1);
-        };
-        backend = .{ .silero = &silero_vad };
+    switch (args.vad_choice) {
+        .ten => {
+            const model: [:0]const u8 = "dist/models/ten-vad-ggml.bin";
+            ten_vad_ggml_ctx = TenVadGgml.init(model) catch |err| {
+                std.debug.print("Error loading TEN-VAD model {s}: {}\n", .{ model, err });
+                std.process.exit(1);
+            };
+            backend = .{ .ten_vad_ggml = &ten_vad_ggml_ctx };
+        },
+        .silero => {
+            const model: [:0]const u8 = "dist/models/ggml-silero-v5.1.2.bin";
+            silero_vad = SileroVad.init(model) catch |err| {
+                std.debug.print("Error loading Silero VAD model {s}: {}\n", .{ model, err });
+                std.process.exit(1);
+            };
+            backend = .{ .silero = &silero_vad };
+        },
     }
-    defer {
-        if (args.use_ten_vad) ten_vad.deinit()
-        else if (args.use_ten_vad_ggml) ten_vad_ggml_ctx.deinit()
-        else silero_vad.deinit();
-    }
+    defer switch (args.vad_choice) {
+        .ten => ten_vad_ggml_ctx.deinit(),
+        .silero => silero_vad.deinit(),
+    };
 
     // Process audio chunk-by-chunk, collecting metadata
     const chunk_size = VadFilter.chunk_pcm_bytes;

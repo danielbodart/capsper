@@ -5,7 +5,6 @@ const pw = @import("pipewire_c.zig");
 const vad_mod = @import("vad.zig");
 const SileroVad = vad_mod.SileroVad;
 const TenVadGgml = vad_mod.TenVadGgml;
-const TenVad = vad_mod.TenVad;
 const VadBackend = vad_mod.VadBackend;
 const VadFilter = vad_mod.VadFilter;
 const Pipeline = @import("pipeline.zig").Pipeline;
@@ -27,10 +26,10 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var model_path: [:0]const u8 = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
-    var vad_model_path: [:0]const u8 = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
-    var use_ten_vad: bool = false;
-    var use_ten_vad_ggml: bool = false;
+    var model_path: [:0]const u8 = "../models/ggml-large-v3-turbo-q5_0.bin";
+    var model_path_is_default = true;
+    const VadChoice = enum { ten, silero };
+    var vad_choice: VadChoice = .ten;
     var port: u16 = 43007;
     var warmup_file: ?[:0]const u8 = "jfk.wav";
     var warmup_file_is_default = true;
@@ -64,10 +63,10 @@ pub fn main() !void {
             verbose = true;
         } else if (std.mem.eql(u8, arg, "--model") or std.mem.eql(u8, arg, "-m")) {
             i += 1;
-            if (i < args.len) model_path = args[i];
-        } else if (std.mem.eql(u8, arg, "--vad-model")) {
-            i += 1;
-            if (i < args.len) vad_model_path = args[i];
+            if (i < args.len) {
+                model_path = args[i];
+                model_path_is_default = false;
+            }
         } else if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
             i += 1;
             if (i < args.len) port = std.fmt.parseInt(u16, args[i], 10) catch |err| blk: {
@@ -153,10 +152,18 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--min-silence-ms")) {
             i += 1;
             if (i < args.len) min_silence_ms = std.fmt.parseInt(u32, args[i], 10) catch null;
-        } else if (std.mem.eql(u8, arg, "--ten-vad")) {
-            use_ten_vad = true;
-        } else if (std.mem.eql(u8, arg, "--ten-vad-ggml")) {
-            use_ten_vad_ggml = true;
+        } else if (std.mem.eql(u8, arg, "--vad")) {
+            i += 1;
+            if (i < args.len) {
+                if (std.mem.eql(u8, args[i], "ten")) {
+                    vad_choice = .ten;
+                } else if (std.mem.eql(u8, args[i], "silero")) {
+                    vad_choice = .silero;
+                } else {
+                    std.debug.print("Invalid --vad value '{s}', expected 'ten' or 'silero'\n", .{args[i]});
+                    return;
+                }
+            }
         } else {
             printUsage();
             return;
@@ -180,15 +187,28 @@ pub fn main() !void {
         input_mode = .local;
     }
 
+    // Resolve exe-relative paths (default paths are relative to the binary location)
+    const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch null;
+    defer if (exe_dir) |d| allocator.free(d);
+
+    const resolved_model_path: [:0]const u8 = blk: {
+        if (!model_path_is_default or std.fs.path.isAbsolute(model_path)) break :blk model_path;
+        if (exe_dir) |d| {
+            break :blk std.fs.path.joinZ(allocator, &.{ d, model_path }) catch break :blk model_path;
+        }
+        break :blk model_path;
+    };
+    defer if (resolved_model_path.ptr != model_path.ptr) allocator.free(resolved_model_path);
+
     // Load whisper model
-    std.debug.print("Loading model: {s}\n", .{model_path});
+    std.debug.print("Loading model: {s}\n", .{resolved_model_path});
     var cparams = c.whisper_context_default_params();
     cparams.use_gpu = true;
     cparams.flash_attn = false;
     cparams.dtw_token_timestamps = true;
     cparams.dtw_aheads_preset = c.WHISPER_AHEADS_LARGE_V3_TURBO;
 
-    const ctx = c.whisper_init_from_file_with_params(model_path.ptr, cparams) orelse {
+    const ctx = c.whisper_init_from_file_with_params(resolved_model_path.ptr, cparams) orelse {
         std.debug.print("Failed to load model\n", .{});
         return;
     };
@@ -199,40 +219,46 @@ pub fn main() !void {
     // Load VAD backend
     var silero_vad: SileroVad = undefined;
     var ten_vad_ggml: TenVadGgml = undefined;
-    var ten_vad: TenVad = undefined;
     var vad_backend: VadBackend = undefined;
 
-    if (use_ten_vad) {
-        std.debug.print("Loading VAD (ten-vad)\n", .{});
-        ten_vad = TenVad.init() catch |err| {
-            std.debug.print("Failed to init TEN-VAD: {}\n", .{err});
-            return;
-        };
-        vad_backend = .{ .ten_vad = &ten_vad };
-    } else if (use_ten_vad_ggml) {
-        const ten_vad_model: [:0]const u8 = if (std.mem.eql(u8, vad_model_path, "whisper.cpp/models/ggml-silero-v5.1.2.bin"))
-            "whisper.cpp/models/ten-vad-ggml.bin"
-        else
-            vad_model_path;
-        std.debug.print("Loading VAD model (ten-vad-ggml): {s}\n", .{ten_vad_model});
-        ten_vad_ggml = TenVadGgml.init(ten_vad_model) catch |err| {
-            std.debug.print("Failed to init TEN-VAD GGML: {}\n", .{err});
-            return;
-        };
-        vad_backend = .{ .ten_vad_ggml = &ten_vad_ggml };
-    } else {
-        std.debug.print("Loading VAD model (silero): {s}\n", .{vad_model_path});
-        silero_vad = SileroVad.init(vad_model_path) catch |err| {
-            std.debug.print("Failed to init Silero VAD: {}\n", .{err});
-            return;
-        };
-        vad_backend = .{ .silero = &silero_vad };
+    switch (vad_choice) {
+        .ten => {
+            const vad_rel_path: [:0]const u8 = "../models/ten-vad-ggml.bin";
+            const vad_path: [:0]const u8 = blk: {
+                if (exe_dir) |d| {
+                    break :blk std.fs.path.joinZ(allocator, &.{ d, vad_rel_path }) catch break :blk vad_rel_path;
+                }
+                break :blk vad_rel_path;
+            };
+            defer if (vad_path.ptr != vad_rel_path.ptr) allocator.free(vad_path);
+            std.debug.print("Loading VAD model (ten-vad): {s}\n", .{vad_path});
+            ten_vad_ggml = TenVadGgml.init(vad_path) catch |err| {
+                std.debug.print("Failed to init TEN-VAD: {}\n", .{err});
+                return;
+            };
+            vad_backend = .{ .ten_vad_ggml = &ten_vad_ggml };
+        },
+        .silero => {
+            const vad_rel_path: [:0]const u8 = "../models/ggml-silero-v5.1.2.bin";
+            const vad_path: [:0]const u8 = blk: {
+                if (exe_dir) |d| {
+                    break :blk std.fs.path.joinZ(allocator, &.{ d, vad_rel_path }) catch break :blk vad_rel_path;
+                }
+                break :blk vad_rel_path;
+            };
+            defer if (vad_path.ptr != vad_rel_path.ptr) allocator.free(vad_path);
+            std.debug.print("Loading VAD model (silero): {s}\n", .{vad_path});
+            silero_vad = SileroVad.init(vad_path) catch |err| {
+                std.debug.print("Failed to init Silero VAD: {}\n", .{err});
+                return;
+            };
+            vad_backend = .{ .silero = &silero_vad };
+        },
     }
-    defer {
-        if (use_ten_vad) ten_vad.deinit()
-        else if (use_ten_vad_ggml) ten_vad_ggml.deinit()
-        else silero_vad.deinit();
-    }
+    defer switch (vad_choice) {
+        .ten => ten_vad_ggml.deinit(),
+        .silero => silero_vad.deinit(),
+    };
 
     // Tokenize domain terms (requires whisper context)
     var prompt_tokens: []c.whisper_token = &.{};
@@ -336,10 +362,10 @@ pub fn main() !void {
         // Default warmup file lives next to the binary; user-provided paths resolve from CWD
         const resolved_path = blk: {
             if (!warmup_file_is_default or std.fs.path.isAbsolute(wf)) break :blk wf;
-            const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch break :blk wf;
-            defer allocator.free(exe_dir);
-            const joined = std.fs.path.joinZ(allocator, &.{ exe_dir, wf }) catch break :blk wf;
-            break :blk joined;
+            if (exe_dir) |d| {
+                break :blk std.fs.path.joinZ(allocator, &.{ d, wf }) catch break :blk wf;
+            }
+            break :blk wf;
         };
         defer if (resolved_path.ptr != wf.ptr) allocator.free(resolved_path);
 
@@ -434,7 +460,7 @@ fn requireGpu() bool {
 }
 
 fn printUsage() void {
-    std.debug.print("Usage: capsper [--model PATH] [--vad-model PATH] [--port PORT]\n", .{});
+    std.debug.print("Usage: capsper [--model PATH] [--port PORT]\n", .{});
     std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
     std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
@@ -442,7 +468,7 @@ fn printUsage() void {
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
     std.debug.print("       [--transcribe FILE]\n", .{});
     std.debug.print("       [--pw-gain FACTOR]\n", .{});
-    std.debug.print("       [--ten-vad | --ten-vad-ggml] [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
+    std.debug.print("       [--vad ten|silero] [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
     std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
 }

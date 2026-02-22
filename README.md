@@ -12,7 +12,7 @@ Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://g
 
 1. A single Zig binary grabs your keyboard via evdev, intercepts CapsLock as push-to-talk
 2. Audio is captured directly via PipeWire while the trigger key is held
-3. Incremental transcription runs on the GPU with VAD (Silero, on CPU) and token accumulation for consistency
+3. Incremental transcription runs on the GPU with VAD (TEN-VAD, on CPU) and token accumulation for consistency
 4. Transcribed text is injected as keystrokes via uinput into the focused window
 
 ## Requirements
@@ -152,7 +152,7 @@ This auto-detects and handles everything:
 - Installs toolchain (mise, Zig 0.15.2, Bun) on first run via `bootstrap.sh`
 - Installs system packages (`pv`, `ncat`)
 - Initialises the whisper.cpp submodule if needed
-- Downloads models (~574 MB Whisper model + VAD model) if missing
+- Downloads the Whisper model (~574 MB) if missing (VAD models are included in the repo)
 - Compiles the Zig binary (pre-built whisper.cpp shared libs are committed via Git LFS)
 - Runs unit and property tests, then integration smoke tests
 - Configures uinput permissions (for text injection via virtual keyboard)
@@ -166,7 +166,7 @@ Every step is incremental — re-running `./run` is fast if everything is alread
 Physical Keyboard ──evdev──→ capsper ──uinput──→ Virtual Keyboard → Apps
                               │
                               ├─ Trigger key held → PipeWire audio capture
-                              ├─ whisper.cpp (GPU) + Silero VAD (CPU)
+                              ├─ whisper.cpp (GPU) + TEN-VAD (CPU)
                               ├─ AlignAtt streaming + token accumulation
                               └─ All other keys → forwarded transparently
 ```
@@ -183,7 +183,7 @@ A single self-contained binary (`src/`):
 | `alignatt.zig` | Cross-attention analysis for streaming stop/rewind decisions |
 | `recorder.zig` | Per-utterance debug recording (WAV + diagnostic log capture) |
 | `utils.zig` | Pure utility functions (PCM conversion, WAV parsing, buffer trimming, RMS analysis) |
-| `vad.zig` | Silero VAD wrapper for speech/silence detection |
+| `vad.zig` | Multi-backend VAD (TEN-VAD GGML default, Silero via whisper.cpp) |
 | `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream`, software gain |
 | `pw_detect.zig` | Interactive PipeWire setup wizard (device selection, channel detection, gain calibration) |
 | `auto_gain.zig` | Pure-math auto-gain controller (runtime + calibration), capped at PipeWire's 10x ceiling |
@@ -199,7 +199,7 @@ A single self-contained binary (`src/`):
 
 When the 30-second sliding window trims audio from the front, the corresponding tokens are demoted from forced output to conditioning context. Instead of being deleted (which caused misalignment and hallucination), they move to the `<|startofprev|>` section before `[sot]`, where the model treats them as a hint rather than a constraint. This two-tier approach — forced tokens for audio in the buffer, conditioning tokens for trimmed audio — is inspired by SimulStreaming's token management.
 
-**CPU-only VAD** — Silero voice activity detection runs on the CPU (2 threads, ~5ms per check) while whisper.cpp transcription runs on the GPU. This avoids GPU context switching overhead for the frequent VAD checks (every 0.5–1s) and means VAD has zero impact on transcription throughput.
+**CPU-only VAD** — TEN-VAD voice activity detection runs on the CPU via a pure GGML reimplementation (296 KB model, zero additional dependencies) while whisper.cpp transcription runs on the GPU. This avoids GPU context switching overhead for the frequent VAD checks (every 0.5–1s) and means VAD has zero impact on transcription throughput. Silero VAD is also available via `--vad silero`.
 
 **Transparent keyboard forwarding** — Rather than intercepting specific keys, Capsper grabs all physical keyboards via `EVIOCGRAB` and creates a uinput virtual keyboard that forwards every event transparently. Only the trigger key (CapsLock) is consumed; all other keys pass through unchanged. This means the grab is invisible to applications while giving Capsper exclusive access to the trigger. The virtual keyboard also handles text injection — transcribed text is emitted as synthetic keystrokes with proper shift-state handling, which works on both X11 and Wayland without any external tools. A panic sequence (Enter+Backspace+Escape simultaneously) ungrab all keyboards as a safety net.
 
@@ -212,8 +212,7 @@ Running `capsper` with no arguments prints usage and exits.
 ```
 capsper [OPTIONS]
 
-  --model, -m PATH        Whisper model path (default: whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin)
-  --vad-model PATH        VAD model path (default: whisper.cpp/models/ggml-silero-v5.1.2.bin)
+  --model, -m PATH        Whisper model path (default: ../models/ggml-large-v3-turbo-q5_0.bin relative to binary)
   --port, -p PORT         TCP port (default: 43007, use 0 for OS-assigned)
   --warmup-file PATH      WAV file for GPU warmup (default: jfk.wav next to binary)
   --no-warmup             Skip warmup inference
@@ -229,6 +228,7 @@ capsper [OPTIONS]
   --record-dir DIR        Record each utterance to DIR (WAV + diagnostic log)
   --record-keep N         Number of recording pairs to keep (default: 10, ring buffer)
   --transcribe FILE       Batch-transcribe a WAV file (non-streaming) and exit
+  --vad ten|silero        VAD backend (default: ten)
   --pw-detect             Interactive setup wizard (device selection, channel detection, gain calibration)
   --detect-duration SECS  Duration per detection phase (default: 5)
   --verbose               Enable verbose logging
@@ -276,7 +276,7 @@ On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
 | Key press → PipeWire connect | ~2ms | `pw_stream_connect` request |
 | PipeWire stream setup | ~330ms | Format negotiation, source starts delivering buffers |
 | Audio accumulation | ~1,000ms | Waiting for 1s of audio (`transcribe_interval_bytes`) |
-| VAD speech detection | ~15ms | Silero VAD on last 0.5s window |
+| VAD speech detection | ~15ms | TEN-VAD on last 0.5s window |
 | Mel spectrogram | ~15ms | Incremental, only computes new frames |
 | Encoder (self-attention) | ~100ms | Full self-attention, not incrementalisable |
 | Decoder | ~5ms | Autoregressive token generation |
@@ -302,7 +302,7 @@ Once audio is flowing, new words appear every ~1s (the transcription interval). 
 
 **"Failed to load model"** — model file not found. Download it:
 ```bash
-cd whisper.cpp/models && ./download-ggml-model.sh large-v3-turbo-q5_0
+curl -L -o dist/models/ggml-large-v3-turbo-q5_0.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
 ```
 
 **Cannot open /dev/input** — ensure your user is in the `input` group (`groups` to check, `sudo usermod -aG input $USER` then log out/in).

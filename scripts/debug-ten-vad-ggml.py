@@ -742,7 +742,7 @@ def main():
                         help="Path to native libten_vad.so")
     parser.add_argument("--onnx", default="ten-vad/src/onnx_model/ten-vad.onnx",
                         help="Path to ONNX model (for conv+LSTM validation)")
-    parser.add_argument("--ggml", default="whisper.cpp/models/ten-vad-ggml.bin",
+    parser.add_argument("--ggml", default="dist/models/ten-vad-ggml.bin",
                         help="Path to GGML model file (for weight loading)")
     parser.add_argument("--features-only", action="store_true",
                         help="Only compare feature extraction, skip model inference")

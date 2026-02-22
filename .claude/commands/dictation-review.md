@@ -8,8 +8,8 @@ Analyze captured debug recordings to find transcription issues and create regres
 
 2. **For each recording**:
    - Read the `.log` file and extract the "Emitted Text" section (what streaming mode produced)
-   - Batch-transcribe the `.wav` file using: `./dist/bin/capsper --transcribe <file> --model <model> --vad-model <vad-model> 2>/dev/null`
-     - Model paths: check the systemd service file at `~/.config/systemd/user/capsper.service` for the `--model` and `--vad-model` paths, or fall back to `whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin` and `whisper.cpp/models/ggml-silero-v5.1.2.bin`
+   - Batch-transcribe the `.wav` file using: `./dist/bin/capsper --transcribe <file> --model <model> 2>/dev/null`
+     - Model path: check the systemd service file at `~/.config/systemd/user/capsper.service` for the `--model` path, or fall back to `dist/models/ggml-large-v3-turbo-q5_0.bin`
    - Compare streaming vs batch output, normalizing both (lowercase, strip punctuation except apostrophes)
    - Calculate the WAV duration: `(file_size - 44) / 32000` seconds
 

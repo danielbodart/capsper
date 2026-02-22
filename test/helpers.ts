@@ -6,8 +6,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 export const BINARY = "./dist/bin/capsper";
-export const MODEL = "whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin";
-export const VAD_MODEL = "whisper.cpp/models/ggml-silero-v5.1.2.bin";
+export const MODEL = "dist/models/ggml-large-v3-turbo-q5_0.bin";
 export const WARMUP_FILE = "test/jfk.wav";
 
 // Track all spawned child processes so we can kill them on exit/signal.

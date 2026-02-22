@@ -179,7 +179,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert TEN-VAD ONNX to GGML")
     parser.add_argument("--onnx", default="/home/dan/Projects/ten-vad/src/onnx_model/ten-vad.onnx",
                         help="Path to ONNX model")
-    parser.add_argument("--output", default="whisper.cpp/models/ten-vad-ggml.bin",
+    parser.add_argument("--output", default="dist/models/ten-vad-ggml.bin",
                         help="Path to output GGML file")
     args = parser.parse_args()
     convert(args.onnx, args.output)

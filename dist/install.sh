@@ -14,9 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
 
 WHISPER_MODEL_NAME="ggml-large-v3-turbo-q5_0.bin"
-VAD_MODEL_NAME="ggml-silero-v5.1.2.bin"
 WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${WHISPER_MODEL_NAME}"
-VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/${VAD_MODEL_NAME}"
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 RECORDINGS_DIR="$INSTALL_DIR/recordings"
@@ -88,40 +86,25 @@ check_permissions() {
 download_models() {
     local model_dir="$1"
     mkdir -p "$model_dir"
-    local missing=()
 
-    [ -f "$model_dir/$WHISPER_MODEL_NAME" ] || missing+=("Whisper model (large-v3-turbo-q5_0, ~574 MB)")
-    [ -f "$model_dir/$VAD_MODEL_NAME" ] || missing+=("VAD model (silero-v5.1.2, ~2 MB)")
-
-    if [ ${#missing[@]} -eq 0 ]; then
-        echo "Models already present."
+    if [ -f "$model_dir/$WHISPER_MODEL_NAME" ]; then
+        echo "Whisper model already present."
         return
     fi
 
-    echo "Missing models:"
-    for m in "${missing[@]}"; do echo "  - $m"; done
+    echo "Missing: Whisper model (large-v3-turbo-q5_0, ~574 MB)"
 
     if ! confirm "Download now?"; then
         echo ""
         echo "Models directory: $model_dir"
-        echo "Copy the following files there before starting capsper:"
-        [ ! -f "$model_dir/$WHISPER_MODEL_NAME" ] && echo "  - $WHISPER_MODEL_NAME"
-        [ ! -f "$model_dir/$VAD_MODEL_NAME" ] && echo "  - $VAD_MODEL_NAME"
+        echo "Copy $WHISPER_MODEL_NAME there before starting capsper."
         return
     fi
 
     require_cmd curl "Install curl to download models."
-
-    if [ ! -f "$model_dir/$WHISPER_MODEL_NAME" ]; then
-        echo "Downloading Whisper model..."
-        curl -L --progress-bar -o "$model_dir/$WHISPER_MODEL_NAME" "$WHISPER_MODEL_URL"
-    fi
-    if [ ! -f "$model_dir/$VAD_MODEL_NAME" ]; then
-        echo "Downloading VAD model..."
-        curl -L --progress-bar -o "$model_dir/$VAD_MODEL_NAME" "$VAD_MODEL_URL"
-    fi
-
-    echo "Models downloaded."
+    echo "Downloading Whisper model..."
+    curl -L --progress-bar -o "$model_dir/$WHISPER_MODEL_NAME" "$WHISPER_MODEL_URL"
+    echo "Model downloaded."
 }
 
 # ─── PipeWire Channel Detection & Gain Calibration ───────────────────────────
@@ -157,7 +140,6 @@ install_service() {
         exec_start="$exec_start --pw-gain $gain"
     fi
     exec_start="$exec_start --model $model_dir/$WHISPER_MODEL_NAME"
-    exec_start="$exec_start --vad-model $model_dir/$VAD_MODEL_NAME"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
     [ -n "$domain_terms" ] && exec_start="$exec_start --domain-terms $domain_terms"
     if $enable_recordings; then
@@ -367,9 +349,10 @@ install_files() {
 
     mkdir -p "$release_dir"
 
-    # Copy bin/ and lib/ into versioned directory
+    # Copy bin/, lib/, and models/ into versioned directory
     cp -a "$SCRIPT_DIR/bin" "$release_dir/"
     cp -a "$SCRIPT_DIR/lib" "$release_dir/"
+    [ -d "$SCRIPT_DIR/models" ] && cp -a "$SCRIPT_DIR/models" "$release_dir/"
     cp "$SCRIPT_DIR/VERSION" "$release_dir/"
 
     # Save current version for rollback (if upgrading)
@@ -521,7 +504,7 @@ cmd_install() {
                 low_latency=true
             fi
 
-            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$project_dir/whisper.cpp/models" "" false "$domain_terms" $enable_recordings $low_latency "$gain"
+            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$SCRIPT_DIR/models" "" false "$domain_terms" $enable_recordings $low_latency "$gain"
         fi
     else
         echo "=== Capsper Installer ==="

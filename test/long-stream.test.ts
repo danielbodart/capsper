@@ -3,9 +3,7 @@ import { hasGpu, ensureBinary, ensureFile, startServer, readPcm, streamPcmFast, 
 
 const gpu = await hasGpu();
 const vadBackend = process.env.VAD_BACKEND;
-const extraServerArgs: string[] = vadBackend === "ten-vad" ? ["--ten-vad"]
-    : vadBackend === "ten-vad-ggml" ? ["--ten-vad-ggml"]
-    : [];
+const extraServerArgs: string[] = vadBackend ? ["--vad", vadBackend] : [];
 
 describe.skipIf(!gpu)("long-stream", () => {
     beforeAll(() => {
