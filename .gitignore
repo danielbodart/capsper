@@ -10,4 +10,5 @@ capsper-linux-x86_64.tar.gz
 capsper-linux-x86_64.tar.gz.sha256
 .claude/worktrees/
 .worktrees/
+test/results/vad-segments/
 .playwright-mcp

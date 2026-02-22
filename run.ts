@@ -208,6 +208,12 @@ export async function slowTest() {
     await $`bun test test/`;
 }
 
+export async function vadTest(...args: string[]) {
+    await build();
+    const input = args[0] || "test/long-pause.wav";
+    await $`./dist/bin/vad-filter-test ${input} ${args.slice(1)}`;
+}
+
 export async function dist() {
     ensureBinary();
 
@@ -286,6 +292,7 @@ const commands: Record<string, Function> = {
     "medium-test": mediumTest,
     "long-test": longTest,
     "slow-test": slowTest,
+    "vad-test": vadTest,
     "rebuild-whisper": rebuildWhisper,
 };
 

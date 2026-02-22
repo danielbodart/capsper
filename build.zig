@@ -56,6 +56,27 @@ pub fn build(b: *std.Build) void {
     // Install warmup file next to the binary (dist/bin/jfk.wav)
     b.installFile("test/jfk.wav", "bin/jfk.wav");
 
+    // --- VAD filter test tool ---
+    const vad_filter_test_exe = b.addExecutable(.{
+        .name = "vad-filter-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vad_filter_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    vad_filter_test_exe.root_module.addIncludePath(b.path("whisper.cpp/include"));
+    vad_filter_test_exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
+    vad_filter_test_exe.root_module.addLibraryPath(b.path("dist/lib"));
+    vad_filter_test_exe.root_module.addRPathSpecial("$ORIGIN/../lib");
+    vad_filter_test_exe.each_lib_rpath = false;
+    vad_filter_test_exe.linkSystemLibrary("whisper");
+    vad_filter_test_exe.linkSystemLibrary("ggml");
+    vad_filter_test_exe.linkSystemLibrary("ggml-base");
+    vad_filter_test_exe.linkSystemLibrary("ggml-cpu");
+    vad_filter_test_exe.linkLibC();
+    b.installArtifact(vad_filter_test_exe);
+
     // --- Run step ---
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -107,6 +128,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_auto_gain_tests = b.addRunArtifact(auto_gain_tests);
     test_step.dependOn(&run_auto_gain_tests.step);
+
+    // vad.zig tests need whisper linked (imports whisper_c.zig at compile time,
+    // but unit tests only exercise processChunkProb which is pure Zig)
+    const vad_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vad.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    vad_tests.root_module.addIncludePath(b.path("whisper.cpp/include"));
+    vad_tests.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
+    vad_tests.root_module.addLibraryPath(b.path("dist/lib"));
+    vad_tests.linkSystemLibrary("whisper");
+    vad_tests.linkLibC();
+    const run_vad_tests = b.addRunArtifact(vad_tests);
+    test_step.dependOn(&run_vad_tests.step);
 
     // input.zig tests need libc for @cImport of linux/input-event-codes.h
     const input_tests = b.addTest(.{
