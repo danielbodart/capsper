@@ -134,13 +134,7 @@ async function version(): Promise<string> {
 
 // ─── Commands ──────────────────────────────────────────────────────────────
 
-export async function build() {
-    await ensureDeps();
-    await ensureSubmodule();
-    await ensureLfs();
-    if (!process.env.CI) await ensureModels();
-
-    // Copy ten-vad native library to dist/lib/ (from submodule)
+async function ensureTenVadLib() {
     const tenVadSrc = "ten-vad/lib/Linux/x64/libten_vad.so";
     const tenVadDst = "dist/lib/libten_vad.so";
     if (existsSync(tenVadSrc)) {
@@ -149,7 +143,14 @@ export async function build() {
         console.error(`ERROR: ${tenVadSrc} not found — run: git submodule update --init`);
         process.exit(1);
     }
+}
 
+export async function build() {
+    await ensureDeps();
+    await ensureSubmodule();
+    await ensureLfs();
+    if (!process.env.CI) await ensureModels();
+    await ensureTenVadLib();
     const ver = await version();
     console.log(`Building v${ver}...`);
     await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
@@ -283,6 +284,7 @@ export async function lint() {
 export async function ci() {
     await ensureSubmodule();
     await ensureLfs();
+    await ensureTenVadLib();
     const ver = await version();
     console.log("Running static analysis...");
     await $`zig build analyze`;
