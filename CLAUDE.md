@@ -47,9 +47,9 @@ Push-to-talk voice dictation for Linux. Self-contained binary: grabs keyboards v
 Single binary handles everything: keyboard grab, audio capture, transcription, text injection.
 
 - **`main.zig`** — Entry point. Loads whisper + VAD models, warmup, wires input handler to server.
-- **`server.zig`** — Streaming state machine (`idle` -> `speaking` -> `trailing_silence`). Accepts PCM from PipeWire (local mode) or TCP socket. Uses VAD for speech boundaries. Emits word-level deltas. Supports `TypeCallback` for uinput text injection.
+- **`server.zig`** — Streaming 2-state machine (`idle` → `speaking`). Accepts PCM from PipeWire (local mode) or TCP socket. VadFilter edge detection drives state transitions. `speech_buf` only contains speech audio (never silence). Emits word-level deltas. Supports `TypeCallback` for uinput text injection.
 - **`input.zig`** — evdev/uinput input handling. Grabs physical keyboards, forwards all keys through virtual uinput keyboard, intercepts trigger key for push-to-talk, injects transcribed text as keystrokes. Includes hotplug (inotify) and panic sequence (Enter+Backspace+Escape = ungrab).
-- **`pipeline.zig`** — Low-level whisper.cpp integration. Manually drives mel spectrogram, encode, and autoregressive decode loop (no `whisper_full`). Implements AlignAtt streaming policy via cross-attention analysis to decide when to stop decoding. Supports domain term prompting via `<|startofprev|>` token prefix.
+- **`pipeline.zig`** — Low-level whisper.cpp integration. Manually drives mel spectrogram, encode, and autoregressive decode loop (no `whisper_full`). Implements AlignAtt streaming policy via cross-attention analysis for stopping and rewind detection. Two-tier token system: forced tokens (after `[notimestamps]`) for audio in buffer, context tokens (before `[sot]`) for trimmed audio. Supports domain term prompting via `<|startofprev|>` token prefix.
 - **`alignatt.zig`** — AlignAtt attention analysis: z-score normalization, median filtering, head averaging, stopping/rewind detection.
 - **`utils.zig`** — Pure utility functions (no C deps): PCM-to-float conversion, buffer trimming, WAV parsing/writing, per-channel RMS analysis, text preview. Independently unit-tested.
 - **`audio_capture.zig`** — PipeWire audio capture via `pw_thread_loop` + `pw_stream`. Supports software gain via `setGain()`.

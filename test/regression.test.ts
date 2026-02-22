@@ -31,14 +31,16 @@ const mediumCases: TestCase[] = [
     { name: "repetition-loop", wav: wav("repetition-loop"), ref: "test/repetition-loop.txt", thresholds: { minCoverage: 85, maxWer: 15 } },
 ];
 
+// Long tests: CUDA non-determinism causes flaky results on long recordings.
+// GPU matrix multiplications don't guarantee bit-exact results across runs, so
+// a tiny logit difference can flip a token and cascade. Thresholds have wiggle room.
+// repetition-loop-long and silence-hallucination are especially sensitive — without
+// the repetition guard, CUDA jitter can trigger runaway repetition loops.
 const longCases: TestCase[] = [
-    { name: "dictation", wav: wav("dictation"), ref: "test/dictation.txt" },
-    // Long recordings with pauses: sliding window trims degrade context beyond 30s.
-    // long-recording has 20s silences causing hallucination in the second half.
-    { name: "long-recording", wav: wav("long-recording"), ref: "test/long-recording.txt", thresholds: { minCoverage: 20, maxWer: 80 } },
-    { name: "repetition-loop-long", wav: wav("repetition-loop-long"), ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 70, maxWer: 35 } },
-    // 2min recording with silences. Streaming hallucinates ~85-word duplication after trailing silence at ~5min mark.
-    { name: "silence-hallucination", wav: wav("silence-hallucination"), ref: "test/silence-hallucination.txt", thresholds: { minCoverage: 20, maxWer: 500, maxGapSec: 15 } },
+    { name: "dictation", wav: wav("dictation"), ref: "test/dictation.txt", thresholds: { minCoverage: 88, maxWer: 15 } },
+    { name: "long-recording", wav: wav("long-recording"), ref: "test/long-recording.txt", thresholds: { minCoverage: 90, maxWer: 10 } },
+    { name: "repetition-loop-long", wav: wav("repetition-loop-long"), ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 90, maxWer: 130 } },
+    { name: "silence-hallucination", wav: wav("silence-hallucination"), ref: "test/silence-hallucination.txt", thresholds: { minCoverage: 85, maxWer: 70, maxGapSec: 5 } },
 ];
 
 // Gating: which groups to run

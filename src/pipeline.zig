@@ -52,6 +52,16 @@ pub const Pipeline = struct {
     // Parallel to accumulated_tokens — used for exact trim decisions.
     accumulated_frames: std.ArrayListUnmanaged(usize) = .{},
 
+    // Context tokens from audio that has been trimmed from the buffer.
+    // Fed as conditioning BEFORE [sot] (in the <|startofprev|> section).
+    // The model uses these as a hint but isn't forced to reproduce them.
+    context_tokens: std.ArrayListUnmanaged(c.whisper_token) = .{},
+
+    // Cross-cycle rewind detection: last most-attended frame from previous decode.
+    // If attention jumps backwards by > rewind_threshold, tokens are discarded.
+    // Reset on segment boundary; adjusted on buffer trim.
+    last_attend_frame: ?usize = null,
+
     // Incremental mel spectrogram cache. Persists across transcribe cycles within
     // a VAD segment; reset on segment boundary.
     mel_buffer: mel.MelBuffer,
@@ -90,6 +100,7 @@ pub const Pipeline = struct {
         self.mel_buffer.deinit();
         self.accumulated_tokens.deinit(self.allocator);
         self.accumulated_frames.deinit(self.allocator);
+        self.context_tokens.deinit(self.allocator);
         c.whisper_free_state(self.state);
     }
 
@@ -101,26 +112,34 @@ pub const Pipeline = struct {
         try self.accumulated_frames.appendSlice(self.allocator, frames);
     }
 
-    /// Clear accumulated tokens/frames and mel cache (on VAD segment boundary / flush).
+    /// Clear all segment state: accumulated tokens, context tokens, mel cache, rewind cursor.
     pub fn resetSegment(self: *Pipeline) void {
         self.accumulated_tokens.clearRetainingCapacity();
         self.accumulated_frames.clearRetainingCapacity();
+        self.context_tokens.clearRetainingCapacity();
+        self.last_attend_frame = null;
         self.mel_buffer.reset();
     }
 
-    /// Handle audio trimmed from the front of the buffer: invalidate mel cache
-    /// and drop tokens whose audio was trimmed, adjusting remaining frame offsets.
-    pub fn handleTrim(self: *Pipeline, trimmed_bytes: usize) void {
+    /// Handle audio trimmed from the front of the buffer: invalidate mel cache,
+    /// adjust last_attend_frame, and demote tokens whose audio was trimmed from
+    /// forced (after [notimestamps]) to conditioning (before [sot]).
+    pub fn handleTrim(self: *Pipeline, trimmed_bytes: usize) !void {
         if (trimmed_bytes == 0) return;
 
         // Mel cache is relative to buffer start — invalidate after front trim.
         self.mel_buffer.reset();
 
+        // Convert trimmed bytes to encoder frame count (50fps = 320 samples/frame * 2 bytes/sample = 640 bytes/frame)
+        const trim_frame = trimmed_bytes / 640;
+
+        // Shift last_attend_frame so it stays relative to the new buffer start
+        if (self.last_attend_frame) |laf| {
+            self.last_attend_frame = laf -| trim_frame;
+        }
+
         const n = self.accumulated_tokens.items.len;
         if (n == 0) return;
-
-        // Convert trimmed bytes to encoder frame threshold (50fps = 320 samples/frame * 2 bytes/sample = 640 bytes/frame)
-        const trim_frame = trimmed_bytes / 640;
 
         // Find split point: first token whose frame >= trim_frame
         var drop: usize = 0;
@@ -128,9 +147,12 @@ pub const Pipeline = struct {
             if (frame >= trim_frame) break;
             drop += 1;
         }
-        // Always drop at least 1 token when audio was trimmed, to avoid
+        // Always demote at least 1 token when audio was trimmed, to avoid
         // tokens referencing trimmed-away audio when frame data is imprecise.
         if (drop == 0) drop = 1;
+
+        // Demote front tokens to context (conditioning before [sot])
+        try self.context_tokens.appendSlice(self.allocator, self.accumulated_tokens.items[0..drop]);
 
         // Shift remaining tokens and frames to front
         const remaining = n - drop;
@@ -204,20 +226,30 @@ pub const Pipeline = struct {
         }
         timing.encode_ms = msFromNs(t_encode);
 
-        // Step 3: Build prompt
-        //   [sot_prev] [domain_terms...] [sot] [lang] [transcribe] [notimestamps] [forced_tokens...]
-        // Or without domain terms or forced tokens:
-        //   [sot] [lang] [transcribe] [notimestamps]
+        // Step 3: Build prompt — two-tier token system:
+        //   [sot_prev] [domain_terms...] [context_tokens...] [sot] [lang] [transcribe] [notimestamps] [forced_tokens...]
+        //
+        // Before [sot] (<|startofprev|> section) = conditioning:
+        //   - domain_terms: fixed vocabulary hints (protected from trimming)
+        //   - context_tokens: tokens from audio that was trimmed from the buffer;
+        //     the model uses these as a hint but isn't forced to reproduce them
+        //
+        // After [notimestamps] = forced decoder output:
+        //   - forced_tokens: tokens corresponding to audio still in the buffer
         const sot_seq = [_]c.whisper_token{ self.sot, self.lang_en, self.tok_transcribe, self.notimestamps };
         const max_decode: usize = 224;
         const total_budget: usize = 448 - sot_seq.len - max_decode;
 
+        // Allocate budget: domain terms first (protected), then context, then forced
         const domain_len = @min(self.prompt_tokens.len, total_budget);
-        const forced_budget = total_budget - domain_len;
+        const context_budget = total_budget - domain_len;
+        const ctx_len = @min(self.context_tokens.items.len, context_budget);
+        const forced_budget = context_budget - ctx_len;
         const forced_len = @min(forced_tokens.len, forced_budget);
 
-        const has_conditioning = domain_len > 0;
-        const prefix_len: usize = if (has_conditioning) 1 + domain_len else 0;
+        // Need [sot_prev] prefix if we have any conditioning tokens (domain or context)
+        const has_conditioning = domain_len > 0 or ctx_len > 0;
+        const prefix_len: usize = if (has_conditioning) 1 + domain_len + ctx_len else 0;
 
         const full_prompt = try self.allocator.alloc(c.whisper_token, prefix_len + sot_seq.len + forced_len);
         defer self.allocator.free(full_prompt);
@@ -225,8 +257,15 @@ pub const Pipeline = struct {
         if (has_conditioning) {
             full_prompt[pos] = self.sot_prev;
             pos += 1;
-            @memcpy(full_prompt[pos..][0..domain_len], self.prompt_tokens[0..domain_len]);
-            pos += domain_len;
+            if (domain_len > 0) {
+                @memcpy(full_prompt[pos..][0..domain_len], self.prompt_tokens[0..domain_len]);
+                pos += domain_len;
+            }
+            if (ctx_len > 0) {
+                // Use most recent context tokens (trim from front when budget exceeded)
+                @memcpy(full_prompt[pos..][0..ctx_len], self.context_tokens.items[self.context_tokens.items.len - ctx_len ..]);
+                pos += ctx_len;
+            }
         }
         @memcpy(full_prompt[pos..][0..sot_seq.len], &sot_seq);
         pos += sot_seq.len;
@@ -341,10 +380,10 @@ pub const Pipeline = struct {
             // Update the frame for this token
             token_frames.items[token_frames.items.len - 1] = most_attended;
 
-            // AlignAtt stopping check (no rewind — pass null for last_attend_frame)
+            // AlignAtt stopping check with cross-cycle rewind detection
             const decision = alignatt.checkStopping(
                 most_attended, content_frames,
-                null, // no cross-cycle rewind detection
+                self.last_attend_frame,
                 flush, self.config,
             );
 
@@ -354,17 +393,20 @@ pub const Pipeline = struct {
                         _ = generated.pop();
                         _ = token_frames.pop();
                     }
+                    self.last_attend_frame = most_attended;
                     timing.stop_reason = "attn_end";
                     break;
                 },
                 .rewind_detected => {
-                    // Should not happen with null last_attend_frame, but handle gracefully
                     generated.clearRetainingCapacity();
                     token_frames.clearRetainingCapacity();
+                    self.last_attend_frame = null;
                     timing.stop_reason = "rewind";
                     break;
                 },
-                .continue_decoding => {},
+                .continue_decoding => {
+                    self.last_attend_frame = most_attended;
+                },
             }
         }
 

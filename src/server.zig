@@ -451,7 +451,7 @@ pub const Server = struct {
                 const trimmed = old_len - speech_buf.items.len;
                 speech_trim_total += trimmed;
                 if (trimmed > 0) {
-                    pipeline.handleTrim(trimmed);
+                    try pipeline.handleTrim(trimmed);
                 }
             }
         }
