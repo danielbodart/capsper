@@ -41,6 +41,15 @@ async function ensureDeps(opts?: { cuda?: boolean }) {
         if (!await which("cmake")) missing.push("cmake");
         if (!await which("nvcc")) {
             console.error("ERROR: nvcc not found. CUDA toolkit required for rebuild-whisper.");
+            console.error("       Install with: sudo apt install nvidia-cuda-toolkit");
+            process.exit(1);
+        }
+        // Verify CUDA 12.x toolkit (not 13+ which requires bleeding-edge drivers)
+        const nvccOut = await $`nvcc --version`.text();
+        const cudaVer = nvccOut.match(/release (\d+)\./)?.[1];
+        if (cudaVer !== "12") {
+            console.error(`ERROR: CUDA 12 toolkit required (found CUDA ${cudaVer ?? "unknown"}).`);
+            console.error("       Install with: sudo apt install nvidia-cuda-toolkit");
             process.exit(1);
         }
         if (!await which("nvidia-smi")) {

@@ -19,7 +19,7 @@ Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://g
 
 - Linux (Debian/Ubuntu)
 - NVIDIA GPU with ~4 GB VRAM (Turing or newer: GTX 16xx, RTX 20xx/30xx/40xx/50xx)
-- CUDA 13 runtime libraries (~600 MB — the installer will set this up for you)
+- NVIDIA GPU drivers (Ubuntu: `sudo ubuntu-drivers autoinstall`)
 - PipeWire (default audio server on modern Ubuntu/Fedora)
 
 ## Install
@@ -140,7 +140,7 @@ Where SimulStreaming targets multilingual translation with Whisper + a 9B-parame
 
 Want to hack on Capsper? You'll need the [requirements](#requirements) above. The Zig binary compiles without CUDA — pre-built whisper.cpp shared libs are committed via Git LFS.
 
-To rebuild the whisper.cpp shared libs (only needed after bumping the submodule), you'll need CUDA toolkit 12.8+ installed. The libs are compiled as PTX (virtual architectures) so no specific GPU hardware is required for compilation — the driver JIT-compiles to the target GPU at first launch.
+To rebuild the whisper.cpp shared libs (only needed after bumping the submodule), you'll need the CUDA 12 toolkit (`sudo apt install nvidia-cuda-toolkit`). The libs are compiled as PTX (virtual architectures) so no specific GPU hardware is required for compilation — the driver JIT-compiles to the target GPU at first launch.
 
 ```bash
 git clone --recurse-submodules https://github.com/danielbodart/capsper.git
