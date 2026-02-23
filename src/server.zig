@@ -258,8 +258,8 @@ pub const Server = struct {
 
         const start_ns = std.time.nanoTimestamp();
 
-        // Speech buffer — accumulates audio from VAD onset. Trailing silence is trimmed
-        // on offset (vad_event.trailing_silence_bytes). Fed to pipeline.transcribe().
+        // Speech buffer — only contains audio during confirmed speech (after VadFilter onset).
+        // Never contains silence. Fed to pipeline.transcribe().
         var speech_buf = std.ArrayListUnmanaged(u8){};
         defer speech_buf.deinit(self.allocator);
 
@@ -297,17 +297,14 @@ pub const Server = struct {
 
                 // VadFilter: run on raw audio for edge detection (handles any size via pcm_partial)
                 const was_triggered = vad_filter.triggered;
-                const vad_event = vad_filter.filterAudio(audio);
+                _ = vad_filter.filterAudio(audio);
 
                 // VadFilter onset edge: idle → speaking
                 if (!was_triggered and vad_filter.triggered and vad_state == .idle) {
                     vad_state = .speaking;
                     pipeline.resetSegment();
-                    // Append only from the onset point — discard pre-onset silence
-                    const onset_start = vad_event.onset_byte_offset orelse 0;
-                    const onset_audio = audio[onset_start..];
-                    try speech_buf.appendSlice(self.allocator, onset_audio);
-                    bytes_since_last_cycle += onset_audio.len;
+                    try speech_buf.appendSlice(self.allocator, audio);
+                    bytes_since_last_cycle += audio.len;
                     var ts_buf: [32]u8 = undefined;
                     std.debug.print("[{s}s] idle → speaking (buf={d})\n", .{ formatElapsed(&ts_buf, start_ns), speech_buf.items.len });
                     if (self.recorder) |rec| rec.logEvent(start_ns, "idle → speaking");
@@ -331,11 +328,6 @@ pub const Server = struct {
 
                 // VadFilter offset edge: speaking → flush → idle
                 if (was_triggered and !vad_filter.triggered and vad_state == .speaking) {
-                    // Trim trailing silence accumulated during the bridging period
-                    const silence_trim = vad_event.trailing_silence_bytes;
-                    if (silence_trim > 0 and silence_trim < speech_buf.items.len) {
-                        speech_buf.items.len -= silence_trim;
-                    }
                     if (speech_buf.items.len >= min_transcribe_bytes) {
                         cycle_count += 1;
                         const flush_emit = try self.transcribeAndEmit(&pipeline, speech_buf.items, true, output_fd, start_ns, type_cb, cycle_count, "vad-flush");
