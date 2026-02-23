@@ -426,6 +426,7 @@ test "processChunkProb: exact threshold_off boundary keeps triggered" {
     var filter = VadFilter{
         .backend = undefined,
         .allocator = std.testing.allocator,
+        .chunk_size = 512,
         .triggered = true,
         .silence_bytes = 4096,
     };
