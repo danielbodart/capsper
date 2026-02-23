@@ -9,7 +9,6 @@ const AutoGain = @import("auto_gain.zig").AutoGain;
 const utils = @import("utils.zig");
 const recorder_mod = @import("recorder.zig");
 const Recorder = recorder_mod.Recorder;
-const EndReason = recorder_mod.EndReason;
 
 const posix = std.posix;
 const net = std.net;
@@ -302,10 +301,7 @@ pub const Server = struct {
                     bytes_since_last_cycle += audio.len;
                     var ts_buf: [32]u8 = undefined;
                     std.debug.print("[{s}s] idle → speaking (buf={d})\n", .{ formatElapsed(&ts_buf, start_ns), speech_buf.items.len });
-                    if (self.recorder) |rec| {
-                        rec.startUtterance(speech_buf.items);
-                        rec.logEvent(start_ns, "idle → speaking");
-                    }
+                    if (self.recorder) |rec| rec.logEvent(start_ns, "idle → speaking");
                 } else if (vad_state == .speaking) {
                     try speech_buf.appendSlice(self.allocator, audio);
                     bytes_since_last_cycle += audio.len;
@@ -336,7 +332,7 @@ pub const Server = struct {
                     }
                     var ts_buf: [32]u8 = undefined;
                     std.debug.print("[{s}s] flush → idle\n", .{formatElapsed(&ts_buf, start_ns)});
-                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter, .flush);
+                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter);
                     vad_state = .idle;
                     cycle_count = 0;
                     bytes_since_last_cycle = 0;
@@ -365,12 +361,15 @@ pub const Server = struct {
                     }
                     var ts_buf: [32]u8 = undefined;
                     std.debug.print("[{s}s] flush → idle\n", .{formatElapsed(&ts_buf, start_ns)});
-                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter, .released);
+                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter);
                 } else {
                     speech_trim_total += speech_buf.items.len;
                     speech_buf.clearRetainingCapacity();
                     vad_filter.reset();
                 }
+                if (self.recorder) |rec| rec.endRecording() catch |err| {
+                    std.debug.print("[rec] write error: {}\n", .{err});
+                };
                 vad_state = .idle;
                 cycle_count = 0;
                 bytes_since_last_cycle = 0;
@@ -410,7 +409,10 @@ pub const Server = struct {
                 vad_filter.reset();
                 speech_trim_total += speech_buf.items.len;
                 speech_buf.clearRetainingCapacity();
-                if (self.recorder) |rec| rec.logEvent(start_ns, "PTT pressed");
+                if (self.recorder) |rec| {
+                    rec.startRecording();
+                    rec.logEvent(start_ns, "PTT pressed");
+                }
             }
 
             // --- Final flush on disconnect or timeout ---
@@ -422,10 +424,14 @@ pub const Server = struct {
                         std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
                         ptt_tracking_press_ns = 0;
                     }
-                    const end_reason: EndReason = if (!live) .released else .timeout;
-                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter, end_reason);
+                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter);
                 }
-                if (client_closed) return;
+                if (client_closed) {
+                    if (self.recorder) |rec| rec.endRecording() catch |err| {
+                        std.debug.print("[rec] write error: {}\n", .{err});
+                    };
+                    return;
+                }
                 speech_trim_total += speech_buf.items.len;
                 speech_buf.clearRetainingCapacity();
                 vad_filter.reset();
@@ -539,13 +545,10 @@ pub const Server = struct {
         speech_buf: *std.ArrayListUnmanaged(u8),
         speech_trim_total: *usize,
         vad_filter: *VadFilter,
-        end_reason: EndReason,
     ) void {
+        _ = self;
         pipeline.resetSegment();
         vad_filter.reset();
-        if (self.recorder) |rec| rec.endUtterance(end_reason) catch |err| {
-            std.debug.print("[rec] write error: {}\n", .{err});
-        };
         speech_trim_total.* += speech_buf.items.len;
         speech_buf.clearRetainingCapacity();
     }

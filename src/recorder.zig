@@ -3,20 +3,6 @@ const utils = @import("utils.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const EndReason = enum {
-    flush,
-    timeout,
-    released,
-
-    pub fn label(self: EndReason) []const u8 {
-        return switch (self) {
-            .flush => "flush",
-            .timeout => "timeout",
-            .released => "released",
-        };
-    }
-};
-
 pub const Recorder = struct {
     allocator: Allocator,
     dir: std.fs.Dir,
@@ -27,7 +13,7 @@ pub const Recorder = struct {
     emit_buf: std.ArrayListUnmanaged(u8),
     rec_buf: std.ArrayListUnmanaged(u8),
     active: bool,
-    utterance_start_ns: i128,
+    recording_start_ns: i128,
 
     pub fn init(allocator: Allocator, dir_path: []const u8, keep: usize, version: []const u8) !Recorder {
         const dir = try std.fs.cwd().openDir(dir_path, .{});
@@ -41,7 +27,7 @@ pub const Recorder = struct {
             .emit_buf = .{},
             .rec_buf = .{},
             .active = false,
-            .utterance_start_ns = 0,
+            .recording_start_ns = 0,
         };
     }
 
@@ -52,16 +38,14 @@ pub const Recorder = struct {
         self.dir.close();
     }
 
-    /// Called on idle→speaking. Seeds rec_buf with current pcm_buf (which contains
-    /// the pre-speech audio that triggered VAD) so the recording captures the full
-    /// utterance from the start, not just audio arriving after the state transition.
-    pub fn startUtterance(self: *Recorder, initial_pcm: []const u8) void {
+    /// Called when a session begins (PTT press or TCP connect).
+    /// Clears buffers and starts accumulating audio.
+    pub fn startRecording(self: *Recorder) void {
         self.rec_buf.clearRetainingCapacity();
-        self.rec_buf.appendSlice(self.allocator, initial_pcm) catch {};
         self.diag_buf.clearRetainingCapacity();
         self.emit_buf.clearRetainingCapacity();
         self.active = true;
-        self.utterance_start_ns = std.time.nanoTimestamp();
+        self.recording_start_ns = std.time.nanoTimestamp();
     }
 
     /// Called on each recv_buf read during active utterance. Appends PCM to rec_buf.
@@ -106,15 +90,16 @@ pub const Recorder = struct {
         self.emit_buf.appendSlice(self.allocator, text) catch {};
     }
 
-    /// Called at utterance end. Writes NNN.wav + NNN.log, advances seq.
-    pub fn endUtterance(self: *Recorder, reason: EndReason) !void {
+    /// Called when a session ends (PTT release or TCP disconnect).
+    /// Writes NNN.wav + NNN.log, advances seq.
+    pub fn endRecording(self: *Recorder) !void {
         if (!self.active) return;
         self.active = false;
 
         const idx = self.seq % self.keep;
         self.seq += 1;
 
-        // Write WAV: build in memory, then write atomically
+        // Write WAV
         var wav_name_buf: [16]u8 = undefined;
         const wav_name = std.fmt.bufPrint(&wav_name_buf, "{d:0>3}.wav", .{idx}) catch return;
         {
@@ -126,19 +111,18 @@ pub const Recorder = struct {
             try file.writeAll(wav_buf.items);
         }
 
-        // Write log: build in memory, then write atomically
+        // Write log
         var log_name_buf: [16]u8 = undefined;
         const log_name = std.fmt.bufPrint(&log_name_buf, "{d:0>3}.log", .{idx}) catch return;
         {
             var log_buf = std.ArrayListUnmanaged(u8){};
             defer log_buf.deinit(self.allocator);
             const w = log_buf.writer(self.allocator);
-            const duration_ms = self.utteranceDurationMs();
+            const duration_ms = self.recordingDurationMs();
             std.fmt.format(w, "=== Capsper Recording {d:0>3} (v{s}) ===\n", .{ self.seq - 1, self.version }) catch {};
             std.fmt.format(w, "Duration: {d}.{d}s ({d} bytes)\n", .{
                 duration_ms / 1000, (duration_ms % 1000) / 100, self.rec_buf.items.len,
             }) catch {};
-            std.fmt.format(w, "End reason: {s}\n", .{reason.label()}) catch {};
             w.writeAll("\n--- Emitted Text ---\n") catch {};
             w.writeAll(self.emit_buf.items) catch {};
             w.writeAll("\n\n--- Cycle Log ---\n") catch {};
@@ -153,8 +137,8 @@ pub const Recorder = struct {
         });
     }
 
-    fn utteranceDurationMs(self: *const Recorder) u64 {
-        const elapsed_ns = std.time.nanoTimestamp() - self.utterance_start_ns;
+    fn recordingDurationMs(self: *const Recorder) u64 {
+        const elapsed_ns = std.time.nanoTimestamp() - self.recording_start_ns;
         return @intCast(@max(0, @divTrunc(elapsed_ns, 1_000_000)));
     }
 };
