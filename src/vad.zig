@@ -148,7 +148,7 @@ pub const VadFilter = struct {
     pub const default_threshold: f32 = 0.3;
     pub const default_threshold_off: f32 = 0.1;
     pub const default_min_silence_bytes: usize = 32000; // 1000ms at 32000 bytes/sec
-    pub const chunk_pcm_bytes: usize = 1024; // 512 samples * 2 bytes
+    pub const chunk_pcm_bytes: usize = 512; // 256 samples * 2 bytes — one TEN-VAD hop per chunk
 
     threshold: f32 = default_threshold,
     threshold_off: f32 = default_threshold_off,
@@ -162,6 +162,12 @@ pub const VadFilter = struct {
     pcm_partial: [chunk_pcm_bytes]u8 = undefined,
     pcm_partial_len: usize = 0,
     output_buf: std.ArrayListUnmanaged(u8) = .{},
+
+    pub const AudioEvent = struct {
+        audio: []const u8, // filtered speech (valid until next filterAudio call)
+        onset_byte_offset: ?usize, // byte offset into input where onset was detected
+        trailing_silence_bytes: usize, // silence_bytes at the moment offset fired
+    };
 
     pub const Options = struct {
         threshold: f32 = default_threshold,
@@ -211,23 +217,43 @@ pub const VadFilter = struct {
         return true;
     }
 
-    /// Filter audio, returning a slice containing only speech PCM.
-    /// The returned slice is valid until the next call to filterAudio.
-    pub fn filterAudio(self: *VadFilter, pcm_bytes: []const u8) []const u8 {
+    /// Filter audio, returning an AudioEvent with filtered speech PCM and
+    /// precise onset/offset byte positions for trimming.
+    pub fn filterAudio(self: *VadFilter, pcm_bytes: []const u8) AudioEvent {
         self.output_buf.items.len = 0;
+        var onset_byte_offset: ?usize = null;
+        var trailing_silence_bytes: usize = 0;
 
+        // Track how many bytes of pcm_bytes were consumed by carry completion,
+        // so onset positions in the main loop are relative to the original pcm_bytes.
+        var carry_consumed: usize = 0;
         var pos: usize = 0;
         var input = pcm_bytes;
+
+        const fail_event = AudioEvent{
+            .audio = self.output_buf.items,
+            .onset_byte_offset = onset_byte_offset,
+            .trailing_silence_bytes = trailing_silence_bytes,
+        };
 
         // Handle partial chunk carryover from previous call
         if (self.pcm_partial_len > 0) {
             const need = chunk_pcm_bytes - self.pcm_partial_len;
             if (input.len >= need) {
                 @memcpy(self.pcm_partial[self.pcm_partial_len..chunk_pcm_bytes], input[0..need]);
+                const was_triggered = self.triggered;
                 const forward = self.processOneChunk(&self.pcm_partial);
-                if (forward) {
-                    self.output_buf.appendSlice(self.allocator, &self.pcm_partial) catch return self.output_buf.items;
+                if (!was_triggered and self.triggered) {
+                    // Onset in carry chunk — attribute to start of current input
+                    onset_byte_offset = 0;
                 }
+                if (was_triggered and !self.triggered) {
+                    trailing_silence_bytes = self.silence_bytes;
+                }
+                if (forward) {
+                    self.output_buf.appendSlice(self.allocator, &self.pcm_partial) catch return fail_event;
+                }
+                carry_consumed = need;
                 input = input[need..];
                 self.pcm_partial_len = 0;
             } else {
@@ -237,16 +263,27 @@ pub const VadFilter = struct {
                 if (self.triggered) {
                     self.output_buf.appendSlice(self.allocator, input) catch {};
                 }
-                return self.output_buf.items;
+                return .{
+                    .audio = self.output_buf.items,
+                    .onset_byte_offset = onset_byte_offset,
+                    .trailing_silence_bytes = trailing_silence_bytes,
+                };
             }
         }
 
         // Process complete chunks
         while (pos + chunk_pcm_bytes <= input.len) {
             const chunk = input[pos..][0..chunk_pcm_bytes];
+            const was_triggered = self.triggered;
             const forward = self.processOneChunk(chunk);
+            if (!was_triggered and self.triggered) {
+                onset_byte_offset = carry_consumed + pos;
+            }
+            if (was_triggered and !self.triggered) {
+                trailing_silence_bytes = self.silence_bytes;
+            }
             if (forward) {
-                self.output_buf.appendSlice(self.allocator, chunk) catch return self.output_buf.items;
+                self.output_buf.appendSlice(self.allocator, chunk) catch return fail_event;
             }
             pos += chunk_pcm_bytes;
         }
@@ -262,7 +299,11 @@ pub const VadFilter = struct {
             }
         }
 
-        return self.output_buf.items;
+        return .{
+            .audio = self.output_buf.items,
+            .onset_byte_offset = onset_byte_offset,
+            .trailing_silence_bytes = trailing_silence_bytes,
+        };
     }
 
     pub fn processOneChunk(self: *VadFilter, chunk: *const [chunk_pcm_bytes]u8) bool {
@@ -331,7 +372,7 @@ test "processChunkProb: triggered, below threshold_off, short silence -> bridges
         .triggered = true,
         .silence_bytes = 0,
     };
-    // One chunk of silence (1024 bytes) — well below min_silence_bytes (32000)
+    // One chunk of silence (512 bytes) — well below min_silence_bytes (32000)
     try std.testing.expect(filter.processChunkProb(0.05));
     try std.testing.expect(filter.triggered);
     try std.testing.expectEqual(VadFilter.chunk_pcm_bytes, filter.silence_bytes);
