@@ -14,9 +14,9 @@ const posix = std.posix;
 const net = std.net;
 
 // Global live state (module-level so input handler can access it via setLive).
-// Default live (TCP mode always processes audio). main.zig calls setLive(false)
-// at startup when --trigger is used, then trigger key toggles it.
-pub var is_live = std.atomic.Value(bool).init(true);
+// Default not-live. Callers set it explicitly: runTcp on accept/disconnect,
+// main.zig for no-trigger local mode, trigger key press/release.
+pub var is_live = std.atomic.Value(bool).init(false);
 
 // Global capture pointer — set by runLocal so setLive can toggle the PipeWire stream.
 // When non-null, setLive also activates/deactivates the stream so the desktop
@@ -184,9 +184,15 @@ pub const Server = struct {
             defer posix.close(conn);
 
             std.debug.print("Client connected\n", .{});
+            setLive(true);
+            if (self.recorder) |rec| rec.startRecording();
             self.handleConnection(conn, conn, self.type_callback) catch |err| {
                 std.debug.print("Connection error: {}\n", .{err});
             };
+            if (self.recorder) |rec| rec.endRecording() catch |err| {
+                std.debug.print("[rec] write error: {}\n", .{err});
+            };
+            setLive(false);
             std.debug.print("Client disconnected\n", .{});
         }
     }

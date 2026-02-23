@@ -348,9 +348,12 @@ pub fn main() !void {
             };
         }
 
-        // Start not-live when using trigger key (trigger press goes live)
+        // With trigger key: start not-live (trigger press goes live)
+        // Without trigger key in local mode: start live (always on)
         if (trigger_key != null) {
             server_mod.setLive(false);
+        } else if (input_mode == .local) {
+            server_mod.setLive(true);
         }
     }
     defer {
