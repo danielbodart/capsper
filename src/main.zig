@@ -5,6 +5,7 @@ const pw = @import("pipewire_c.zig");
 const vad_mod = @import("vad.zig");
 const SileroVad = vad_mod.SileroVad;
 const TenVadGgml = vad_mod.TenVadGgml;
+const TenVadNative = vad_mod.TenVadNative;
 const VadBackend = vad_mod.VadBackend;
 const VadFilter = vad_mod.VadFilter;
 const Pipeline = @import("pipeline.zig").Pipeline;
@@ -28,7 +29,7 @@ pub fn main() !void {
 
     var model_path: [:0]const u8 = "../models/ggml-large-v3-turbo-q5_0.bin";
     var model_path_is_default = true;
-    const VadChoice = enum { ten, silero };
+    const VadChoice = enum { ten, silero, ten_native };
     var vad_choice: VadChoice = .ten;
     var port: u16 = 43007;
     var warmup_file: ?[:0]const u8 = "jfk.wav";
@@ -159,8 +160,10 @@ pub fn main() !void {
                     vad_choice = .ten;
                 } else if (std.mem.eql(u8, args[i], "silero")) {
                     vad_choice = .silero;
+                } else if (std.mem.eql(u8, args[i], "ten-native")) {
+                    vad_choice = .ten_native;
                 } else {
-                    std.debug.print("Invalid --vad value '{s}', expected 'ten' or 'silero'\n", .{args[i]});
+                    std.debug.print("Invalid --vad value '{s}', expected 'ten', 'silero', or 'ten-native'\n", .{args[i]});
                     return;
                 }
             }
@@ -219,6 +222,7 @@ pub fn main() !void {
     // Load VAD backend
     var silero_vad: SileroVad = undefined;
     var ten_vad_ggml: TenVadGgml = undefined;
+    var ten_vad_native: TenVadNative = undefined;
     var vad_backend: VadBackend = undefined;
 
     switch (vad_choice) {
@@ -254,10 +258,19 @@ pub fn main() !void {
             };
             vad_backend = .{ .silero = &silero_vad };
         },
+        .ten_native => {
+            std.debug.print("Loading VAD (ten-native): prebuilt libten_vad.so (with pitch)\n", .{});
+            ten_vad_native = TenVadNative.init() catch |err| {
+                std.debug.print("Failed to init TEN-VAD native: {}\n", .{err});
+                return;
+            };
+            vad_backend = .{ .ten_native = &ten_vad_native };
+        },
     }
     defer switch (vad_choice) {
         .ten => ten_vad_ggml.deinit(),
         .silero => silero_vad.deinit(),
+        .ten_native => ten_vad_native.deinit(),
     };
 
     // Tokenize domain terms (requires whisper context)
@@ -471,7 +484,7 @@ fn printUsage() void {
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
     std.debug.print("       [--transcribe FILE]\n", .{});
     std.debug.print("       [--pw-gain FACTOR]\n", .{});
-    std.debug.print("       [--vad ten|silero] [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
+    std.debug.print("       [--vad ten|silero|ten-native] [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
     std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
 }

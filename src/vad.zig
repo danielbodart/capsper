@@ -5,6 +5,10 @@ const ten_vad_ggml_c = @cImport({
     @cInclude("ten_vad_ggml.h");
 });
 
+const ten_vad_native_c = @cImport({
+    @cInclude("ten_vad.h");
+});
+
 // ============================================================
 // VAD Backends
 // ============================================================
@@ -12,12 +16,14 @@ const ten_vad_ggml_c = @cImport({
 pub const VadBackend = union(enum) {
     silero: *SileroVad,
     ten_vad_ggml: *TenVadGgml,
+    ten_native: *TenVadNative,
 
     /// Native chunk size in bytes for this backend.
     pub fn chunkBytes(self: VadBackend) usize {
         return switch (self) {
             .silero => SileroVad.chunk_bytes,
             .ten_vad_ggml => TenVadGgml.chunk_bytes,
+            .ten_native => TenVadNative.chunk_bytes,
         };
     }
 
@@ -27,6 +33,7 @@ pub const VadBackend = union(enum) {
         return switch (self) {
             .silero => |vad| vad.chunkProbS16(chunk),
             .ten_vad_ggml => |tv| tv.chunkProbS16(chunk),
+            .ten_native => |tv| tv.chunkProbS16(chunk),
         };
     }
 
@@ -34,6 +41,7 @@ pub const VadBackend = union(enum) {
         switch (self) {
             .silero => |vad| vad.reset(),
             .ten_vad_ggml => |tv| tv.reset(),
+            .ten_native => |tv| tv.reset(),
         }
     }
 
@@ -41,6 +49,7 @@ pub const VadBackend = union(enum) {
         return switch (self) {
             .silero => "silero",
             .ten_vad_ggml => "ten-vad",
+            .ten_native => "ten-native",
         };
     }
 
@@ -55,6 +64,7 @@ pub const VadBackend = union(enum) {
         return switch (self) {
             .silero => .{ .onset = 0.3, .offset = 0.1, .min_silence_ms = 1000 },
             .ten_vad_ggml => .{ .onset = 0.6, .offset = 0.5, .min_silence_ms = 1000 },
+            .ten_native => .{ .onset = 0.6, .offset = 0.5, .min_silence_ms = 1000 },
         };
     }
 };
@@ -153,6 +163,51 @@ pub const TenVadGgml = struct {
 
     pub fn reset(self: *TenVadGgml) void {
         ten_vad_ggml_c.ten_vad_ggml_reset(self.ctx);
+    }
+};
+
+pub const TenVadNative = struct {
+    pub const chunk_bytes: usize = 512; // 256 samples * 2 bytes — same hop as GGML
+
+    handle: ten_vad_native_c.ten_vad_handle_t,
+
+    pub fn init() !TenVadNative {
+        var handle: ten_vad_native_c.ten_vad_handle_t = null;
+        const rc = ten_vad_native_c.ten_vad_create(&handle, 256, 0.5);
+        if (rc != 0 or handle == null) return error.TenVadNativeInitFailed;
+        return .{ .handle = handle };
+    }
+
+    pub fn deinit(self: *TenVadNative) void {
+        _ = ten_vad_native_c.ten_vad_destroy(&self.handle);
+    }
+
+    /// Get speech probability from S16_LE PCM.
+    /// Processes 256-sample hops (ten-VAD's native size), returns max prob.
+    pub fn chunkProbS16(self: *TenVadNative, chunk: []const u8) f32 {
+        const hop_samples = 256;
+        const hop_bytes = hop_samples * 2;
+        var max_prob: f32 = 0;
+        var offset: usize = 0;
+        while (offset + hop_bytes <= chunk.len) {
+            var i16_buf: [hop_samples]i16 = undefined;
+            for (&i16_buf, 0..) |*out, i| {
+                out.* = std.mem.readInt(i16, chunk[offset + i * 2 ..][0..2], .little);
+            }
+            var prob: f32 = 0;
+            var flag: c_int = 0;
+            _ = ten_vad_native_c.ten_vad_process(self.handle, &i16_buf, hop_samples, &prob, &flag);
+            if (prob > max_prob) max_prob = prob;
+            offset += hop_bytes;
+        }
+        return max_prob;
+    }
+
+    pub fn reset(self: *TenVadNative) void {
+        // Native library has no reset — destroy and recreate
+        _ = ten_vad_native_c.ten_vad_destroy(&self.handle);
+        self.handle = null;
+        _ = ten_vad_native_c.ten_vad_create(&self.handle, 256, 0.5);
     }
 };
 
