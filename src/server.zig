@@ -297,7 +297,7 @@ pub const Server = struct {
 
                 // VadFilter: run on raw audio for edge detection (handles any size via pcm_partial)
                 const was_triggered = vad_filter.triggered;
-                _ = vad_filter.filterAudio(audio);
+                const vad_event = vad_filter.filterAudio(audio);
 
                 // VadFilter onset edge: idle → speaking
                 if (!was_triggered and vad_filter.triggered and vad_state == .idle) {
@@ -328,6 +328,13 @@ pub const Server = struct {
 
                 // VadFilter offset edge: speaking → flush → idle
                 if (was_triggered and !vad_filter.triggered and vad_state == .speaking) {
+                    // Trim trailing silence, but keep 375ms safety buffer for whisper context
+                    const safety_buffer: usize = 12000; // 375ms at 32000 bytes/sec
+                    const silence_trim = vad_event.trailing_silence_bytes;
+                    const trim_amount = if (silence_trim > safety_buffer) silence_trim - safety_buffer else 0;
+                    if (trim_amount > 0 and trim_amount < speech_buf.items.len) {
+                        speech_buf.items.len -= trim_amount;
+                    }
                     if (speech_buf.items.len >= min_transcribe_bytes) {
                         cycle_count += 1;
                         const flush_emit = try self.transcribeAndEmit(&pipeline, speech_buf.items, true, output_fd, start_ns, type_cb, cycle_count, "vad-flush");
