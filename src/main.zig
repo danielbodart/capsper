@@ -236,7 +236,7 @@ pub fn main() !void {
             };
             defer if (vad_path.ptr != vad_rel_path.ptr) allocator.free(vad_path);
             std.debug.print("Loading VAD model (ten-vad): {s}\n", .{vad_path});
-            ten_vad_ggml = TenVadGgml.init(vad_path) catch |err| {
+            ten_vad_ggml = TenVadGgml.init(allocator, vad_path) catch |err| {
                 std.debug.print("Failed to init TEN-VAD: {}\n", .{err});
                 return;
             };

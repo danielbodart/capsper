@@ -217,7 +217,7 @@ pub fn main() !void {
     switch (args.vad_choice) {
         .ten => {
             const model: [:0]const u8 = "dist/models/ten-vad-ggml.bin";
-            ten_vad_ggml_ctx = TenVadGgml.init(model) catch |err| {
+            ten_vad_ggml_ctx = TenVadGgml.init(allocator, model) catch |err| {
                 std.debug.print("Error loading TEN-VAD model {s}: {}\n", .{ model, err });
                 std.process.exit(1);
             };

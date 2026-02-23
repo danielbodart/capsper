@@ -1,9 +1,6 @@
 const std = @import("std");
 const c = @import("whisper_c.zig");
-
-const ten_vad_ggml_c = @cImport({
-    @cInclude("ten_vad_ggml.h");
-});
+const ten_vad_ggml_mod = @import("ten_vad_ggml.zig");
 
 const ten_vad_native_c = @cImport({
     @cInclude("ten_vad.h");
@@ -131,15 +128,15 @@ pub const SileroVad = struct {
 pub const TenVadGgml = struct {
     pub const chunk_bytes: usize = 512; // 256 samples * 2 bytes — TEN-VAD's native hop
 
-    ctx: *ten_vad_ggml_c.ten_vad_ctx,
+    ctx: *ten_vad_ggml_mod.TenVadGgmlCtx,
 
-    pub fn init(model_path: [:0]const u8) !TenVadGgml {
-        const ctx = ten_vad_ggml_c.ten_vad_ggml_init(model_path.ptr) orelse return error.TenVadInitFailed;
+    pub fn init(allocator: std.mem.Allocator, model_path: [:0]const u8) !TenVadGgml {
+        const ctx = try ten_vad_ggml_mod.TenVadGgmlCtx.init(allocator, model_path);
         return .{ .ctx = ctx };
     }
 
     pub fn deinit(self: *TenVadGgml) void {
-        ten_vad_ggml_c.ten_vad_ggml_free(self.ctx);
+        self.ctx.deinit();
     }
 
     /// Get speech probability from S16_LE PCM.
@@ -154,7 +151,7 @@ pub const TenVadGgml = struct {
             for (&i16_buf, 0..) |*out, i| {
                 out.* = std.mem.readInt(i16, chunk[offset + i * 2 ..][0..2], .little);
             }
-            const prob = ten_vad_ggml_c.ten_vad_ggml_process(self.ctx, &i16_buf, hop_samples);
+            const prob = self.ctx.process(&i16_buf);
             if (prob > max_prob) max_prob = prob;
             offset += hop_bytes;
         }
@@ -162,7 +159,7 @@ pub const TenVadGgml = struct {
     }
 
     pub fn reset(self: *TenVadGgml) void {
-        ten_vad_ggml_c.ten_vad_ggml_reset(self.ctx);
+        self.ctx.reset();
     }
 };
 

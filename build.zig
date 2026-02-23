@@ -36,11 +36,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // TEN-VAD GGML reimplementation
-    exe.root_module.addIncludePath(b.path("src"));
+    // TEN-VAD GGML: Zig reimplementation + submodule FFT (C)
+    exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
+    exe.root_module.addIncludePath(b.path("ten-vad/src"));
     const ten_vad_flags: []const []const u8 = &.{};
-    exe.root_module.addCSourceFile(.{ .file = b.path("src/ten_vad_ggml.c"), .flags = ten_vad_flags });
-    exe.root_module.addCSourceFile(.{ .file = b.path("src/ten_vad_fft.c"), .flags = ten_vad_flags });
+    exe.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
 
     // TEN-VAD native (prebuilt .so with pitch support)
     exe.root_module.addIncludePath(b.path("ten-vad/include"));
@@ -77,7 +77,7 @@ pub fn build(b: *std.Build) void {
     });
     vad_filter_test_exe.root_module.addIncludePath(b.path("whisper.cpp/include"));
     vad_filter_test_exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
-    vad_filter_test_exe.root_module.addIncludePath(b.path("src"));
+    vad_filter_test_exe.root_module.addIncludePath(b.path("ten-vad/src"));
     vad_filter_test_exe.root_module.addIncludePath(b.path("ten-vad/include"));
     vad_filter_test_exe.root_module.addLibraryPath(b.path("dist/lib"));
     vad_filter_test_exe.root_module.addRPathSpecial("$ORIGIN/../lib");
@@ -87,8 +87,7 @@ pub fn build(b: *std.Build) void {
     vad_filter_test_exe.linkSystemLibrary("ggml-base");
     vad_filter_test_exe.linkSystemLibrary("ggml-cpu");
     vad_filter_test_exe.linkSystemLibrary("ten_vad");
-    vad_filter_test_exe.root_module.addCSourceFile(.{ .file = b.path("src/ten_vad_ggml.c"), .flags = ten_vad_flags });
-    vad_filter_test_exe.root_module.addCSourceFile(.{ .file = b.path("src/ten_vad_fft.c"), .flags = ten_vad_flags });
+    vad_filter_test_exe.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
     vad_filter_test_exe.linkLibC();
     b.installArtifact(vad_filter_test_exe);
 
@@ -155,7 +154,7 @@ pub fn build(b: *std.Build) void {
     });
     vad_tests.root_module.addIncludePath(b.path("whisper.cpp/include"));
     vad_tests.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
-    vad_tests.root_module.addIncludePath(b.path("src"));
+    vad_tests.root_module.addIncludePath(b.path("ten-vad/src"));
     vad_tests.root_module.addIncludePath(b.path("ten-vad/include"));
     vad_tests.root_module.addLibraryPath(b.path("dist/lib"));
     vad_tests.linkSystemLibrary("whisper");
@@ -163,8 +162,7 @@ pub fn build(b: *std.Build) void {
     vad_tests.linkSystemLibrary("ggml-base");
     vad_tests.linkSystemLibrary("ggml-cpu");
     vad_tests.linkSystemLibrary("ten_vad");
-    vad_tests.root_module.addCSourceFile(.{ .file = b.path("src/ten_vad_ggml.c"), .flags = ten_vad_flags });
-    vad_tests.root_module.addCSourceFile(.{ .file = b.path("src/ten_vad_fft.c"), .flags = ten_vad_flags });
+    vad_tests.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
     vad_tests.linkLibC();
     const run_vad_tests = b.addRunArtifact(vad_tests);
     test_step.dependOn(&run_vad_tests.step);
