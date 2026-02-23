@@ -32,7 +32,7 @@ interface TestCase {
 const shortCases: TestCase[] = [
     { name: "jfk", wav: wav("jfk"), ref: "test/jfk.txt", thresholds: { minCoverage: 100, maxWer: 0 } },
     { name: "fully-committed", wav: wav("fully-committed"), ref: "test/fully-committed.txt", thresholds: { minCoverage: 100, maxWer: 0 } },
-    { name: "working-test", wav: wav("working-test"), ref: "test/working-test.txt", thresholds: { minCoverage: 94, maxWer: 6 } },
+    { name: "working-test", wav: wav("working-test"), ref: "test/working-test.txt", thresholds: { minCoverage: 100, maxWer: 0 } },
     { name: "queued-fix", wav: wav("queued-fix"), ref: "test/queued-fix.txt", thresholds: { minCoverage: 100, maxWer: 0 } },
 ];
 
