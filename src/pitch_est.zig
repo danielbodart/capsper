@@ -405,10 +405,7 @@ pub const PitchEstimator = struct {
         const best_b = (sy - best_a * sx) / sw;
         const estimated_period = best_b + 5.5 * best_a;
 
-        if (voiced) {
-            return PROC_FS / @max(1.0, estimated_period);
-        }
-        return 0;
+        return if (voiced) PROC_FS / @max(1.0, estimated_period) else 0;
     }
 
     // ── Internal functions ──
