@@ -91,6 +91,31 @@ pub fn build(b: *std.Build) void {
     vad_filter_test_exe.linkLibC();
     b.installArtifact(vad_filter_test_exe);
 
+    // --- VAD compare test tool ---
+    const vad_compare_exe = b.addExecutable(.{
+        .name = "vad-compare-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vad_compare_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    vad_compare_exe.root_module.addIncludePath(b.path("whisper.cpp/include"));
+    vad_compare_exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
+    vad_compare_exe.root_module.addIncludePath(b.path("ten-vad/src"));
+    vad_compare_exe.root_module.addIncludePath(b.path("ten-vad/include"));
+    vad_compare_exe.root_module.addLibraryPath(b.path("dist/lib"));
+    vad_compare_exe.root_module.addRPathSpecial("$ORIGIN/../lib");
+    vad_compare_exe.each_lib_rpath = false;
+    vad_compare_exe.linkSystemLibrary("whisper");
+    vad_compare_exe.linkSystemLibrary("ggml");
+    vad_compare_exe.linkSystemLibrary("ggml-base");
+    vad_compare_exe.linkSystemLibrary("ggml-cpu");
+    vad_compare_exe.linkSystemLibrary("ten_vad");
+    vad_compare_exe.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
+    vad_compare_exe.linkLibC();
+    b.installArtifact(vad_compare_exe);
+
     // --- Run step ---
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

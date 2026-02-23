@@ -8,6 +8,7 @@
 ///   SepConv2D(1→16, VALID) → MaxPool → SepConv1D(16→16) → SepConv1D(16→16) → Flatten(80)
 ///   → LSTM(80→64) → LSTM(64→64) → Concat(h1,h0→128) → Dense(128→32) → Dense(32→1) → Sigmoid
 const std = @import("std");
+const PitchEstimator = @import("pitch_est.zig").PitchEstimator;
 const ggml = @cImport({
     @cInclude("ggml.h");
     @cInclude("ggml-alloc.h");
@@ -90,6 +91,7 @@ const Features = struct {
     mel_fb: [MEL_BANDS * N_BINS]f32 = undefined,
     mel_bins: [MEL_BANDS + 2]i32 = undefined,
     feat_stack: [CONTEXT_LEN * FEA_LEN]f32 = [_]f32{0} ** (CONTEXT_LEN * FEA_LEN),
+    pitch_est: PitchEstimator = PitchEstimator.init(),
 
     fn initMelFilterbank(self: *Features) void {
         const low_mel = 2595.0 * std.math.log10(1.0 + 0.0 / 700.0);
@@ -126,6 +128,7 @@ const Features = struct {
         self.preemph_prev = 0;
         @memset(&self.input_q, 0);
         @memset(&self.feat_stack, 0);
+        self.pitch_est.reset();
     }
 
     /// Extract one frame of features from a hop of raw int16 samples.
@@ -184,8 +187,9 @@ const Features = struct {
             cur[i] = (sum - FEATURE_MEANS[i]) / (FEATURE_STDS[i] + EPS);
         }
 
-        // 7. Pitch = 0.0, normalized
-        cur[MEL_BANDS] = (0.0 - FEATURE_MEANS[MEL_BANDS]) / (FEATURE_STDS[MEL_BANDS] + EPS);
+        // 7. Pitch estimation (LPC-residual autocorrelation with Viterbi tracking)
+        const pitch_freq = self.pitch_est.process(&raw, &bin_pow);
+        cur[MEL_BANDS] = (pitch_freq - FEATURE_MEANS[MEL_BANDS]) / (FEATURE_STDS[MEL_BANDS] + EPS);
 
         return &self.feat_stack;
     }
