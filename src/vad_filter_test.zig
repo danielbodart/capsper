@@ -238,7 +238,7 @@ pub fn main() !void {
     };
 
     // Process audio chunk-by-chunk, collecting metadata
-    const chunk_size = VadFilter.chunk_pcm_bytes;
+    const chunk_size = backend.chunkBytes();
     const min_silence_bytes_override: usize = @as(usize, args.min_silence_ms) * bytes_per_sec / 1000;
 
     var chunks = std.ArrayListUnmanaged(ChunkInfo){};

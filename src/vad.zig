@@ -13,9 +13,17 @@ pub const VadBackend = union(enum) {
     silero: *SileroVad,
     ten_vad_ggml: *TenVadGgml,
 
+    /// Native chunk size in bytes for this backend.
+    pub fn chunkBytes(self: VadBackend) usize {
+        return switch (self) {
+            .silero => SileroVad.chunk_bytes,
+            .ten_vad_ggml => TenVadGgml.chunk_bytes,
+        };
+    }
+
     /// Get speech probability for a chunk of S16_LE PCM bytes.
     /// Each backend handles its own format conversion internally.
-    pub fn chunkProb(self: VadBackend, chunk: *const [VadFilter.chunk_pcm_bytes]u8) f32 {
+    pub fn chunkProb(self: VadBackend, chunk: []const u8) f32 {
         return switch (self) {
             .silero => |vad| vad.chunkProbS16(chunk),
             .ten_vad_ggml => |tv| tv.chunkProbS16(chunk),
@@ -52,6 +60,8 @@ pub const VadBackend = union(enum) {
 };
 
 pub const SileroVad = struct {
+    pub const chunk_bytes: usize = 1024; // 512 samples * 2 bytes — Silero's native n_window
+
     vctx: *c.whisper_vad_context,
 
     pub fn init(model_path: [:0]const u8) !SileroVad {
@@ -79,16 +89,16 @@ pub const SileroVad = struct {
     }
 
     /// Get speech probability from S16_LE PCM. Converts to f32 for Silero.
-    pub fn chunkProbS16(self: *SileroVad, chunk: *const [VadFilter.chunk_pcm_bytes]u8) f32 {
-        const n_samples = VadFilter.chunk_pcm_bytes / 2;
-        var float_buf: [n_samples]f32 = undefined;
-        for (&float_buf, 0..) |*sample, i| {
-            const offset = i * 2;
-            const raw = std.mem.readInt(i16, chunk[offset..][0..2], .little);
+    pub fn chunkProbS16(self: *SileroVad, chunk: []const u8) f32 {
+        const n_samples = chunk.len / 2;
+        var float_buf: [chunk_bytes / 2]f32 = undefined;
+        for (float_buf[0..n_samples], 0..) |*sample, i| {
+            const off = i * 2;
+            const raw = std.mem.readInt(i16, chunk[off..][0..2], .little);
             sample.* = @as(f32, @floatFromInt(raw)) / 32768.0;
         }
 
-        const ok = c.whisper_vad_detect_speech(self.vctx, &float_buf, n_samples);
+        const ok = c.whisper_vad_detect_speech(self.vctx, &float_buf, @intCast(n_samples));
         if (!ok) return 0;
 
         const n_probs = c.whisper_vad_n_probs(self.vctx);
@@ -105,6 +115,8 @@ pub const SileroVad = struct {
 };
 
 pub const TenVadGgml = struct {
+    pub const chunk_bytes: usize = 512; // 256 samples * 2 bytes — TEN-VAD's native hop
+
     ctx: *ten_vad_ggml_c.ten_vad_ctx,
 
     pub fn init(model_path: [:0]const u8) !TenVadGgml {
@@ -118,12 +130,12 @@ pub const TenVadGgml = struct {
 
     /// Get speech probability from S16_LE PCM.
     /// Processes 256-sample hops (ten-VAD's native size), returns max prob.
-    pub fn chunkProbS16(self: *TenVadGgml, chunk: *const [VadFilter.chunk_pcm_bytes]u8) f32 {
+    pub fn chunkProbS16(self: *TenVadGgml, chunk: []const u8) f32 {
         const hop_samples = 256;
         const hop_bytes = hop_samples * 2;
         var max_prob: f32 = 0;
         var offset: usize = 0;
-        while (offset + hop_bytes <= VadFilter.chunk_pcm_bytes) {
+        while (offset + hop_bytes <= chunk.len) {
             var i16_buf: [hop_samples]i16 = undefined;
             for (&i16_buf, 0..) |*out, i| {
                 out.* = std.mem.readInt(i16, chunk[offset + i * 2 ..][0..2], .little);
@@ -148,18 +160,19 @@ pub const VadFilter = struct {
     pub const default_threshold: f32 = 0.3;
     pub const default_threshold_off: f32 = 0.1;
     pub const default_min_silence_bytes: usize = 32000; // 1000ms at 32000 bytes/sec
-    pub const chunk_pcm_bytes: usize = 512; // 256 samples * 2 bytes — one TEN-VAD hop per chunk
+    pub const max_chunk_bytes: usize = 1024; // buffer size — fits largest backend (Silero)
 
     threshold: f32 = default_threshold,
     threshold_off: f32 = default_threshold_off,
     min_silence_bytes: usize = default_min_silence_bytes,
+    chunk_size: usize, // runtime — set from backend.chunkBytes()
 
     backend: VadBackend,
     allocator: std.mem.Allocator,
     triggered: bool = false,
     silence_bytes: usize = 0,
     last_prob: f32 = 0,
-    pcm_partial: [chunk_pcm_bytes]u8 = undefined,
+    pcm_partial: [max_chunk_bytes]u8 = undefined,
     pcm_partial_len: usize = 0,
     output_buf: std.ArrayListUnmanaged(u8) = .{},
 
@@ -179,6 +192,7 @@ pub const VadFilter = struct {
         return .{
             .backend = backend,
             .allocator = allocator,
+            .chunk_size = backend.chunkBytes(),
             .threshold = opts.threshold,
             .threshold_off = opts.threshold_off,
             .min_silence_bytes = opts.min_silence_bytes,
@@ -208,7 +222,7 @@ pub const VadFilter = struct {
         }
 
         // Below threshold_off — accumulate silence
-        self.silence_bytes += chunk_pcm_bytes;
+        self.silence_bytes += self.chunk_size;
         if (self.silence_bytes >= self.min_silence_bytes) {
             self.triggered = false;
             return false;
@@ -235,12 +249,14 @@ pub const VadFilter = struct {
         };
 
         // Handle partial chunk carryover from previous call
+        const cs = self.chunk_size;
         if (self.pcm_partial_len > 0) {
-            const need = chunk_pcm_bytes - self.pcm_partial_len;
+            const need = cs - self.pcm_partial_len;
             if (input.len >= need) {
-                @memcpy(self.pcm_partial[self.pcm_partial_len..chunk_pcm_bytes], input[0..need]);
+                @memcpy(self.pcm_partial[self.pcm_partial_len..self.pcm_partial_len + need], input[0..need]);
+                const partial_chunk = self.pcm_partial[0..cs];
                 const was_triggered = self.triggered;
-                const forward = self.processOneChunk(&self.pcm_partial);
+                const forward = self.processOneChunk(partial_chunk);
                 if (!was_triggered and self.triggered) {
                     onset_byte_offset = 0;
                 }
@@ -248,7 +264,7 @@ pub const VadFilter = struct {
                     trailing_silence_bytes = self.silence_bytes;
                 }
                 if (forward) {
-                    self.output_buf.appendSlice(self.allocator, &self.pcm_partial) catch return fail_event;
+                    self.output_buf.appendSlice(self.allocator, partial_chunk) catch return fail_event;
                 }
                 carry_consumed = need;
                 input = input[need..];
@@ -269,8 +285,8 @@ pub const VadFilter = struct {
         }
 
         // Process complete chunks
-        while (pos + chunk_pcm_bytes <= input.len) {
-            const chunk = input[pos..][0..chunk_pcm_bytes];
+        while (pos + cs <= input.len) {
+            const chunk = input[pos..][0..cs];
             const was_triggered = self.triggered;
             const forward = self.processOneChunk(chunk);
             if (!was_triggered and self.triggered) {
@@ -282,7 +298,7 @@ pub const VadFilter = struct {
             if (forward) {
                 self.output_buf.appendSlice(self.allocator, chunk) catch return fail_event;
             }
-            pos += chunk_pcm_bytes;
+            pos += cs;
         }
 
         // Buffer remaining partial chunk
@@ -303,7 +319,7 @@ pub const VadFilter = struct {
         };
     }
 
-    pub fn processOneChunk(self: *VadFilter, chunk: *const [chunk_pcm_bytes]u8) bool {
+    pub fn processOneChunk(self: *VadFilter, chunk: []const u8) bool {
         const prob = self.backend.chunkProb(chunk);
         self.last_prob = prob;
         return self.processChunkProb(prob);
@@ -326,6 +342,7 @@ test "processChunkProb: not triggered, below threshold -> stays not-triggered" {
     var filter = VadFilter{
         .backend = undefined,
         .allocator = std.testing.allocator,
+        .chunk_size = 512,
     };
     try std.testing.expect(!filter.processChunkProb(0.2));
     try std.testing.expect(!filter.triggered);
@@ -335,6 +352,7 @@ test "processChunkProb: not triggered, above threshold -> triggers" {
     var filter = VadFilter{
         .backend = undefined,
         .allocator = std.testing.allocator,
+        .chunk_size = 512,
     };
     try std.testing.expect(filter.processChunkProb(0.5));
     try std.testing.expect(filter.triggered);
@@ -345,6 +363,7 @@ test "processChunkProb: not triggered, exact threshold boundary -> triggers" {
     var filter = VadFilter{
         .backend = undefined,
         .allocator = std.testing.allocator,
+        .chunk_size = 512,
     };
     try std.testing.expect(filter.processChunkProb(VadFilter.default_threshold));
     try std.testing.expect(filter.triggered);
@@ -354,6 +373,7 @@ test "processChunkProb: triggered, above threshold_off -> resets silence counter
     var filter = VadFilter{
         .backend = undefined,
         .allocator = std.testing.allocator,
+        .chunk_size = 512,
         .triggered = true,
         .silence_bytes = 4096,
     };
@@ -366,21 +386,23 @@ test "processChunkProb: triggered, below threshold_off, short silence -> bridges
     var filter = VadFilter{
         .backend = undefined,
         .allocator = std.testing.allocator,
+        .chunk_size = 512,
         .triggered = true,
         .silence_bytes = 0,
     };
     // One chunk of silence (512 bytes) — well below min_silence_bytes (32000)
     try std.testing.expect(filter.processChunkProb(0.05));
     try std.testing.expect(filter.triggered);
-    try std.testing.expectEqual(VadFilter.chunk_pcm_bytes, filter.silence_bytes);
+    try std.testing.expectEqual(@as(usize, 512), filter.silence_bytes);
 }
 
 test "processChunkProb: triggered, sustained silence -> un-triggers" {
     var filter = VadFilter{
         .backend = undefined,
         .allocator = std.testing.allocator,
+        .chunk_size = 512,
         .triggered = true,
-        .silence_bytes = VadFilter.default_min_silence_bytes - VadFilter.chunk_pcm_bytes,
+        .silence_bytes = VadFilter.default_min_silence_bytes - 512,
     };
     // This chunk pushes silence_bytes past min_silence_bytes
     try std.testing.expect(!filter.processChunkProb(0.05));
@@ -391,6 +413,7 @@ test "processChunkProb: speech during bridging -> resets silence counter" {
     var filter = VadFilter{
         .backend = undefined,
         .allocator = std.testing.allocator,
+        .chunk_size = 512,
         .triggered = true,
         .silence_bytes = 16000, // mid-bridge
     };
