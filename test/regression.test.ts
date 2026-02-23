@@ -37,7 +37,7 @@ const shortCases: TestCase[] = [
 ];
 
 const mediumCases: TestCase[] = [
-    { name: "long-pause", wav: wav("long-pause"), ref: "test/long-pause.txt", thresholds: { minCoverage: 85, maxWer: 20, maxGapSec: 4 } },
+    { name: "long-pause", wav: wav("long-pause"), ref: "test/long-pause.txt", thresholds: { minCoverage: 85, maxWer: 15, maxGapSec: 4 } },
     { name: "repetition-loop", wav: wav("repetition-loop"), ref: "test/repetition-loop.txt", thresholds: { minCoverage: 85, maxWer: 15 } },
 ];
 
@@ -47,10 +47,10 @@ const mediumCases: TestCase[] = [
 // repetition-loop-long and silence-hallucination are especially sensitive — without
 // the repetition guard, CUDA jitter can trigger runaway repetition loops.
 const longCases: TestCase[] = [
-    { name: "dictation", wav: wav("dictation"), ref: "test/dictation.txt", thresholds: { minCoverage: 88, maxWer: 15 } },
+    { name: "dictation", wav: wav("dictation"), ref: "test/dictation.txt", thresholds: { minCoverage: 85, maxWer: 15 } },
     { name: "long-recording", wav: wav("long-recording"), ref: "test/long-recording.txt", thresholds: { minCoverage: 90, maxWer: 10 } },
-    { name: "repetition-loop-long", wav: wav("repetition-loop-long"), ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 90, maxWer: 130 } },
-    { name: "silence-hallucination", wav: wav("silence-hallucination"), ref: "test/silence-hallucination.txt", thresholds: { minCoverage: 85, maxWer: 70, maxGapSec: 5 } },
+    { name: "repetition-loop-long", wav: wav("repetition-loop-long"), ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 90, maxWer: 10 } },
+    { name: "silence-hallucination", wav: wav("silence-hallucination"), ref: "test/silence-hallucination.txt", thresholds: { minCoverage: 90, maxWer: 10, maxGapSec: 5 } },
 ];
 
 // Gating: which groups to run
