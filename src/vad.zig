@@ -32,7 +32,7 @@ pub const VadBackend = union(enum) {
 
     pub fn reset(self: VadBackend) void {
         switch (self) {
-            .silero => {},
+            .silero => |vad| vad.reset(),
             .ten_vad_ggml => |tv| tv.reset(),
         }
     }
@@ -88,6 +88,10 @@ pub const SileroVad = struct {
         c.whisper_vad_free(self.vctx);
     }
 
+    pub fn reset(self: *SileroVad) void {
+        c.whisper_vad_reset_state(self.vctx);
+    }
+
     /// Get speech probability from S16_LE PCM. Converts to f32 for Silero.
     pub fn chunkProbS16(self: *SileroVad, chunk: []const u8) f32 {
         const n_samples = chunk.len / 2;
@@ -98,7 +102,7 @@ pub const SileroVad = struct {
             sample.* = @as(f32, @floatFromInt(raw)) / 32768.0;
         }
 
-        const ok = c.whisper_vad_detect_speech(self.vctx, &float_buf, @intCast(n_samples));
+        const ok = c.whisper_vad_detect_speech_no_reset(self.vctx, &float_buf, @intCast(n_samples));
         if (!ok) return 0;
 
         const n_probs = c.whisper_vad_n_probs(self.vctx);
