@@ -15,8 +15,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          lfs: true
           fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('dist/lib/*.so.*', 'dist/models/ten-vad-ggml.bin') }}
+          restore-keys: lfs-
+      - run: git lfs pull
+      - uses: actions/cache@v4
+        with:
+          path: tools
+          key: mise-tools-${{ hashFiles('.mise.toml') }}
       - name: CI
         run: ./run ci
         env:
