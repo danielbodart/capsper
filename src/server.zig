@@ -157,7 +157,7 @@ pub const Server = struct {
     pub fn run(self: *Server) !void {
         switch (self.input_mode) {
             .tcp => try self.runTcp(),
-            .local => try self.runLocal(),
+            .local => try self.runPipeWire(),
         }
     }
 
@@ -197,7 +197,7 @@ pub const Server = struct {
         }
     }
 
-    fn runLocal(self: *Server) !void {
+    fn runPipeWire(self: *Server) !void {
         std.debug.print("Starting local PipeWire capture...\n", .{});
 
         var capture = AudioCapture.init(self.pw_target, self.pw_channel) catch |err| {
