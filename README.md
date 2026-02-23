@@ -296,7 +296,7 @@ Once audio is flowing, new words appear every ~1s (the transcription interval). 
 
 ## Troubleshooting
 
-**"No CUDA GPU detected"** — capsper requires a CUDA-capable NVIDIA GPU and won't fall back to CPU. Ensure CUDA 13 runtime libraries are installed (`sudo apt install cuda-cudart-13-1 libcublas-13-1`) and that `nvidia-smi` shows your GPU.
+**"No CUDA GPU detected"** — capsper requires a CUDA-capable NVIDIA GPU and won't fall back to CPU. Ensure NVIDIA drivers are installed (`sudo ubuntu-drivers autoinstall`) and that `nvidia-smi` shows your GPU.
 
 **Server fails to start** — check `/tmp/capsper.log`. Ensure CUDA is installed and GPU has sufficient VRAM.
 

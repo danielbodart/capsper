@@ -206,56 +206,6 @@ run_dry_run() {
     echo "Setup validated successfully."
 }
 
-# ─── CUDA Runtime ─────────────────────────────────────────────────────────
-
-check_cuda_libraries() {
-    # libcudart and libcublas are needed at runtime by the bundled whisper.cpp CUDA backend.
-    # These come from the CUDA toolkit packages (any CUDA 13.x), not the nvidia driver.
-    local missing=()
-    ldconfig -p 2>/dev/null | grep -q 'libcudart\.so\.13' || missing+=("libcudart.so.13")
-    ldconfig -p 2>/dev/null | grep -q 'libcublas\.so\.13' || missing+=("libcublas.so.13")
-    ldconfig -p 2>/dev/null | grep -q 'libcublasLt\.so\.13' || missing+=("libcublasLt.so.13")
-
-    [ ${#missing[@]} -eq 0 ] && return
-
-    # Find available CUDA 13.x packages (could be 13-0, 13-1, etc.)
-    local cudart_pkg="" cublas_pkg=""
-    if command -v apt-cache >/dev/null 2>&1; then
-        cudart_pkg=$(apt-cache search --names-only '^cuda-cudart-13-' 2>/dev/null | sort -V | tail -1 | awk '{print $1}')
-        cublas_pkg=$(apt-cache search --names-only '^libcublas-13-' 2>/dev/null | sort -V | tail -1 | awk '{print $1}')
-    fi
-    # Fallback if apt-cache didn't find anything
-    : "${cudart_pkg:=cuda-cudart-13-1}"
-    : "${cublas_pkg:=libcublas-13-1}"
-
-    echo ""
-    echo "=== CUDA Runtime Libraries ==="
-    echo "Missing: ${missing[*]}"
-    echo ""
-    echo "These are provided by the CUDA 13 toolkit packages (~600 MB):"
-    echo "  sudo apt install $cudart_pkg $cublas_pkg"
-    echo ""
-    echo "If apt can't find them, add the NVIDIA package repository first:"
-    echo "  https://developer.nvidia.com/cuda-downloads"
-    echo ""
-
-    if command -v apt >/dev/null 2>&1; then
-        if confirm "Try to install them now? (requires sudo)"; then
-            if sudo apt install -y "$cudart_pkg" "$cublas_pkg"; then
-                echo "CUDA runtime libraries installed."
-                return
-            else
-                echo ""
-                echo "apt install failed. You may need to add the NVIDIA repository first."
-                echo "See: https://developer.nvidia.com/cuda-downloads"
-                die "Missing CUDA runtime libraries."
-            fi
-        fi
-    fi
-
-    die "Missing CUDA runtime libraries. Install them with: sudo apt install $cudart_pkg $cublas_pkg"
-}
-
 # ─── Update Infrastructure ─────────────────────────────────────────────────
 
 has_auto_update() {
@@ -511,8 +461,7 @@ cmd_install() {
         echo ""
 
         # Check runtime deps (always, even on upgrade)
-        require_cmd nvidia-smi "NVIDIA driver required for CUDA inference."
-        check_cuda_libraries
+        require_cmd nvidia-smi "NVIDIA driver required. Install with: sudo ubuntu-drivers autoinstall"
         command -v pw-cli >/dev/null 2>&1 || echo "WARNING: pw-cli not found. PipeWire may not be installed."
 
         # Copy files to ~/.local/share/capsper/ (always, this is the upgrade)
