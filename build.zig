@@ -194,6 +194,42 @@ pub fn build(b: *std.Build) void {
     const run_input_tests = b.addRunArtifact(input_tests);
     test_step.dependOn(&run_input_tests.step);
 
+    // dsp.zig tests — pure Zig, no C deps
+    const dsp_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dsp.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_dsp_tests = b.addRunArtifact(dsp_tests);
+    test_step.dependOn(&run_dsp_tests.step);
+
+    // conv.zig tests — pure Zig, no C deps
+    const conv_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/conv.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_conv_tests = b.addRunArtifact(conv_tests);
+    test_step.dependOn(&run_conv_tests.step);
+
+    // pitch_est.zig tests — needs fftw.c + ten-vad includes + libc (like vad_tests)
+    const pitch_est_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pitch_est.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    pitch_est_tests.root_module.addIncludePath(b.path("ten-vad/src"));
+    pitch_est_tests.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
+    pitch_est_tests.linkLibC();
+    const run_pitch_est_tests = b.addRunArtifact(pitch_est_tests);
+    test_step.dependOn(&run_pitch_est_tests.step);
+
     // --- Property tests (minish-based, runs as executable) ---
     const prop_step = b.step("prop-test", "Run property-based tests (minish)");
 
@@ -225,6 +261,16 @@ pub fn build(b: *std.Build) void {
                     .target = target,
                     .optimize = optimize,
                     .link_libc = true,
+                }) },
+                .{ .name = "dsp.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/dsp.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+                .{ .name = "conv.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/conv.zig"),
+                    .target = target,
+                    .optimize = optimize,
                 }) },
             },
         }),

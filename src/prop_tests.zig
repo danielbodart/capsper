@@ -8,6 +8,8 @@ const mgen = minish.gen;
 const utils = @import("utils.zig");
 const alignatt = @import("alignatt.zig");
 const input = @import("input.zig");
+const dsp = @import("dsp.zig");
+const conv = @import("conv.zig");
 
 // Generator for "word-like" strings: lowercase letters and spaces.
 // This mimics Whisper output text (words separated by single spaces).
@@ -738,6 +740,212 @@ fn prop_checkLowConfidence_good_peak_resets(n: usize) !void {
 }
 
 // ============================================================================
+// dsp.zig: celtLpc error bounds
+// ============================================================================
+
+// For valid autocorrelation: 0 < err ≤ ac[0]
+fn prop_celtLpc_error_bounds(n: usize) !void {
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const rng = prng.random();
+
+    // Generate valid autocorrelation: fill random signal, compute dot products
+    const sig_len = 64;
+    var signal: [sig_len]f32 = undefined;
+    for (&signal) |*v| {
+        v.* = @as(f32, @floatFromInt(rng.int(i16))) / 32768.0;
+    }
+
+    var ac: [dsp.LPC_ORDER + 1]f32 = undefined;
+    for (0..dsp.LPC_ORDER + 1) |lag| {
+        var sum: f32 = 0;
+        for (0..sig_len - lag) |i| {
+            sum += signal[i] * signal[i + lag];
+        }
+        ac[lag] = sum;
+    }
+
+    var lpc_out: [dsp.LPC_ORDER]f32 = undefined;
+    const err = dsp.celtLpc(&ac, &lpc_out);
+
+    if (ac[0] > 0) {
+        try std.testing.expect(err > 0);
+        try std.testing.expect(err <= ac[0] + 1e-4);
+    }
+}
+
+// ============================================================================
+// dsp.zig: computeBandEnergy linearity
+// ============================================================================
+
+// bandEnergy(k * spectrum) = k * bandEnergy(spectrum) for k > 0
+fn prop_computeBandEnergy_linearity(n: usize) !void {
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const rng = prng.random();
+
+    // Generate non-negative power spectrum
+    var spec: [dsp.N_BINS]f32 = undefined;
+    for (&spec) |*v| {
+        v.* = @as(f32, @floatFromInt(rng.intRangeAtMost(u16, 0, 1000))) / 100.0;
+    }
+
+    const k = 1.0 + @as(f32, @floatFromInt(rng.intRangeAtMost(u16, 1, 500))) / 100.0;
+
+    var band1: [dsp.NB_BANDS]f32 = undefined;
+    dsp.computeBandEnergy(&spec, &band1);
+
+    var scaled_spec: [dsp.N_BINS]f32 = undefined;
+    for (&scaled_spec, spec) |*sv, v| {
+        sv.* = k * v;
+    }
+    var band_scaled: [dsp.NB_BANDS]f32 = undefined;
+    dsp.computeBandEnergy(&scaled_spec, &band_scaled);
+
+    for (0..dsp.NB_BANDS) |i| {
+        try std.testing.expectApproxEqRel(k * band1[i], band_scaled[i], 1e-4);
+    }
+}
+
+// ============================================================================
+// dsp.zig: computeBandEnergy non-negativity
+// ============================================================================
+
+fn prop_computeBandEnergy_non_negative(n: usize) !void {
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const rng = prng.random();
+
+    var spec: [dsp.N_BINS]f32 = undefined;
+    for (&spec) |*v| {
+        v.* = @as(f32, @floatFromInt(rng.intRangeAtMost(u16, 0, 10000))) / 100.0;
+    }
+
+    var band_e: [dsp.NB_BANDS]f32 = undefined;
+    dsp.computeBandEnergy(&spec, &band_e);
+    for (band_e) |e| {
+        try std.testing.expect(e >= -1e-6);
+    }
+}
+
+// ============================================================================
+// dsp.zig: BiquadFilter linearity
+// ============================================================================
+
+// process(k*x) = k * process(x) with fresh filter state each time
+fn prop_biquad_linearity(n: usize) !void {
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const rng = prng.random();
+
+    const len = 16;
+    var x: [len]f32 = undefined;
+    for (&x) |*v| {
+        v.* = @as(f32, @floatFromInt(rng.int(i16))) / 32768.0;
+    }
+    const k = 0.5 + @as(f32, @floatFromInt(rng.intRangeAtMost(u16, 0, 400))) / 100.0;
+
+    var bq1 = dsp.BiquadFilter{};
+    var out1: [len]f32 = undefined;
+    bq1.process(&x, &out1);
+
+    var kx: [len]f32 = undefined;
+    for (&kx, x) |*kv, v| kv.* = k * v;
+    var bq2 = dsp.BiquadFilter{};
+    var out2: [len]f32 = undefined;
+    bq2.process(&kx, &out2);
+
+    for (0..len) |i| {
+        try std.testing.expectApproxEqAbs(k * out1[i], out2[i], 1e-3);
+    }
+}
+
+// ============================================================================
+// dsp.zig: BiquadFilter chunk equivalence
+// ============================================================================
+
+// Processing N samples as one call vs two calls of N/2 gives same output
+fn prop_biquad_chunk_equivalence(n: usize) !void {
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const rng = prng.random();
+
+    const len = 16;
+    var x: [len]f32 = undefined;
+    for (&x) |*v| {
+        v.* = @as(f32, @floatFromInt(rng.int(i16))) / 32768.0;
+    }
+
+    // One-shot
+    var bq1 = dsp.BiquadFilter{};
+    var out1: [len]f32 = undefined;
+    bq1.process(&x, &out1);
+
+    // Two halves
+    var bq2 = dsp.BiquadFilter{};
+    var out2a: [len / 2]f32 = undefined;
+    var out2b: [len / 2]f32 = undefined;
+    bq2.process(x[0 .. len / 2], &out2a);
+    bq2.process(x[len / 2 .. len], &out2b);
+
+    for (0..len / 2) |i| {
+        try std.testing.expectApproxEqAbs(out1[i], out2a[i], 1e-5);
+    }
+    for (0..len / 2) |i| {
+        try std.testing.expectApproxEqAbs(out1[len / 2 + i], out2b[i], 1e-5);
+    }
+}
+
+// ============================================================================
+// dsp.zig: xcorrKernel energy identity
+// ============================================================================
+
+// xcorr(x, x)[0] = sum(x[i]^2)
+fn prop_xcorrKernel_energy(n: usize) !void {
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const rng = prng.random();
+
+    const len = 8 + (n % 25); // 8..32
+    var buf: [64]f32 = undefined;
+    var energy: f32 = 0;
+    for (0..len) |i| {
+        buf[i] = @as(f32, @floatFromInt(rng.int(i16))) / 32768.0;
+        energy += buf[i] * buf[i];
+    }
+    // Pad y with 3 extra elements for the kernel's 4-wide window
+    var sum = [4]f32{ 0, 0, 0, 0 };
+    dsp.xcorrKernel(buf[0..len], buf[0 .. len + 3], &sum, len);
+    try std.testing.expectApproxEqRel(energy, sum[0], 1e-4);
+}
+
+// ============================================================================
+// conv.zig: runConvs finiteness
+// ============================================================================
+
+// For any finite weights and finite features, all 80 outputs are finite
+fn prop_runConvs_finiteness(n: usize) !void {
+    var prng = std.Random.DefaultPrng.init(@intCast(n));
+    const rng = prng.random();
+
+    var w: conv.ConvWeights = undefined;
+    // Fill weights with small random values
+    for (&w.dw0) |*v| v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+    for (&w.pw0) |*v| v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+    for (&w.b0) |*v| v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+    for (&w.dw1) |*v| v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+    for (&w.pw1) |*v| v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+    for (&w.b1) |*v| v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+    for (&w.dw2) |*v| v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+    for (&w.pw2) |*v| v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+    for (&w.b2) |*v| v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+
+    var features: [conv.CONTEXT_LEN * conv.FEA_LEN]f32 = undefined;
+    for (&features) |*v| {
+        v.* = @as(f32, @floatFromInt(rng.int(i8))) / 128.0;
+    }
+
+    const out = conv.runConvs(&w, &features);
+    for (out) |v| {
+        try std.testing.expect(std.math.isFinite(v));
+    }
+}
+
+// ============================================================================
 // Runner
 // ============================================================================
 
@@ -866,5 +1074,29 @@ pub fn main() !void {
     std.debug.print("prop: checkLowConfidence good peak resets... ", .{});
     try minish.check(allocator, frame_gen, prop_checkLowConfidence_good_peak_resets, .{ .num_runs = runs });
 
-    std.debug.print("\nAll 39 property tests passed!\n", .{});
+    // dsp.zig: celtLpc
+    std.debug.print("prop: celtLpc error bounds... ", .{});
+    try minish.check(allocator, frame_gen, prop_celtLpc_error_bounds, .{ .num_runs = runs });
+
+    // dsp.zig: computeBandEnergy
+    std.debug.print("prop: computeBandEnergy linearity... ", .{});
+    try minish.check(allocator, frame_gen, prop_computeBandEnergy_linearity, .{ .num_runs = runs });
+    std.debug.print("prop: computeBandEnergy non-negative... ", .{});
+    try minish.check(allocator, frame_gen, prop_computeBandEnergy_non_negative, .{ .num_runs = runs });
+
+    // dsp.zig: BiquadFilter
+    std.debug.print("prop: BiquadFilter linearity... ", .{});
+    try minish.check(allocator, frame_gen, prop_biquad_linearity, .{ .num_runs = runs });
+    std.debug.print("prop: BiquadFilter chunk equivalence... ", .{});
+    try minish.check(allocator, frame_gen, prop_biquad_chunk_equivalence, .{ .num_runs = runs });
+
+    // dsp.zig: xcorrKernel
+    std.debug.print("prop: xcorrKernel energy identity... ", .{});
+    try minish.check(allocator, small_frame_gen, prop_xcorrKernel_energy, .{ .num_runs = runs });
+
+    // conv.zig: runConvs
+    std.debug.print("prop: runConvs finiteness... ", .{});
+    try minish.check(allocator, frame_gen, prop_runConvs_finiteness, .{ .num_runs = runs });
+
+    std.debug.print("\nAll 46 property tests passed!\n", .{});
 }

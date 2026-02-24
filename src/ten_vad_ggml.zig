@@ -8,6 +8,7 @@
 ///   SepConv2D(1→16, VALID) → MaxPool → SepConv1D(16→16) → SepConv1D(16→16) → Flatten(80)
 ///   → LSTM(80→64) → LSTM(64→64) → Concat(h1,h0→128) → Dense(128→32) → Dense(32→1) → Sigmoid
 const std = @import("std");
+const conv = @import("conv.zig");
 const PitchEstimator = @import("pitch_est.zig").PitchEstimator;
 const ggml = @cImport({
     @cInclude("ggml.h");
@@ -27,8 +28,8 @@ const WINDOW_SIZE = 768;
 const FFT_SIZE = 1024;
 const N_BINS = FFT_SIZE / 2 + 1; // 513
 const MEL_BANDS = 40;
-const FEA_LEN = MEL_BANDS + 1; // 41 = 40 mel + 1 pitch
-const CONTEXT_LEN = 3;
+const FEA_LEN = conv.FEA_LEN;
+const CONTEXT_LEN = conv.CONTEXT_LEN;
 const HIDDEN_DIM = 64;
 const EPS = 1e-20;
 const PREEMPH = 0.97;
@@ -221,125 +222,8 @@ const Model = struct {
     dense_bias: [2]*ggml.ggml_tensor = undefined,
 };
 
-// ── Conv weight cache ──
-
-const ConvWeights = struct {
-    dw0: [9]f32,
-    pw0: [16]f32,
-    b0: [16]f32,
-    dw1: [48]f32,
-    pw1: [256]f32,
-    b1: [16]f32,
-    dw2: [48]f32,
-    pw2: [256]f32,
-    b2: [16]f32,
-};
-
-// ── Separable conv layers ──
-
-fn runConvs(w: *const ConvWeights, features: *const [CONTEXT_LEN * FEA_LEN]f32) [80]f32 {
-    // Layer 0: SeparableConv2D on [1,1,3,41], VALID → [1,1,1,39]
-    var dw0_out: [39]f32 = undefined;
-    for (0..39) |col| {
-        var sum: f32 = 0;
-        for (0..3) |kh| {
-            for (0..3) |kw| {
-                sum += features[kh * FEA_LEN + (col + kw)] * w.dw0[kh * 3 + kw];
-            }
-        }
-        dw0_out[col] = sum;
-    }
-
-    // Pointwise conv: (16,1,1,1) + bias + ReLU → [16, 1, 39]
-    var pw0_out: [16 * 39]f32 = undefined;
-    for (0..16) |oc| {
-        for (0..39) |i| {
-            const val = dw0_out[i] * w.pw0[oc] + w.b0[oc];
-            pw0_out[oc * 39 + i] = @max(val, 0);
-        }
-    }
-
-    // MaxPool: kernel(1,3), stride(1,2) → [16, 1, 19]
-    var pool_out: [16 * 19]f32 = undefined;
-    for (0..16) |oc| {
-        for (0..19) |ow| {
-            const w_start = ow * 2;
-            var mx: f32 = -1e30;
-            for (0..3) |k| {
-                const iw = w_start + k;
-                if (iw < 39) {
-                    mx = @max(mx, pw0_out[oc * 39 + iw]);
-                }
-            }
-            pool_out[oc * 19 + ow] = mx;
-        }
-    }
-
-    // Layer 1: DW conv kernel(1,3), stride(2,2), pads=[0,1,0,1]
-    var dw1_out: [16 * 10]f32 = undefined;
-    for (0..16) |ch| {
-        for (0..10) |ow| {
-            var sum: f32 = 0;
-            for (0..3) |k| {
-                const iw_signed: i32 = @as(i32, @intCast(ow)) * 2 + @as(i32, @intCast(k)) - 1;
-                if (iw_signed >= 0 and iw_signed < 19) {
-                    const iw: usize = @intCast(iw_signed);
-                    sum += pool_out[ch * 19 + iw] * w.dw1[ch * 3 + k];
-                }
-            }
-            dw1_out[ch * 10 + ow] = sum;
-        }
-    }
-
-    // Pointwise + bias + ReLU
-    var pw1_out: [16 * 10]f32 = undefined;
-    for (0..16) |oc| {
-        for (0..10) |i| {
-            var sum: f32 = w.b1[oc];
-            for (0..16) |ic| {
-                sum += dw1_out[ic * 10 + i] * w.pw1[oc * 16 + ic];
-            }
-            pw1_out[oc * 10 + i] = @max(sum, 0);
-        }
-    }
-
-    // Layer 2: DW conv kernel(1,3), stride(2,2), pads=[0,0,0,1]
-    var dw2_out: [16 * 5]f32 = undefined;
-    for (0..16) |ch| {
-        for (0..5) |ow| {
-            var sum: f32 = 0;
-            for (0..3) |k| {
-                const iw = ow * 2 + k;
-                if (iw < 10) {
-                    sum += pw1_out[ch * 10 + iw] * w.dw2[ch * 3 + k];
-                }
-            }
-            dw2_out[ch * 5 + ow] = sum;
-        }
-    }
-
-    // Pointwise + bias + ReLU
-    var pw2_out: [16 * 5]f32 = undefined;
-    for (0..16) |oc| {
-        for (0..5) |i| {
-            var sum: f32 = w.b2[oc];
-            for (0..16) |ic| {
-                sum += dw2_out[ic * 5 + i] * w.pw2[oc * 16 + ic];
-            }
-            pw2_out[oc * 5 + i] = @max(sum, 0);
-        }
-    }
-
-    // Flatten: [16, 1, 5] → [80] via transpose [16,5] → [5,16]
-    var out: [80]f32 = undefined;
-    for (0..5) |col| {
-        for (0..16) |ch| {
-            out[col * 16 + ch] = pw2_out[ch * 5 + col];
-        }
-    }
-    // zwanzig-disable-next-line: stack-escape-engine
-    return out;
-}
+const ConvWeights = conv.ConvWeights;
+const runConvs = conv.runConvs;
 
 // ── Public API ──
 

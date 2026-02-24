@@ -1,6 +1,9 @@
 const std = @import("std");
-const c = @import("whisper_c.zig");
 const ten_vad_ggml_mod = @import("ten_vad_ggml.zig");
+
+// Re-export backends from separate files
+pub const SileroVad = @import("vad_silero.zig").SileroVad;
+pub const TenVadNative = @import("vad_ten_native.zig").TenVadNative;
 
 // ============================================================
 // VAD Backends
@@ -62,65 +65,6 @@ pub const VadBackend = union(enum) {
     }
 };
 
-pub const SileroVad = struct {
-    pub const chunk_bytes: usize = 1024; // 512 samples * 2 bytes — Silero's native n_window
-
-    vctx: *c.whisper_vad_context,
-
-    pub fn init(model_path: [:0]const u8) !SileroVad {
-        c.whisper_log_set(&sileroLogFilter, null);
-
-        var ctx_params = c.whisper_vad_default_context_params();
-        ctx_params.use_gpu = false;
-        ctx_params.n_threads = 2;
-
-        const vctx = c.whisper_vad_init_from_file_with_params(model_path.ptr, ctx_params);
-        if (vctx == null) return error.VadInitFailed;
-
-        return .{ .vctx = vctx.? };
-    }
-
-    fn sileroLogFilter(_: c.ggml_log_level, text: [*c]const u8, _: ?*anyopaque) callconv(.c) void {
-        if (text == null) return;
-        const msg = std.mem.span(text);
-        if (std.mem.startsWith(u8, msg, "whisper_vad_detect_speech:")) return;
-        std.debug.print("{s}", .{msg});
-    }
-
-    pub fn deinit(self: *SileroVad) void {
-        c.whisper_vad_free(self.vctx);
-    }
-
-    pub fn reset(self: *SileroVad) void {
-        c.whisper_vad_reset_state(self.vctx);
-    }
-
-    /// Get speech probability from S16_LE PCM. Converts to f32 for Silero.
-    pub fn chunkProbS16(self: *SileroVad, chunk: []const u8) f32 {
-        const n_samples = chunk.len / 2;
-        var float_buf: [chunk_bytes / 2]f32 = undefined;
-        for (float_buf[0..n_samples], 0..) |*sample, i| {
-            const off = i * 2;
-            const raw = std.mem.readInt(i16, chunk[off..][0..2], .little);
-            sample.* = @as(f32, @floatFromInt(raw)) / 32768.0;
-        }
-
-        const ok = c.whisper_vad_detect_speech_no_reset(self.vctx, &float_buf, @intCast(n_samples));
-        if (!ok) return 0;
-
-        const n_probs = c.whisper_vad_n_probs(self.vctx);
-        if (n_probs <= 0) return 0;
-
-        const probs: [*]const f32 = c.whisper_vad_probs(self.vctx) orelse return 0;
-        const n: usize = @intCast(n_probs);
-        var max_prob: f32 = 0.0;
-        for (probs[0..n]) |p| {
-            if (p > max_prob) max_prob = p;
-        }
-        return max_prob;
-    }
-};
-
 pub const TenVadGgml = struct {
     pub const chunk_bytes: usize = 512; // 256 samples * 2 bytes — TEN-VAD's native hop
 
@@ -156,74 +100,6 @@ pub const TenVadGgml = struct {
 
     pub fn reset(self: *TenVadGgml) void {
         self.ctx.reset();
-    }
-};
-
-pub const TenVadNative = struct {
-    pub const chunk_bytes: usize = 512; // 256 samples * 2 bytes — same hop as GGML
-
-    const CreateFn = *const fn (*?*anyopaque, usize, f32) callconv(.c) c_int;
-    const ProcessFn = *const fn (?*anyopaque, [*]const i16, usize, *f32, *c_int) callconv(.c) c_int;
-    const DestroyFn = *const fn (*?*anyopaque) callconv(.c) c_int;
-
-    handle: ?*anyopaque,
-    lib: std.DynLib,
-    create_fn: CreateFn,
-    process_fn: ProcessFn,
-    destroy_fn: DestroyFn,
-
-    pub fn init() !TenVadNative {
-        var lib = std.DynLib.open("libten_vad.so") catch return error.TenVadNativeLoadFailed;
-        errdefer lib.close();
-
-        const create_fn = lib.lookup(CreateFn, "ten_vad_create") orelse return error.TenVadNativeSymbolFailed;
-        const process_fn = lib.lookup(ProcessFn, "ten_vad_process") orelse return error.TenVadNativeSymbolFailed;
-        const destroy_fn = lib.lookup(DestroyFn, "ten_vad_destroy") orelse return error.TenVadNativeSymbolFailed;
-
-        var handle: ?*anyopaque = null;
-        const rc = create_fn(&handle, 256, 0.5);
-        if (rc != 0 or handle == null) return error.TenVadNativeInitFailed;
-
-        return .{
-            .handle = handle,
-            .lib = lib,
-            .create_fn = create_fn,
-            .process_fn = process_fn,
-            .destroy_fn = destroy_fn,
-        };
-    }
-
-    pub fn deinit(self: *TenVadNative) void {
-        _ = self.destroy_fn(&self.handle);
-        self.lib.close();
-    }
-
-    /// Get speech probability from S16_LE PCM.
-    /// Processes 256-sample hops (ten-VAD's native size), returns max prob.
-    pub fn chunkProbS16(self: *TenVadNative, chunk: []const u8) f32 {
-        const hop_samples = 256;
-        const hop_bytes = hop_samples * 2;
-        var max_prob: f32 = 0;
-        var offset: usize = 0;
-        while (offset + hop_bytes <= chunk.len) {
-            var i16_buf: [hop_samples]i16 = undefined;
-            for (&i16_buf, 0..) |*out, i| {
-                out.* = std.mem.readInt(i16, chunk[offset + i * 2 ..][0..2], .little);
-            }
-            var prob: f32 = 0;
-            var flag: c_int = 0;
-            _ = self.process_fn(self.handle, &i16_buf, hop_samples, &prob, &flag);
-            if (prob > max_prob) max_prob = prob;
-            offset += hop_bytes;
-        }
-        return max_prob;
-    }
-
-    pub fn reset(self: *TenVadNative) void {
-        // Native library has no reset — destroy and recreate
-        _ = self.destroy_fn(&self.handle);
-        self.handle = null;
-        _ = self.create_fn(&self.handle, 256, 0.5);
     }
 };
 
