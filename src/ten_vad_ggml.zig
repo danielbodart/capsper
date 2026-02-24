@@ -82,6 +82,50 @@ fn computeHannWindow() [WINDOW_SIZE]f32 {
     return w;
 }
 
+const MEL_BINS = computeMelBins();
+const MEL_FB = computeMelFilterbank();
+
+fn computeMelBins() [MEL_BANDS + 2]i32 {
+    const ln10 = @log(@as(f32, 10.0));
+    const low_mel = 2595.0 * @log(@as(f32, 1.0 + 0.0 / 700.0)) / ln10;
+    const high_mel = 2595.0 * @log(@as(f32, 1.0 + 8000.0 / 700.0)) / ln10;
+
+    var bins: [MEL_BANDS + 2]i32 = undefined;
+    for (0..MEL_BANDS + 2) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const mel = fi * (high_mel - low_mel) / (@as(f32, MEL_BANDS) + 1.0) + low_mel;
+        const hz = 700.0 * (@exp(@log(@as(f32, 10.0)) * mel / 2595.0) - 1.0);
+        bins[i] = @intFromFloat((FFT_SIZE + 1.0) * hz / @as(f32, FS));
+    }
+    // zwanzig-disable-next-line: stack-escape-engine
+    return bins;
+}
+
+fn computeMelFilterbank() [MEL_BANDS * N_BINS]f32 {
+    @setEvalBranchQuota(10000);
+    var fb: [MEL_BANDS * N_BINS]f32 = [_]f32{0} ** (MEL_BANDS * N_BINS);
+
+    for (0..MEL_BANDS) |j| {
+        const lo = MEL_BINS[j];
+        const mid = MEL_BINS[j + 1];
+        const hi = MEL_BINS[j + 2];
+        var i = lo;
+        while (i < mid) : (i += 1) {
+            const ui: usize = @intCast(i);
+            fb[j * N_BINS + ui] = @as(f32, @floatFromInt(i - lo)) /
+                @as(f32, @floatFromInt(mid - lo));
+        }
+        i = mid;
+        while (i < hi) : (i += 1) {
+            const ui: usize = @intCast(i);
+            fb[j * N_BINS + ui] = @as(f32, @floatFromInt(hi - i)) /
+                @as(f32, @floatFromInt(hi - mid));
+        }
+    }
+    // zwanzig-disable-next-line: stack-escape-engine
+    return fb;
+}
+
 // ── Feature extraction state ──
 
 const Features = struct {
@@ -89,41 +133,8 @@ const Features = struct {
     input_q: [WINDOW_SIZE]f32 = [_]f32{0} ** WINDOW_SIZE,
     fft_in: [FFT_SIZE]f32 = undefined,
     fft_out: [FFT_SIZE]f32 = undefined,
-    mel_fb: [MEL_BANDS * N_BINS]f32 = undefined,
-    mel_bins: [MEL_BANDS + 2]i32 = undefined,
     feat_stack: [CONTEXT_LEN * FEA_LEN]f32 = [_]f32{0} ** (CONTEXT_LEN * FEA_LEN),
     pitch_est: PitchEstimator = PitchEstimator.init(),
-
-    fn initMelFilterbank(self: *Features) void {
-        const low_mel = 2595.0 * std.math.log10(1.0 + 0.0 / 700.0);
-        const high_mel = 2595.0 * std.math.log10(1.0 + 8000.0 / 700.0);
-
-        for (0..MEL_BANDS + 2) |i| {
-            const fi: f32 = @floatFromInt(i);
-            const mel = fi * (high_mel - low_mel) / (@as(f32, MEL_BANDS) + 1.0) + low_mel;
-            const hz = 700.0 * (std.math.pow(f32, 10.0, mel / 2595.0) - 1.0);
-            self.mel_bins[i] = @intFromFloat((FFT_SIZE + 1.0) * hz / @as(f32, FS));
-        }
-
-        @memset(&self.mel_fb, 0);
-        for (0..MEL_BANDS) |j| {
-            const lo = self.mel_bins[j];
-            const mid = self.mel_bins[j + 1];
-            const hi = self.mel_bins[j + 2];
-            var i = lo;
-            while (i < mid) : (i += 1) {
-                const ui: usize = @intCast(i);
-                self.mel_fb[j * N_BINS + ui] = @as(f32, @floatFromInt(i - lo)) /
-                    @as(f32, @floatFromInt(mid - lo));
-            }
-            i = mid;
-            while (i < hi) : (i += 1) {
-                const ui: usize = @intCast(i);
-                self.mel_fb[j * N_BINS + ui] = @as(f32, @floatFromInt(hi - i)) /
-                    @as(f32, @floatFromInt(hi - mid));
-            }
-        }
-    }
 
     fn reset(self: *Features) void {
         self.preemph_prev = 0;
@@ -179,7 +190,7 @@ const Features = struct {
         const power_norm: f32 = 32768.0 * 32768.0;
         for (0..MEL_BANDS) |i| {
             var sum: f32 = 0;
-            const coef = self.mel_fb[i * N_BINS ..][0..N_BINS];
+            const coef = MEL_FB[i * N_BINS ..][0..N_BINS];
             for (0..N_BINS) |j| {
                 sum += bin_pow[j] * coef[j];
             }
@@ -210,49 +221,40 @@ const Model = struct {
     dense_bias: [2]*ggml.ggml_tensor = undefined,
 };
 
+// ── Conv weight cache ──
+
+const ConvWeights = struct {
+    dw0: [9]f32,
+    pw0: [16]f32,
+    b0: [16]f32,
+    dw1: [48]f32,
+    pw1: [256]f32,
+    b1: [16]f32,
+    dw2: [48]f32,
+    pw2: [256]f32,
+    b2: [16]f32,
+};
+
 // ── Separable conv layers ──
 
-fn runConvs(model: *const Model, backend: ggml.ggml_backend_t, features: *const [CONTEXT_LEN * FEA_LEN]f32) [80]f32 {
-    // Read all weights into local buffers
-    var dw0: [9]f32 = undefined;
-    var pw0: [16]f32 = undefined;
-    var b0: [16]f32 = undefined;
-    var dw1: [48]f32 = undefined;
-    var pw1: [256]f32 = undefined;
-    var b1: [16]f32 = undefined;
-    var dw2: [48]f32 = undefined;
-    var pw2: [256]f32 = undefined;
-    var b2: [16]f32 = undefined;
-
-    ggml.ggml_backend_tensor_get(model.sep_conv_dw[0], &dw0, 0, @sizeOf(@TypeOf(dw0)));
-    ggml.ggml_backend_tensor_get(model.sep_conv_pw[0], &pw0, 0, @sizeOf(@TypeOf(pw0)));
-    ggml.ggml_backend_tensor_get(model.sep_conv_bias[0], &b0, 0, @sizeOf(@TypeOf(b0)));
-    ggml.ggml_backend_tensor_get(model.sep_conv_dw[1], &dw1, 0, @sizeOf(@TypeOf(dw1)));
-    ggml.ggml_backend_tensor_get(model.sep_conv_pw[1], &pw1, 0, @sizeOf(@TypeOf(pw1)));
-    ggml.ggml_backend_tensor_get(model.sep_conv_bias[1], &b1, 0, @sizeOf(@TypeOf(b1)));
-    ggml.ggml_backend_tensor_get(model.sep_conv_dw[2], &dw2, 0, @sizeOf(@TypeOf(dw2)));
-    ggml.ggml_backend_tensor_get(model.sep_conv_pw[2], &pw2, 0, @sizeOf(@TypeOf(pw2)));
-    ggml.ggml_backend_tensor_get(model.sep_conv_bias[2], &b2, 0, @sizeOf(@TypeOf(b2)));
-
-    _ = backend;
-
+fn runConvs(w: *const ConvWeights, features: *const [CONTEXT_LEN * FEA_LEN]f32) [80]f32 {
     // Layer 0: SeparableConv2D on [1,1,3,41], VALID → [1,1,1,39]
     var dw0_out: [39]f32 = undefined;
-    for (0..39) |w| {
+    for (0..39) |col| {
         var sum: f32 = 0;
         for (0..3) |kh| {
             for (0..3) |kw| {
-                sum += features[kh * FEA_LEN + (w + kw)] * dw0[kh * 3 + kw];
+                sum += features[kh * FEA_LEN + (col + kw)] * w.dw0[kh * 3 + kw];
             }
         }
-        dw0_out[w] = sum;
+        dw0_out[col] = sum;
     }
 
     // Pointwise conv: (16,1,1,1) + bias + ReLU → [16, 1, 39]
     var pw0_out: [16 * 39]f32 = undefined;
     for (0..16) |oc| {
         for (0..39) |i| {
-            const val = dw0_out[i] * pw0[oc] + b0[oc];
+            const val = dw0_out[i] * w.pw0[oc] + w.b0[oc];
             pw0_out[oc * 39 + i] = @max(val, 0);
         }
     }
@@ -282,7 +284,7 @@ fn runConvs(model: *const Model, backend: ggml.ggml_backend_t, features: *const 
                 const iw_signed: i32 = @as(i32, @intCast(ow)) * 2 + @as(i32, @intCast(k)) - 1;
                 if (iw_signed >= 0 and iw_signed < 19) {
                     const iw: usize = @intCast(iw_signed);
-                    sum += pool_out[ch * 19 + iw] * dw1[ch * 3 + k];
+                    sum += pool_out[ch * 19 + iw] * w.dw1[ch * 3 + k];
                 }
             }
             dw1_out[ch * 10 + ow] = sum;
@@ -293,9 +295,9 @@ fn runConvs(model: *const Model, backend: ggml.ggml_backend_t, features: *const 
     var pw1_out: [16 * 10]f32 = undefined;
     for (0..16) |oc| {
         for (0..10) |i| {
-            var sum: f32 = b1[oc];
+            var sum: f32 = w.b1[oc];
             for (0..16) |ic| {
-                sum += dw1_out[ic * 10 + i] * pw1[oc * 16 + ic];
+                sum += dw1_out[ic * 10 + i] * w.pw1[oc * 16 + ic];
             }
             pw1_out[oc * 10 + i] = @max(sum, 0);
         }
@@ -309,7 +311,7 @@ fn runConvs(model: *const Model, backend: ggml.ggml_backend_t, features: *const 
             for (0..3) |k| {
                 const iw = ow * 2 + k;
                 if (iw < 10) {
-                    sum += pw1_out[ch * 10 + iw] * dw2[ch * 3 + k];
+                    sum += pw1_out[ch * 10 + iw] * w.dw2[ch * 3 + k];
                 }
             }
             dw2_out[ch * 5 + ow] = sum;
@@ -320,9 +322,9 @@ fn runConvs(model: *const Model, backend: ggml.ggml_backend_t, features: *const 
     var pw2_out: [16 * 5]f32 = undefined;
     for (0..16) |oc| {
         for (0..5) |i| {
-            var sum: f32 = b2[oc];
+            var sum: f32 = w.b2[oc];
             for (0..16) |ic| {
-                sum += dw2_out[ic * 5 + i] * pw2[oc * 16 + ic];
+                sum += dw2_out[ic * 5 + i] * w.pw2[oc * 16 + ic];
             }
             pw2_out[oc * 5 + i] = @max(sum, 0);
         }
@@ -330,9 +332,9 @@ fn runConvs(model: *const Model, backend: ggml.ggml_backend_t, features: *const 
 
     // Flatten: [16, 1, 5] → [80] via transpose [16,5] → [5,16]
     var out: [80]f32 = undefined;
-    for (0..5) |w| {
+    for (0..5) |col| {
         for (0..16) |ch| {
-            out[w * 16 + ch] = pw2_out[ch * 5 + w];
+            out[col * 16 + ch] = pw2_out[ch * 5 + col];
         }
     }
     // zwanzig-disable-next-line: stack-escape-engine
@@ -344,6 +346,7 @@ fn runConvs(model: *const Model, backend: ggml.ggml_backend_t, features: *const 
 pub const TenVadGgmlCtx = struct {
     feat: Features,
     model: Model,
+    conv_weights: ConvWeights,
     ctx_weight: *ggml.ggml_context,
     buf_weight: ggml.ggml_backend_buffer_t,
     ctx_state: *ggml.ggml_context,
@@ -401,7 +404,6 @@ pub const TenVadGgmlCtx = struct {
 
         // Initialize feature extraction
         ctx.feat = .{};
-        ctx.feat.initMelFilterbank();
         ctx.feat.reset();
         ctx.frame_count = 0;
         ctx.lstm_reset_pending = false;
@@ -541,6 +543,17 @@ pub const TenVadGgmlCtx = struct {
 
         if (loaded != N_WEIGHT_TENSORS) return error.TenVadIncompleteLoad;
 
+        // Cache conv weights (avoids 9 ggml_backend_tensor_get calls per frame)
+        ggml.ggml_backend_tensor_get(ctx.model.sep_conv_dw[0], &ctx.conv_weights.dw0, 0, @sizeOf(@TypeOf(ctx.conv_weights.dw0)));
+        ggml.ggml_backend_tensor_get(ctx.model.sep_conv_pw[0], &ctx.conv_weights.pw0, 0, @sizeOf(@TypeOf(ctx.conv_weights.pw0)));
+        ggml.ggml_backend_tensor_get(ctx.model.sep_conv_bias[0], &ctx.conv_weights.b0, 0, @sizeOf(@TypeOf(ctx.conv_weights.b0)));
+        ggml.ggml_backend_tensor_get(ctx.model.sep_conv_dw[1], &ctx.conv_weights.dw1, 0, @sizeOf(@TypeOf(ctx.conv_weights.dw1)));
+        ggml.ggml_backend_tensor_get(ctx.model.sep_conv_pw[1], &ctx.conv_weights.pw1, 0, @sizeOf(@TypeOf(ctx.conv_weights.pw1)));
+        ggml.ggml_backend_tensor_get(ctx.model.sep_conv_bias[1], &ctx.conv_weights.b1, 0, @sizeOf(@TypeOf(ctx.conv_weights.b1)));
+        ggml.ggml_backend_tensor_get(ctx.model.sep_conv_dw[2], &ctx.conv_weights.dw2, 0, @sizeOf(@TypeOf(ctx.conv_weights.dw2)));
+        ggml.ggml_backend_tensor_get(ctx.model.sep_conv_pw[2], &ctx.conv_weights.pw2, 0, @sizeOf(@TypeOf(ctx.conv_weights.pw2)));
+        ggml.ggml_backend_tensor_get(ctx.model.sep_conv_bias[2], &ctx.conv_weights.b2, 0, @sizeOf(@TypeOf(ctx.conv_weights.b2)));
+
         // LSTM state context
         const state_ctx_size = 4 * ggml.ggml_tensor_overhead();
         ctx.ctx_state = ggml.ggml_init(.{
@@ -576,7 +589,7 @@ pub const TenVadGgmlCtx = struct {
 
     pub fn process(self: *TenVadGgmlCtx, samples: []const i16) f32 {
         const features = self.feat.extract(samples);
-        const conv_out = runConvs(&self.model, self.backend, features);
+        const conv_out = runConvs(&self.conv_weights, features);
 
         // Periodic LSTM reset: native zeroes hidden states every 1875 frames (aed.cc:476-481).
         // The flag is set after frame N completes; the clear happens before frame N+1's inference.

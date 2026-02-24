@@ -62,6 +62,28 @@ const A_4KHZ = [NSECT][3]f32{
 };
 const G_4KHZ: f32 = 0.2692541;
 
+const DCT_RATIO: f32 = @sqrt(2.0 / @as(f32, NB_BANDS));
+
+const BandInfo = struct {
+    band_sz: i32,
+    index_offset: i32,
+};
+
+const BAND_TABLE = computeBandTable();
+
+fn computeBandTable() [NB_BANDS - 1]BandInfo {
+    var table: [NB_BANDS - 1]BandInfo = undefined;
+    const index_conv: f32 = @as(f32, FFT_SZ) / ASSUMED_FFT_4_BAND_ENG;
+    for (0..NB_BANDS - 1) |i| {
+        table[i] = .{
+            .band_sz = @intFromFloat(@round(@as(f32, @floatFromInt(BAND_START_INDEX[i + 1] - BAND_START_INDEX[i])) * index_conv)),
+            .index_offset = @intFromFloat(@round(@as(f32, @floatFromInt(BAND_START_INDEX[i])) * index_conv)),
+        };
+    }
+    // zwanzig-disable-next-line: stack-escape-engine
+    return table;
+}
+
 // ── 5-section cascaded biquad IIR filter ──
 
 const BiquadFilter = struct {
@@ -411,24 +433,22 @@ pub const PitchEstimator = struct {
     // ── Internal functions ──
 
     fn dct(self: *const PitchEstimator, in: *const [NB_BANDS]f32, out: *[NB_BANDS]f32) void {
-        const ratio = @sqrt(2.0 / @as(f32, NB_BANDS));
         for (0..NB_BANDS) |i| {
             var sum: f32 = 0;
             for (0..NB_BANDS) |j| {
                 sum += in[j] * self.dct_table[j * NB_BANDS + i];
             }
-            out[i] = sum * ratio;
+            out[i] = sum * DCT_RATIO;
         }
     }
 
     fn idct(self: *const PitchEstimator, in: *const [NB_BANDS]f32, out: *[NB_BANDS]f32) void {
-        const ratio = @sqrt(2.0 / @as(f32, NB_BANDS));
         for (0..NB_BANDS) |i| {
             var sum: f32 = 0;
             for (0..NB_BANDS) |j| {
                 sum += in[j] * self.dct_table[i * NB_BANDS + j];
             }
-            out[i] = sum * ratio;
+            out[i] = sum * DCT_RATIO;
         }
     }
 
@@ -476,12 +496,11 @@ pub const PitchEstimator = struct {
 // ── Static helper functions ──
 
 fn computeBandEnergy(bin_pow: []const f32, band_e: *[NB_BANDS]f32) void {
-    const index_conv: f32 = @as(f32, FFT_SZ) / ASSUMED_FFT_4_BAND_ENG;
     @memset(band_e, 0);
 
     for (0..NB_BANDS - 1) |i| {
-        const band_sz: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(BAND_START_INDEX[i + 1] - BAND_START_INDEX[i])) * index_conv));
-        const index_offset: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(BAND_START_INDEX[i])) * index_conv));
+        const band_sz = BAND_TABLE[i].band_sz;
+        const index_offset = BAND_TABLE[i].index_offset;
 
         for (0..@intCast(band_sz)) |j| {
             const fj: f32 = @floatFromInt(j);
@@ -496,12 +515,11 @@ fn computeBandEnergy(bin_pow: []const f32, band_e: *[NB_BANDS]f32) void {
 }
 
 fn interpBandGain(band_e: *const [NB_BANDS]f32, g: *[N_BINS]f32) void {
-    const index_conv: f32 = @as(f32, FFT_SZ) / ASSUMED_FFT_4_BAND_ENG;
     @memset(g, 0);
 
     for (0..NB_BANDS - 1) |i| {
-        const band_sz: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(BAND_START_INDEX[i + 1] - BAND_START_INDEX[i])) * index_conv));
-        const index_offset: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(BAND_START_INDEX[i])) * index_conv));
+        const band_sz = BAND_TABLE[i].band_sz;
+        const index_offset = BAND_TABLE[i].index_offset;
 
         for (0..@intCast(band_sz)) |j| {
             const fj: f32 = @floatFromInt(j);
