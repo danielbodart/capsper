@@ -33,6 +33,7 @@ const HIDDEN_DIM = 64;
 const EPS = 1e-20;
 const PREEMPH = 0.97;
 const N_WEIGHT_TENSORS = 21;
+const RESET_FRAME_NUM: u32 = 1875; // native resets LSTM hidden states every 1875 frames (30s)
 
 const FEATURE_MEANS = [FEA_LEN]f32{
     -8.198236465454e+00, -6.265716552734e+00, -5.483818531036e+00,
@@ -354,6 +355,8 @@ pub const TenVadGgmlCtx = struct {
     gf: *ggml.ggml_cgraph,
     sched: ggml.ggml_backend_sched_t,
     allocator: std.mem.Allocator,
+    frame_count: u32,
+    lstm_reset_pending: bool,
 
     pub fn init(allocator: std.mem.Allocator, model_path: [:0]const u8) !*TenVadGgmlCtx {
         const fp = std.c.fopen(model_path.ptr, "rb") orelse return error.TenVadOpenFailed;
@@ -400,6 +403,8 @@ pub const TenVadGgmlCtx = struct {
         ctx.feat = .{};
         ctx.feat.initMelFilterbank();
         ctx.feat.reset();
+        ctx.frame_count = 0;
+        ctx.lstm_reset_pending = false;
 
         // CPU backend
         ctx.backend = ggml.ggml_backend_cpu_init() orelse return error.TenVadBackendFailed;
@@ -573,6 +578,13 @@ pub const TenVadGgmlCtx = struct {
         const features = self.feat.extract(samples);
         const conv_out = runConvs(&self.model, self.backend, features);
 
+        // Periodic LSTM reset: native zeroes hidden states every 1875 frames (aed.cc:476-481).
+        // The flag is set after frame N completes; the clear happens before frame N+1's inference.
+        if (self.lstm_reset_pending) {
+            ggml.ggml_backend_buffer_clear(self.buf_state, 0);
+            self.lstm_reset_pending = false;
+        }
+
         const input_tensor = ggml.ggml_graph_get_tensor(self.gf, "input") orelse return 0;
         const prob_tensor = ggml.ggml_graph_get_tensor(self.gf, "prob") orelse return 0;
 
@@ -583,12 +595,21 @@ pub const TenVadGgmlCtx = struct {
 
         var result: f32 = 0;
         ggml.ggml_backend_tensor_get(prob_tensor, &result, 0, @sizeOf(f32));
+
+        self.frame_count += 1;
+        if (self.frame_count >= RESET_FRAME_NUM) {
+            self.lstm_reset_pending = true;
+            self.frame_count = 0;
+        }
+
         return result;
     }
 
     pub fn reset(self: *TenVadGgmlCtx) void {
         ggml.ggml_backend_buffer_clear(self.buf_state, 0);
         self.feat.reset();
+        self.frame_count = 0;
+        self.lstm_reset_pending = false;
     }
 
     pub fn deinit(self: *TenVadGgmlCtx) void {
