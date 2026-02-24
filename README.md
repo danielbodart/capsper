@@ -183,11 +183,20 @@ A single self-contained binary (`src/`):
 | `alignatt.zig` | Cross-attention analysis for streaming stop/rewind decisions |
 | `recorder.zig` | Per-utterance debug recording (WAV + diagnostic log capture) |
 | `utils.zig` | Pure utility functions (PCM conversion, WAV parsing, buffer trimming, RMS analysis) |
-| `vad.zig` | Multi-backend VAD (Silero default, TEN-VAD GGML, TEN-VAD Native) — see [VAD](#voice-activity-detection-vad) |
+| `vad.zig` | VAD backend dispatch (`VadBackend` tagged union) and `VadFilter` state machine — see [VAD](#voice-activity-detection-vad) |
+| `vad_silero.zig` | Silero backend — wraps whisper.cpp's `whisper_vad_detect_speech` with streaming LSTM state |
+| `ten_vad_ggml.zig` | TEN-VAD GGML backend — feature extraction + GGML inference (separable convs, LSTM, dense) |
+| `vad_ten_native.zig` | TEN-VAD Native backend — dlopen wrapper for prebuilt `libten_vad.so` |
+| `conv.zig` | Separable conv layers for TEN-VAD GGML (pure Zig, no C FFI) |
+| `pitch_est.zig` | LPC-residual autocorrelation pitch estimator for TEN-VAD GGML |
+| `dsp.zig` | Pure DSP helpers for pitch estimation (biquad filters, LPC, band energy) |
 | `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream`, software gain |
 | `pw_detect.zig` | Interactive PipeWire setup wizard (device selection, channel detection, gain calibration) |
 | `auto_gain.zig` | Pure-math auto-gain controller (runtime + calibration), capped at PipeWire's 10x ceiling |
 | `pw_helpers.c` | C helpers for PipeWire SPA pod building, stream gain, and source enumeration |
+| `whisper_c.zig` | C import bridge for whisper.cpp |
+| `pipewire_c.zig` | C import bridge for PipeWire |
+| `prop_tests.zig` | Property-based tests (PCM conversion, WAV roundtrips, buffer trimming, attention analysis) |
 
 ### Technical highlights
 
