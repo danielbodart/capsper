@@ -88,10 +88,11 @@ const AlignedReader = struct {
     }
 };
 
-// Streaming constants (byte counts for S16_LE at 16kHz = 32000 bytes/sec)
-const transcribe_interval_bytes: usize = 32000; // 1s — re-transcribe cadence during speech
-const max_buffer_bytes: usize = 960000; // 30s — sliding window cap (matches whisper's full 30s window)
-const min_transcribe_bytes: usize = 16000; // 0.5s — minimum audio worth transcribing
+// Streaming constants (S16_LE at 16kHz = 32000 bytes/sec)
+const bytes_per_second: usize = 16000 * 2; // sample_rate * bytes_per_sample
+const transcribe_interval_bytes: usize = bytes_per_second; // 1s — re-transcribe cadence during speech
+const max_buffer_bytes: usize = bytes_per_second * 30; // 30s — sliding window cap (matches whisper's full 30s window)
+const min_transcribe_bytes: usize = bytes_per_second / 2; // 0.5s — minimum audio worth transcribing
 
 // VadFilter drives all segmentation. No hasSpeech polling — only two states.
 const VadState = enum { idle, speaking };

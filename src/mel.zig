@@ -18,9 +18,6 @@ pub const MelBuffer = struct {
     // Precomputed mel filterbank [n_mel * N_FFT_BINS] — triangular filters on mel scale
     filters: []f32,
 
-    // Precomputed periodic Hann window [N_FFT]
-    hann: [N_FFT]f32,
-
     // Cached raw mel frames (pre-normalization, log10 scale).
     // Layout: frame-major — [frame0_band0, frame0_band1, ..., frame1_band0, ...]
     // Each frame is n_mel consecutive floats.
@@ -43,14 +40,10 @@ pub const MelBuffer = struct {
         const output_buf = try allocator.alloc(f32, n_mel * WHISPER_N_FRAMES);
         errdefer allocator.free(output_buf);
 
-        var hann: [N_FFT]f32 = undefined;
-        computeHannWindow(&hann);
-
         return .{
             .allocator = allocator,
             .n_mel = n_mel,
             .filters = filters,
-            .hann = hann,
             .output_buf = output_buf,
         };
     }
@@ -154,7 +147,7 @@ pub const MelBuffer = struct {
                 const src_idx = padded_idx - reflect_pad;
                 break :blk if (src_idx < self.samples.len) self.samples[src_idx] else 0;
             };
-            fft_in[j] = self.hann[j] * sample;
+            fft_in[j] = HANN_WINDOW[j] * sample;
         }
 
         // FFT (real input in fft_in[0..N_FFT], scratch in fft_in[N_FFT..2*N_FFT])
@@ -263,14 +256,19 @@ fn dft(in: []const f32, N: usize, out: []f32) void {
 
 // ─── Hann window ────────────────────────────────────────────────────────────────
 
+const HANN_WINDOW = computeHannWindow();
+
 /// Periodic Hann window: w[n] = 0.5 * (1 - cos(2π·n / N))
 /// Matches whisper.cpp (and PyTorch's periodic mode).
-fn computeHannWindow(out: *[N_FFT]f32) void {
+fn computeHannWindow() [N_FFT]f32 {
     const n_f: f64 = @floatFromInt(N_FFT);
+    var w: [N_FFT]f32 = undefined;
     for (0..N_FFT) |i| {
         const x: f64 = 2.0 * math.pi * @as(f64, @floatFromInt(i)) / n_f;
-        out[i] = @floatCast(0.5 * (1.0 - @cos(x)));
+        w[i] = @floatCast(0.5 * (1.0 - @cos(x)));
     }
+    // zwanzig-disable-next-line: stack-escape-engine
+    return w;
 }
 
 // ─── Mel filterbank ─────────────────────────────────────────────────────────────
@@ -337,8 +335,7 @@ fn htkMelInverse(m: f64) f64 {
 // ─── Tests ──────────────────────────────────────────────────────────────────────
 
 test "Hann window properties" {
-    var hann: [N_FFT]f32 = undefined;
-    computeHannWindow(&hann);
+    const hann = HANN_WINDOW;
 
     // First sample should be ~0 (periodic Hann starts at 0)
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), hann[0], 1e-7);

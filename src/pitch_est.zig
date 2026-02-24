@@ -39,6 +39,23 @@ const VOICED_THR: f32 = 0.4;
 
 const DCT_RATIO: f32 = @sqrt(2.0 / @as(f32, NB_BANDS));
 
+const DCT_TABLE = computeDctTable();
+
+fn computeDctTable() [NB_BANDS * NB_BANDS]f32 {
+    @setEvalBranchQuota(2000);
+    var table: [NB_BANDS * NB_BANDS]f32 = undefined;
+    for (0..NB_BANDS) |i| {
+        const fi: f32 = @floatFromInt(i);
+        for (0..NB_BANDS) |j| {
+            const fj: f32 = @floatFromInt(j);
+            table[i * NB_BANDS + j] = @cos((fi + 0.5) * fj * std.math.pi / NB_BANDS);
+            if (j == 0) table[i * NB_BANDS + j] *= @sqrt(0.5);
+        }
+    }
+    // zwanzig-disable-next-line: stack-escape-engine
+    return table;
+}
+
 // ── Pitch Estimator ──
 
 pub const PitchEstimator = struct {
@@ -67,9 +84,6 @@ pub const PitchEstimator = struct {
     pitch_max_path_all: f32 = 0,
     best_period_est: i32 = 0,
 
-    // DCT table [18×18]
-    dct_table: [NB_BANDS * NB_BANDS]f32 = undefined,
-
     // Biquad filter for decimation
     biquad: dsp.BiquadFilter = .{},
 
@@ -78,17 +92,7 @@ pub const PitchEstimator = struct {
     input_resample_buf_idx: usize = 0,
 
     pub fn init() PitchEstimator {
-        var pe = PitchEstimator{};
-        // Precompute DCT table
-        for (0..NB_BANDS) |i| {
-            const fi: f32 = @floatFromInt(i);
-            for (0..NB_BANDS) |j| {
-                const fj: f32 = @floatFromInt(j);
-                pe.dct_table[i * NB_BANDS + j] = @cos((fi + 0.5) * fj * std.math.pi / NB_BANDS);
-                if (j == 0) pe.dct_table[i * NB_BANDS + j] *= @sqrt(0.5);
-            }
-        }
-        return pe;
+        return PitchEstimator{};
     }
 
     pub fn reset(self: *PitchEstimator) void {
@@ -362,21 +366,21 @@ pub const PitchEstimator = struct {
 
     // ── Internal functions ──
 
-    fn dct(self: *const PitchEstimator, in: *const [NB_BANDS]f32, out: *[NB_BANDS]f32) void {
+    fn dct(_: *const PitchEstimator, in: *const [NB_BANDS]f32, out: *[NB_BANDS]f32) void {
         for (0..NB_BANDS) |i| {
             var sum: f32 = 0;
             for (0..NB_BANDS) |j| {
-                sum += in[j] * self.dct_table[j * NB_BANDS + i];
+                sum += in[j] * DCT_TABLE[j * NB_BANDS + i];
             }
             out[i] = sum * DCT_RATIO;
         }
     }
 
-    fn idct(self: *const PitchEstimator, in: *const [NB_BANDS]f32, out: *[NB_BANDS]f32) void {
+    fn idct(_: *const PitchEstimator, in: *const [NB_BANDS]f32, out: *[NB_BANDS]f32) void {
         for (0..NB_BANDS) |i| {
             var sum: f32 = 0;
             for (0..NB_BANDS) |j| {
-                sum += in[j] * self.dct_table[i * NB_BANDS + j];
+                sum += in[j] * DCT_TABLE[i * NB_BANDS + j];
             }
             out[i] = sum * DCT_RATIO;
         }
