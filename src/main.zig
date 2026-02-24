@@ -30,7 +30,7 @@ pub fn main() !void {
     var model_path: [:0]const u8 = "../models/ggml-large-v3-turbo-q5_0.bin";
     var model_path_is_default = true;
     const VadChoice = enum { ten, silero, ten_native };
-    var vad_choice: VadChoice = .ten;
+    var vad_choice: VadChoice = .silero;
     var port: u16 = 43007;
     var warmup_file: ?[:0]const u8 = "jfk.wav";
     var warmup_file_is_default = true;
