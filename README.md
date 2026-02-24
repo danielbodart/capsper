@@ -193,7 +193,7 @@ A single self-contained binary (`src/`):
 
 **Manual decode loop with cross-attention introspection** — Instead of using whisper.cpp's high-level `whisper_full()`, Capsper manually drives the mel spectrogram → encode → decode pipeline token by token. This gives per-token access to the decoder's cross-attention weights, which is how AlignAtt decides when to stop: it watches where each attention head is "looking" in the audio, and stops when attention drifts past the end of the buffer or jumps backwards (a sign of hallucination). The attention values go through z-score normalisation, median filtering, and head averaging before the stopping decision. Cross-attention also provides per-token audio frame positions, which are used for exact token-audio alignment when the sliding window trims audio from the front — instead of estimating how many tokens to demote, the pipeline knows precisely which tokens correspond to trimmed audio. The most-attended frame persists across decode cycles, so backward attention jumps between cycles (not just within a single decode) are also caught as rewind signals.
 
-**N-gram repetition guard** — The decode loop monitors for repeating token patterns (1 to 64 tokens long). If any n-gram repeats 3 times consecutively, the repeated tokens are discarded and decoding stops. This catches both single-token hallucination loops ("the the the...") and longer phrase repetitions that the attention-based stopping might miss.
+**Incremental mel spectrogram** — Rather than recomputing the full mel spectrogram from scratch each cycle, Capsper caches raw (pre-normalisation) mel frames and only computes FFT for new audio samples. The mel filterbank, Hann window, and FFT are implemented in pure Zig (`mel.zig`), giving full control over the caching boundary. Normalisation is still a full pass each cycle but takes under 1ms. The cache is reset on segment boundaries or buffer trims (clean slate).
 
 **Token accumulation with two-tier context** — Rather than re-transcribing the entire audio buffer each cycle and diffing the output, Capsper commits confirmed tokens as a forced decoder prefix. Each cycle, the model is given previously emitted tokens after `[notimestamps]` as forced output — it processes them as its own previous output, building KV cache state, then continues generating from where it left off. This eliminates the instability that comes from re-decoding: the model always sees the same prefix, so it never contradicts what was already emitted.
 
@@ -202,8 +202,6 @@ When the 30-second sliding window trims audio from the front, the corresponding 
 **CPU-only VAD** — Voice activity detection runs entirely on the CPU while whisper.cpp transcription runs on the GPU, avoiding GPU context switching overhead. Three backends are available (Silero, TEN-VAD GGML, TEN-VAD Native) — all streaming, all CPU-only. See [VAD](#voice-activity-detection-vad) for details.
 
 **Transparent keyboard forwarding** — Rather than intercepting specific keys, Capsper grabs all physical keyboards via `EVIOCGRAB` and creates a uinput virtual keyboard that forwards every event transparently. Only the trigger key (CapsLock) is consumed; all other keys pass through unchanged. This means the grab is invisible to applications while giving Capsper exclusive access to the trigger. The virtual keyboard also handles text injection — transcribed text is emitted as synthetic keystrokes with proper shift-state handling, which works on both X11 and Wayland without any external tools. A panic sequence (Enter+Backspace+Escape simultaneously) ungrab all keyboards as a safety net.
-
-**Incremental mel spectrogram** — Rather than recomputing the full mel spectrogram from scratch each cycle, Capsper caches raw (pre-normalisation) mel frames and only computes FFT for new audio samples. The mel filterbank, Hann window, and FFT are implemented in pure Zig (`mel.zig`), giving full control over the caching boundary. Normalisation is still a full pass each cycle but takes under 1ms. The cache is reset on segment boundaries or buffer trims (clean slate).
 
 ## Server options
 
@@ -219,7 +217,7 @@ capsper [OPTIONS]
   --input tcp|local       Input mode: tcp (socket) or local (PipeWire capture)
   --trigger KEY           Trigger key for push-to-talk (default: capslock)
   --trigger-passthrough   Forward trigger key to OS after interception
-  --type-delay MS         Delay between injected keystrokes in ms (default: 12)
+  --type-delay US         Delay between injected keystrokes in microseconds (default: 12000)
   --low-latency           Keep PipeWire stream open (mic indicator always visible, ~300ms faster)
   --pw-target NODE        PipeWire capture target node name
   --pw-channel CHANNEL    PipeWire channel: MONO, FL, FR, AUX0-AUX63 (default: FL)
@@ -228,11 +226,12 @@ capsper [OPTIONS]
   --record-dir DIR        Record each utterance to DIR (WAV + diagnostic log)
   --record-keep N         Number of recording pairs to keep (default: 10, ring buffer)
   --transcribe FILE       Batch-transcribe a WAV file (non-streaming) and exit
-  --vad ten|silero        VAD backend (default: ten)
+  --vad ten|silero|ten-native  VAD backend (default: silero)
   --pw-detect             Interactive setup wizard (device selection, channel detection, gain calibration)
   --detect-duration SECS  Duration per detection phase (default: 5)
   --verbose               Enable verbose logging
   --dry-run               Load models, run warmup, then exit (validates setup)
+  --version               Print version and exit
 ```
 
 ## Voice activity detection (VAD)
@@ -254,6 +253,7 @@ The regression tests accept `VAD_BACKEND` to override the default:
 ```bash
 VAD_BACKEND=ten ./run.ts short-test
 VAD_BACKEND=silero ./run.ts medium-test
+VAD_BACKEND=ten-native ./run.ts short-test
 ```
 
 Additional environment variables for threshold tuning: `VAD_THRESHOLD`, `VAD_THRESHOLD_OFF`, `VAD_MIN_SILENCE_MS`.
@@ -285,8 +285,6 @@ All commands go through the Bun-based task runner (`run.ts`), which bootstraps i
 
 | Variable | Default | Description |
 |---|---|---|
-| `CAPSPER_PW_CHANNEL` | `FL` | PipeWire channel to capture |
-| `CAPSPER_PW_TARGET` | *(unset)* | PipeWire node to capture from |
 | `VAD_BACKEND` | *(unset)* | Override VAD backend in regression tests (`ten`, `silero`, `ten-native`) |
 | `VAD_THRESHOLD` | *(unset)* | Override VAD onset threshold in regression tests |
 | `VAD_THRESHOLD_OFF` | *(unset)* | Override VAD offset threshold in regression tests |
