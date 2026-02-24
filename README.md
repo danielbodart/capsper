@@ -12,7 +12,7 @@ Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://g
 
 1. A single Zig binary grabs your keyboard via evdev, intercepts CapsLock as push-to-talk
 2. Audio is captured directly via PipeWire while the trigger key is held
-3. Incremental transcription runs on the GPU with VAD (TEN-VAD, on CPU) and token accumulation for consistency
+3. Incremental transcription runs on the GPU with VAD (Silero, on CPU) and token accumulation for consistency
 4. Transcribed text is injected as keystrokes via uinput into the focused window
 
 ## Requirements
@@ -166,7 +166,7 @@ Every step is incremental — re-running `./run` is fast if everything is alread
 Physical Keyboard ──evdev──→ capsper ──uinput──→ Virtual Keyboard → Apps
                               │
                               ├─ Trigger key held → PipeWire audio capture
-                              ├─ whisper.cpp (GPU) + TEN-VAD (CPU)
+                              ├─ whisper.cpp (GPU) + Silero VAD (CPU)
                               ├─ AlignAtt streaming + token accumulation
                               └─ All other keys → forwarded transparently
 ```
@@ -183,7 +183,7 @@ A single self-contained binary (`src/`):
 | `alignatt.zig` | Cross-attention analysis for streaming stop/rewind decisions |
 | `recorder.zig` | Per-utterance debug recording (WAV + diagnostic log capture) |
 | `utils.zig` | Pure utility functions (PCM conversion, WAV parsing, buffer trimming, RMS analysis) |
-| `vad.zig` | Multi-backend VAD (TEN-VAD GGML default, Silero via whisper.cpp) |
+| `vad.zig` | Multi-backend VAD (Silero default, TEN-VAD GGML, TEN-VAD Native) — see [VAD](#voice-activity-detection-vad) |
 | `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream`, software gain |
 | `pw_detect.zig` | Interactive PipeWire setup wizard (device selection, channel detection, gain calibration) |
 | `auto_gain.zig` | Pure-math auto-gain controller (runtime + calibration), capped at PipeWire's 10x ceiling |
@@ -199,7 +199,7 @@ A single self-contained binary (`src/`):
 
 When the 30-second sliding window trims audio from the front, the corresponding tokens are demoted from forced output to conditioning context. Instead of being deleted (which caused misalignment and hallucination), they move to the `<|startofprev|>` section before `[sot]`, where the model treats them as a hint rather than a constraint. This two-tier approach — forced tokens for audio in the buffer, conditioning tokens for trimmed audio — is inspired by SimulStreaming's token management.
 
-**CPU-only VAD** — TEN-VAD voice activity detection runs on the CPU via a pure GGML reimplementation (296 KB model, zero additional dependencies) while whisper.cpp transcription runs on the GPU. This avoids GPU context switching overhead for the frequent VAD checks (every 0.5–1s) and means VAD has zero impact on transcription throughput. Silero VAD is also available via `--vad silero`.
+**CPU-only VAD** — Voice activity detection runs entirely on the CPU while whisper.cpp transcription runs on the GPU, avoiding GPU context switching overhead. Three backends are available (Silero, TEN-VAD GGML, TEN-VAD Native) — all streaming, all CPU-only. See [VAD](#voice-activity-detection-vad) for details.
 
 **Transparent keyboard forwarding** — Rather than intercepting specific keys, Capsper grabs all physical keyboards via `EVIOCGRAB` and creates a uinput virtual keyboard that forwards every event transparently. Only the trigger key (CapsLock) is consumed; all other keys pass through unchanged. This means the grab is invisible to applications while giving Capsper exclusive access to the trigger. The virtual keyboard also handles text injection — transcribed text is emitted as synthetic keystrokes with proper shift-state handling, which works on both X11 and Wayland without any external tools. A panic sequence (Enter+Backspace+Escape simultaneously) ungrab all keyboards as a safety net.
 
@@ -235,6 +235,29 @@ capsper [OPTIONS]
   --dry-run               Load models, run warmup, then exit (validates setup)
 ```
 
+## Voice activity detection (VAD)
+
+All VAD backends run on the CPU in streaming mode, processing small audio chunks as they arrive. Whisper transcription runs on the GPU, so VAD has zero impact on transcription throughput.
+
+| Backend | Flag | Model | Chunk size | Deps | Notes |
+|---|---|---|---|---|---|
+| **Silero** (default) | `--vad silero` | `ggml-silero-v5.1.2.bin` (865 KB) | 512 samples (32ms) | Via whisper.cpp | Best accuracy, slightly higher CPU. LSTM state carried across chunks for temporal context ([upstream PR](https://github.com/ggml-org/whisper.cpp/pull/3677)). |
+| **TEN-VAD GGML** | `--vad ten` | `ten-vad-ggml.bin` (296 KB) | 256 samples (16ms) | None (pure Zig + GGML) | Only GGML reimplementation of TEN-VAD in existence. Separable convs + LSTM + dense layers, all in Zig. Performance matches the native ONNX model. |
+| **TEN-VAD Native** | `--vad ten-native` | Embedded in `libten_vad.so` (306 KB) | 256 samples (16ms) | `libc++`, `libc++abi` | Reference implementation using the original ONNX model via the prebuilt shared library. |
+
+**Trade-offs**: Silero has the best speech detection accuracy (94.3% avg coverage, 8.5% avg WER on regression tests vs TEN-VAD's 92.8% / 9.9%), but the difference is single-digit percentages and only shows on medium/long recordings — short utterances are identical across all backends. TEN-VAD GGML has zero external dependencies (the model is a 296 KB GGML file, the inference is pure Zig), while TEN-VAD Native requires `libc++` / `libc++abi` shared libraries.
+
+### Testing with different backends
+
+The regression tests accept `VAD_BACKEND` to override the default:
+
+```bash
+VAD_BACKEND=ten ./run.ts short-test
+VAD_BACKEND=silero ./run.ts medium-test
+```
+
+Additional environment variables for threshold tuning: `VAD_THRESHOLD`, `VAD_THRESHOLD_OFF`, `VAD_MIN_SILENCE_MS`.
+
 ## Building & testing
 
 All commands go through the Bun-based task runner (`run.ts`), which bootstraps its own toolchain via `bootstrap.sh` + mise. See [Development](#development) for first-time setup.
@@ -264,6 +287,10 @@ All commands go through the Bun-based task runner (`run.ts`), which bootstraps i
 |---|---|---|
 | `CAPSPER_PW_CHANNEL` | `FL` | PipeWire channel to capture |
 | `CAPSPER_PW_TARGET` | *(unset)* | PipeWire node to capture from |
+| `VAD_BACKEND` | *(unset)* | Override VAD backend in regression tests (`ten`, `silero`, `ten-native`) |
+| `VAD_THRESHOLD` | *(unset)* | Override VAD onset threshold in regression tests |
+| `VAD_THRESHOLD_OFF` | *(unset)* | Override VAD offset threshold in regression tests |
+| `VAD_MIN_SILENCE_MS` | *(unset)* | Override minimum silence duration (ms) in regression tests |
 
 ## Performance
 
@@ -276,7 +303,7 @@ On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
 | Key press → PipeWire connect | ~2ms | `pw_stream_connect` request |
 | PipeWire stream setup | ~330ms | Format negotiation, source starts delivering buffers |
 | Audio accumulation | ~1,000ms | Waiting for 1s of audio (`transcribe_interval_bytes`) |
-| VAD speech detection | ~15ms | TEN-VAD on last 0.5s window |
+| VAD speech detection | ~15ms | Silero on last 0.5s window |
 | Mel spectrogram | ~15ms | Incremental, only computes new frames |
 | Encoder (self-attention) | ~100ms | Full self-attention, not incrementalisable |
 | Decoder | ~5ms | Autoregressive token generation |
