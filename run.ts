@@ -271,7 +271,7 @@ export async function ci() {
     await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
     await dist();
     if (process.env.GH_TOKEN) {
-        const commitMsg = (await $`git log -1 --format=%s`.quiet()).text().trim();
+        const commitMsg = (await $`git log -1 --format=%B`.quiet()).text().trim();
         console.log(`Creating release v${ver}...`);
         await $`gh release create v${ver} ${TARBALL} ${TARBALL}.sha256 --title v${ver} --notes ${commitMsg}`;
     }
