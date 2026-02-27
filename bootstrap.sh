@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-export MISE_DATA_DIR="$SCRIPT_DIR/tools"
+TOOLS_ROOT=$(git -C "$SCRIPT_DIR" worktree list 2>/dev/null | head -1 | awk '{print $1}')
+export MISE_DATA_DIR="${TOOLS_ROOT:-$SCRIPT_DIR}/tools"
 export MISE_INSTALL_PATH="$MISE_DATA_DIR/mise"
 export MISE_INSTALL_HELP=0
 export MISE_GLOBAL_CONFIG_FILE=/dev/null
+export ZIG_GLOBAL_CACHE_DIR="$MISE_DATA_DIR/zig-cache"
 export PATH="$MISE_DATA_DIR:$PATH"
 
 http() { curl --progress-bar "$@" || wget -qO- "$@"; }
