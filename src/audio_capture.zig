@@ -18,6 +18,8 @@ pub const AudioCapture = struct {
     channel_position: u32,
     pipe_read_fd: posix.fd_t,
     pipe_write_fd: posix.fd_t,
+    monitor: ?*pw.pw_device_monitor,
+    connected_to_target: bool,
 
     const stream_events = pw.pw_stream_events{
         .version = 2, // PW_VERSION_STREAM_EVENTS
@@ -107,8 +109,18 @@ pub const AudioCapture = struct {
             return error.PipeWireInitFailed;
         }
 
+        // Create device monitor for hotplug detection when a target is specified
+        const monitor: ?*pw.pw_device_monitor = if (target) |t|
+            pw.pw_device_monitor_create(t.ptr)
+        else
+            null;
+
         if (target) |t| {
-            log.info("PipeWire capture ready (target={s}, channel=0x{x})", .{ t, channel_position });
+            if (monitor != null) {
+                log.info("PipeWire capture ready (target={s}, channel=0x{x}, device monitoring active)", .{ t, channel_position });
+            } else {
+                log.info("PipeWire capture ready (target={s}, channel=0x{x})", .{ t, channel_position });
+            }
         } else {
             log.info("PipeWire capture ready (default source, channel=0x{x})", .{channel_position});
         }
@@ -120,16 +132,34 @@ pub const AudioCapture = struct {
             .channel_position = channel_position,
             .pipe_read_fd = pipe_fds[0],
             .pipe_write_fd = pipe_fds[1],
+            .monitor = monitor,
+            .connected_to_target = false,
         };
     }
 
     /// Connect or disconnect the PipeWire stream. When disconnected, no
     /// source-output exists so the desktop microphone indicator disappears.
+    /// On connect: if a target device has appeared since last connect, PipeWire
+    /// will route to it (the stream has target.object set in its properties).
     pub fn setActive(self: *AudioCapture, active: bool) void {
         pw.pw_thread_loop_lock(self.thread_loop);
         defer pw.pw_thread_loop_unlock(self.thread_loop);
         if (active) {
+            if (self.monitor) |mon| {
+                const target_here = pw.pw_device_monitor_target_available(mon) != 0;
+                if (!self.connected_to_target and target_here) {
+                    log.info("Target device now available, switching to it", .{});
+                }
+                self.connected_to_target = target_here;
+            }
             _ = pw.pw_connect_capture(self.stream, 16000, self.channel_position);
+            if (self.monitor != null) {
+                if (self.connected_to_target) {
+                    log.info("PipeWire capture connected (target device)", .{});
+                } else {
+                    log.info("PipeWire capture connected (fallback — target device not available)", .{});
+                }
+            }
         } else {
             _ = pw.pw_stream_disconnect(self.stream);
         }
@@ -145,9 +175,24 @@ pub const AudioCapture = struct {
     /// Cork or uncork the stream. The stream stays connected (mic indicator
     /// remains visible) but audio delivery is paused/resumed. Much faster
     /// than connect/disconnect (~2ms vs ~1300ms).
+    /// On uncork: if the target device appeared since last connect, disconnect
+    /// and reconnect so PipeWire routes to it.
     pub fn setCork(self: *AudioCapture, corked: bool) void {
         pw.pw_thread_loop_lock(self.thread_loop);
         defer pw.pw_thread_loop_unlock(self.thread_loop);
+        if (!corked) {
+            if (self.monitor) |mon| {
+                const target_here = pw.pw_device_monitor_target_available(mon) != 0;
+                if (!self.connected_to_target and target_here) {
+                    log.info("Target device now available, reconnecting", .{});
+                    _ = pw.pw_stream_disconnect(self.stream);
+                    _ = pw.pw_connect_capture(self.stream, 16000, self.channel_position);
+                    self.connected_to_target = true;
+                    log.info("PipeWire capture connected (target device)", .{});
+                    return;
+                }
+            }
+        }
         _ = pw.pw_stream_set_active(self.stream, !corked);
     }
 
@@ -156,6 +201,7 @@ pub const AudioCapture = struct {
     }
 
     pub fn deinit(self: *AudioCapture) void {
+        if (self.monitor) |mon| pw.pw_device_monitor_destroy(mon);
         pw.pw_thread_loop_stop(self.thread_loop);
         pw.pw_stream_destroy(self.stream);
         pw.pw_thread_loop_destroy(self.thread_loop);

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 /* Build a SPA pod for S16_LE mono capture at the given channel position.
    Called from Zig because spa_format_audio_raw_build uses complex C macros
@@ -268,4 +269,158 @@ pw_enumerate_sources(struct pw_source_info *results, uint32_t max_results)
                 "(saw %u PipeWire objects).\n", data.total_globals);
 
     return (int)data.count;
+}
+
+/* ─── PipeWire device monitor (hotplug) ──────────────────────────────────── */
+
+struct pw_device_monitor {
+    struct pw_thread_loop *thread_loop;
+    struct pw_context     *context;
+    struct pw_core        *core;
+    struct pw_registry    *registry;
+    struct spa_hook        registry_listener;
+    struct spa_hook        core_listener;
+    char       target[256];
+    _Atomic uint32_t target_node_id;  /* PW id when present, 0 = absent */
+    int        initial_enum_done;     /* set after first pw_core_sync */
+    int        pending_sync;
+};
+
+static void
+on_monitor_global(void *data, uint32_t id, uint32_t permissions,
+                  const char *type, uint32_t version,
+                  const struct spa_dict *props)
+{
+    struct pw_device_monitor *m = data;
+    (void)permissions; (void)version;
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0 || !props)
+        return;
+
+    const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    if (!media_class)
+        return;
+    if (strncmp(media_class, "Audio/Source", 11) != 0)
+        return;
+
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (!name || strcmp(name, m->target) != 0)
+        return;
+
+    atomic_store(&m->target_node_id, id);
+    if (m->initial_enum_done)
+        fprintf(stderr, "[hotplug] Target device appeared: %s\n", name);
+}
+
+static void
+on_monitor_global_remove(void *data, uint32_t id)
+{
+    struct pw_device_monitor *m = data;
+    if (atomic_load(&m->target_node_id) == id) {
+        atomic_store(&m->target_node_id, 0);
+        fprintf(stderr, "[hotplug] Target device removed\n");
+    }
+}
+
+static void
+on_monitor_core_done(void *data, uint32_t id, int seq)
+{
+    struct pw_device_monitor *m = data;
+    if (id == PW_ID_CORE && seq == m->pending_sync)
+        m->initial_enum_done = 1;
+}
+
+struct pw_device_monitor *
+pw_device_monitor_create(const char *target)
+{
+    struct pw_device_monitor *m = calloc(1, sizeof(*m));
+    if (!m) return NULL;
+
+    snprintf(m->target, sizeof(m->target), "%s", target);
+
+    m->thread_loop = pw_thread_loop_new("capsper-hotplug", NULL);
+    if (!m->thread_loop) { free(m); return NULL; }
+
+    m->context = pw_context_new(
+        pw_thread_loop_get_loop(m->thread_loop), NULL, 0);
+    if (!m->context) {
+        pw_thread_loop_destroy(m->thread_loop);
+        free(m); return NULL;
+    }
+
+    /* Lock before connect so registry events don't fire before listeners are set */
+    pw_thread_loop_lock(m->thread_loop);
+
+    if (pw_thread_loop_start(m->thread_loop) < 0) {
+        pw_thread_loop_unlock(m->thread_loop);
+        pw_context_destroy(m->context);
+        pw_thread_loop_destroy(m->thread_loop);
+        free(m); return NULL;
+    }
+
+    m->core = pw_context_connect(m->context, NULL, 0);
+    if (!m->core) {
+        pw_thread_loop_unlock(m->thread_loop);
+        pw_thread_loop_stop(m->thread_loop);
+        pw_context_destroy(m->context);
+        pw_thread_loop_destroy(m->thread_loop);
+        free(m); return NULL;
+    }
+
+    m->registry = pw_core_get_registry(m->core, PW_VERSION_REGISTRY, 0);
+    if (!m->registry) {
+        pw_core_disconnect(m->core);
+        pw_thread_loop_unlock(m->thread_loop);
+        pw_thread_loop_stop(m->thread_loop);
+        pw_context_destroy(m->context);
+        pw_thread_loop_destroy(m->thread_loop);
+        free(m); return NULL;
+    }
+
+    static const struct pw_registry_events reg_events = {
+        PW_VERSION_REGISTRY_EVENTS,
+        .global = on_monitor_global,
+        .global_remove = on_monitor_global_remove,
+    };
+    spa_zero(m->registry_listener);
+    pw_registry_add_listener(m->registry, &m->registry_listener,
+                             &reg_events, m);
+
+    static const struct pw_core_events core_events = {
+        PW_VERSION_CORE_EVENTS,
+        .done = on_monitor_core_done,
+    };
+    spa_zero(m->core_listener);
+    pw_core_add_listener(m->core, &m->core_listener, &core_events, m);
+
+    /* Sync roundtrip — initial_enum_done is set in the callback */
+    m->pending_sync = pw_core_sync(m->core, PW_ID_CORE, 0);
+
+    pw_thread_loop_unlock(m->thread_loop);
+
+    return m;
+}
+
+void
+pw_device_monitor_destroy(struct pw_device_monitor *m)
+{
+    if (!m) return;
+
+    pw_thread_loop_lock(m->thread_loop);
+    spa_hook_remove(&m->registry_listener);
+    spa_hook_remove(&m->core_listener);
+    pw_proxy_destroy((struct pw_proxy *)m->registry);
+    pw_core_disconnect(m->core);
+    pw_thread_loop_unlock(m->thread_loop);
+
+    pw_thread_loop_stop(m->thread_loop);
+    pw_context_destroy(m->context);
+    pw_thread_loop_destroy(m->thread_loop);
+    free(m);
+}
+
+int
+pw_device_monitor_target_available(struct pw_device_monitor *m)
+{
+    return atomic_load(&m->target_node_id) != 0;
 }

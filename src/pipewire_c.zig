@@ -102,6 +102,12 @@ pub extern fn pw_enumerate_sources(
     max_results: u32,
 ) c_int;
 
+// Device monitor (hotplug detection)
+pub const pw_device_monitor = opaque {};
+pub extern fn pw_device_monitor_create(target: [*:0]const u8) ?*pw_device_monitor;
+pub extern fn pw_device_monitor_destroy(m: *pw_device_monitor) void;
+pub extern fn pw_device_monitor_target_available(m: *pw_device_monitor) c_int;
+
 // PipeWire property keys
 pub const PW_KEY_MEDIA_TYPE = pw.PW_KEY_MEDIA_TYPE;
 pub const PW_KEY_MEDIA_CATEGORY = pw.PW_KEY_MEDIA_CATEGORY;
