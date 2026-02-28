@@ -51,6 +51,7 @@ const longCases: TestCase[] = [
     { name: "long-recording", wav: wav("long-recording"), ref: "test/long-recording.txt", thresholds: { minCoverage: 90, maxWer: 10 } },
     { name: "repetition-loop-long", wav: wav("repetition-loop-long"), ref: "test/repetition-loop-long.txt", thresholds: { minCoverage: 90, maxWer: 10 } },
     { name: "silence-hallucination", wav: wav("silence-hallucination"), ref: "test/silence-hallucination.txt", thresholds: { minCoverage: 90, maxWer: 10, maxGapSec: 5 } },
+    { name: "signaling-loop", wav: wav("signaling-loop"), ref: "test/signaling-loop.txt", thresholds: { minCoverage: 85, maxWer: 15, maxRepetitions: 5 } },
 ];
 
 // Gating: which groups to run

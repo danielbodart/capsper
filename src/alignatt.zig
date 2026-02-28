@@ -5,6 +5,8 @@ pub const Config = struct {
     frame_threshold: usize = 25, // stop if attention within this many frames of audio end
     rewind_threshold: usize = 200, // discard if attention jumps back this far
     median_filter_width: usize = 7,
+    stagnation_window: usize = 16, // number of recent tokens to check for frame stagnation
+    stagnation_threshold: usize = 100, // frames behind frontier to trigger stagnation (100 = 2 seconds)
 };
 
 /// Result of analyzing cross-attention after a decode step.
@@ -17,6 +19,7 @@ pub const Decision = enum {
     continue_decoding,
     stop_attention_at_end, // attention reached end — strip last token and stop
     rewind_detected, // attention jumped backwards — discard segment
+    stop_frame_stagnation, // attention stuck behind frontier — decoder looping
 };
 
 /// Analyze cross-attention data for the last decoded token.
@@ -136,6 +139,8 @@ pub fn checkStopping(
     content_frames: usize,
     last_attend_frame: ?usize,
     flush: bool,
+    token_frames: []const usize,
+    frontier: usize,
     config: Config,
 ) Decision {
     // Rewind detection: attention jumped backwards too far
@@ -151,6 +156,12 @@ pub fn checkStopping(
         content_frames - most_attended_frame <= threshold)
     {
         return .stop_attention_at_end;
+    }
+
+    // Frame stagnation: recent tokens collectively attending well behind the frontier.
+    // Catches repetition loops where the decoder generates tokens stuck in one region.
+    if (detectFrameRegression(token_frames, frontier, config.stagnation_window, config.stagnation_threshold) != null) {
+        return .stop_frame_stagnation;
     }
 
     return .continue_decoding;
@@ -283,42 +294,63 @@ test "argmax: negative values" {
 }
 
 test "checkStopping: continue when attention far from end" {
-    const result = checkStopping(10, 100, null, false, .{});
+    const result = checkStopping(10, 100, null, false, &.{}, 0, .{});
     try std.testing.expectEqual(Decision.continue_decoding, result);
 }
 
 test "checkStopping: stop when attention near end (streaming)" {
     // content_frames=100, most_attended=80, threshold=25 → 100-80=20 <= 25 → stop
-    const result = checkStopping(80, 100, null, false, .{});
+    const result = checkStopping(80, 100, null, false, &.{}, 0, .{});
     try std.testing.expectEqual(Decision.stop_attention_at_end, result);
 }
 
 test "checkStopping: flush uses threshold=4" {
     // content_frames=100, most_attended=80, threshold=4 → 100-80=20 > 4 → continue
-    const result = checkStopping(80, 100, null, true, .{});
+    const result = checkStopping(80, 100, null, true, &.{}, 0, .{});
     try std.testing.expectEqual(Decision.continue_decoding, result);
 }
 
 test "checkStopping: flush stops when very close to end" {
     // content_frames=100, most_attended=97, threshold=4 → 100-97=3 <= 4 → stop
-    const result = checkStopping(97, 100, null, true, .{});
+    const result = checkStopping(97, 100, null, true, &.{}, 0, .{});
     try std.testing.expectEqual(Decision.stop_attention_at_end, result);
 }
 
 test "checkStopping: rewind detected" {
     // last=500, most_attended=100, diff=400 > rewind_threshold=200
-    const result = checkStopping(100, 1000, 500, false, .{});
+    const result = checkStopping(100, 1000, 500, false, &.{}, 0, .{});
     try std.testing.expectEqual(Decision.rewind_detected, result);
 }
 
 test "checkStopping: small backward jump is not rewind" {
     // last=110, most_attended=100, diff=10 < rewind_threshold=200
-    const result = checkStopping(100, 1000, 110, false, .{});
+    const result = checkStopping(100, 1000, 110, false, &.{}, 0, .{});
     try std.testing.expectEqual(Decision.continue_decoding, result);
 }
 
 test "checkStopping: forward movement is not rewind" {
-    const result = checkStopping(200, 1000, 100, false, .{});
+    const result = checkStopping(200, 1000, 100, false, &.{}, 0, .{});
+    try std.testing.expectEqual(Decision.continue_decoding, result);
+}
+
+test "checkStopping: frame stagnation detected" {
+    // 16 tokens all attending to frame 100, but frontier is at 300 → gap=200 > threshold=100
+    const frames = [_]usize{ 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100 };
+    const result = checkStopping(100, 1000, 99, false, &frames, 300, .{});
+    try std.testing.expectEqual(Decision.stop_frame_stagnation, result);
+}
+
+test "checkStopping: no stagnation when frames near frontier" {
+    // 16 tokens attending near the frontier
+    const frames = [_]usize{ 190, 195, 192, 198, 193, 196, 199, 197, 191, 194, 196, 198, 193, 195, 197, 199 };
+    const result = checkStopping(199, 1000, 198, false, &frames, 200, .{});
+    try std.testing.expectEqual(Decision.continue_decoding, result);
+}
+
+test "checkStopping: no stagnation with insufficient tokens" {
+    // Only 3 tokens — below stagnation_window=16
+    const frames = [_]usize{ 10, 10, 10 };
+    const result = checkStopping(10, 1000, 9, false, &frames, 200, .{});
     try std.testing.expectEqual(Decision.continue_decoding, result);
 }
 

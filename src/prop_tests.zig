@@ -277,7 +277,7 @@ fn prop_checkStopping_exhaustive(n: usize) !void {
     const last_attend: ?usize = if (has_last) prng.random().intRangeAtMost(usize, 0, 1500) else null;
     const flush = prng.random().boolean();
 
-    const decision = alignatt.checkStopping(most_attended, content_frames, last_attend, flush, .{});
+    const decision = alignatt.checkStopping(most_attended, content_frames, last_attend, flush, &.{}, 0, .{});
 
     // Verify the decision is consistent with the inputs
     switch (decision) {
@@ -294,6 +294,9 @@ fn prop_checkStopping_exhaustive(n: usize) !void {
             try std.testing.expect(content_frames > most_attended);
             try std.testing.expect(content_frames - most_attended <= threshold);
         },
+        .stop_frame_stagnation => {
+            // Stagnation won't trigger with empty token_frames, but handle for exhaustiveness
+        },
         .continue_decoding => {
             // Continue is the default — just verify it's a valid state
         },
@@ -309,7 +312,7 @@ fn prop_checkStopping_rewind_priority(n: usize) !void {
     const content_frames = most_attended + prng.random().intRangeAtMost(usize, 1, 25);
     const flush = prng.random().boolean();
 
-    const decision = alignatt.checkStopping(most_attended, content_frames, last_attend, flush, .{});
+    const decision = alignatt.checkStopping(most_attended, content_frames, last_attend, flush, &.{}, 0, .{});
     // Rewind should take priority
     try std.testing.expectEqual(alignatt.Decision.rewind_detected, decision);
 }
@@ -322,8 +325,8 @@ fn prop_checkStopping_flush_tighter(n: usize) !void {
     const most_attended = 100 + prng.random().intRangeAtMost(usize, 0, 500);
     const content_frames = most_attended + gap;
 
-    const streaming = alignatt.checkStopping(most_attended, content_frames, null, false, .{});
-    const flushing = alignatt.checkStopping(most_attended, content_frames, null, true, .{});
+    const streaming = alignatt.checkStopping(most_attended, content_frames, null, false, &.{}, 0, .{});
+    const flushing = alignatt.checkStopping(most_attended, content_frames, null, true, &.{}, 0, .{});
 
     if (gap <= 4) {
         // Both should stop

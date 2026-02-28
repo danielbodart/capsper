@@ -304,6 +304,7 @@ pub const Pipeline = struct {
 
         var n_past: c_int = @intCast(full_prompt.len);
         const max_tokens: usize = if (flush) (flush_budget orelse 224) else 224;
+        var frontier: usize = self.last_attend_frame orelse 0;
 
         for (0..max_tokens) |_| {
             const logits = c.whisper_get_logits_from_state(self.state);
@@ -382,11 +383,17 @@ pub const Pipeline = struct {
             // Update the frame for this token
             token_frames.items[token_frames.items.len - 1] = most_attended;
 
+            // Track the high-water mark of attention position
+            frontier = @max(frontier, most_attended);
+
             // AlignAtt stopping check with cross-cycle rewind detection
             const decision = alignatt.checkStopping(
                 most_attended, content_frames,
                 self.last_attend_frame,
-                flush, self.config,
+                flush,
+                token_frames.items,
+                frontier,
+                self.config,
             );
 
             switch (decision) {
@@ -404,6 +411,19 @@ pub const Pipeline = struct {
                     token_frames.clearRetainingCapacity();
                     self.last_attend_frame = null;
                     timing.stop_reason = "rewind";
+                    break;
+                },
+                .stop_frame_stagnation => {
+                    // Discard the stagnant tokens from the end
+                    const discard = alignatt.detectFrameRegression(
+                        token_frames.items, frontier,
+                        self.config.stagnation_window,
+                        self.config.stagnation_threshold,
+                    ) orelse self.config.stagnation_window;
+                    const keep = generated.items.len -| discard;
+                    generated.items.len = keep;
+                    token_frames.items.len = keep;
+                    timing.stop_reason = "stagnation";
                     break;
                 },
                 .continue_decoding => {
