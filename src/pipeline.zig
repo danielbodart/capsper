@@ -241,11 +241,13 @@ pub const Pipeline = struct {
         const total_budget: usize = 448 - sot_seq.len - max_decode;
 
         // Allocate budget: domain terms first (protected), then forced, then context.
-        // Forced tokens are the model's memory of what it already generated — they must
-        // never be dropped. Context is expendable conditioning (matches SimulStreaming).
+        // Forced tokens cap: 30s of speech ≈ 80-100 tokens. Allowing more creates a
+        // feedback loop where repetitive tokens from one cycle become forced prefix for
+        // the next, causing the decoder to amplify repetition catastrophically.
+        const max_forced: usize = 125;
         const domain_len = @min(self.prompt_tokens.len, total_budget);
         const after_domain = total_budget - domain_len;
-        const forced_len = @min(forced_tokens.len, after_domain);
+        const forced_len = @min(forced_tokens.len, @min(after_domain, max_forced));
         const context_budget = after_domain - forced_len;
         const ctx_len = @min(self.context_tokens.items.len, context_budget);
 
