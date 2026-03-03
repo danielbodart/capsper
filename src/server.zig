@@ -111,6 +111,7 @@ pub const Server = struct {
     low_latency: bool,
     type_callback: ?TypeCallback,
     prompt_tokens: []const c.whisper_token,
+    drop_terms: []const []const u8,
     recorder: ?*Recorder,
     initial_gain: f32,
     vad_threshold: f32,
@@ -129,6 +130,7 @@ pub const Server = struct {
         low_latency: bool,
         type_callback: ?TypeCallback,
         prompt_tokens: []const c.whisper_token,
+        drop_terms: []const []const u8,
         recorder: ?*Recorder,
         initial_gain: f32,
         vad_threshold: f32,
@@ -147,6 +149,7 @@ pub const Server = struct {
             .low_latency = low_latency,
             .type_callback = type_callback,
             .prompt_tokens = prompt_tokens,
+            .drop_terms = drop_terms,
             .recorder = recorder,
             .initial_gain = initial_gain,
             .vad_threshold = vad_threshold,
@@ -523,6 +526,19 @@ pub const Server = struct {
                 });
             }
             return .{ .emitted = false };
+        }
+
+        // Drop terms: check if full result text matches any drop term
+        // Whisper prepends a leading space, so compare " " ++ term against result.text
+        if (self.drop_terms.len > 0) {
+            const text = result.text;
+            for (self.drop_terms) |term| {
+                // Match " <term>" (whisper's leading space + the drop term)
+                if (text.len == term.len + 1 and text[0] == ' ' and std.mem.eql(u8, text[1..], term)) {
+                    std.debug.print("  [drop] suppressed: \"{s}\"\n", .{text});
+                    return .{ .emitted = false };
+                }
+            }
         }
 
         const buf_duration_ms = speech_buf.len * 1000 / 32000;

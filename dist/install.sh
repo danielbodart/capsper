@@ -131,9 +131,10 @@ install_service() {
     mkdir -p "$service_dir"
 
     local domain_terms="${7:-}"
-    local enable_recordings="${8:-false}"
-    local low_latency="${9:-false}"
-    local gain="${10:-1.0}"
+    local drop_terms="${8:-}"
+    local enable_recordings="${9:-false}"
+    local low_latency="${10:-false}"
+    local gain="${11:-1.0}"
 
     local exec_start="$binary --trigger capslock --pw-channel $channel"
     if [ -n "$gain" ] && [ "$gain" != "1.0" ] && [ "$gain" != "1" ]; then
@@ -142,6 +143,7 @@ install_service() {
     exec_start="$exec_start --model $model_dir/$WHISPER_MODEL_NAME"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
     [ -n "$domain_terms" ] && exec_start="$exec_start --domain-terms $domain_terms"
+    [ -n "$drop_terms" ] && exec_start="$exec_start --drop-terms $drop_terms"
     if $enable_recordings; then
         mkdir -p "$RECORDINGS_DIR"
         exec_start="$exec_start --record-dir $RECORDINGS_DIR"
@@ -227,6 +229,9 @@ extract_service_config() {
 
     SAVED_DOMAIN_TERMS=$(echo "$exec_start" | sed -n 's/.*--domain-terms \([^ ]*\).*/\1/p')
     SAVED_DOMAIN_TERMS="${SAVED_DOMAIN_TERMS:-}"
+
+    SAVED_DROP_TERMS=$(echo "$exec_start" | sed -n 's/.*--drop-terms \([^ ]*\).*/\1/p')
+    SAVED_DROP_TERMS="${SAVED_DROP_TERMS:-}"
 
     SAVED_RECORDINGS_ENABLED=false
     echo "$exec_start" | grep -q -- '--record-dir' && SAVED_RECORDINGS_ENABLED=true
@@ -432,6 +437,20 @@ cmd_install() {
                 fi
             fi
 
+            # Drop terms
+            local drop_terms=""
+            echo ""
+            echo "=== Drop Terms (optional) ==="
+            echo "Suppress hallucinated phrases (e.g. \"Thank you.\", \"I love you\") that"
+            echo "Whisper sometimes emits on silence. One phrase per line in a text file."
+            if confirm_default_no "Do you have a drop terms file?"; then
+                printf 'Path to drop terms file: '
+                read -r drop_terms
+                if [ -n "$drop_terms" ] && [ ! -f "$drop_terms" ]; then
+                    echo "WARNING: File not found: $drop_terms (continuing anyway)"
+                fi
+            fi
+
             # Debug recordings
             local enable_recordings=false
             echo ""
@@ -454,7 +473,7 @@ cmd_install() {
                 low_latency=true
             fi
 
-            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$SCRIPT_DIR/models" "" false "$domain_terms" $enable_recordings $low_latency "$gain"
+            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$SCRIPT_DIR/models" "" false "$domain_terms" "$drop_terms" $enable_recordings $low_latency "$gain"
         fi
     else
         echo "=== Capsper Installer ==="
@@ -504,6 +523,20 @@ cmd_install() {
                 fi
             fi
 
+            # Drop terms
+            local drop_terms=""
+            echo ""
+            echo "=== Drop Terms (optional) ==="
+            echo "Suppress hallucinated phrases (e.g. \"Thank you.\", \"I love you\") that"
+            echo "Whisper sometimes emits on silence. One phrase per line in a text file."
+            if confirm_default_no "Do you have a drop terms file?"; then
+                printf 'Path to drop terms file: '
+                read -r drop_terms
+                if [ -n "$drop_terms" ] && [ ! -f "$drop_terms" ]; then
+                    echo "WARNING: File not found: $drop_terms (continuing anyway)"
+                fi
+            fi
+
             # Debug recordings
             local enable_recordings=false
             echo ""
@@ -533,7 +566,7 @@ cmd_install() {
                 enable_updates=false
             fi
 
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "" $enable_updates "$domain_terms" $enable_recordings $low_latency "$gain"
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "" $enable_updates "$domain_terms" "$drop_terms" $enable_recordings $low_latency "$gain"
 
             if $enable_updates; then
                 install_update_timer
@@ -545,7 +578,7 @@ cmd_install() {
 
             if has_auto_update; then
                 # Auto-update already configured: keep it, just update paths
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
             else
                 # Pre-auto-update install: offer to enable
                 local enable_updates=true
@@ -554,7 +587,7 @@ cmd_install() {
                     enable_updates=false
                 fi
 
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
 
                 if $enable_updates; then
                     install_update_timer

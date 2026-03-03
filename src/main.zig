@@ -45,6 +45,7 @@ pub fn main() !void {
     var do_pw_detect: bool = false;
     var detect_duration: u32 = 5;
     var domain_terms_path: ?[:0]const u8 = null;
+    var drop_terms_path: ?[:0]const u8 = null;
     var record_dir: ?[:0]const u8 = null;
     var record_keep: usize = 10;
     var transcribe_file: ?[:0]const u8 = null;
@@ -130,6 +131,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--domain-terms")) {
             i += 1;
             if (i < args.len) domain_terms_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--drop-terms")) {
+            i += 1;
+            if (i < args.len) drop_terms_path = args[i];
         } else if (std.mem.eql(u8, arg, "--record-dir")) {
             i += 1;
             if (i < args.len) record_dir = args[i];
@@ -304,6 +308,39 @@ pub fn main() !void {
     // zwanzig-disable-next-line: store-violations-engine
     defer if (prompt_tokens.len > 0) allocator.free(prompt_tokens);
 
+    // Read drop terms file (newline-separated, one term per line)
+    var drop_terms: []const []const u8 = &.{};
+    if (drop_terms_path) |dpath| {
+        const dt_file = std.fs.cwd().openFile(dpath, .{}) catch |err| {
+            std.debug.print("Failed to open drop terms file '{s}': {}\n", .{ dpath, err });
+            return;
+        };
+        defer dt_file.close();
+
+        const dt_raw = dt_file.readToEndAlloc(allocator, 8192) catch |err| {
+            std.debug.print("Failed to read drop terms file: {}\n", .{err});
+            return;
+        };
+        defer allocator.free(dt_raw);
+
+        var terms_list = std.ArrayListUnmanaged([]const u8){};
+        var lines = std.mem.splitScalar(u8, dt_raw, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            const duped = try allocator.dupe(u8, trimmed);
+            try terms_list.append(allocator, duped);
+        }
+        drop_terms = try terms_list.toOwnedSlice(allocator);
+        std.debug.print("Drop terms: {d} terms from {s}\n", .{ drop_terms.len, dpath });
+    }
+    // zwanzig-disable: store-violations-engine
+    defer {
+        for (drop_terms) |term| allocator.free(term);
+        if (drop_terms.len > 0) allocator.free(drop_terms);
+    }
+    // zwanzig-enable: store-violations-engine
+
     // --transcribe: batch transcription using whisper_full (non-streaming) and exit
     if (transcribe_file) |tfile| {
         const samples = loadWav(allocator, tfile) catch |err| {
@@ -438,7 +475,7 @@ pub fn main() !void {
     std.debug.print("VAD: backend={s}  onset={d:.2}  offset={d:.2}  min_silence={d}ms\n", .{
         vad_backend.name(), resolved_threshold, resolved_threshold_off, resolved_min_silence_ms,
     });
-    var server = Server.init(allocator, ctx, vad_backend, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, recorder, pw_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes);
+    var server = Server.init(allocator, ctx, vad_backend, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, drop_terms, recorder, pw_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes);
     try server.run();
 }
 
@@ -480,7 +517,7 @@ fn printUsage() void {
     std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
     std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
-    std.debug.print("       [--domain-terms FILE]\n", .{});
+    std.debug.print("       [--domain-terms FILE] [--drop-terms FILE]\n", .{});
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
     std.debug.print("       [--transcribe FILE]\n", .{});
     std.debug.print("       [--pw-gain FACTOR]\n", .{});

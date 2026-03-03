@@ -85,6 +85,22 @@ Example `my-terms.txt`:
 Kubernetes, kubectl, Terraform, Ansible, gRPC, PostgreSQL
 ```
 
+### Drop terms
+
+Whisper sometimes hallucinates short phrases (e.g. "Thank you.", "I love you") on segments that contain no real speech. You can suppress these by providing a drop terms file:
+
+```bash
+capsper --trigger capslock --drop-terms ~/my-drop-terms.txt
+```
+
+The file is one phrase per line. If the entire output of a single decode cycle exactly matches a drop term, it's silently suppressed. Matching is case-sensitive and includes punctuation.
+
+Example `my-drop-terms.txt`:
+```
+Thank you.
+I love you
+```
+
 ### PipeWire setup
 
 Run the interactive setup wizard to detect your microphone channel and calibrate gain:
@@ -231,7 +247,8 @@ capsper [OPTIONS]
   --pw-target NODE        PipeWire capture target node name
   --pw-channel CHANNEL    PipeWire channel: MONO, FL, FR, AUX0-AUX63 (default: FL)
   --pw-gain FACTOR        PipeWire software gain multiplier (default: 1.0, max: 10.0)
-  --domain-terms FILE     Text file of domain terms to bias transcription toward
+  --domain-terms FILE     Text file of domain terms to bias transcription toward (one per line)
+  --drop-terms FILE       Text file of phrases to suppress (one per line, exact match)
   --record-dir DIR        Record each utterance to DIR (WAV + diagnostic log)
   --record-keep N         Number of recording pairs to keep (default: 10, ring buffer)
   --transcribe FILE       Batch-transcribe a WAV file (non-streaming) and exit

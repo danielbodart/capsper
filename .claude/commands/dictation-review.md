@@ -79,6 +79,7 @@ Tests use `streamPcmFast()` which sends all PCM in one TCP write + half-close (v
 
 ## Notes
 
+- **Hallucination suppression**: If review reveals short hallucinated phrases (e.g. "Thank you.", "I love you") appearing as entire VAD segments, add them to a `--drop-terms` file rather than trying to fix VAD thresholds. Drop terms suppress exact single-chunk matches.
 - The "last word drop" and "duplicate word" issues are the primary targets for improvement
 - The cycle log in `.log` files shows exactly when each word was emitted and the stability state, which helps diagnose timing-related issues
 - Short recordings (< 15s) make the best regression tests — fast, reproducible, and fast-forward produces identical results to real-time
