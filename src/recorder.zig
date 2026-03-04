@@ -55,10 +55,10 @@ pub const Recorder = struct {
     }
 
     /// Called for state transitions and PTT events.
-    pub fn logEvent(self: *Recorder, start_ns: i128, event: []const u8) void {
+    pub fn logEvent(self: *Recorder, total_audio_bytes: usize, event: []const u8) void {
         if (!self.active) return;
         var ts_buf: [32]u8 = undefined;
-        const ts = formatElapsed(&ts_buf, start_ns);
+        const ts = formatAudioTime(&ts_buf, total_audio_bytes);
         const w = self.diag_buf.writer(self.allocator);
         std.fmt.format(w, "[{s}s] {s}\n", .{ ts, event }) catch {};
     }
@@ -66,7 +66,7 @@ pub const Recorder = struct {
     /// Called after each transcription cycle.
     pub fn logCycle(
         self: *Recorder,
-        start_ns: i128,
+        total_audio_bytes: usize,
         cycle: usize,
         state_name: []const u8,
         buf_ms: usize,
@@ -75,7 +75,7 @@ pub const Recorder = struct {
     ) void {
         if (!self.active) return;
         var ts_buf: [32]u8 = undefined;
-        const ts = formatElapsed(&ts_buf, start_ns);
+        const ts = formatAudioTime(&ts_buf, total_audio_bytes);
         const w = self.diag_buf.writer(self.allocator);
         std.fmt.format(w, "[{s}s] cycle={d} {s} buf={d}ms words={d} | \"{s}\"\n", .{
             ts, cycle, state_name, buf_ms, word_count, utils.textPreview(text),
@@ -143,8 +143,7 @@ pub const Recorder = struct {
     }
 };
 
-fn formatElapsed(buf: []u8, start_ns: i128) []u8 {
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
-    const elapsed_ms: u64 = @intCast(@max(0, @divTrunc(elapsed_ns, 1_000_000)));
+fn formatAudioTime(buf: []u8, total_audio_bytes: usize) []u8 {
+    const elapsed_ms: u64 = total_audio_bytes * 1000 / 32000;
     return std.fmt.bufPrint(buf, "{d}.{d}", .{ elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch buf[0..3];
 }

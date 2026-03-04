@@ -25,7 +25,7 @@ pub const AudioCapture = struct {
         .version = 2, // PW_VERSION_STREAM_EVENTS
         .process = onProcess,
         .destroy = null,
-        .state_changed = null,
+        .state_changed = onStateChanged,
         .control_info = null,
         .io_changed = null,
         .param_changed = null,
@@ -206,17 +206,41 @@ pub const AudioCapture = struct {
         pw.pw_stream_destroy(self.stream);
         pw.pw_thread_loop_destroy(self.thread_loop);
         posix.close(self.pipe_read_fd);
-        posix.close(self.pipe_write_fd);
+        // pipe_write_fd may already be closed by onStateChanged
+        if (self.stream_data.pipe_write_fd != -1) {
+            posix.close(self.pipe_write_fd);
+        }
         std.heap.page_allocator.destroy(self.stream_data);
         pw.pw_deinit();
     }
 };
+
+/// PipeWire state_changed callback — runs in PipeWire's thread.
+/// On stream error (e.g. source node destroyed), closes the pipe write fd
+/// so the server's read() returns EOF instead of hanging.
+fn onStateChanged(userdata: ?*anyopaque, _: pw.pw_stream_state, state: pw.pw_stream_state, err: ?[*:0]const u8) callconv(.c) void {
+    const data: *StreamData = @ptrCast(@alignCast(userdata orelse return));
+    // PW_STREAM_STATE_ERROR = -1
+    if (state == pw.PW_STREAM_STATE_ERROR) {
+        if (err) |e| {
+            log.warn("PipeWire stream error: {s}", .{e});
+        } else {
+            log.warn("PipeWire stream error (no details)", .{});
+        }
+        // Close pipe write fd → server's ChunkedReader.read() returns EOF
+        if (data.pipe_write_fd != -1) {
+            posix.close(data.pipe_write_fd);
+            data.pipe_write_fd = -1;
+        }
+    }
+}
 
 /// PipeWire process callback — runs in PipeWire's realtime thread.
 /// Dequeues captured audio buffers and writes raw S16_LE PCM to the pipe.
 fn onProcess(userdata: ?*anyopaque) callconv(.c) void {
     const data: *StreamData = @ptrCast(@alignCast(userdata orelse return));
     const stream = data.stream orelse return;
+    if (data.pipe_write_fd == -1) return; // fd closed by onStateChanged
 
     const pw_buf: *pw.pw_buffer = pw.pw_stream_dequeue_buffer(stream) orelse return;
     defer _ = pw.pw_stream_queue_buffer(stream, pw_buf);

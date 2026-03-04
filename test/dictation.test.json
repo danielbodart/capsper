@@ -1,0 +1,5 @@
+{
+  "group": "long",
+  "thresholds": { "minCoverage": 85, "maxWer": 15 },
+  "serverArgs": ["--domain-terms", "test/dictation-terms.txt"]
+}

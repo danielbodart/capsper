@@ -54,6 +54,7 @@ pub fn main() !void {
     var vad_threshold: ?f32 = null;
     var vad_threshold_off: ?f32 = null;
     var min_silence_ms: ?u32 = null;
+    var no_auto_gain: bool = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -157,6 +158,8 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--min-silence-ms")) {
             i += 1;
             if (i < args.len) min_silence_ms = std.fmt.parseInt(u32, args[i], 10) catch null;
+        } else if (std.mem.eql(u8, arg, "--no-auto-gain")) {
+            no_auto_gain = true;
         } else if (std.mem.eql(u8, arg, "--vad")) {
             i += 1;
             if (i < args.len) {
@@ -475,7 +478,7 @@ pub fn main() !void {
     std.debug.print("VAD: backend={s}  onset={d:.2}  offset={d:.2}  min_silence={d}ms\n", .{
         vad_backend.name(), resolved_threshold, resolved_threshold_off, resolved_min_silence_ms,
     });
-    var server = Server.init(allocator, ctx, vad_backend, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, drop_terms, recorder, pw_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes);
+    var server = Server.init(allocator, ctx, vad_backend, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, drop_terms, recorder, pw_gain, no_auto_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes);
     try server.run();
 }
 
@@ -520,7 +523,7 @@ fn printUsage() void {
     std.debug.print("       [--domain-terms FILE] [--drop-terms FILE]\n", .{});
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
     std.debug.print("       [--transcribe FILE]\n", .{});
-    std.debug.print("       [--pw-gain FACTOR]\n", .{});
+    std.debug.print("       [--pw-gain FACTOR] [--no-auto-gain]\n", .{});
     std.debug.print("       [--vad ten|silero|ten-native] [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
     std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});

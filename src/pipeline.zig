@@ -128,17 +128,26 @@ pub const Pipeline = struct {
         if (trimmed_bytes == 0) return;
 
         // Mel cache is relative to buffer start — invalidate after front trim.
+        const mel_frames_before = self.mel_buffer.n_computed;
         self.mel_buffer.reset();
 
         // Convert trimmed bytes to encoder frame count (50fps = 320 samples/frame * 2 bytes/sample = 640 bytes/frame)
         const trim_frame = trimmed_bytes / 640;
 
         // Shift last_attend_frame so it stays relative to the new buffer start
+        const laf_before = self.last_attend_frame;
         if (self.last_attend_frame) |laf| {
             self.last_attend_frame = laf -| trim_frame;
         }
 
         const n = self.accumulated_tokens.items.len;
+
+        std.debug.print("  [trim] bytes={d} frames={d} mel_cache={d}→0 laf={?d}→{?d} accum_tok={d} ctx_tok={d}\n", .{
+            trimmed_bytes, trim_frame, mel_frames_before,
+            laf_before, self.last_attend_frame,
+            n, self.context_tokens.items.len,
+        });
+
         if (n == 0) return;
 
         // Find split point: first token whose frame >= trim_frame
@@ -150,6 +159,16 @@ pub const Pipeline = struct {
         // Always demote at least 1 token when audio was trimmed, to avoid
         // tokens referencing trimmed-away audio when frame data is imprecise.
         if (drop == 0) drop = 1;
+
+        // Log the demoted tokens
+        std.debug.print("  [trim] demoting {d}/{d} tokens to context (trim_frame={d})\n", .{ drop, n, trim_frame });
+        if (drop <= 10) {
+            for (self.accumulated_frames.items[0..drop], 0..) |frame, i| {
+                const tok = self.accumulated_tokens.items[i];
+                const text = std.mem.span(c.whisper_token_to_str(self.ctx, tok));
+                std.debug.print("    demote[{d}]: tok={d} frame={d} \"{s}\"\n", .{ i, tok, frame, text });
+            }
+        }
 
         // Demote front tokens to context (conditioning before [sot])
         try self.context_tokens.appendSlice(self.allocator, self.accumulated_tokens.items[0..drop]);
@@ -168,6 +187,12 @@ pub const Pipeline = struct {
             self.accumulated_frames.items[i] = frame -| trim_frame;
         }
         self.accumulated_frames.items.len = remaining;
+
+        std.debug.print("  [trim] after: accum_tok={d} ctx_tok={d} forced_front_frame={?d}\n", .{
+            self.accumulated_tokens.items.len,
+            self.context_tokens.items.len,
+            if (self.accumulated_frames.items.len > 0) self.accumulated_frames.items[0] else null,
+        });
     }
 
     fn msFromNs(start: i128) f64 {

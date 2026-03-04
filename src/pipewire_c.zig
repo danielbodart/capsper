@@ -38,6 +38,10 @@ pub const PW_STREAM_FLAG_AUTOCONNECT: c_uint = pw.PW_STREAM_FLAG_AUTOCONNECT;
 pub const PW_STREAM_FLAG_MAP_BUFFERS: c_uint = pw.PW_STREAM_FLAG_MAP_BUFFERS;
 pub const PW_STREAM_FLAG_RT_PROCESS: c_uint = pw.PW_STREAM_FLAG_RT_PROCESS;
 
+// Stream state
+pub const pw_stream_state = pw.enum_pw_stream_state;
+pub const PW_STREAM_STATE_ERROR = pw.PW_STREAM_STATE_ERROR;
+
 // Stream control
 pub const pw_stream_disconnect = pw.pw_stream_disconnect;
 pub const pw_stream_set_active = pw.pw_stream_set_active;
