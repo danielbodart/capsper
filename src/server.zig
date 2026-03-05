@@ -65,14 +65,37 @@ const ChunkedReader = struct {
     buffered: usize = 0, // bytes available in buf[0..buffered]
     offset: usize = 0, // read cursor within buf[0..buffered]
     saw_eof: bool = false,
+    skip_digital_zero: bool,
 
-    fn init(fd: posix.fd_t, chunk_size: usize) ChunkedReader {
-        return .{ .fd = fd, .chunk_size = chunk_size };
+    // Cumulative counters for logging
+    total_raw_reads: usize = 0,
+    total_raw_bytes: usize = 0,
+    total_chunks_yielded: usize = 0,
+    total_chunks_bytes: usize = 0,
+    total_zero_chunks_skipped: usize = 0,
+    total_partial_bytes: usize = 0,
+
+    fn init(fd: posix.fd_t, chunk_size: usize, skip_digital_zero: bool) ChunkedReader {
+        return .{ .fd = fd, .chunk_size = chunk_size, .skip_digital_zero = skip_digital_zero };
     }
 
     /// Read exactly one chunk of audio, or empty slice on EOF.
     /// Caller does not own the returned memory.
     fn read(self: *ChunkedReader) ![]u8 {
+        while (true) {
+            const chunk = try self.readChunk();
+            if (chunk.len == 0) return chunk; // EOF
+            // Digital zero is never real audio — skip it. This strips PipeWire
+            // pipeline latency and trailing silence from loopback teardown.
+            if (self.skip_digital_zero and std.mem.allEqual(u8, chunk, 0)) {
+                self.total_zero_chunks_skipped += 1;
+                continue;
+            }
+            return chunk;
+        }
+    }
+
+    fn readChunk(self: *ChunkedReader) ![]u8 {
         // Compact: move unconsumed data to front
         if (self.offset > 0 and self.buffered > self.offset) {
             const remaining = self.buffered - self.offset;
@@ -98,6 +121,7 @@ const ChunkedReader = struct {
                     var len = self.buffered - self.offset;
                     len -= len % 2; // ensure even number of bytes
                     if (len > 0) {
+                        self.total_partial_bytes += len;
                         const start = self.offset;
                         self.offset += len;
                         return self.buf[start..start + len];
@@ -105,13 +129,30 @@ const ChunkedReader = struct {
                 }
                 return &.{};
             }
+            self.total_raw_reads += 1;
+            self.total_raw_bytes += n;
             self.buffered += n;
         }
 
         // Yield exactly one chunk
+        self.total_chunks_yielded += 1;
+        self.total_chunks_bytes += self.chunk_size;
         const start = self.offset;
         self.offset += self.chunk_size;
         return self.buf[start..start + self.chunk_size];
+    }
+
+    fn logSummary(self: *const ChunkedReader) void {
+        std.debug.print("[chunked-reader] raw_reads={d} raw_bytes={d} ({d}ms) chunks={d} chunk_bytes={d} ({d}ms) partial={d}bytes zero_skipped={d}\n", .{
+            self.total_raw_reads,
+            self.total_raw_bytes,
+            self.total_raw_bytes * 1000 / 32000,
+            self.total_chunks_yielded,
+            self.total_chunks_bytes,
+            self.total_chunks_bytes * 1000 / 32000,
+            self.total_partial_bytes,
+            self.total_zero_chunks_skipped,
+        });
     }
 };
 
@@ -297,13 +338,17 @@ pub const Server = struct {
 
         var speech_trim_total: usize = 0; // cumulative bytes trimmed (for absolute frame calc)
 
-        var reader = ChunkedReader.init(audio_fd, vad_filter.chunk_size);
+        // Real audio always has a noise floor — exact digital zero is never real
+        // audio. Discard all-zero chunks to strip synthetic silence (PipeWire
+        // pipeline latency, loopback teardown, etc.) regardless of transport.
+        var reader = ChunkedReader.init(audio_fd, vad_filter.chunk_size, true);
         var vad_state: VadState = .idle;
         var bytes_since_last_cycle: usize = 0;
         var cycle_count: usize = 0;
         var was_live: bool = is_live.load(.monotonic);
         var ptt_tracking_press_ns: i128 = 0;
         var total_audio_bytes: usize = 0; // audio-position clock (32000 bytes/sec)
+        var audio_hash: u32 = 0; // running FNV hash of all audio bytes for determinism checks
 
         while (true) {
             const audio = try reader.read();
@@ -313,6 +358,9 @@ pub const Server = struct {
             // --- Audio input processing ---
             if (n > 0) {
                 if (self.recorder) |rec| rec.recordPcm(audio);
+
+                // Running hash of all audio bytes for determinism verification
+                audio_hash = hashAudio(audio_hash, audio);
 
                 // VadFilter: run on raw audio for edge detection (handles any size via pcm_partial)
                 const was_triggered = vad_filter.triggered;
@@ -325,7 +373,7 @@ pub const Server = struct {
                     try speech_buf.appendSlice(self.allocator, audio);
                     bytes_since_last_cycle += audio.len;
                     var ts_buf: [32]u8 = undefined;
-                    std.debug.print("[{s}s] idle → speaking (buf={d})\n", .{ formatAudioTime(&ts_buf, total_audio_bytes), speech_buf.items.len });
+                    std.debug.print("[{s}s] idle → speaking (buf={d} hash=0x{x:0>8})\n", .{ formatAudioTime(&ts_buf, total_audio_bytes), speech_buf.items.len, audio_hash });
                     if (self.recorder) |rec| rec.logEvent(total_audio_bytes, "idle → speaking");
                 } else if (vad_state == .speaking) {
                     try speech_buf.appendSlice(self.allocator, audio);
@@ -449,6 +497,15 @@ pub const Server = struct {
 
             // --- Final flush on client disconnect (TCP EOF or PipeWire pipe close) ---
             if (client_closed) {
+                var ts_eof: [32]u8 = undefined;
+                std.debug.print("[{s}s] EOF: vad={s} speech_buf={d}ms total_audio={d}ms hash=0x{x:0>8}\n", .{
+                    formatAudioTime(&ts_eof, total_audio_bytes),
+                    if (vad_state == .speaking) "speaking" else "idle",
+                    speech_buf.items.len * 1000 / 32000,
+                    total_audio_bytes * 1000 / 32000,
+                    audio_hash,
+                });
+                reader.logSummary();
                 if (vad_state == .speaking and speech_buf.items.len >= min_transcribe_bytes) {
                     cycle_count += 1;
                     const flush_emit = try self.transcribeAndEmit(&pipeline, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "client-eof");
@@ -461,6 +518,7 @@ pub const Server = struct {
                 if (self.recorder) |rec| rec.endRecording() catch |err| {
                     std.debug.print("[rec] write error: {}\n", .{err});
                 };
+                std.debug.print("handleConnection returning (EOF path)\n", .{});
                 return;
             }
 
@@ -594,6 +652,16 @@ pub const Server = struct {
         speech_buf.clearRetainingCapacity();
     }
 };
+
+/// Simple FNV-1a hash for audio determinism verification.
+fn hashAudio(prev: u32, data: []const u8) u32 {
+    var h: u32 = if (prev == 0) 0x811c9dc5 else prev;
+    for (data) |b| {
+        h ^= b;
+        h *%= 0x01000193;
+    }
+    return h;
+}
 
 fn nsToF64Ms(ns: i128) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;

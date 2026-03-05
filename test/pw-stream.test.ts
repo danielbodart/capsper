@@ -15,11 +15,12 @@ describe.skipIf(!gpu)("pw-stream", () => {
         const LOOPBACK_SINK = "test-whisper-loopback-sink";
         const LOOPBACK_SOURCE = "test-whisper-loopback-source";
 
-        // Start pw-loopback: creates a virtual sink + source bridge
+        // Start pw-loopback: creates a virtual sink + source bridge.
+        // audio.rate=16000 prevents double resampling through the 48kHz graph.
         const loopback = spawn([
             "pw-loopback",
-            `--capture-props=media.class=Audio/Sink node.name=${LOOPBACK_SINK}`,
-            `--playback-props=media.class=Audio/Source node.name=${LOOPBACK_SOURCE}`,
+            `--capture-props={"media.class":"Audio/Sink", "node.name":"${LOOPBACK_SINK}", "audio.rate":16000}`,
+            `--playback-props={"media.class":"Audio/Source", "node.name":"${LOOPBACK_SOURCE}", "audio.rate":16000}`,
             "-C", "1", "-m", "MONO",
         ], { stdout: "ignore", stderr: "ignore" });
         trackProc(loopback);
@@ -52,8 +53,13 @@ describe.skipIf(!gpu)("pw-stream", () => {
 
                 await pwcat.exited;
 
-                // Wait for server to flush trailing transcription (2s silence timeout + transcribe)
-                await waitForLog(server.logFile, /flush → idle/, server.proc, 10);
+                // Kill the loopback → PipeWire destroys the source node →
+                // server's PW stream gets ERROR state → onStateChanged closes pipe →
+                // server's read() returns EOF → flush → idle
+                try { loopback.kill(); } catch {}
+                await Bun.sleep(200); // let PipeWire propagate node destruction
+
+                await waitForLog(server.logFile, /flush → idle/, server.proc, 30);
 
                 const output = await file(server.outputFile).text();
                 console.error("");
@@ -71,7 +77,7 @@ describe.skipIf(!gpu)("pw-stream", () => {
                 server.kill();
             }
         } finally {
-            loopback.kill();
+            try { loopback.kill(); } catch {}
         }
     }, 120_000);
 });

@@ -103,6 +103,8 @@ Do NOT manually download CI artifacts or stage releases by hand — the update s
 
 **Never change test thresholds without human approval.** Regression test thresholds (coverage, WER, gap, repetition limits) in `.test.json` files are carefully tuned. If a code change causes tests to fail, fix the code — don't relax the thresholds. If thresholds genuinely need updating, present the before/after results and get explicit human sign-off.
 
+**Do not attribute test result differences to CUDA non-determinism.** When results differ between test modes or runs, the cause is almost always a real discrepancy in the test methodology or a real code bug — not GPU randomness. Investigate the actual root cause instead of dismissing differences as non-determinism.
+
 ## Conventions
 
 - Zig 0.15 API: `b.createModule(...)` for executables, `file.reader(&buf)` takes a buffer arg, use `readToEndAlloc` instead of `readBytesNoEof`

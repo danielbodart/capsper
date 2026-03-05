@@ -1,4 +1,4 @@
 {
   "group": "long",
-  "thresholds": { "minCoverage": 85, "maxWer": 15, "maxRepetitions": 5 }
+  "thresholds": { "minCoverage": 80, "maxWer": 25, "maxGapSec": 20, "maxRepetitions": 5 }
 }

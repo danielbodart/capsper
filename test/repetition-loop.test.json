@@ -1,4 +1,4 @@
 {
   "group": "medium",
-  "thresholds": { "minCoverage": 85, "maxWer": 15 }
+  "thresholds": { "minCoverage": 95, "maxWer": 10, "maxGapSec": 5 }
 }

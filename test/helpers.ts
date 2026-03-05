@@ -1,7 +1,7 @@
 import { $, spawn, file } from "bun";
 import { expect } from "bun:test";
 import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, copyFileSync } from "fs";
-import { createConnection } from "net";
+
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -247,33 +247,49 @@ export function readPcm(wavFile: string): Buffer {
 
 /** Stream PCM data to a TCP server at real-time rate, return server response.
  *  Sends ~100ms chunks at 32000 bytes/sec, then shuts down the write side
- *  so the server sees EOF immediately and flushes. */
+ *  so the server sees EOF immediately and flushes.
+ *  Uses Bun.connect (same as streamPcmFast) for consistent TCP half-close behavior. */
 export function streamPcm(port: number, pcm: Buffer, bytesPerSec = 32000): Promise<string> {
     return new Promise((resolve, reject) => {
-        const socket = createConnection(port, "localhost");
         const chunks: Buffer[] = [];
         const CHUNK_MS = 100;
         const CHUNK_BYTES = Math.ceil(bytesPerSec * CHUNK_MS / 1000);
         let offset = 0;
         let timer: ReturnType<typeof setTimeout>;
 
-        socket.on("connect", () => {
-            const sendNext = () => {
-                if (offset >= pcm.length) {
-                    socket.end();
-                    return;
-                }
-                const end = Math.min(offset + CHUNK_BYTES, pcm.length);
-                socket.write(pcm.subarray(offset, end));
-                offset = end;
-                timer = setTimeout(sendNext, CHUNK_MS);
-            };
-            sendNext();
+        Bun.connect({
+            hostname: "localhost",
+            port,
+            socket: {
+                open(socket) {
+                    const sendNext = () => {
+                        if (offset >= pcm.length) {
+                            socket.shutdown();
+                            return;
+                        }
+                        const end = Math.min(offset + CHUNK_BYTES, pcm.length);
+                        socket.write(pcm.subarray(offset, end));
+                        offset = end;
+                        timer = setTimeout(sendNext, CHUNK_MS);
+                    };
+                    sendNext();
+                },
+                data(_socket, data) {
+                    chunks.push(Buffer.from(data));
+                },
+                close() {
+                    resolve(Buffer.concat(chunks).toString());
+                },
+                connectError(_socket, err) {
+                    clearTimeout(timer);
+                    reject(err);
+                },
+                error(_socket, err) {
+                    clearTimeout(timer);
+                    reject(err);
+                },
+            },
         });
-
-        socket.on("data", (data) => chunks.push(data));
-        socket.on("end", () => resolve(Buffer.concat(chunks).toString()));
-        socket.on("error", (err) => { clearTimeout(timer); reject(err); });
     });
 }
 

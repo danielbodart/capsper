@@ -147,11 +147,13 @@ async function streamPcmPipeWire(
 ): Promise<{ output: string; logFile: string }> {
     console.error(`  Streaming ${wavFile} (${wavDuration(wavFile)}s) via PipeWire...`);
 
-    // Create a fresh loopback for this test
+    // Create a fresh loopback for this test.
+    // audio.rate=16000 prevents PipeWire from resampling 16kHz→48kHz→16kHz
+    // through the graph, which degrades SNR by ~11dB.
     const loopback = spawn([
         "pw-loopback",
-        `--capture-props=media.class=Audio/Sink node.name=${LOOPBACK_SINK}`,
-        `--playback-props=media.class=Audio/Source node.name=${LOOPBACK_SOURCE}`,
+        `--capture-props={"media.class":"Audio/Sink", "node.name":"${LOOPBACK_SINK}", "audio.rate":16000}`,
+        `--playback-props={"media.class":"Audio/Source", "node.name":"${LOOPBACK_SOURCE}", "audio.rate":16000}`,
         "-C", "1", "-m", "MONO",
     ], { stdout: "ignore", stderr: "ignore" });
     trackProc(loopback);

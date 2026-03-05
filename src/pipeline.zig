@@ -108,6 +108,14 @@ pub const Pipeline = struct {
     /// Called by the server after emitting words — the confirmed tokens become
     /// forced prefix for subsequent decode cycles, ensuring consistency.
     pub fn commitTokens(self: *Pipeline, tokens: []const c.whisper_token, frames: []const usize) !void {
+        if (self.verbose) {
+            std.debug.print("    [commit] +{d} tokens (total={d}) frames=[", .{ tokens.len, self.accumulated_tokens.items.len + tokens.len });
+            for (frames, 0..) |f, i| {
+                if (i > 0) std.debug.print(",", .{});
+                std.debug.print("{d}", .{f});
+            }
+            std.debug.print("]\n", .{});
+        }
         try self.accumulated_tokens.appendSlice(self.allocator, tokens);
         try self.accumulated_frames.appendSlice(self.allocator, frames);
     }
@@ -302,6 +310,27 @@ pub const Pipeline = struct {
             @memcpy(full_prompt[pos..][0..forced_len], forced_tokens[forced_tokens.len - forced_len ..]);
         }
 
+        if (self.verbose) {
+            std.debug.print("    [state] samples={d} ({d}ms) mel_computed={d} content_frames={d} laf={?d} flush={}\n", .{
+                samples.len, samples.len * 1000 / 32000, self.mel_buffer.n_computed, content_frames,
+                self.last_attend_frame, flush,
+            });
+            std.debug.print("    [state] accum_tok={d} ctx_tok={d} domain_tok={d} | prompt: domain={d} ctx={d} forced={d} total={d}\n", .{
+                self.accumulated_tokens.items.len, self.context_tokens.items.len, self.prompt_tokens.len,
+                domain_len, ctx_len, forced_len, full_prompt.len,
+            });
+            // Log the forced token text
+            if (forced_len > 0) {
+                std.debug.print("    [state] forced: \"", .{});
+                const forced_start = forced_tokens.len - forced_len;
+                for (forced_tokens[forced_start..]) |tok| {
+                    const s = std.mem.span(c.whisper_token_to_str(self.ctx, tok));
+                    std.debug.print("{s}", .{s});
+                }
+                std.debug.print("\"\n", .{});
+            }
+        }
+
         // Decode prompt in two parts: batch the first N-1 tokens, then decode the
         // last token separately. whisper.cpp only populates logits for the last token
         // in a batch, but whisper_get_logits_from_state always reads from offset 0.
@@ -353,6 +382,9 @@ pub const Pipeline = struct {
             }
 
             if (best_token == self.eot) {
+                if (self.verbose) {
+                    std.debug.print("      [tok] EOT (logit={d:.2}) after {d} tokens\n", .{ best_logit, generated.items.len });
+                }
                 timing.stop_reason = "eot";
                 break;
             }
@@ -422,6 +454,20 @@ pub const Pipeline = struct {
                 frontier,
                 self.config,
             );
+
+            if (self.verbose) {
+                const tok_str = std.mem.span(c.whisper_token_to_str(self.ctx, best_token));
+                std.debug.print("      [tok] #{d} id={d} \"{s}\" frame={d} frontier={d} decision={s}\n", .{
+                    generated.items.len - 1, best_token, tok_str,
+                    most_attended, frontier,
+                    switch (decision) {
+                        .continue_decoding => "continue",
+                        .stop_attention_at_end => "attn_end",
+                        .rewind_detected => "rewind",
+                        .stop_frame_stagnation => "stagnation",
+                    },
+                });
+            }
 
             switch (decision) {
                 .stop_attention_at_end => {
