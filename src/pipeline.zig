@@ -135,12 +135,17 @@ pub const Pipeline = struct {
     pub fn handleTrim(self: *Pipeline, trimmed_bytes: usize) !void {
         if (trimmed_bytes == 0) return;
 
-        // Mel cache is relative to buffer start — invalidate after front trim.
-        const mel_frames_before = self.mel_buffer.n_computed;
-        self.mel_buffer.reset();
-
-        // Convert trimmed bytes to encoder frame count (50fps = 320 samples/frame * 2 bytes/sample = 640 bytes/frame)
+        // Convert trimmed bytes to frame counts at both rates:
+        // - Mel frames at 100fps (HOP_LENGTH=160 samples, 320 bytes/frame)
+        // - Encoder frames at 50fps (320 samples, 640 bytes/frame)
+        const mel_trim_frames = trimmed_bytes / 320;
         const trim_frame = trimmed_bytes / 640;
+
+        // Shift mel cache: discard trimmed frames, keep the rest.
+        // Preserves normalization continuity across the trim boundary,
+        // preventing the encoder feature mismatch that causes immediate EOT.
+        const mel_frames_before = self.mel_buffer.n_computed;
+        self.mel_buffer.trimFront(mel_trim_frames);
 
         // Shift last_attend_frame so it stays relative to the new buffer start
         const laf_before = self.last_attend_frame;
@@ -150,8 +155,8 @@ pub const Pipeline = struct {
 
         const n = self.accumulated_tokens.items.len;
 
-        std.debug.print("  [trim] bytes={d} frames={d} mel_cache={d}→0 laf={?d}→{?d} accum_tok={d} ctx_tok={d}\n", .{
-            trimmed_bytes, trim_frame, mel_frames_before,
+        std.debug.print("  [trim] bytes={d} frames={d} mel_cache={d}→{d} laf={?d}→{?d} accum_tok={d} ctx_tok={d}\n", .{
+            trimmed_bytes, trim_frame, mel_frames_before, self.mel_buffer.n_computed,
             laf_before, self.last_attend_frame,
             n, self.context_tokens.items.len,
         });

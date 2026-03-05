@@ -60,6 +60,25 @@ pub const MelBuffer = struct {
         self.samples = &.{};
     }
 
+    /// Discard the first `frames` mel frames from the cache.
+    /// Used after sliding window trim: the audio buffer lost its front,
+    /// so the corresponding mel frames are no longer valid. Remaining
+    /// frames are preserved to maintain normalization continuity.
+    pub fn trimFront(self: *MelBuffer, frames: usize) void {
+        if (frames == 0) return;
+        if (frames >= self.n_computed) {
+            self.reset();
+            return;
+        }
+        const floats_to_drop = frames * self.n_mel;
+        const total_floats = self.n_computed * self.n_mel;
+        const remaining_floats = total_floats - floats_to_drop;
+        std.mem.copyForwards(f32, self.raw_mel.items[0..remaining_floats], self.raw_mel.items[floats_to_drop..total_floats]);
+        self.raw_mel.items.len = remaining_floats;
+        self.n_computed -= frames;
+        self.samples = &.{}; // will be re-set by next addSamples call
+    }
+
     /// Compute mel frames for the given audio buffer.
     /// `samples` must be the FULL audio buffer (growing each cycle).
     /// Only computes frames not already cached. Returns number of new frames.
