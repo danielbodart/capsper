@@ -536,6 +536,29 @@ pub const Server = struct {
                     ptt_tracking_press_ns = 0;
                 }
 
+                // Rate limit recovery: decoder went haywire, discard its output
+                // and reset to just the untranscribed audio after last_attend_frame.
+                if (emit_result.rate_limited) {
+                    const keep_from = if (pipeline.last_attend_frame) |laf|
+                        @min(laf * 640, speech_buf.items.len)
+                    else
+                        0;
+                    const keep_bytes = speech_buf.items.len - keep_from;
+                    if (keep_from > 0 and keep_bytes > 0) {
+                        std.mem.copyForwards(u8, speech_buf.items[0..keep_bytes], speech_buf.items[keep_from..speech_buf.items.len]);
+                    }
+                    speech_trim_total += keep_from;
+                    speech_buf.items.len = keep_bytes;
+                    pipeline.resetSegment();
+                    var ts_buf3: [32]u8 = undefined;
+                    std.debug.print("[{s}s] RATE RESET: kept {d}ms of untranscribed audio, dropped {d}ms\n", .{
+                        formatAudioTime(&ts_buf3, total_audio_bytes),
+                        keep_bytes * 1000 / 32000,
+                        keep_from * 1000 / 32000,
+                    });
+                    continue;
+                }
+
                 // Sliding window trim
                 const old_len = speech_buf.items.len;
                 utils.trimBuffer(&speech_buf, max_buffer_bytes);
@@ -557,6 +580,7 @@ pub const Server = struct {
     }
     const TranscribeResult = struct {
         emitted: bool,
+        rate_limited: bool = false,
     };
 
     fn transcribeAndEmit(
@@ -576,6 +600,17 @@ pub const Server = struct {
         defer self.allocator.free(samples);
 
         const result = try pipeline.transcribe(samples, flush, null) orelse {
+            if (pipeline.rate_limited) {
+                pipeline.rate_limited = false;
+                if (self.verbose) {
+                    var ts_buf: [32]u8 = undefined;
+                    const ts = formatAudioTime(&ts_buf, total_audio_bytes);
+                    std.debug.print("    [{s}s] cycle={d} RATE LIMITED buf={d}ms — decoder reset\n", .{
+                        ts, cycle_count, speech_buf.len * 1000 / 32000,
+                    });
+                }
+                return .{ .emitted = false, .rate_limited = true };
+            }
             if (self.verbose) {
                 var ts_buf: [32]u8 = undefined;
                 const ts = formatAudioTime(&ts_buf, total_audio_bytes);

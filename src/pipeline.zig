@@ -21,6 +21,7 @@ pub const TranscribeResult = struct {
     tokens: []const c.whisper_token,
     token_frames: []const usize, // per-token audio frame from cross-attention
     was_rewind: bool,
+    was_rate_limited: bool = false, // decoder produced too many tokens — caller should reset
     timing: Timing,
 };
 
@@ -31,7 +32,7 @@ pub const Pipeline = struct {
     config: alignatt.Config,
     n_threads: c_int,
     verbose: bool,
-    max_tokens_per_second: usize = 10, // token-rate ceiling per transcribe cycle
+    max_tokens_per_second: usize = 15, // token-rate ceiling per transcribe cycle
 
     // Special tokens
     sot: c.whisper_token,
@@ -62,6 +63,7 @@ pub const Pipeline = struct {
     // If attention jumps backwards by > rewind_threshold, tokens are discarded.
     // Reset on segment boundary; adjusted on buffer trim.
     last_attend_frame: ?usize = null,
+    rate_limited: bool = false, // set when token-rate ceiling triggers; caller should reset
 
     // Incremental mel spectrogram cache. Persists across transcribe cycles within
     // a VAD segment; reset on segment boundary.
@@ -418,16 +420,17 @@ pub const Pipeline = struct {
             // possible for one transcription cycle. Each cycle processes ~1 second
             // of new audio (transcribe_interval_bytes). Human speech is ~2-3
             // words/sec (4-8 tokens/sec). A burst of 87 tokens from 1s of new
-            // audio is a decoder repetition loop — stop it before it amplifies.
-            // Skip on flush — the model needs freedom to finish the utterance.
+            // audio is a decoder repetition loop — discard everything and signal
+            // the caller to reset. Skip on flush (model needs freedom to finish).
             if (!flush and generated.items.len > self.max_tokens_per_second) {
-                _ = generated.pop();
-                _ = token_frames.pop();
                 if (self.verbose) {
-                    std.debug.print("      [tok] RATE LIMIT: {d} tokens exceeds ceiling {d}/cycle\n", .{
-                        generated.items.len + 1, self.max_tokens_per_second,
+                    std.debug.print("      [tok] RATE LIMIT: {d} tokens exceeds ceiling {d}/cycle — discarding all\n", .{
+                        generated.items.len, self.max_tokens_per_second,
                     });
                 }
+                generated.clearRetainingCapacity();
+                token_frames.clearRetainingCapacity();
+                self.rate_limited = true;
                 timing.stop_reason = "rate_limit";
                 break;
             }

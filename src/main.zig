@@ -56,7 +56,7 @@ pub fn main() !void {
     var vad_threshold_off: ?f32 = null;
     var min_silence_ms: ?u32 = null;
     var no_auto_gain: bool = false;
-    var max_tokens_per_second: usize = 10;
+    var max_tokens_per_second: usize = 15;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -167,7 +167,7 @@ pub fn main() !void {
             no_auto_gain = true;
         } else if (std.mem.eql(u8, arg, "--max-tokens-per-sec")) {
             i += 1;
-            if (i < args.len) max_tokens_per_second = std.fmt.parseInt(usize, args[i], 10) catch 10;
+            if (i < args.len) max_tokens_per_second = std.fmt.parseInt(usize, args[i], 10) catch 15;
         } else if (std.mem.eql(u8, arg, "--vad")) {
             i += 1;
             if (i < args.len) {
