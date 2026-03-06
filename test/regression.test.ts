@@ -5,7 +5,7 @@ import { basename, join } from "path";
 import {
     hasGpu, ensureBinary, ensureFile,
     startServer, startLocalServer, readPcm,
-    streamPcmFast, streamPcm,
+    streamPcmFast, streamPcm, streamWavDirect,
     assertTranscript, printScorecard, saveLog, saveScoring,
     wavDuration, trackProc, waitForLog,
     type Thresholds, type TranscriptResult,
@@ -13,12 +13,12 @@ import {
 
 const gpu = await hasGpu();
 
-// --- Test mode: tcp (default), tcp-realtime, pipewire ---
-type TestMode = "tcp" | "tcp-realtime" | "pipewire";
+// --- Test mode: tcp (default), tcp-realtime, pipewire, stream-wav ---
+type TestMode = "tcp" | "tcp-realtime" | "pipewire" | "stream-wav";
 const testMode: TestMode = (() => {
-    const m = process.env.CAPSPER_TEST_MODE ?? "tcp";
-    if (m !== "tcp" && m !== "tcp-realtime" && m !== "pipewire") {
-        throw new Error(`Invalid CAPSPER_TEST_MODE: ${m} (expected tcp|tcp-realtime|pipewire)`);
+    const m = process.env.CAPSPER_TEST_MODE ?? "stream-wav";
+    if (m !== "tcp" && m !== "tcp-realtime" && m !== "pipewire" && m !== "stream-wav") {
+        throw new Error(`Invalid CAPSPER_TEST_MODE: ${m} (expected tcp|tcp-realtime|pipewire|stream-wav)`);
     }
     return m;
 })();
@@ -77,7 +77,6 @@ const testCase = process.env.TEST_CASE; // single test filter
 const runShort = !group || group === "short" || !!process.env.SLOW_TESTS;
 const runMedium = group === "medium" || !!process.env.SLOW_TESTS;
 const runLong = group === "long" || !!process.env.SLOW_TESTS;
-
 function shouldRunGroup(g: string): boolean {
     if (testCase) return true; // TEST_CASE overrides group gating
     switch (g) {
@@ -215,7 +214,7 @@ for (const g of groups) {
                 if (c.ref) ensureFile(c.ref, "reference transcript");
             }
 
-            if (testMode !== "pipewire") {
+            if (testMode !== "pipewire" && testMode !== "stream-wav") {
                 tcpServer = await startServer(["--port", "0", ...serverArgs]);
             }
         });
@@ -236,7 +235,12 @@ for (const g of groups) {
             test(tc.name, async () => {
                 let output: string;
 
-                if (testMode === "pipewire") {
+                if (testMode === "stream-wav") {
+                    // Direct WAV: bypasses TCP/PipeWire, feeds file fd through streaming pipeline
+                    const sw = await streamWavDirect(tc.wav, serverArgs);
+                    output = sw.output;
+                    saveLog(sw.logFile, `${tc.name}-${testMode}`);
+                } else if (testMode === "pipewire") {
                     // PipeWire: fresh server per test (no connection-level isolation)
                     const pw = await streamPcmPipeWire(serverArgs, tc.wav);
                     output = pw.output;

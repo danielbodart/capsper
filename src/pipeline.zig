@@ -31,6 +31,7 @@ pub const Pipeline = struct {
     config: alignatt.Config,
     n_threads: c_int,
     verbose: bool,
+    max_tokens_per_second: usize = 10, // token-rate ceiling per transcribe cycle
 
     // Special tokens
     sot: c.whisper_token,
@@ -412,6 +413,24 @@ pub const Pipeline = struct {
 
             try generated.append(self.allocator, best_token);
             try token_frames.append(self.allocator, 0); // placeholder — updated after attention
+
+            // Token-rate ceiling: stop if generating more tokens than physically
+            // possible for one transcription cycle. Each cycle processes ~1 second
+            // of new audio (transcribe_interval_bytes). Human speech is ~2-3
+            // words/sec (4-8 tokens/sec). A burst of 87 tokens from 1s of new
+            // audio is a decoder repetition loop — stop it before it amplifies.
+            // Skip on flush — the model needs freedom to finish the utterance.
+            if (!flush and generated.items.len > self.max_tokens_per_second) {
+                _ = generated.pop();
+                _ = token_frames.pop();
+                if (self.verbose) {
+                    std.debug.print("      [tok] RATE LIMIT: {d} tokens exceeds ceiling {d}/cycle\n", .{
+                        generated.items.len + 1, self.max_tokens_per_second,
+                    });
+                }
+                timing.stop_reason = "rate_limit";
+                break;
+            }
 
             // Decode this token
             var next = [_]c.whisper_token{best_token};

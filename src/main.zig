@@ -49,12 +49,14 @@ pub fn main() !void {
     var record_dir: ?[:0]const u8 = null;
     var record_keep: usize = 10;
     var transcribe_file: ?[:0]const u8 = null;
+    var stream_wav_file: ?[:0]const u8 = null;
     var low_latency: bool = false;
     var pw_gain: f32 = 1.0;
     var vad_threshold: ?f32 = null;
     var vad_threshold_off: ?f32 = null;
     var min_silence_ms: ?u32 = null;
     var no_auto_gain: bool = false;
+    var max_tokens_per_second: usize = 10;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -144,6 +146,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--transcribe")) {
             i += 1;
             if (i < args.len) transcribe_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--stream-wav")) {
+            i += 1;
+            if (i < args.len) stream_wav_file = args[i];
         } else if (std.mem.eql(u8, arg, "--pw-gain")) {
             i += 1;
             if (i < args.len) pw_gain = std.fmt.parseFloat(f32, args[i]) catch 1.0;
@@ -160,6 +165,9 @@ pub fn main() !void {
             if (i < args.len) min_silence_ms = std.fmt.parseInt(u32, args[i], 10) catch null;
         } else if (std.mem.eql(u8, arg, "--no-auto-gain")) {
             no_auto_gain = true;
+        } else if (std.mem.eql(u8, arg, "--max-tokens-per-sec")) {
+            i += 1;
+            if (i < args.len) max_tokens_per_second = std.fmt.parseInt(usize, args[i], 10) catch 10;
         } else if (std.mem.eql(u8, arg, "--vad")) {
             i += 1;
             if (i < args.len) {
@@ -378,6 +386,39 @@ pub fn main() !void {
         return;
     }
 
+    // --stream-wav: feed WAV through the streaming pipeline (VAD → speech_buf → transcribe → trim)
+    // Same code path as live PipeWire/TCP but with deterministic byte-for-byte audio delivery.
+    // Opens the WAV file directly and seeks past the header — the ChunkedReader reads
+    // 1024-byte chunks from the file fd identically to how it reads from a socket or pipe.
+    if (stream_wav_file) |swf| {
+        const file = std.fs.cwd().openFile(swf, .{}) catch |err| {
+            std.debug.print("Failed to open WAV file '{s}': {}\n", .{ swf, err });
+            return;
+        };
+
+        // Seek past standard 44-byte WAV header to the PCM data.
+        file.seekTo(44) catch |err| {
+            std.debug.print("Failed to seek in WAV file '{s}': {}\n", .{ swf, err });
+            file.close();
+            return;
+        };
+
+        // Resolve VAD thresholds
+        const defaults = vad_backend.defaultThresholds();
+        const resolved_threshold2 = vad_threshold orelse defaults.onset;
+        const resolved_threshold_off2 = vad_threshold_off orelse defaults.offset;
+        const resolved_min_silence_ms2 = min_silence_ms orelse defaults.min_silence_ms;
+        const resolved_min_silence_bytes2: usize = @as(usize, resolved_min_silence_ms2) * 32000 / 1000;
+
+        var server2 = Server.init(allocator, ctx, vad_backend, 0, .tcp, null, 0, verbose, false, null, prompt_tokens, drop_terms, null, 1.0, true, resolved_threshold2, resolved_threshold_off2, resolved_min_silence_bytes2, max_tokens_per_second);
+        server_mod.setLive(true);
+        server2.handleConnection(file.handle, 1, null) catch |err| {
+            std.debug.print("Stream error: {}\n", .{err});
+        };
+        file.close();
+        return;
+    }
+
     // Initialize evdev input handler (if --trigger specified, skip in dry-run)
     var input_handler: ?InputHandler = null;
     var type_callback: ?TypeCallback = null;
@@ -478,7 +519,7 @@ pub fn main() !void {
     std.debug.print("VAD: backend={s}  onset={d:.2}  offset={d:.2}  min_silence={d}ms\n", .{
         vad_backend.name(), resolved_threshold, resolved_threshold_off, resolved_min_silence_ms,
     });
-    var server = Server.init(allocator, ctx, vad_backend, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, drop_terms, recorder, pw_gain, no_auto_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes);
+    var server = Server.init(allocator, ctx, vad_backend, port, input_mode, pw_target, pw_channel, verbose, low_latency, type_callback, prompt_tokens, drop_terms, recorder, pw_gain, no_auto_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes, max_tokens_per_second);
     try server.run();
 }
 
@@ -522,8 +563,8 @@ fn printUsage() void {
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
     std.debug.print("       [--domain-terms FILE] [--drop-terms FILE]\n", .{});
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
-    std.debug.print("       [--transcribe FILE]\n", .{});
-    std.debug.print("       [--pw-gain FACTOR] [--no-auto-gain]\n", .{});
+    std.debug.print("       [--transcribe FILE] [--stream-wav FILE]\n", .{});
+    std.debug.print("       [--pw-gain FACTOR] [--no-auto-gain] [--max-tokens-per-sec N]\n", .{});
     std.debug.print("       [--vad ten|silero|ten-native] [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
     std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});

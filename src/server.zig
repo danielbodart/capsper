@@ -186,6 +186,7 @@ pub const Server = struct {
     vad_threshold: f32,
     vad_threshold_off: f32,
     min_silence_bytes: usize,
+    max_tokens_per_second: usize,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -206,6 +207,7 @@ pub const Server = struct {
         vad_threshold: f32,
         vad_threshold_off: f32,
         min_silence_bytes: usize,
+        max_tokens_per_second: usize,
     ) Server {
         return .{
             .allocator = allocator,
@@ -226,6 +228,7 @@ pub const Server = struct {
             .vad_threshold = vad_threshold,
             .vad_threshold_off = vad_threshold_off,
             .min_silence_bytes = min_silence_bytes,
+            .max_tokens_per_second = max_tokens_per_second,
         };
     }
 
@@ -318,8 +321,9 @@ pub const Server = struct {
         };
     }
 
-    fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
+    pub fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
         var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4, self.verbose, self.prompt_tokens);
+        pipeline.max_tokens_per_second = self.max_tokens_per_second;
         defer pipeline.deinit();
 
         var auto_gain = AutoGain{ .current_gain = self.initial_gain };

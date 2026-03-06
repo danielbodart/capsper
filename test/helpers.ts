@@ -340,6 +340,27 @@ export function streamPcmFast(port: number, pcm: Buffer): Promise<string> {
     });
 }
 
+/** Stream a WAV file directly through the streaming pipeline via --stream-wav.
+ *  Bypasses TCP and PipeWire entirely — the binary reads the WAV file and feeds
+ *  PCM chunks through the same VAD → speech_buf → pipeline → trim code path.
+ *  Produces deterministic, byte-for-byte identical processing to the live path. */
+export async function streamWavDirect(
+    wavFile: string,
+    serverArgs: string[],
+): Promise<{ output: string; logFile: string }> {
+    const logFile = tmpFile("whisper-stream-wav", ".log");
+
+    const proc = spawn([BINARY, "--warmup-file", WARMUP_FILE, "--stream-wav", wavFile, ...serverArgs], {
+        stdout: "pipe",
+        stderr: Bun.file(logFile),
+    });
+    trackProc(proc);
+
+    const output = await new Response(proc.stdout).text();
+    await proc.exited;
+    return { output, logFile };
+}
+
 export interface Emission {
     time: number;
     text: string;

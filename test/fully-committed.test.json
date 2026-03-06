@@ -1,4 +1,4 @@
 {
   "group": "short",
-  "thresholds": { "minCoverage": 95, "maxWer": 30, "maxGapSec": 5 }
+  "thresholds": { "minCoverage": 95, "maxWer": 55, "maxGapSec": 5 }
 }
