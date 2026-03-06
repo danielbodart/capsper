@@ -99,6 +99,8 @@ Do NOT manually download CI artifacts or stage releases by hand — the update s
 
 **Don't run redundant test commands.** `./run.ts` (no args) already does build + unit tests + property tests + short regressions + PipeWire plumbing — that's the standard verify step. Do NOT run `./run.ts build`, `./run.ts test`, and `./run.ts short-test` separately — that just repeats work. Only run `./run.ts slow-test` when you specifically need medium/long regression results (e.g. measuring WER improvement on long files).
 
+**Test changes incrementally.** When experimenting with changes that affect transcription quality, run tests in order: short → medium → long. Only proceed to the next level if scores improve. Get baseline by reverting if needed. Use env vars for parameterized experiments: `CAPSPER_TEST_MODE=tcp TEST_GROUP=medium CHUNK_MS=1000 bun test test/regression.test.ts`.
+
 ## Rules
 
 **Never change test thresholds without human approval.** Regression test thresholds (coverage, WER, gap, repetition limits) in `.test.json` files are carefully tuned. If a code change causes tests to fail, fix the code — don't relax the thresholds. If thresholds genuinely need updating, present the before/after results and get explicit human sign-off.
