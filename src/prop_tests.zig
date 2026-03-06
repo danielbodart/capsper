@@ -294,9 +294,6 @@ fn prop_checkStopping_exhaustive(n: usize) !void {
             try std.testing.expect(content_frames > most_attended);
             try std.testing.expect(content_frames - most_attended <= threshold);
         },
-        .stop_frame_stagnation => {
-            // Stagnation won't trigger with empty token_frames, but handle for exhaustiveness
-        },
         .continue_decoding => {
             // Continue is the default — just verify it's a valid state
         },

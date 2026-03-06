@@ -491,7 +491,6 @@ pub const Pipeline = struct {
                         .continue_decoding => "continue",
                         .stop_attention_at_end => "attn_end",
                         .rewind_detected => "rewind",
-                        .stop_frame_stagnation => "stagnation",
                     },
                 });
             }
@@ -511,19 +510,6 @@ pub const Pipeline = struct {
                     token_frames.clearRetainingCapacity();
                     self.last_attend_frame = null;
                     timing.stop_reason = "rewind";
-                    break;
-                },
-                .stop_frame_stagnation => {
-                    // Discard the stagnant tokens from the end
-                    const discard = alignatt.detectFrameRegression(
-                        token_frames.items, frontier,
-                        self.config.stagnation_window,
-                        self.config.stagnation_threshold,
-                    ) orelse self.config.stagnation_window;
-                    const keep = generated.items.len -| discard;
-                    generated.items.len = keep;
-                    token_frames.items.len = keep;
-                    timing.stop_reason = "stagnation";
                     break;
                 },
                 .continue_decoding => {

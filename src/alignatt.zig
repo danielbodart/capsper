@@ -19,7 +19,6 @@ pub const Decision = enum {
     continue_decoding,
     stop_attention_at_end, // attention reached end — strip last token and stop
     rewind_detected, // attention jumped backwards — discard segment
-    stop_frame_stagnation, // attention stuck behind frontier — decoder looping
 };
 
 /// Analyze cross-attention data for the last decoded token.
@@ -139,8 +138,8 @@ pub fn checkStopping(
     content_frames: usize,
     last_attend_frame: ?usize,
     flush: bool,
-    token_frames: []const usize,
-    frontier: usize,
+    _: []const usize, // token_frames — unused after stagnation removal
+    _: usize, // frontier — unused after stagnation removal
     config: Config,
 ) Decision {
     // Rewind detection: attention jumped backwards too far
@@ -156,12 +155,6 @@ pub fn checkStopping(
         content_frames - most_attended_frame <= threshold)
     {
         return .stop_attention_at_end;
-    }
-
-    // Frame stagnation: recent tokens collectively attending well behind the frontier.
-    // Catches repetition loops where the decoder generates tokens stuck in one region.
-    if (detectFrameRegression(token_frames, frontier, config.stagnation_window, config.stagnation_threshold) != null) {
-        return .stop_frame_stagnation;
     }
 
     return .continue_decoding;
@@ -333,24 +326,9 @@ test "checkStopping: forward movement is not rewind" {
     try std.testing.expectEqual(Decision.continue_decoding, result);
 }
 
-test "checkStopping: frame stagnation detected" {
-    // 16 tokens all attending to frame 100, but frontier is at 300 → gap=200 > threshold=100
-    const frames = [_]usize{ 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100 };
-    const result = checkStopping(100, 1000, 99, false, &frames, 300, .{});
-    try std.testing.expectEqual(Decision.stop_frame_stagnation, result);
-}
-
-test "checkStopping: no stagnation when frames near frontier" {
-    // 16 tokens attending near the frontier
-    const frames = [_]usize{ 190, 195, 192, 198, 193, 196, 199, 197, 191, 194, 196, 198, 193, 195, 197, 199 };
-    const result = checkStopping(199, 1000, 198, false, &frames, 200, .{});
-    try std.testing.expectEqual(Decision.continue_decoding, result);
-}
-
-test "checkStopping: no stagnation with insufficient tokens" {
-    // Only 3 tokens — below stagnation_window=16
-    const frames = [_]usize{ 10, 10, 10 };
-    const result = checkStopping(10, 1000, 9, false, &frames, 200, .{});
+test "checkStopping: continue when frames not at end or rewound" {
+    const frames = [_]usize{ 100, 100, 100 };
+    const result = checkStopping(100, 1000, 99, false, &frames, 200, .{});
     try std.testing.expectEqual(Decision.continue_decoding, result);
 }
 
