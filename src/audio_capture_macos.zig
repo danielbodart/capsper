@@ -32,9 +32,11 @@ const CallbackData = struct {
 pub const AudioCapture = struct {
     au_unit: ca.AudioComponentInstance,
     callback_data: *CallbackData,
+    device_id: ca.AudioDeviceID,
     pipe_read_fd: posix.fd_t,
     pipe_write_fd: posix.fd_t,
     active: bool,
+    has_hardware_gain: bool,
 
     /// Default channel: 0 = first/mono channel on macOS (zero-indexed).
     pub const default_channel: u32 = 0;
@@ -167,14 +169,27 @@ pub const AudioCapture = struct {
             return error.AudioInitFailed;
         }
 
-        log.info("CoreAudio capture ready (16kHz mono S16)", .{});
+        // Check if hardware input gain is available
+        var gain_addr = ca.AudioObjectPropertyAddress{
+            .mSelector = ca.kAudioDevicePropertyVolumeScalar,
+            .mScope = ca.kAudioObjectPropertyScopeInput,
+            .mElement = 0,
+        };
+        const has_hw_gain = ca.AudioObjectHasProperty(device_id, &gain_addr) != 0;
+        if (has_hw_gain) {
+            log.info("CoreAudio capture ready (16kHz mono S16, hardware gain available)", .{});
+        } else {
+            log.info("CoreAudio capture ready (16kHz mono S16, software gain only)", .{});
+        }
 
         return .{
             .au_unit = au_unit,
             .callback_data = callback_data,
+            .device_id = device_id,
             .pipe_read_fd = pipe_fds[0],
             .pipe_write_fd = pipe_fds[1],
             .active = false,
+            .has_hardware_gain = has_hw_gain,
         };
     }
 
@@ -204,25 +219,42 @@ pub const AudioCapture = struct {
         self.setActive(!corked);
     }
 
-    /// Set hardware input gain via CoreAudio volume property.
+    /// Set input gain. Prefers hardware gain via CoreAudio device volume
+    /// (kAudioDevicePropertyVolumeScalar on input scope). Falls back to
+    /// software gain in the capture callback if hardware is unavailable.
+    ///
+    /// gain is a linear multiplier: 1.0 = unity, 10.0 = +20 dB.
     pub fn setGain(self: *AudioCapture, gain: f32) void {
-        // Store gain for the callback to use as software fallback
+        // Always store for software fallback
         self.callback_data.gain.store(gain, .monotonic);
 
-        // Try hardware gain via the AUHAL volume property.
-        // This controls the device's input gain if supported.
-        var volume: ca.Float32 = gain;
-        const result = ca.AudioUnitSetProperty(
-            self.au_unit,
-            ca.kHALOutputParam_Volume,
-            ca.kAudioUnitScope_Output,
-            1,
-            &volume,
-            @sizeOf(ca.Float32),
-        );
-        if (result != ca.noErr) {
-            // Hardware gain not supported — callback will apply software gain
-            log.info("Hardware gain not available, using software gain ({d:.1}x)", .{gain});
+        if (!self.has_hardware_gain) return;
+
+        // Convert linear gain to dB: dB = 20 * log10(gain)
+        const gain_db: f32 = 20.0 * @log10(gain);
+
+        // Use the device's dB-to-scalar conversion for accurate mapping.
+        // This accounts for the device's actual dB range and transfer function.
+        var scalar: ca.Float32 = gain_db;
+        var scalar_size: ca.UInt32 = @sizeOf(ca.Float32);
+        var convert_addr = ca.AudioObjectPropertyAddress{
+            .mSelector = ca.kAudioDevicePropertyVolumeDecibelsToScalar,
+            .mScope = ca.kAudioObjectPropertyScopeInput,
+            .mElement = 0,
+        };
+        if (ca.AudioObjectGetPropertyData(self.device_id, &convert_addr, 0, null, &scalar_size, @ptrCast(&scalar)) != ca.noErr) {
+            // Conversion failed — fall back to linear approximation (0-1 scalar ≈ linear)
+            scalar = std.math.clamp(gain / 10.0, 0.0, 1.0);
+        }
+
+        var set_addr = ca.AudioObjectPropertyAddress{
+            .mSelector = ca.kAudioDevicePropertyVolumeScalar,
+            .mScope = ca.kAudioObjectPropertyScopeInput,
+            .mElement = 0,
+        };
+        if (ca.AudioObjectSetPropertyData(self.device_id, &set_addr, 0, null, @sizeOf(ca.Float32), @ptrCast(&scalar)) == ca.noErr) {
+            // Hardware gain applied — disable software gain so we don't double-amplify
+            self.callback_data.gain.store(1.0, .monotonic);
         }
     }
 
