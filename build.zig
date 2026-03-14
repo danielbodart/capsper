@@ -342,6 +342,7 @@ fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
     exe.each_lib_rpath = false;
 
     if (is_macos) {
+        exe.linkFramework("AudioToolbox");
         exe.linkFramework("CoreAudio");
         exe.linkFramework("CoreFoundation");
         exe.linkFramework("ApplicationServices");
