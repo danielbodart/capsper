@@ -58,9 +58,11 @@ pub const AudioCapture = struct {
         _ = _channel_position; // Channel selection deferred — mono only for now
 
         // Check and request microphone permission before anything else.
-        // CoreAudio silently delivers zero samples without permission — even
-        // for virtual devices like BlackHole, because TCC applies per-process.
-        const mic_status = capsper_mic_permission_status();
+        // CoreAudio silently delivers zero samples without permission.
+        // Skip when a specific target device is given (e.g. BlackHole loopback) —
+        // virtual devices deliver real audio without mic permission, and the user
+        // explicitly chose the device.
+        const mic_status = if (target != null) @as(c_int, 3) else capsper_mic_permission_status();
         if (mic_status == 0) {
             log.info("Requesting microphone permission...", .{});
             if (capsper_mic_request_permission() == 0) {
