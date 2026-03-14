@@ -2,8 +2,12 @@
 //
 // Captures microphone audio via AUHAL (Audio Unit HAL Output) and delivers
 // S16_LE mono 16kHz PCM through a pipe fd, matching the PipeWire capture
-// interface on Linux. AUHAL's internal AudioConverter handles sample rate
-// conversion from the device's native rate (typically 48kHz) to 16kHz.
+// interface on Linux.
+//
+// AUHAL captures at the device's native sample rate (typically 48kHz) as
+// mono S16 — it can do channel mixing and float→int conversion but NOT
+// sample rate conversion. An AudioConverter then resamples to 16kHz using
+// Apple's high-quality SRC (proper anti-aliasing filter).
 
 const std = @import("std");
 const posix = std.posix;
@@ -25,23 +29,23 @@ const CallbackData = struct {
     au_unit: ca.AudioComponentInstance,
     pipe_write_fd: posix.fd_t,
     gain: std.atomic.Value(f32),
-    /// Ratio for integer decimation (e.g. 3 for 48kHz→16kHz). 1 = no SRC.
-    src_ratio: u32,
+    converter: ca.AudioConverterRef,
     /// Pre-allocated buffer for AudioUnitRender at device rate (S16 mono).
     render_buf: [max_render_frames * 2]u8 = undefined,
-    /// Pre-allocated buffer for decimated output at 16kHz (S16 mono).
+    /// Pre-allocated buffer for converter output at 16kHz (S16 mono).
     output_buf: [max_output_frames * 2]u8 = undefined,
 
     // Device may deliver up to 4096 frames per callback at 48kHz.
     const max_render_frames = 4096;
-    // After 3:1 decimation: 4096/3 ≈ 1366 frames.
-    const max_output_frames = max_render_frames;
+    // After SRC: 4096 * (16000/48000) ≈ 1366 frames. Over-allocate for safety.
+    const max_output_frames = 2048;
 };
 
 pub const AudioCapture = struct {
     au_unit: ca.AudioComponentInstance,
     callback_data: *CallbackData,
     device_id: ca.AudioDeviceID,
+    converter: ca.AudioConverterRef,
     pipe_read_fd: posix.fd_t,
     pipe_write_fd: posix.fd_t,
     active: bool,
@@ -54,25 +58,23 @@ pub const AudioCapture = struct {
         _ = _channel_position; // Channel selection deferred — mono only for now
 
         // Check and request microphone permission before anything else.
-        // CoreAudio silently delivers zero samples without permission.
-        // Skip for virtual devices (e.g. BlackHole) which don't need mic permission.
-        if (target == null) {
-            const mic_status = capsper_mic_permission_status();
-            if (mic_status == 0) {
-                log.info("Requesting microphone permission...", .{});
-                if (capsper_mic_request_permission() == 0) {
-                    log.err("Microphone permission denied.", .{});
-                    log.err("Grant access in: System Settings → Privacy & Security → Microphone", .{});
-                    return error.AudioInitFailed;
-                }
-            } else if (mic_status == 2) {
+        // CoreAudio silently delivers zero samples without permission — even
+        // for virtual devices like BlackHole, because TCC applies per-process.
+        const mic_status = capsper_mic_permission_status();
+        if (mic_status == 0) {
+            log.info("Requesting microphone permission...", .{});
+            if (capsper_mic_request_permission() == 0) {
                 log.err("Microphone permission denied.", .{});
                 log.err("Grant access in: System Settings → Privacy & Security → Microphone", .{});
                 return error.AudioInitFailed;
-            } else if (mic_status == 1) {
-                log.err("Microphone access is restricted by system policy.", .{});
-                return error.AudioInitFailed;
             }
+        } else if (mic_status == 2) {
+            log.err("Microphone permission denied.", .{});
+            log.err("Grant access in: System Settings → Privacy & Security → Microphone", .{});
+            return error.AudioInitFailed;
+        } else if (mic_status == 1) {
+            log.err("Microphone access is restricted by system policy.", .{});
+            return error.AudioInitFailed;
         }
 
         // Create pipe for passing PCM from CoreAudio thread to main thread
@@ -162,21 +164,42 @@ pub const AudioCapture = struct {
             ca.CFRelease(@ptrCast(name_ref));
         }
 
-        // Set desired output format: 16kHz mono S16_LE on output scope, bus 1.
-        // AUHAL's internal AudioConverter handles resampling from device native rate.
-        var format = ca.AudioStreamBasicDescription{
-            .mSampleRate = 16000.0,
-            .mFormatID = ca.kAudioFormatLinearPCM,
-            .mFormatFlags = ca.kAudioFormatFlagIsSignedInteger | ca.kAudioFormatFlagIsPacked,
-            .mBytesPerPacket = 2,
-            .mFramesPerPacket = 1,
-            .mBytesPerFrame = 2,
-            .mChannelsPerFrame = 1,
-            .mBitsPerChannel = 16,
+        // Get device's native sample rate
+        var native_rate: ca.Float64 = 0;
+        var rate_size: ca.UInt32 = @sizeOf(ca.Float64);
+        var rate_addr = ca.AudioObjectPropertyAddress{
+            .mSelector = ca.kAudioDevicePropertyNominalSampleRate,
+            .mScope = ca.kAudioObjectPropertyScopeGlobal,
+            .mElement = ca.kAudioObjectPropertyElementMain,
         };
-        if (ca.AudioUnitSetProperty(au_unit, ca.kAudioUnitProperty_StreamFormat, ca.kAudioUnitScope_Output, 1, &format, @sizeOf(ca.AudioStreamBasicDescription)) != ca.noErr) {
-            log.err("Failed to set 16kHz mono S16 format", .{});
+        if (ca.AudioObjectGetPropertyData(device_id, &rate_addr, 0, null, &rate_size, @ptrCast(&native_rate)) != ca.noErr) {
+            log.err("Failed to get device sample rate", .{});
             return error.AudioInitFailed;
+        }
+
+        // Set AUHAL output format: device native rate, mono, S16.
+        // AUHAL can do channel mixing (stereo→mono) and float→int, but NOT SRC.
+        // We handle SRC separately via AudioConverter.
+        var device_format = makePcmFormat(native_rate, 1);
+        if (ca.AudioUnitSetProperty(au_unit, ca.kAudioUnitProperty_StreamFormat, ca.kAudioUnitScope_Output, 1, &device_format, @sizeOf(ca.AudioStreamBasicDescription)) != ca.noErr) {
+            log.err("Failed to set capture format", .{});
+            return error.AudioInitFailed;
+        }
+
+        // Create AudioConverter for sample rate conversion: native rate → 16kHz.
+        // Uses Apple's high-quality resampler with proper anti-aliasing.
+        var output_format = makePcmFormat(16000.0, 1);
+        var converter: ca.AudioConverterRef = undefined;
+        const needs_src = native_rate != 16000.0;
+        if (needs_src) {
+            if (ca.AudioConverterNew(&device_format, &output_format, &converter) != ca.noErr) {
+                log.err("Failed to create sample rate converter ({d}Hz → 16kHz)", .{native_rate});
+                return error.AudioInitFailed;
+            }
+            // Set highest quality SRC
+            var quality: ca.UInt32 = ca.kAudioConverterQuality_Max;
+            _ = ca.AudioConverterSetProperty(converter, ca.kAudioConverterSampleRateConverterQuality, @sizeOf(ca.UInt32), &quality);
+            log.info("Sample rate conversion: {d}Hz → 16kHz (quality=max)", .{native_rate});
         }
 
         // Allocate callback data on heap (stable pointer for unit lifetime)
@@ -185,6 +208,7 @@ pub const AudioCapture = struct {
             .au_unit = au_unit,
             .pipe_write_fd = pipe_fds[1],
             .gain = std.atomic.Value(f32).init(1.0),
+            .converter = if (needs_src) converter else null,
         };
         errdefer std.heap.page_allocator.destroy(callback_data);
 
@@ -198,7 +222,7 @@ pub const AudioCapture = struct {
             return error.AudioInitFailed;
         }
 
-        // Initialize (allocates internal resources, creates internal converter)
+        // Initialize (allocates internal resources)
         const init_result = ca.AudioUnitInitialize(au_unit);
         if (init_result != ca.noErr) {
             log.err("Failed to initialize AUHAL (error {d}). Microphone permission may be denied.", .{init_result});
@@ -223,6 +247,7 @@ pub const AudioCapture = struct {
             .au_unit = au_unit,
             .callback_data = callback_data,
             .device_id = device_id,
+            .converter = if (needs_src) converter else null,
             .pipe_read_fd = pipe_fds[0],
             .pipe_write_fd = pipe_fds[1],
             .active = false,
@@ -280,7 +305,6 @@ pub const AudioCapture = struct {
             .mElement = 0,
         };
         if (ca.AudioObjectGetPropertyData(self.device_id, &convert_addr, 0, null, &scalar_size, @ptrCast(&scalar)) != ca.noErr) {
-            // Conversion failed — fall back to linear approximation (0-1 scalar ≈ linear)
             scalar = std.math.clamp(gain / 10.0, 0.0, 1.0);
         }
 
@@ -305,6 +329,7 @@ pub const AudioCapture = struct {
         }
         _ = ca.AudioUnitUninitialize(self.au_unit);
         _ = ca.AudioComponentInstanceDispose(self.au_unit);
+        if (self.converter) |conv| _ = ca.AudioConverterDispose(conv);
         posix.close(self.pipe_read_fd);
         if (self.callback_data.pipe_write_fd != -1) {
             posix.close(self.pipe_write_fd);
@@ -313,12 +338,10 @@ pub const AudioCapture = struct {
     }
 
     /// Parse channel name to zero-based channel index.
-    /// macOS uses simple integer indices, not SPA position constants.
     pub fn parseChannelName(name: []const u8) ?u32 {
         if (std.ascii.eqlIgnoreCase(name, "MONO")) return 0;
         if (std.ascii.eqlIgnoreCase(name, "FL")) return 0;
         if (std.ascii.eqlIgnoreCase(name, "FR")) return 1;
-        // Parse AUXn → channel index n
         if (name.len >= 4 and std.ascii.eqlIgnoreCase(name[0..3], "AUX")) {
             return std.fmt.parseInt(u32, name[3..], 10) catch return null;
         }
@@ -326,7 +349,21 @@ pub const AudioCapture = struct {
     }
 };
 
-/// Find an audio device by name. Searches all devices with input channels.
+/// Build a mono S16 packed PCM format descriptor at the given sample rate.
+fn makePcmFormat(rate: f64, channels: u32) ca.AudioStreamBasicDescription {
+    return .{
+        .mSampleRate = rate,
+        .mFormatID = ca.kAudioFormatLinearPCM,
+        .mFormatFlags = ca.kAudioFormatFlagIsSignedInteger | ca.kAudioFormatFlagIsPacked,
+        .mBytesPerPacket = 2 * channels,
+        .mFramesPerPacket = 1,
+        .mBytesPerFrame = 2 * channels,
+        .mChannelsPerFrame = channels,
+        .mBitsPerChannel = 16,
+    };
+}
+
+/// Find an audio device by name.
 fn findDeviceByName(name: [:0]const u8) ?ca.AudioDeviceID {
     var size: ca.UInt32 = 0;
     var addr = ca.AudioObjectPropertyAddress{
@@ -336,10 +373,9 @@ fn findDeviceByName(name: [:0]const u8) ?ca.AudioDeviceID {
     };
     if (ca.AudioObjectGetPropertyDataSize(ca.kAudioObjectSystemObject, &addr, 0, null, &size) != ca.noErr) return null;
     const count = size / @sizeOf(ca.AudioDeviceID);
-    if (count == 0) return null;
+    if (count == 0 or count > 64) return null;
 
     var devices: [64]ca.AudioDeviceID = undefined;
-    if (count > 64) return null;
     if (ca.AudioObjectGetPropertyData(ca.kAudioObjectSystemObject, &addr, 0, null, &size, @ptrCast(&devices)) != ca.noErr) return null;
 
     for (0..count) |i| {
@@ -365,8 +401,42 @@ fn findDeviceByName(name: [:0]const u8) ?ca.AudioDeviceID {
     return null;
 }
 
+/// State passed to the AudioConverter data supplier callback.
+/// Points at the current render buffer so the converter can pull input data.
+const ConverterContext = struct {
+    data: [*]u8,
+    byte_count: u32,
+    consumed: bool,
+};
+
+/// AudioConverter data supplier — called by FillComplexBuffer to get input data.
+/// Simply points at the render buffer from the current AUHAL callback. Called once
+/// per FillComplexBuffer invocation since we provide all input in a single chunk.
+fn converterSupplier(
+    _: ca.AudioConverterRef,
+    io_number_data_packets: [*c]ca.UInt32,
+    io_data: [*c]ca.AudioBufferList,
+    _: [*c][*c]ca.AudioStreamPacketDescription,
+    in_user_data: ?*anyopaque,
+) callconv(.c) ca.OSStatus {
+    const ctx: *ConverterContext = @ptrCast(@alignCast(in_user_data orelse return -50));
+    if (ctx.consumed) {
+        // No more data — signal end of input
+        io_number_data_packets.* = 0;
+        return ca.noErr;
+    }
+    io_number_data_packets.* = ctx.byte_count / 2; // S16 mono: 1 frame = 2 bytes = 1 packet
+    io_data.*.mBuffers[0].mData = ctx.data;
+    io_data.*.mBuffers[0].mDataByteSize = ctx.byte_count;
+    io_data.*.mBuffers[0].mNumberChannels = 1;
+    ctx.consumed = true;
+    return ca.noErr;
+}
+
 /// CoreAudio input callback — runs on a real-time I/O thread.
-/// Pulls audio via AudioUnitRender and writes S16_LE PCM to the pipe.
+/// Pulls audio via AudioUnitRender at device native rate, converts to 16kHz
+/// via AudioConverter (FillComplexBuffer with proper SRC), applies gain,
+/// and writes S16_LE PCM to the pipe.
 fn onCapture(
     in_ref_con: ?*anyopaque,
     io_action_flags: [*c]ca.AudioUnitRenderActionFlags,
@@ -379,20 +449,20 @@ fn onCapture(
     if (data.pipe_write_fd == -1) return ca.noErr;
 
     // Clamp frames to our buffer size
-    const frames: u32 = @min(in_number_frames, CallbackData.max_frames_per_callback);
-    const byte_count = frames * 2; // S16 = 2 bytes per frame
+    const frames: u32 = @min(in_number_frames, CallbackData.max_render_frames);
+    const render_bytes = frames * 2; // S16 mono = 2 bytes per frame
 
-    // Set up AudioBufferList pointing to our pre-allocated buffer
+    // Set up AudioBufferList pointing to our pre-allocated render buffer
     var buf_list = ca.AudioBufferList{
         .mNumberBuffers = 1,
         .mBuffers = [1]ca.AudioBuffer{.{
             .mNumberChannels = 1,
-            .mDataByteSize = byte_count,
+            .mDataByteSize = render_bytes,
             .mData = &data.render_buf,
         }},
     };
 
-    // Pull audio from the AUHAL — fills buf_list with S16_LE PCM
+    // Pull audio from AUHAL at device native rate, mono S16
     const render_result = ca.AudioUnitRender(
         data.au_unit,
         io_action_flags,
@@ -401,24 +471,71 @@ fn onCapture(
         frames,
         &buf_list,
     );
-    if (render_result != ca.noErr) return ca.noErr; // skip this callback on error
+    if (render_result != ca.noErr) {
+        // Log first error only to avoid spamming
+        const count = struct {
+            var n: u32 = 0;
+        };
+        if (count.n == 0) log.warn("AudioUnitRender error: {d}", .{render_result});
+        count.n += 1;
+        return ca.noErr;
+    }
 
-    const actual_bytes = buf_list.mBuffers[0].mDataByteSize;
-    if (actual_bytes == 0) return ca.noErr;
+    const rendered_bytes = buf_list.mBuffers[0].mDataByteSize;
+    if (rendered_bytes == 0) return ca.noErr;
 
-    // Apply software gain if > 1.0 (hardware gain is preferred but may not be available)
+    // Apply software gain before SRC (if hardware gain unavailable)
     const gain = data.gain.load(.monotonic);
     if (gain > 1.01) {
         const samples: [*]i16 = @ptrCast(@alignCast(&data.render_buf));
-        const sample_count = actual_bytes / 2;
+        const sample_count = rendered_bytes / 2;
         for (0..sample_count) |i| {
             const amplified: i32 = @as(i32, samples[i]) * @as(i32, @intFromFloat(gain));
             samples[i] = @intCast(std.math.clamp(amplified, -32768, 32767));
         }
     }
 
-    // Write to pipe — non-blocking best-effort (same as PipeWire's onProcess)
-    _ = posix.write(data.pipe_write_fd, data.render_buf[0..actual_bytes]) catch {};
+    if (data.converter) |conv| {
+        // Sample rate conversion via AudioConverterFillComplexBuffer.
+        // The supplier callback points at our render buffer.
+        var ctx = ConverterContext{
+            .data = &data.render_buf,
+            .byte_count = rendered_bytes,
+            .consumed = false,
+        };
+
+        // Estimate output frames: input_frames * (16000 / device_rate) + 1
+        var output_frames: ca.UInt32 = frames / 3 + 1; // 48kHz→16kHz = 3:1
+        if (output_frames > CallbackData.max_output_frames)
+            output_frames = CallbackData.max_output_frames;
+
+        var out_list = ca.AudioBufferList{
+            .mNumberBuffers = 1,
+            .mBuffers = [1]ca.AudioBuffer{.{
+                .mNumberChannels = 1,
+                .mDataByteSize = output_frames * 2,
+                .mData = &data.output_buf,
+            }},
+        };
+
+        const conv_result = ca.AudioConverterFillComplexBuffer(
+            conv,
+            converterSupplier,
+            &ctx,
+            &output_frames,
+            &out_list,
+            null,
+        );
+        if (conv_result != ca.noErr and conv_result != 100) return ca.noErr; // 100 = underflow (OK at end)
+
+        const output_bytes = out_list.mBuffers[0].mDataByteSize;
+        if (output_bytes > 0) {
+            _ = posix.write(data.pipe_write_fd, data.output_buf[0..output_bytes]) catch {};
+        }
+    } else {
+        // No SRC needed — device is already at 16kHz
+        _ = posix.write(data.pipe_write_fd, data.render_buf[0..rendered_bytes]) catch {};
+    }
 
     return ca.noErr;
 }
