@@ -84,19 +84,27 @@ async function launchService(args: string[]): Promise<{ outFile: string; logFile
     createPlist(args, outFile, logFile);
     await $`launchctl load ${PLIST_PATH}`.quiet();
 
-    // Wait for capture to start (up to 180s for model load + warmup)
-    const deadline = Date.now() + 180_000;
+    // Wait for capture to start (up to 120s for model load + warmup)
+    const deadline = Date.now() + 120_000;
+    let started = false;
     while (Date.now() < deadline) {
         await Bun.sleep(500);
         try {
             const log = readFileSync(logFile, "utf-8");
-            if (log.includes("Capturing audio")) break;
+            if (log.includes("Capturing audio")) { started = true; break; }
             if (log.includes("error.AudioInitFailed") || log.includes("Failed to")) {
-                throw new Error(`Server failed to start: ${log.slice(-200)}`);
+                throw new Error(`Server failed to start: ${log.slice(-500)}`);
+            }
+            if (log.includes("permission denied") || log.includes("Microphone permission")) {
+                throw new Error(`Microphone permission denied — grant access via System Settings or dismiss pending dialogs on the Mac desktop`);
             }
         } catch (e: any) {
-            if (e.message?.startsWith("Server failed")) throw e;
+            if (e.message?.startsWith("Server failed") || e.message?.startsWith("Microphone")) throw e;
         }
+    }
+    if (!started) {
+        const log = readFileSync(logFile, "utf-8");
+        throw new Error(`Server did not start capturing within 120s. Last log:\n${log.slice(-500)}`);
     }
 
     const stop = async () => {
