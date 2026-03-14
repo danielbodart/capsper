@@ -15,18 +15,27 @@ const ca = @cImport({
     @cInclude("CoreAudio/CoreAudio.h");
 });
 
+// Objective-C helper for microphone permission (mic_permission_macos.m)
+extern fn capsper_mic_permission_status() c_int;
+extern fn capsper_mic_request_permission() c_int;
+
 /// Shared state between main thread and CoreAudio callback thread.
 /// Heap-allocated so the pointer remains stable for the unit's lifetime.
 const CallbackData = struct {
     au_unit: ca.AudioComponentInstance,
     pipe_write_fd: posix.fd_t,
     gain: std.atomic.Value(f32),
-    /// Pre-allocated buffer for AudioUnitRender. Sized for max expected frames.
-    render_buf: [max_frames_per_callback * 2]u8 = undefined, // S16 = 2 bytes per frame
+    /// Ratio for integer decimation (e.g. 3 for 48kHz→16kHz). 1 = no SRC.
+    src_ratio: u32,
+    /// Pre-allocated buffer for AudioUnitRender at device rate (S16 mono).
+    render_buf: [max_render_frames * 2]u8 = undefined,
+    /// Pre-allocated buffer for decimated output at 16kHz (S16 mono).
+    output_buf: [max_output_frames * 2]u8 = undefined,
 
-    // 16kHz / ~10 callbacks per second = ~1600 frames typical, but allow headroom.
-    // Device callbacks at 48kHz with 4096-frame buffers → 1365 frames at 16kHz after SRC.
-    const max_frames_per_callback = 4096;
+    // Device may deliver up to 4096 frames per callback at 48kHz.
+    const max_render_frames = 4096;
+    // After 3:1 decimation: 4096/3 ≈ 1366 frames.
+    const max_output_frames = max_render_frames;
 };
 
 pub const AudioCapture = struct {
@@ -41,9 +50,30 @@ pub const AudioCapture = struct {
     /// Default channel: 0 = first/mono channel on macOS (zero-indexed).
     pub const default_channel: u32 = 0;
 
-    pub fn init(_target: ?[:0]const u8, _channel_position: u32) !AudioCapture {
-        _ = _target; // Device selection deferred — uses system default input
+    pub fn init(target: ?[:0]const u8, _channel_position: u32) !AudioCapture {
         _ = _channel_position; // Channel selection deferred — mono only for now
+
+        // Check and request microphone permission before anything else.
+        // CoreAudio silently delivers zero samples without permission.
+        // Skip for virtual devices (e.g. BlackHole) which don't need mic permission.
+        if (target == null) {
+            const mic_status = capsper_mic_permission_status();
+            if (mic_status == 0) {
+                log.info("Requesting microphone permission...", .{});
+                if (capsper_mic_request_permission() == 0) {
+                    log.err("Microphone permission denied.", .{});
+                    log.err("Grant access in: System Settings → Privacy & Security → Microphone", .{});
+                    return error.AudioInitFailed;
+                }
+            } else if (mic_status == 2) {
+                log.err("Microphone permission denied.", .{});
+                log.err("Grant access in: System Settings → Privacy & Security → Microphone", .{});
+                return error.AudioInitFailed;
+            } else if (mic_status == 1) {
+                log.err("Microphone access is restricted by system policy.", .{});
+                return error.AudioInitFailed;
+            }
+        }
 
         // Create pipe for passing PCM from CoreAudio thread to main thread
         const pipe_fds = try posix.pipe();
@@ -86,17 +116,24 @@ pub const AudioCapture = struct {
             return error.AudioInitFailed;
         }
 
-        // Set default input device
-        var device_id: ca.AudioDeviceID = undefined;
-        var device_size: ca.UInt32 = @sizeOf(ca.AudioDeviceID);
-        var device_addr = ca.AudioObjectPropertyAddress{
-            .mSelector = ca.kAudioHardwarePropertyDefaultInputDevice,
-            .mScope = ca.kAudioObjectPropertyScopeGlobal,
-            .mElement = ca.kAudioObjectPropertyElementMain,
-        };
-        if (ca.AudioObjectGetPropertyData(ca.kAudioObjectSystemObject, &device_addr, 0, null, &device_size, &device_id) != ca.noErr) {
-            log.err("Failed to get default input device", .{});
-            return error.AudioInitFailed;
+        // Find input device — by name if target specified, otherwise system default
+        var device_id: ca.AudioDeviceID = ca.kAudioObjectUnknown;
+        if (target) |t| {
+            device_id = findDeviceByName(t) orelse {
+                log.err("Input device not found: {s}", .{t});
+                return error.AudioInitFailed;
+            };
+        } else {
+            var device_size: ca.UInt32 = @sizeOf(ca.AudioDeviceID);
+            var device_addr = ca.AudioObjectPropertyAddress{
+                .mSelector = ca.kAudioHardwarePropertyDefaultInputDevice,
+                .mScope = ca.kAudioObjectPropertyScopeGlobal,
+                .mElement = ca.kAudioObjectPropertyElementMain,
+            };
+            if (ca.AudioObjectGetPropertyData(ca.kAudioObjectSystemObject, &device_addr, 0, null, &device_size, @ptrCast(&device_id)) != ca.noErr) {
+                log.err("Failed to get default input device", .{});
+                return error.AudioInitFailed;
+            }
         }
         if (device_id == ca.kAudioObjectUnknown) {
             log.err("No input device available. Microphone permission may be needed.", .{});
@@ -288,6 +325,45 @@ pub const AudioCapture = struct {
         return null;
     }
 };
+
+/// Find an audio device by name. Searches all devices with input channels.
+fn findDeviceByName(name: [:0]const u8) ?ca.AudioDeviceID {
+    var size: ca.UInt32 = 0;
+    var addr = ca.AudioObjectPropertyAddress{
+        .mSelector = ca.kAudioHardwarePropertyDevices,
+        .mScope = ca.kAudioObjectPropertyScopeGlobal,
+        .mElement = ca.kAudioObjectPropertyElementMain,
+    };
+    if (ca.AudioObjectGetPropertyDataSize(ca.kAudioObjectSystemObject, &addr, 0, null, &size) != ca.noErr) return null;
+    const count = size / @sizeOf(ca.AudioDeviceID);
+    if (count == 0) return null;
+
+    var devices: [64]ca.AudioDeviceID = undefined;
+    if (count > 64) return null;
+    if (ca.AudioObjectGetPropertyData(ca.kAudioObjectSystemObject, &addr, 0, null, &size, @ptrCast(&devices)) != ca.noErr) return null;
+
+    for (0..count) |i| {
+        var name_ref: ca.CFStringRef = undefined;
+        var name_size: ca.UInt32 = @sizeOf(ca.CFStringRef);
+        var name_addr = ca.AudioObjectPropertyAddress{
+            .mSelector = ca.kAudioObjectPropertyName,
+            .mScope = ca.kAudioObjectPropertyScopeGlobal,
+            .mElement = ca.kAudioObjectPropertyElementMain,
+        };
+        if (ca.AudioObjectGetPropertyData(devices[i], &name_addr, 0, null, &name_size, @ptrCast(&name_ref)) == ca.noErr) {
+            var name_buf: [256]u8 = undefined;
+            if (ca.CFStringGetCString(name_ref, &name_buf, name_buf.len, ca.kCFStringEncodingUTF8) != 0) {
+                const dev_name = std.mem.sliceTo(&name_buf, 0);
+                if (std.mem.eql(u8, dev_name, name)) {
+                    ca.CFRelease(@ptrCast(name_ref));
+                    return devices[i];
+                }
+            }
+            ca.CFRelease(@ptrCast(name_ref));
+        }
+    }
+    return null;
+}
 
 /// CoreAudio input callback — runs on a real-time I/O thread.
 /// Pulls audio via AudioUnitRender and writes S16_LE PCM to the pipe.

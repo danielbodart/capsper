@@ -346,6 +346,12 @@ fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
         exe.linkFramework("CoreAudio");
         exe.linkFramework("CoreFoundation");
         exe.linkFramework("ApplicationServices");
+        exe.linkFramework("AVFoundation");
+        // Objective-C helper for microphone permission (AVCaptureDevice)
+        exe.root_module.addCSourceFile(.{
+            .file = b.path("src/mic_permission_macos.m"),
+            .flags = &.{"-fobjc-arc"},
+        });
     } else {
         exe.linkSystemLibrary("libpipewire-0.3");
         exe.root_module.addCSourceFile(.{
