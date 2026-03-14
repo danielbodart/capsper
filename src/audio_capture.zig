@@ -21,6 +21,22 @@ pub const AudioCapture = struct {
     monitor: ?*pw.pw_device_monitor,
     connected_to_target: bool,
 
+    /// Default channel: PipeWire SPA_AUDIO_CHANNEL_FL.
+    pub const default_channel: u32 = pw.SPA_AUDIO_CHANNEL_FL;
+
+    /// Parse channel name to SPA audio channel position constant.
+    pub fn parseChannelName(name: []const u8) ?u32 {
+        if (std.ascii.eqlIgnoreCase(name, "MONO")) return pw.SPA_AUDIO_CHANNEL_MONO;
+        if (std.ascii.eqlIgnoreCase(name, "FL")) return pw.SPA_AUDIO_CHANNEL_FL;
+        if (std.ascii.eqlIgnoreCase(name, "FR")) return pw.SPA_AUDIO_CHANNEL_FR;
+        // Parse AUXn (case-insensitive prefix, numeric suffix)
+        if (name.len >= 4 and std.ascii.eqlIgnoreCase(name[0..3], "AUX")) {
+            const n = std.fmt.parseInt(u32, name[3..], 10) catch return null;
+            if (n <= 63) return pw.spaAudioChannelAux(n);
+        }
+        return null;
+    }
+
     const stream_events = pw.pw_stream_events{
         .version = 2, // PW_VERSION_STREAM_EVENTS
         .process = onProcess,

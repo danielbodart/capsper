@@ -3,11 +3,15 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const is_macos = target.result.os.tag == .macos;
 
     // --- Build options ---
     const version_str = b.option([]const u8, "version", "Version string") orelse "0.0.0";
     const options = b.addOptions();
     options.addOption([]const u8, "version", version_str);
+
+    // --- Shared build config ---
+    const ten_vad_flags: []const []const u8 = &.{};
 
     // --- Zig executable ---
     const exe = b.addExecutable(.{
@@ -19,44 +23,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", options);
-
-    // Include paths for whisper.h and ggml.h
-    exe.root_module.addIncludePath(b.path("whisper.cpp/include"));
-    exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
-
-    // PipeWire: pkg-config provides include paths for both pipewire-0.3 and spa-0.2
-    exe.linkSystemLibrary("libpipewire-0.3");
-
-    // C helper for PipeWire SPA format building (variadic macros that Zig can't handle)
-    exe.root_module.addCSourceFile(.{
-        .file = b.path("src/pw_helpers.c"),
-        .flags = &.{
-            "-I/usr/include/pipewire-0.3",
-            "-I/usr/include/spa-0.2",
-        },
-    });
-
-    // TEN-VAD GGML: Zig reimplementation + submodule FFT (C)
-    exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
-    exe.root_module.addIncludePath(b.path("ten-vad/src"));
-    const ten_vad_flags: []const []const u8 = &.{};
-    exe.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
-
-    // Link from pre-built shared libs in dist/lib/ (committed via Git LFS)
-    exe.root_module.addLibraryPath(b.path("dist/lib"));
-    exe.root_module.addRPathSpecial("$ORIGIN/../lib");
-    exe.each_lib_rpath = false;
-
-    // Link whisper.cpp and its dependencies
-    exe.linkSystemLibrary("whisper");
-    exe.linkSystemLibrary("ggml");
-    exe.linkSystemLibrary("ggml-base");
-    exe.linkSystemLibrary("ggml-cpu");
-    exe.linkSystemLibrary("ggml-cuda");
-
-    // System dependencies
+    addWhisperIncludes(b, exe);
+    addTenVad(b, exe, ten_vad_flags);
+    addPlatformDeps(b, exe, is_macos);
+    addWhisperLibs(b, exe, is_macos);
     exe.linkLibC();
-
     b.installArtifact(exe);
 
     // Install warmup file next to the binary (dist/bin/jfk.wav)
@@ -71,17 +42,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    vad_filter_test_exe.root_module.addIncludePath(b.path("whisper.cpp/include"));
-    vad_filter_test_exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
-    vad_filter_test_exe.root_module.addIncludePath(b.path("ten-vad/src"));
-    vad_filter_test_exe.root_module.addLibraryPath(b.path("dist/lib"));
-    vad_filter_test_exe.root_module.addRPathSpecial("$ORIGIN/../lib");
-    vad_filter_test_exe.each_lib_rpath = false;
-    vad_filter_test_exe.linkSystemLibrary("whisper");
-    vad_filter_test_exe.linkSystemLibrary("ggml");
-    vad_filter_test_exe.linkSystemLibrary("ggml-base");
-    vad_filter_test_exe.linkSystemLibrary("ggml-cpu");
-    vad_filter_test_exe.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
+    addWhisperIncludes(b, vad_filter_test_exe);
+    addTenVad(b, vad_filter_test_exe, ten_vad_flags);
+    addLibPath(b, vad_filter_test_exe, is_macos);
+    addWhisperLibsNoGpu(b, vad_filter_test_exe);
     vad_filter_test_exe.linkLibC();
     b.installArtifact(vad_filter_test_exe);
 
@@ -94,17 +58,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    vad_compare_exe.root_module.addIncludePath(b.path("whisper.cpp/include"));
-    vad_compare_exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
-    vad_compare_exe.root_module.addIncludePath(b.path("ten-vad/src"));
-    vad_compare_exe.root_module.addLibraryPath(b.path("dist/lib"));
-    vad_compare_exe.root_module.addRPathSpecial("$ORIGIN/../lib");
-    vad_compare_exe.each_lib_rpath = false;
-    vad_compare_exe.linkSystemLibrary("whisper");
-    vad_compare_exe.linkSystemLibrary("ggml");
-    vad_compare_exe.linkSystemLibrary("ggml-base");
-    vad_compare_exe.linkSystemLibrary("ggml-cpu");
-    vad_compare_exe.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
+    addWhisperIncludes(b, vad_compare_exe);
+    addTenVad(b, vad_compare_exe, ten_vad_flags);
+    addLibPath(b, vad_compare_exe, is_macos);
+    addWhisperLibsNoGpu(b, vad_compare_exe);
     vad_compare_exe.linkLibC();
     b.installArtifact(vad_compare_exe);
 
@@ -117,51 +74,29 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run capsper");
     run_step.dependOn(&run_cmd.step);
 
-    // --- Test step (pure Zig modules only, no C deps) ---
+    // --- Test step ---
     const test_step = b.step("test", "Run unit tests");
 
-    const utils_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/utils.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_utils_tests = b.addRunArtifact(utils_tests);
-    test_step.dependOn(&run_utils_tests.step);
+    // Pure Zig tests (no C deps, no platform deps)
+    inline for (.{
+        "src/utils.zig",
+        "src/alignatt.zig",
+        "src/mel.zig",
+        "src/auto_gain.zig",
+        "src/dsp.zig",
+        "src/conv.zig",
+    }) |src| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 
-    const alignatt_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/alignatt.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_alignatt_tests = b.addRunArtifact(alignatt_tests);
-    test_step.dependOn(&run_alignatt_tests.step);
-
-    const mel_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/mel.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_mel_tests = b.addRunArtifact(mel_tests);
-    test_step.dependOn(&run_mel_tests.step);
-
-    const auto_gain_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/auto_gain.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_auto_gain_tests = b.addRunArtifact(auto_gain_tests);
-    test_step.dependOn(&run_auto_gain_tests.step);
-
-    // vad.zig tests need whisper linked (imports whisper_c.zig at compile time,
-    // but unit tests only exercise processChunkProb which is pure Zig)
+    // vad.zig tests — needs whisper linked
     const vad_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/vad.zig"),
@@ -169,54 +104,29 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    vad_tests.root_module.addIncludePath(b.path("whisper.cpp/include"));
-    vad_tests.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
-    vad_tests.root_module.addIncludePath(b.path("ten-vad/src"));
-    vad_tests.root_module.addLibraryPath(b.path("dist/lib"));
-    vad_tests.linkSystemLibrary("whisper");
-    vad_tests.linkSystemLibrary("ggml");
-    vad_tests.linkSystemLibrary("ggml-base");
-    vad_tests.linkSystemLibrary("ggml-cpu");
-    vad_tests.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
+    addWhisperIncludes(b, vad_tests);
+    addTenVad(b, vad_tests, ten_vad_flags);
+    addLibPath(b, vad_tests, is_macos);
+    addWhisperLibsNoGpu(b, vad_tests);
     vad_tests.linkLibC();
-    const run_vad_tests = b.addRunArtifact(vad_tests);
-    test_step.dependOn(&run_vad_tests.step);
+    test_step.dependOn(&b.addRunArtifact(vad_tests).step);
 
-    // input.zig tests need libc for @cImport of linux/input-event-codes.h
-    const input_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/input.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    input_tests.linkLibC();
-    const run_input_tests = b.addRunArtifact(input_tests);
-    test_step.dependOn(&run_input_tests.step);
+    // input tests — platform-specific source file
+    if (!is_macos) {
+        // Linux: input.zig tests need libc for @cImport of linux/input-event-codes.h
+        const input_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/input.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        input_tests.linkLibC();
+        test_step.dependOn(&b.addRunArtifact(input_tests).step);
+    }
+    // TODO: macOS input tests once input_macos.zig has real implementation
 
-    // dsp.zig tests — pure Zig, no C deps
-    const dsp_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/dsp.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_dsp_tests = b.addRunArtifact(dsp_tests);
-    test_step.dependOn(&run_dsp_tests.step);
-
-    // conv.zig tests — pure Zig, no C deps
-    const conv_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/conv.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_conv_tests = b.addRunArtifact(conv_tests);
-    test_step.dependOn(&run_conv_tests.step);
-
-    // pitch_est.zig tests — needs fftw.c + ten-vad includes + libc (like vad_tests)
+    // pitch_est.zig tests — needs fftw.c + ten-vad includes + libc
     const pitch_est_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/pitch_est.zig"),
@@ -224,11 +134,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    pitch_est_tests.root_module.addIncludePath(b.path("ten-vad/src"));
-    pitch_est_tests.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = ten_vad_flags });
+    addTenVad(b, pitch_est_tests, ten_vad_flags);
     pitch_est_tests.linkLibC();
-    const run_pitch_est_tests = b.addRunArtifact(pitch_est_tests);
-    test_step.dependOn(&run_pitch_est_tests.step);
+    test_step.dependOn(&b.addRunArtifact(pitch_est_tests).step);
 
     // --- Property tests (minish-based, runs as executable) ---
     const prop_step = b.step("prop-test", "Run property-based tests (minish)");
@@ -238,41 +146,73 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const prop_imports: []const std.Build.Module.Import = if (is_macos)
+        &.{
+            .{ .name = "minish", .module = minish_dep.module("minish") },
+            .{ .name = "utils.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/utils.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+            .{ .name = "alignatt.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/alignatt.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+            .{ .name = "input.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/input_macos.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+            .{ .name = "dsp.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/dsp.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+            .{ .name = "conv.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/conv.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+        }
+    else
+        &.{
+            .{ .name = "minish", .module = minish_dep.module("minish") },
+            .{ .name = "utils.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/utils.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+            .{ .name = "alignatt.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/alignatt.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+            .{ .name = "input.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/input.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }) },
+            .{ .name = "dsp.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/dsp.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+            .{ .name = "conv.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/conv.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+        };
+
     const prop_exe = b.addExecutable(.{
         .name = "prop-tests",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/prop_tests.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "minish", .module = minish_dep.module("minish") },
-                .{ .name = "utils.zig", .module = b.createModule(.{
-                    .root_source_file = b.path("src/utils.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }) },
-                .{ .name = "alignatt.zig", .module = b.createModule(.{
-                    .root_source_file = b.path("src/alignatt.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }) },
-                .{ .name = "input.zig", .module = b.createModule(.{
-                    .root_source_file = b.path("src/input.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .link_libc = true,
-                }) },
-                .{ .name = "dsp.zig", .module = b.createModule(.{
-                    .root_source_file = b.path("src/dsp.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }) },
-                .{ .name = "conv.zig", .module = b.createModule(.{
-                    .root_source_file = b.path("src/conv.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }) },
-            },
+            .imports = prop_imports,
         }),
     });
 
@@ -297,15 +237,14 @@ pub fn build(b: *std.Build) void {
     zwanzig_run.addDirectoryArg(b.path("src"));
     analyze_step.dependOn(&zwanzig_run.step);
 
-    // --- Rebuild whisper.cpp shared libs (cmake → dist/lib/) ---
-    const rebuild_step = b.step("rebuild-libs", "Rebuild whisper.cpp shared libs into dist/lib/");
+    // --- Rebuild whisper.cpp shared libs (cmake → dist/lib/ or dist/lib-macos/) ---
+    const rebuild_step = b.step("rebuild-libs", "Rebuild whisper.cpp shared libs");
 
-    const cmake_build_dir = ".zig-cache/cmake";
-    const abs_dist_lib = b.pathJoin(&.{ b.build_root.path orelse ".", "dist/lib" });
-
-    // Use a disk-backed temp dir for nvcc intermediate files.
-    // Default /tmp is tmpfs (RAM-backed) and nvcc can fill 16GB+ during CUDA kernel compilation.
-    const nvcc_tmp = b.fmt("{s}/{s}/tmp", .{ b.build_root.path orelse ".", cmake_build_dir });
+    const cmake_build_dir = if (is_macos) ".zig-cache/cmake-macos" else ".zig-cache/cmake";
+    const abs_dist_lib = b.pathJoin(&.{
+        b.build_root.path orelse ".",
+        if (is_macos) "dist/lib-macos" else "dist/lib",
+    });
 
     const cmake_configure = b.addSystemCommand(&.{
         "cmake",
@@ -315,21 +254,23 @@ pub fn build(b: *std.Build) void {
         cmake_build_dir,
         "-DCMAKE_BUILD_TYPE=Release",
         "-DBUILD_SHARED_LIBS=ON",
-        "-DGGML_CUDA=ON",
-        "-DCMAKE_CUDA_ARCHITECTURES=75-virtual;86-virtual;89-virtual;120a-virtual",
         "-DWHISPER_BUILD_TESTS=OFF",
         "-DWHISPER_BUILD_EXAMPLES=OFF",
         "-DWHISPER_BUILD_SERVER=OFF",
         "-DGGML_NATIVE=OFF",
     });
     cmake_configure.addArg(b.fmt("-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={s}", .{abs_dist_lib}));
-    // Ensure shared libs use $ORIGIN RPATH so they find each other when installed
-    // anywhere, not just the build directory.
-    cmake_configure.addArg("-DCMAKE_INSTALL_RPATH=$ORIGIN");
     cmake_configure.addArg("-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON");
 
-    const mkdir_nvcc_tmp = b.addSystemCommand(&.{ "mkdir", "-p", nvcc_tmp });
-    mkdir_nvcc_tmp.step.dependOn(&cmake_configure.step);
+    if (is_macos) {
+        cmake_configure.addArg("-DGGML_METAL=ON");
+        cmake_configure.addArg("-DGGML_METAL_EMBED_LIBRARY=ON");
+        cmake_configure.addArg("-DCMAKE_INSTALL_RPATH=@loader_path");
+    } else {
+        cmake_configure.addArg("-DGGML_CUDA=ON");
+        cmake_configure.addArg("-DCMAKE_CUDA_ARCHITECTURES=75-virtual;86-virtual;89-virtual;120a-virtual");
+        cmake_configure.addArg("-DCMAKE_INSTALL_RPATH=$ORIGIN");
+    }
 
     const cmake_build = b.addSystemCommand(&.{
         "cmake",
@@ -339,8 +280,79 @@ pub fn build(b: *std.Build) void {
         "Release",
         "--parallel",
     });
-    cmake_build.setEnvironmentVariable("TMPDIR", nvcc_tmp);
-    cmake_build.step.dependOn(&mkdir_nvcc_tmp.step);
+
+    if (!is_macos) {
+        // Use a disk-backed temp dir for nvcc intermediate files.
+        // Default /tmp is tmpfs (RAM-backed) and nvcc can fill 16GB+ during CUDA kernel compilation.
+        const nvcc_tmp = b.fmt("{s}/{s}/tmp", .{ b.build_root.path orelse ".", cmake_build_dir });
+        const mkdir_nvcc_tmp = b.addSystemCommand(&.{ "mkdir", "-p", nvcc_tmp });
+        mkdir_nvcc_tmp.step.dependOn(&cmake_configure.step);
+        cmake_build.setEnvironmentVariable("TMPDIR", nvcc_tmp);
+        cmake_build.step.dependOn(&mkdir_nvcc_tmp.step);
+    } else {
+        cmake_build.step.dependOn(&cmake_configure.step);
+    }
 
     rebuild_step.dependOn(&cmake_build.step);
+}
+
+// ─── Helper functions to reduce duplication ─────────────────────────────────
+
+const Exe = std.Build.Step.Compile;
+
+fn addWhisperIncludes(b: *std.Build, exe: *Exe) void {
+    exe.root_module.addIncludePath(b.path("whisper.cpp/include"));
+    exe.root_module.addIncludePath(b.path("whisper.cpp/ggml/include"));
+}
+
+fn addTenVad(b: *std.Build, exe: *Exe, flags: []const []const u8) void {
+    exe.root_module.addIncludePath(b.path("ten-vad/src"));
+    exe.root_module.addCSourceFile(.{ .file = b.path("ten-vad/src/fftw.c"), .flags = flags });
+}
+
+fn addLibPath(b: *std.Build, exe: *Exe, is_macos: bool) void {
+    if (is_macos) {
+        exe.root_module.addLibraryPath(b.path("dist/lib-macos"));
+        exe.root_module.addRPathSpecial("@loader_path/../lib-macos");
+    } else {
+        exe.root_module.addLibraryPath(b.path("dist/lib"));
+        exe.root_module.addRPathSpecial("$ORIGIN/../lib");
+    }
+}
+
+fn addWhisperLibsNoGpu(_: *std.Build, exe: *Exe) void {
+    exe.linkSystemLibrary("whisper");
+    exe.linkSystemLibrary("ggml");
+    exe.linkSystemLibrary("ggml-base");
+    exe.linkSystemLibrary("ggml-cpu");
+}
+
+fn addWhisperLibs(b: *std.Build, exe: *Exe, is_macos: bool) void {
+    addWhisperLibsNoGpu(b, exe);
+    if (is_macos) {
+        exe.linkSystemLibrary("ggml-metal");
+        exe.linkSystemLibrary("ggml-blas");
+    } else {
+        exe.linkSystemLibrary("ggml-cuda");
+    }
+}
+
+fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
+    addLibPath(b, exe, is_macos);
+    exe.each_lib_rpath = false;
+
+    if (is_macos) {
+        exe.linkFramework("CoreAudio");
+        exe.linkFramework("CoreFoundation");
+        exe.linkFramework("ApplicationServices");
+    } else {
+        exe.linkSystemLibrary("libpipewire-0.3");
+        exe.root_module.addCSourceFile(.{
+            .file = b.path("src/pw_helpers.c"),
+            .flags = &.{
+                "-I/usr/include/pipewire-0.3",
+                "-I/usr/include/spa-0.2",
+            },
+        });
+    }
 }

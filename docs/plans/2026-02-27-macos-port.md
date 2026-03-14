@@ -1,10 +1,40 @@
 # macOS / Apple Silicon Port
 
-**Goal:** Port capsper to macOS on Apple Silicon, replacing Linux-specific subsystems (evdev/uinput, PipeWire, CUDA) with macOS equivalents (CGEventTap, Core Audio, Metal). Maintain the same UX: CapsLock push-to-talk, transcription injected as keystrokes into any focused application.
+**Goal:** Port capsper to macOS on Apple Silicon, replacing Linux-specific subsystems (evdev/uinput, PipeWire, CUDA) with macOS equivalents (CGEventTap, Core Audio, Metal). Maintain the same UX: CapsLock push-to-talk, transcription injected as keystrokes into any focused application. **This is a multi-platform project — Linux support is not being replaced.**
 
-**Target:** macOS 15+ (Sequoia) on Apple Silicon (M1+). Fine to require latest OS version and cutting-edge hardware. No need for Intel Mac support.
+**Target:** macOS 15+ (Sequoia) on Apple Silicon (M1+). No Intel Mac support needed.
 
-**Distribution:** Local builds + friend distribution via ad-hoc code signing. No Mac App Store, no notarization, no Developer ID cert required initially.
+**Distribution:** Homebrew formula in a personal tap (`homebrew-capsper`). No Apple Developer fee, no code signing, no notarization required. For direct distribution: ad-hoc code signing is sufficient.
+
+**Build requirement:** Full Xcode.app required (not just Command Line Tools) for Metal shader compilation (`xcrun metal`).
+
+**Local Xcode installation:** First-time install must go through the App Store GUI or [developer.apple.com/xcode](https://developer.apple.com/xcode/) — `mas` (Mac App Store CLI) only works for apps you've previously "purchased". After the first install, subsequent updates can use `mas install 497799835`.
+```bash
+# After installing Xcode from App Store:
+sudo xcodebuild -license accept
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+xcodebuild -downloadComponent MetalToolchain  # NO sudo — per-user install
+xcrun metal --version  # verify Metal tools work
+```
+
+**Xcode 26+ Metal Toolchain gotcha:** The Metal compiler is a separate download since Xcode 26. Must be installed with `xcodebuild -downloadComponent MetalToolchain` **without sudo** — the toolchain is [only visible to the user who installed it](https://openradar.appspot.com/FB20389216). Running with sudo installs it as root and your user can't see it.
+The bootstrap script detects whether `xcrun metal` already works and prints setup instructions if not. On GitHub CI runners, Xcode is preinstalled in the runner image — no manual install needed.
+
+---
+
+## Decisions Log
+
+| Decision | Rationale |
+|---|---|
+| Separate files per platform (`input.zig` + `input_macos.zig`) | Files are already large; keeps platform code cleanly separated |
+| Hybrid C/Zig approach | Zig where possible, C helpers for Apple API edge cases (same pattern as `pw_helpers.c`) |
+| Auto-detect platform in `build.zig` / `run.ts` | No CUDA on macOS, no Metal on Linux — auto-detection is unambiguous |
+| Build Metal dylibs on GitHub CI (free M1 runners) | Avoids committing macOS binaries to LFS; CI runners have Metal GPU support |
+| Separate platform release downloads | Linux users shouldn't download macOS dylibs and vice versa |
+| Homebrew formula (not cask) for distribution | CLI tool fits formula pattern; no signing/notarization needed via brew |
+| Comptime platform shims (not build options) | `builtin.os.tag` is idiomatic Zig; avoids threading options through every target |
+| `--stream-wav` for initial Metal validation | Faster and more deterministic than TCP socket; already exists |
+| Full Xcode required for building | Metal shader embedding (`GGML_METAL_EMBED_LIBRARY=ON`) needs `xcrun metal` which is not in CLI tools |
 
 ---
 
@@ -12,540 +42,284 @@
 
 | Linux (current) | macOS equivalent | Complexity vs Linux |
 |---|---|---|
-| evdev exclusive grab | `hidutil` CapsLock remap | Simpler |
+| evdev exclusive grab | `hidutil` CapsLock remap + CGEventTap | Simpler |
 | uinput virtual keyboard | CGEventPost + CGEventKeyboardSetUnicodeString | Simpler |
 | inotify keyboard hotplug | Not needed (hidutil is device-agnostic) | Eliminated |
-| EVIOCGKEY polling safety net | Not needed (CGEventTap is reliable) | Eliminated |
+| EVIOCGKEY polling safety net | `CGEventTapIsEnabled()` health check | Simpler |
 | PipeWire `pw_stream` | Core Audio AUHAL (`kAudioUnitSubType_HALOutput`) | Comparable |
 | PipeWire channel map (`--pw-channel`) | `kAudioOutputUnitProperty_ChannelMap` | Identical concept |
 | PipeWire device hotplug | `AudioObjectAddPropertyListener` | Simpler |
-| PipeWire software gain (`pw_set_stream_gain`) | AUHAL gain or AudioUnit mixer | Comparable |
-| `pw_helpers.c` (SPA pod wrappers) | `ca_helpers.c` (AudioBufferList wrappers) | Same pattern |
+| PipeWire software gain (`pw_set_stream_gain`) | Manual gain in capture callback | Same pattern |
+| `pw_helpers.c` (SPA pod wrappers) | `ca_helpers.c` (CoreAudio wrappers) | Same pattern |
 | CUDA (whisper.cpp) | Metal (whisper.cpp) | Same C API, different backend flag |
 | systemd user service | LaunchAgent plist | Simpler |
-| evdev group permissions | TCC permissions (Accessibility + Microphone) | Different but manageable |
+| systemd update timer | LaunchAgent update timer or `brew upgrade` | See Service Management |
+| evdev group permissions | TCC (Accessibility + Microphone) | Different but manageable |
 | No code signing needed | Ad-hoc code signing + entitlements | New requirement |
+| `apt install` deps | `brew install` deps | Same pattern |
+
+---
+
+## Architecture: Platform Abstraction
+
+### Approach: Comptime Platform Shims
+
+Each platform-specific module gets a macOS sibling and a thin shim that selects at comptime:
+
+```
+src/audio_capture_platform.zig    →  re-exports audio_capture.zig (Linux) or audio_capture_macos.zig
+src/input_platform.zig            →  re-exports input.zig (Linux) or input_macos.zig
+src/audio_detect_platform.zig     →  re-exports pw_detect.zig (Linux) or audio_detect_macos.zig
+```
+
+Shim pattern (4 lines each):
+```zig
+const builtin = @import("builtin");
+pub usingnamespace if (builtin.os.tag == .macos)
+    @import("audio_capture_macos.zig")
+else
+    @import("audio_capture.zig");
+```
+
+This means:
+- `server.zig` imports `audio_capture_platform.zig` — one line change, zero behavior change
+- `main.zig` imports `input_platform.zig` and `audio_detect_platform.zig`
+- No build options to thread through every target
+- Both implementations export identical public surfaces (same struct names, same method signatures)
+
+### Interface Contracts
+
+**`AudioCapture`** — both `audio_capture.zig` and `audio_capture_macos.zig` must export:
+```zig
+pub const AudioCapture = struct {
+    pub const default_channel: u32 = ...; // platform-specific default
+    pub fn init(target: ?[:0]const u8, channel_position: u32) !AudioCapture
+    pub fn deinit(self: *AudioCapture) void
+    pub fn setActive(self: *AudioCapture, active: bool) void
+    pub fn setCork(self: *AudioCapture, corked: bool) void
+    pub fn setGain(self: *AudioCapture, gain: f32) void
+    pub fn getFd(self: *const AudioCapture) posix.fd_t
+    pub fn parseChannelName(name: []const u8) ?u32
+};
+```
+
+**`InputHandler`** — both `input.zig` and `input_macos.zig` must export:
+```zig
+pub const InputHandler = struct {
+    pub fn init(config: Config) !InputHandler
+    pub fn deinit(self: *InputHandler) void
+    pub fn start(self: *InputHandler) !void
+    pub fn typeTextCallback(ctx: *anyopaque, text: []const u8) void
+};
+pub fn parseTriggerKey(name: []const u8) ?u16
+```
+
+### Data Flow: Audio Capture (macOS)
+
+```
+CoreAudio AUHAL callback thread (C, in ca_helpers.c)
+    → AudioUnitRender() to pull PCM from hardware
+    → applies software gain (integer multiply in-place on S16 samples)
+    → posix.write(pipe_write_fd, pcm_chunk)
+
+Main thread (server.zig:handleConnection — UNCHANGED)
+    ChunkedReader.read(pipe_read_fd)
+    → VadFilter.filterAudio()
+    → speech_buf.appendSlice()
+    → Pipeline.transcribe()
+```
+
+The pipe is the synchronization primitive, identical to the Linux path. `server.zig:handleConnection` does not change at all.
+
+### Data Flow: Input Handling (macOS)
+
+```
+CGEventTap callback thread (CoreFoundation RunLoop, in input_helpers_macos.c)
+    → receives CGEvent (keydown/keyup for remapped F19)
+    → if trigger key: calls Zig function pointer (live_fn)
+    → returns NULL to swallow event (or event to pass through)
+
+Zig InputHandler.typeText() (called from server.zig TypeCallback)
+    → for each char: calls input_macos_inject_text() C helper
+    → CGEventCreateKeyboardEvent + CGEventKeyboardSetUnicodeString + CGEventPost
+    → delay between batches (std.Thread.sleep), check cancel flag
+```
+
+---
+
+## Source File Organization
+
+### New Files
+
+| File | Purpose |
+|---|---|
+| `src/audio_capture_platform.zig` | Comptime shim → `audio_capture.zig` or `audio_capture_macos.zig` |
+| `src/input_platform.zig` | Comptime shim → `input.zig` or `input_macos.zig` |
+| `src/audio_detect_platform.zig` | Comptime shim → `pw_detect.zig` or `audio_detect_macos.zig` |
+| `src/audio_capture_macos.zig` | CoreAudio AUHAL capture (same interface as `audio_capture.zig`) |
+| `src/input_macos.zig` | CGEventTap + CGEventPost input handler (same interface as `input.zig`) |
+| `src/audio_detect_macos.zig` | CoreAudio device enumeration wizard |
+| `src/ca_helpers.c` | C wrappers for CoreAudio (AUHAL setup, device enumeration, AudioBufferList) |
+| `src/input_helpers_macos.c` | C wrappers for CGEventTap/CGEventPost/hidutil |
+| `dist/install-macos.sh` | macOS installer (LaunchAgent, permissions, model download) |
+
+### Files to Modify
+
+| File | Changes |
+|---|---|
+| `src/server.zig` | Import `audio_capture_platform.zig`; rename `pw_target`/`pw_channel` → `audio_target`/`audio_channel` |
+| `src/main.zig` | Import platform shims; comptime GPU check message; move `parseChannelName` to platform module |
+| `build.zig` | Platform-conditional linking (frameworks vs PipeWire), RPATH, C source files, lib paths |
+| `run.ts` | Platform detection, `brew` vs `apt`, macOS dep checks, `otool` vs `readelf` validation |
+| `src/prop_tests.zig` | Import `input_platform.zig`; guard Linux-specific tests with comptime |
+| `.github/workflows/ci.yml` | Add parallel macOS job on `macos-15` runner |
+
+### Platform-Agnostic Files (NO Changes)
+
+`pipeline.zig`, `alignatt.zig`, `mel.zig`, `vad.zig`, `utils.zig`, `auto_gain.zig`, `dsp.zig`, `conv.zig`, `whisper_c.zig`, `recorder.zig`, `server.zig` (except the import line and field renames)
 
 ---
 
 ## Subsystem 1: Keyboard Interception & Text Injection
 
-### Current Linux Architecture (`input.zig`, ~1500 lines)
+### CapsLock Interception via `hidutil`
 
-- Opens all `/dev/input/event*` keyboard devices via evdev
-- `EVIOCGRAB` exclusive grab — physical keys only go through our virtual device
-- Creates uinput virtual keyboard, forwards all keys through it
-- Intercepts trigger key (CapsLock), converts to PTT signal
-- Injects transcribed text as keystrokes via uinput `EV_KEY` events
-- Hotplug via inotify on `/dev/input/`
-- Safety: panic sequence (Enter+Backspace+Escape = ungrab), EVIOCGKEY polling every 200ms
-
-### macOS Approach: `hidutil` + CGEventTap + CGEventPost
-
-#### CapsLock Interception
-
-**Problem:** macOS processes CapsLock at the HID driver level before any user-space code sees it. A CGEventTap receives `kCGEventFlagsChanged` (not keyDown/keyUp), and by the time the callback fires, the OS has already toggled CapsLock state and the LED.
-
-**Solution: `hidutil` remap.** `hidutil property --set` remaps keys inside `IOHIDKeyboardFilter`, which runs before the CapsLock toggle logic in the HID stack.
+macOS processes CapsLock at the HID driver level before user-space code sees it. **Solution:** `hidutil property --set` remaps CapsLock to F19 inside `IOHIDKeyboardFilter`, before the CapsLock toggle logic.
 
 ```bash
-# Remap CapsLock (0x39) → F19 (0x6E) at the HID driver level
 hidutil property --set '{"UserKeyMapping":[{
   "HIDKeyboardModifierMappingSrc": 0x700000039,
   "HIDKeyboardModifierMappingDst": 0x70000006E
 }]}'
 ```
 
-This prevents the OS from ever seeing CapsLock:
-- No LED toggle
-- No CapsLock state change
-- No `flagsChanged` event
-- Instead, a clean `keyDown`/`keyUp` pair for F19 enters the event stream
+Effects: no LED toggle, no CapsLock state change, clean keyDown/keyUp pair for F19. Session-scoped (lost on reboot) — capsper applies it on startup.
 
-The remap is session-scoped (lost on reboot). Persistent via LaunchAgent or applied at app startup.
+**Reference:** [Apple TN2450: Remapping Keys](https://developer.apple.com/library/archive/technotes/tn2450/_index.html)
 
-On macOS 15+, the terminal/app calling `hidutil` needs Input Monitoring permission. Since we already need Accessibility permission (which is a superset), this is covered.
-
-**Reference:** [Apple Technical Note TN2450: Remapping Keys in macOS Sierra](https://developer.apple.com/library/archive/technotes/tn2450/_index.html) — official Apple documentation on `hidutil` key remapping.
-
-#### Keyboard Event Interception
-
-**CGEventTap** intercepts the remapped F19 key:
+### CGEventTap for Keyboard Interception
 
 ```c
-// Create an active tap at the HID level (earliest interception point)
 CGEventMask mask = (1 << kCGEventKeyDown) | (1 << kCGEventKeyUp);
 CFMachPortRef tap = CGEventTapCreate(
-    kCGHIDEventTap,              // tap location: HID level (earliest)
-    kCGHeadInsertEventTap,       // placement: first callback at this level
-    kCGEventTapOptionDefault,    // active: can modify/suppress events
-    mask,
-    tapCallback,
-    context
+    kCGHIDEventTap,              // earliest interception point
+    kCGHeadInsertEventTap,
+    kCGEventTapOptionDefault,    // active: can suppress events
+    mask, tapCallback, context
 );
-
-// Callback
-CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
-                        CGEventRef event, void *ctx) {
-    if (type == kCGEventTapDisabledByTimeout) {
-        // Watchdog killed the tap — re-enable immediately
-        CGEventTapEnable(tap, true);
-        return event;
-    }
-
-    int64_t keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-    if (keycode == 0x61) {  // F19 virtual keycode
-        // Signal PTT state change
-        if (type == kCGEventKeyDown) ptt_pressed(ctx);
-        else ptt_released(ctx);
-        return NULL;  // swallow the event — apps never see F19
-    }
-
-    return event;  // pass through all other keys unmodified
-}
 ```
 
-**Tap locations explained:**
-- `kCGHIDEventTap` — where HID device events enter the window server. Earliest interception point. This is the equivalent of our evdev grab position.
-- `kCGSessionEventTap` — where events enter the login session. Downstream of HID tap. Less useful.
-- `kCGAnnotatedSessionEventTap` — after accessibility annotations. Observation only.
+Callback returns `NULL` to swallow F19 (trigger key), returns `event` for all other keys.
 
-**Watchdog behavior:** macOS has an undocumented watchdog that auto-disables active taps if the callback takes too long. The tap object remains valid but stops receiving events. Must handle `kCGEventTapDisabledByTimeout` and call `CGEventTapEnable(tap, true)`. Also check `CGEventTapIsEnabled()` periodically as a safety net (similar to our EVIOCGKEY polling on Linux).
+**Watchdog:** macOS auto-disables taps if callback is slow. Handle `kCGEventTapDisabledByTimeout` and re-enable. Poll `CGEventTapIsEnabled()` periodically as safety net.
 
-**Code signing can silently kill taps:** If the binary is re-signed or the code signature changes while running, the tap may stop receiving events without any error. Runtime health checks via `CGEventTapIsEnabled()` every few seconds are required.
+**Permissions:** Requires Accessibility permission. Check with `AXIsProcessTrustedWithOptions()` — print clear instructions if denied.
 
-**Permissions:** Requires **Accessibility** permission (System Settings → Privacy & Security → Accessibility). Single permission covers both interception (CGEventTap) and injection (CGEventPost). Prompted on first launch via `AXIsProcessTrusted()` check.
+### CGEventPost for Text Injection
 
-**Reference:** [CGEventTapCreate documentation](https://developer.apple.com/documentation/coregraphics/cgevent/tapcreate(tap:place:options:eventsofinterest:callback:userinfo:))
-
-#### Text Injection
-
-**CGEventPost** injects transcribed text as synthetic keyboard events. Two approaches:
-
-**Character-by-character (simple, universal):**
 ```c
-void inject_text(const char *utf8_text) {
-    // Convert UTF-8 to UTF-16 (UniChar)
-    CFStringRef str = CFStringCreateWithCString(NULL, utf8_text, kCFStringEncodingUTF8);
-    CFIndex len = CFStringGetLength(str);
-
-    for (CFIndex i = 0; i < len; i++) {
-        UniChar ch = CFStringGetCharacterAtIndex(str, i);
-        CGEventRef keyDown = CGEventCreateKeyboardEvent(NULL, 0, true);
-        CGEventRef keyUp   = CGEventCreateKeyboardEvent(NULL, 0, false);
-        CGEventKeyboardSetUnicodeString(keyDown, 1, &ch);
-        CGEventKeyboardSetUnicodeString(keyUp, 1, &ch);
-        CGEventPost(kCGSessionEventTap, keyDown);
-        CGEventPost(kCGSessionEventTap, keyUp);
-        CFRelease(keyDown);
-        CFRelease(keyUp);
-    }
-    CFRelease(str);
-}
+// Batched: up to 20 Unicode chars per event
+CGEventRef keyDown = CGEventCreateKeyboardEvent(NULL, 0, true);
+CGEventKeyboardSetUnicodeString(keyDown, batch_len, chars);
+CGEventPost(kCGSessionEventTap, keyDown);
 ```
 
-**Batched (faster, up to 20 chars per event):**
-```c
-void inject_text_batched(const UniChar *chars, size_t len) {
-    for (size_t i = 0; i < len; i += 20) {
-        size_t batch = (len - i > 20) ? 20 : len - i;
-        CGEventRef keyDown = CGEventCreateKeyboardEvent(NULL, 0, true);
-        CGEventRef keyUp   = CGEventCreateKeyboardEvent(NULL, 0, false);
-        CGEventKeyboardSetUnicodeString(keyDown, batch, &chars[i]);
-        CGEventKeyboardSetUnicodeString(keyUp, batch, &chars[i]);
-        CGEventPost(kCGSessionEventTap, keyDown);
-        CGEventPost(kCGSessionEventTap, keyUp);
-        CFRelease(keyDown);
-        CFRelease(keyUp);
-    }
-}
-```
+`CGEventKeyboardSetUnicodeString` bypasses keycode mapping entirely — handles emoji, CJK, accented characters natively. Much simpler than Linux's uinput path.
 
-`CGEventKeyboardSetUnicodeString` attaches up to 20 Unicode characters to a single key event. The virtual keycode (first param, 0 above) is ignored when Unicode string is set — the receiving app gets the Unicode content directly. This handles emoji, CJK, accented characters, everything — no keycode mapping needed (much simpler than our Linux uinput path which must deal with XKB layouts).
+**Limitations:** Secure Keyboard Entry (password fields) blocks injection — acceptable for dictation.
 
-**Where it works:**
-- All native macOS apps (AppKit, SwiftUI)
-- All Electron apps (VS Code, Discord, Slack, Notion)
-- All browsers (Chrome, Firefox, Safari)
-- Terminal emulators (iTerm2, Terminal.app, Alacritty)
-- Java/Swing apps
+### What We Don't Need on macOS
 
-**Where it doesn't work:**
-- Secure Keyboard Entry (password fields) — by design. Not a problem for dictation.
-- Pre-login window — irrelevant for our use case.
-
-**Typing cancel:** Same approach as Linux — on PTT release, stop injecting. Since CGEventPost is synchronous (returns after posting), we can check an atomic flag between batches.
-
-#### What We Don't Need on macOS
-
-- **No hotplug.** `hidutil` remap is device-agnostic — it applies to all keyboards, current and future. No inotify equivalent needed.
-- **No panic sequence.** We're not grabbing the keyboard exclusively. If capsper crashes, all keys still work normally. The only effect is F19 keypresses leaking through (harmless).
-- **No EVIOCGKEY polling.** CGEventTap doesn't have the "lost key release" problem that evdev has. We still want the `CGEventTapIsEnabled()` health check, but for a different reason (watchdog auto-disable).
-- **No virtual keyboard device.** CGEventPost injects directly into the event stream. No uinput equivalent needed.
-
-#### Comparison to Karabiner-Elements
-
-Karabiner takes the heavy approach: root-privileged daemon, IOHIDManager exclusive grab (`kIOHIDOptionsTypeSeizeDevice`), DriverKit virtual HID device. This is necessary because Karabiner remaps arbitrary keys to arbitrary other keys with complex rules.
-
-We don't need any of that. Our requirements are much simpler:
-1. Intercept one specific key (CapsLock) → `hidutil` remap handles this
-2. Suppress it from reaching apps → CGEventTap returning NULL handles this
-3. Inject text → CGEventPost handles this
-
-No root, no DriverKit, no Apple entitlement approval.
-
-**Known Karabiner issue for reference:** There's a DriverKit bug (present through Sonoma 14+) where `kIOHIDOptionsTypeSeizeDevice` doesn't fully hide the physical keyboard from `IOHIDManager` enumeration — other apps see double input. This affects Karabiner's Discord PTT users. We completely sidestep this by not using IOHIDManager at all.
+- **No hotplug** — `hidutil` remap is device-agnostic
+- **No panic sequence** — not grabbing keyboard exclusively; crash = all keys still work
+- **No virtual keyboard device** — CGEventPost injects directly into event stream
 
 ---
 
 ## Subsystem 2: Audio Capture
 
-### Current Linux Architecture (`audio_capture.zig` + `pw_helpers.c`, ~600 lines)
+### Core Audio AUHAL
 
-- PipeWire `pw_stream` with `process` callback delivers raw S16_LE PCM
-- Channel selection via stream params (e.g., `--pw-channel FL`)
-- Software gain via `pw_set_stream_gain()` C helper
-- Device hotplug via PipeWire registry listener
-- Auto-switch to target mic on PTT press
-- `pw_detect.zig` interactive setup wizard for device/channel/gain calibration
+Direct equivalent of PipeWire `pw_stream`. Callback-driven, configurable buffer sizes, direct hardware access.
 
-### macOS Approach: Core Audio AUHAL
+**Key difference from PipeWire:** AUHAL does NOT auto-resample. If hardware mic is 48kHz and we want 16kHz, we need an `AudioConverterRef` for sample rate conversion. PipeWire handles this transparently.
 
-#### Basic Capture Setup
+**Pipe-based handoff:** Same architecture as Linux — AUHAL callback writes S16_LE PCM to a pipe, main thread reads via `ChunkedReader`. Preserves `server.zig:handleConnection` completely unchanged.
 
-Core Audio's AUHAL (Audio Unit HAL Output) is the direct equivalent of `pw_stream`. It's callback-driven with configurable buffer sizes and direct hardware access.
+**Channel selection:** `kAudioOutputUnitProperty_ChannelMap` — zero-based channel index. "MONO"/"FL" → 0, "FR" → 1.
 
-```c
-// 1. Create AUHAL instance
-AudioComponentDescription desc = {
-    .componentType         = kAudioUnitType_Output,
-    .componentSubType      = kAudioUnitSubType_HALOutput,
-    .componentManufacturer = kAudioUnitManufacturer_Apple,
-};
-AudioComponent comp = AudioComponentFindNext(NULL, &desc);
-AudioComponentInstance auHAL;
-AudioComponentInstanceNew(comp, &auHAL);
+**Software gain:** Applied in capture callback via integer multiply (same math as `auto_gain.zig`, just in the callback instead of via `pw_set_stream_gain`).
 
-// 2. Enable input on element 1, disable output on element 0
-UInt32 one = 1, zero = 0;
-AudioUnitSetProperty(auHAL, kAudioOutputUnitProperty_EnableIO,
-    kAudioUnitScope_Input, 1, &one, sizeof(one));
-AudioUnitSetProperty(auHAL, kAudioOutputUnitProperty_EnableIO,
-    kAudioUnitScope_Output, 0, &zero, sizeof(zero));
+**Do NOT use AVAudioEngine.** Documented bugs: forces AirPods into 16kHz headset mode, ignores buffer size hints, broken latency reporting. AUHAL is more code but works correctly. See [It's Over, AVAudioEngine](https://supermegaultragroovy.com/2021/01/26/it-s-over-avaudioengine/).
 
-// 3. Set desired format: 16kHz mono S16_LE
-AudioStreamBasicDescription fmt = {
-    .mSampleRate       = 16000.0,
-    .mFormatID         = kAudioFormatLinearPCM,
-    .mFormatFlags      = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-    .mBytesPerPacket   = 2,
-    .mFramesPerPacket  = 1,
-    .mBytesPerFrame    = 2,
-    .mChannelsPerFrame = 1,
-    .mBitsPerChannel   = 16,
-};
-AudioUnitSetProperty(auHAL, kAudioUnitProperty_StreamFormat,
-    kAudioUnitScope_Output, 1, &fmt, sizeof(fmt));
+### C Wrapper Pattern
 
-// 4. Register input callback
-AURenderCallbackStruct cb = { .inputProc = captureCallback, .inputProcRefCon = ctx };
-AudioUnitSetProperty(auHAL, kAudioOutputUnitProperty_SetInputCallback,
-    kAudioUnitScope_Global, 0, &cb, sizeof(cb));
+Same as `pw_helpers.c` — `AudioBufferList`, `AudioStreamBasicDescription`, and `AudioComponentDescription` have packed-struct and alignment issues from Zig. Keep them in `ca_helpers.c`.
 
-// 5. Initialize and start
-AudioUnitInitialize(auHAL);
-AudioOutputUnitStart(auHAL);
-```
-
-**Critical gotcha:** The `ioData` parameter in the input callback is NULL. You must pre-allocate an `AudioBufferList` and call `AudioUnitRender()` to pull data into it:
-
-```c
-OSStatus captureCallback(void *ctx,
-                          AudioUnitRenderActionFlags *flags,
-                          const AudioTimeStamp *ts,
-                          UInt32 busNumber,
-                          UInt32 numFrames,
-                          AudioBufferList *ioData)  // NULL for input!
-{
-    AudioBufferList bufList;
-    bufList.mNumberBuffers = 1;
-    bufList.mBuffers[0].mNumberChannels = 1;
-    bufList.mBuffers[0].mDataByteSize = numFrames * 2;  // S16 = 2 bytes
-    bufList.mBuffers[0].mData = preallocated_buffer;
-
-    AudioUnitRender(auHAL, flags, ts, busNumber, numFrames, &bufList);
-
-    // bufList.mBuffers[0].mData now contains S16_LE PCM
-    // Feed to server.zig the same way PipeWire callback does
-    return noErr;
-}
-```
-
-**Sample rate conversion:** AUHAL does NOT auto-resample. If the hardware mic runs at 48kHz and we want 16kHz, we need an `AudioConverter` in the chain. The AUHAL's built-in converter handles channel layout changes but not sample rate. Options:
-1. Set up a separate `AudioConverterRef` for 48k→16k SRC
-2. Use `AVAudioConverter` (higher-level, easier API)
-3. Do SRC ourselves (we already have the math for PCM conversion in `utils.zig`)
-
-PipeWire does this automatically via its built-in resampler. This is the one area where Core Audio is more work.
-
-**Reference:** [TN2091: Device Input using the HAL Output Audio Unit](https://developer.apple.com/library/archive/technotes/tn2091/_index.html) — Apple's canonical AUHAL reference.
-
-#### Channel Selection
-
-Direct equivalent of `--pw-channel FL`. Uses `kAudioOutputUnitProperty_ChannelMap`:
-
-```c
-// Capture only channel 2 (0-indexed) from a 4-channel device as mono:
-SInt32 channelMap[1];
-channelMap[0] = 2;  // device channel 2 → our mono output channel 0
-
-AudioUnitSetProperty(auHAL,
-    kAudioOutputUnitProperty_ChannelMap,
-    kAudioUnitScope_Output, 1,
-    channelMap, sizeof(channelMap));
-```
-
-Set `mChannelsPerFrame = 1` in the desired format and a 1-element map pointing to the device channel index. Set unused slots to `-1`. Built into the AUHAL's internal converter — no extra library needed.
-
-#### Device Enumeration
-
-```c
-// Get list of all audio devices
-AudioObjectPropertyAddress prop = {
-    .mSelector = kAudioHardwarePropertyDevices,
-    .mScope    = kAudioObjectPropertyScopeGlobal,
-    .mElement  = kAudioObjectPropertyElementMain,
-};
-
-UInt32 size;
-AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &prop, 0, NULL, &size);
-int count = size / sizeof(AudioDeviceID);
-AudioDeviceID *devices = malloc(size);
-AudioObjectGetPropertyData(kAudioObjectSystemObject, &prop, 0, NULL, &size, devices);
-
-// For each device, get name and check if it has input channels
-for (int i = 0; i < count; i++) {
-    // Get device name
-    CFStringRef name;
-    AudioObjectPropertyAddress nameProp = {
-        .mSelector = kAudioObjectPropertyName,
-        .mScope = kAudioObjectPropertyScopeGlobal,
-        .mElement = kAudioObjectPropertyElementMain,
-    };
-    UInt32 nameSize = sizeof(name);
-    AudioObjectGetPropertyData(devices[i], &nameProp, 0, NULL, &nameSize, &name);
-
-    // Check input channel count
-    AudioObjectPropertyAddress inputProp = {
-        .mSelector = kAudioDevicePropertyStreamConfiguration,
-        .mScope = kAudioObjectPropertyScopeInput,  // input side
-        .mElement = kAudioObjectPropertyElementMain,
-    };
-    UInt32 bufSize;
-    AudioObjectGetPropertyDataSize(devices[i], &inputProp, 0, NULL, &bufSize);
-    AudioBufferList *bufList = malloc(bufSize);
-    AudioObjectGetPropertyData(devices[i], &inputProp, 0, NULL, &bufSize, bufList);
-    // bufList->mBuffers[n].mNumberChannels tells you channel count per stream
-}
-```
-
-#### Device Hotplug
-
-```c
-// Fires when any audio device is added or removed
-AudioObjectPropertyAddress devicesAddr = {
-    .mSelector = kAudioHardwarePropertyDevices,
-    .mScope    = kAudioObjectPropertyScopeGlobal,
-    .mElement  = kAudioObjectPropertyElementMain,
-};
-AudioObjectAddPropertyListener(
-    kAudioObjectSystemObject, &devicesAddr, devicesChangedCallback, ctx);
-
-// Fires when default input device changes
-AudioObjectPropertyAddress defaultInputAddr = {
-    .mSelector = kAudioHardwarePropertyDefaultInputDevice,
-    .mScope    = kAudioObjectPropertyScopeGlobal,
-    .mElement  = kAudioObjectPropertyElementMain,
-};
-AudioObjectAddPropertyListener(
-    kAudioObjectSystemObject, &defaultInputAddr, defaultInputChangedCallback, ctx);
-```
-
-The callback doesn't tell you which device changed — just that the list changed. Re-enumerate and diff against cached list. Simpler than PipeWire's registry listener but same concept.
-
-The `kAudioHardwarePropertyDefaultInputDevice` listener is the direct equivalent of our PTT-press auto-switch. When the user changes their default mic in System Settings, we get notified and can switch the AUHAL to the new device.
-
-#### Software Gain
-
-Two options:
-
-1. **AUHAL volume property:**
-```c
-Float32 gain = 2.0;  // 2x gain
-AudioUnitSetProperty(auHAL, kHALAudioDevicePropertySubVolumeScalar,
-    kAudioUnitScope_Output, 1, &gain, sizeof(gain));
-```
-
-2. **Manual gain in callback** (simpler, more portable):
-```c
-// In captureCallback, after AudioUnitRender:
-int16_t *samples = (int16_t *)bufList.mBuffers[0].mData;
-for (int i = 0; i < numFrames; i++) {
-    int32_t amplified = (int32_t)samples[i] * gain_factor;
-    samples[i] = (int16_t)clamp(amplified, -32768, 32767);
-}
-```
-
-Option 2 is what we'd probably do since our `auto_gain.zig` already works in the sample domain. Same math, just applied in the Core Audio callback instead of via `pw_set_stream_gain`.
-
-#### Avoid AVAudioEngine
-
-**Do not use AVAudioEngine** for this project. Documented problems:
-
-1. Accessing `engine.outputNode` with AirPods connected forces them into 16kHz "headset mode" system-wide. Degrades audio quality for all other apps until your process exits. No workaround.
-2. The `bufferSize` parameter in `installTap()` is a hint only — macOS typically delivers 4800-frame buffers regardless.
-3. `inputNode.presentationLatency` can return 0.0, making timestamp compensation impossible.
-
-AUHAL is more code but actually works correctly.
-
-**Reference:** [It's Over Between Us, AVAudioEngine](https://supermegaultragroovy.com/2021/01/26/it-s-over-avaudioengine/) — detailed bug documentation.
-
-#### C Wrapper Pattern
-
-Same pattern as `pw_helpers.c` — wrap Core Audio calls in C, call from Zig:
-
-```
-src/
-├── ca_helpers.c        # Core Audio C wrappers (AudioBufferList, AUHAL setup)
-├── ca_helpers.h        # Header for Zig @cImport
-├── audio_capture.zig   # Platform-agnostic interface, calls ca_helpers on macOS
-```
-
-The `AudioBufferList` struct, `AudioStreamBasicDescription`, and `AudioComponentDescription` have the same kind of packed-struct and alignment issues as PipeWire's SPA pods. Keep them in C.
-
-#### pw_detect Equivalent
-
-The `--pw-detect` interactive setup wizard can be ported straightforwardly:
-1. Enumerate devices → `kAudioHardwarePropertyDevices` (shown above)
-2. Let user pick → same TUI
-3. Record silence/speech → AUHAL capture (shown above)
-4. Detect best channel → `kAudioOutputUnitProperty_ChannelMap` per-channel RMS analysis
-5. Calibrate auto-gain → same math as `auto_gain.zig`
-
-The flow is identical; only the underlying API calls change.
+Functions:
+- `ca_get_default_input_device(AudioDeviceID *out)`
+- `ca_enumerate_input_devices(struct ca_device_info *results, int max)`
+- `ca_device_uid_for_name(const char *name, char *uid_out, size_t uid_max)`
+- `ca_create_auhal(AudioDeviceID device, int channel, int pipe_write_fd, float *gain_ptr)` → `AudioComponentInstance`
+- `ca_start_auhal(AudioComponentInstance unit)` / `ca_stop_auhal()`
 
 ---
 
-## Subsystem 3: Transcription (whisper.cpp)
+## Subsystem 3: Transcription (whisper.cpp Metal)
 
-### Current Linux Architecture
+**The pipeline layer is fully portable.** `pipeline.zig`, `alignatt.zig`, `mel.zig`, `vad.zig` call whisper.cpp's backend-agnostic C API. Metal is selected at whisper.cpp build time, not at our API level.
 
-- whisper.cpp with CUDA backend (NVIDIA GPU)
-- Model: `ggml-large-v3-turbo-q5_0.bin` (573 MB, q5_0 quantization)
-- Pre-built shared libraries in `dist/lib/` (libwhisper.so, libggml-cuda.so, etc.)
-- Our pipeline code (`pipeline.zig`, `alignatt.zig`, `mel.zig`) calls whisper.cpp's C API directly — manually drives mel spectrogram, encode, decode loop
-
-### macOS Approach: Metal Backend
-
-**The pipeline layer is fully portable.** `pipeline.zig`, `alignatt.zig`, `mel.zig`, `vad.zig` — none of these know about CUDA or Metal. They call whisper.cpp's C API (`whisper_encode()`, `whisper_decode()`, `whisper_get_logits()`, etc.), which is backend-agnostic. The Metal backend is selected at whisper.cpp build time, not at our API call level.
-
-#### Build Changes
-
-Replace CUDA flags with Metal:
+### Build Changes
 
 ```bash
 # Linux (current)
 cmake -DGGML_CUDA=ON -DGGML_NATIVE=OFF ...
 
 # macOS
-cmake -DGGML_METAL=ON -DGGML_NATIVE=OFF \
-      -DGGML_METAL_EMBED_LIBRARY=ON ...
+cmake -DGGML_METAL=ON -DGGML_NATIVE=OFF -DGGML_METAL_EMBED_LIBRARY=ON ...
 ```
 
-`GGML_METAL_EMBED_LIBRARY=ON` embeds the Metal shader source into the library binary. Without this, whisper.cpp looks for `.metal` files at runtime (fragile for distribution).
+`GGML_METAL_EMBED_LIBRARY=ON` embeds Metal shader source into the dylib — no `.metal` files needed at runtime. Requires full Xcode (`xcrun metal` compiler).
 
-The Metal shader compilation requires `xcrun metal` — only available on macOS. This is why cross-compilation from Linux is not possible.
-
-#### Performance on Apple Silicon
-
-Published benchmarks for large-v3-turbo (Metal, Flash Attention ON):
-
-| Chip | Encode | Decode/step | Notes |
-|---|---|---|---|
-| M2 Ultra (76-core GPU) | 147 ms | 1.31 ms | Fastest published |
-| M4 Max (40-core GPU) | 250 ms | 1.65 ms | Current high-end laptop |
-| M2/M3/M4 Pro (est.) | 300-500 ms | 2-4 ms | Mid-range laptop |
-| NVIDIA V100 (CUDA) | 172 ms | 15.76 ms | Datacenter reference |
-
-**Decoder step time is what matters most for our streaming pipeline.** We run many incremental decode cycles per PTT event, each producing a few tokens. At 1.3-4 ms per token step on Apple Silicon vs 15.8 ms on V100, the decode path is significantly faster on Metal.
-
-**Encoder latency** (one call per decode cycle) of 300-500 ms on mid-range Apple Silicon is acceptable for PTT. Our current CUDA path on a GTX 1650 is in a similar range.
-
-#### Unified Memory Advantage
-
-Apple Silicon's unified memory architecture eliminates the PCIe bottleneck:
-
-- **No CPU↔GPU memory copies.** Model weights, KV cache, mel buffer, speech buffer all live in shared memory accessible to both CPU and GPU.
-- **GGML uses `MTLResourceStorageModeShared`** + `newBufferWithBytesNoCopy` for zero-copy Metal buffer creation from CPU-allocated memory.
-- **Die-level fabric bandwidth:** ~200 GB/s on M1 Pro, ~800 GB/s on M2 Ultra (vs PCIe 4.0 x16 at ~32 GB/s bidirectional on discrete GPUs).
-
-For our use case (short PTT bursts, incremental decode cycles with growing KV cache), no data movement between cycles is the key benefit.
-
-#### Quantization
-
-Our existing `q5_0` quantization works on Metal:
-- For large models (large-v3-turbo), quantized weights reduce memory bandwidth demand, which can make them faster than FP16 on the encoder.
-- Official whisper.cpp v1.7.5 release notes: "quantized models (q5_0, q8_0) showed comparable performance to unquantized versions on Metal" for large models.
-- K-quant formats (q4_K_M, q5_K_M) are not available in whisper.cpp — only the older Q4/Q5/Q8 scheme. q5_0 is the right choice.
-
-#### GGML Low-Level Dispatch on Apple Silicon
-
-GGML uses a tiered strategy:
-
-1. **ARM NEON SIMD** — small matrix ops (decoder steps, which are GEMV not GEMM). This is our hot path.
-2. **Accelerate framework (vecLib/CBLAS)** — large matrix ops. Internally dispatches to the **AMX coprocessor** (undocumented 32x32 FMA grid, ~1855 GFLOPS on M1 Pro).
-3. **Metal GPU shaders** — full GPU compute for encoder and decoder. Custom kernels handle dequantization + matmul in a single pass for quantized models.
-
-`-DGGML_USE_ACCELERATE` is on by default on macOS.
-
-#### Optional: Core ML + Neural Engine
-
-Adding `-DWHISPER_COREML=1` enables a **Core ML encoder** that runs on the Apple Neural Engine (ANE):
-
-- Encoder runs on ANE: ~3x faster than CPU-only, lower power draw (0.3W vs 1.5W per forward pass)
-- Decoder still runs on CPU (ANE can't handle autoregressive KV-cache growth efficiently)
-- Requires shipping a `.mlmodelc` bundle alongside the GGML model
-- **First-run JIT compilation:** ANE compiles the Core ML model to device-specific binary on first use. This takes **up to 6 minutes** on M2. Subsequent runs use cache. Could trigger this during install (like our model download).
-
-This is optional and can be added later. Metal-only is the baseline.
-
-#### Shared Library Layout
-
-macOS equivalent of our `dist/lib/` layout:
+### Shared Library Layout
 
 ```
-dist/
-├── bin/capsper                    (built by zig)
-├── lib/
-│   ├── libwhisper.dylib           (Metal backend)
-│   ├── libggml.dylib
-│   ├── libggml-base.dylib
-│   ├── libggml-cpu.dylib
-│   └── libggml-metal.dylib        (replaces libggml-cuda.so)
-├── models/
-│   ├── ten-vad-ggml.bin
-│   ├── ggml-silero-v5.1.2.bin
-│   └── ggml-large-v3-turbo-q5_0.bin
-└── install.sh
+dist/lib-macos/                    (built by CI, NOT committed to LFS)
+├── libwhisper.dylib
+├── libggml.dylib
+├── libggml-base.dylib
+├── libggml-cpu.dylib
+└── libggml-metal.dylib            (replaces libggml-cuda.so)
 ```
 
-RPATH: `@executable_path/../lib` (macOS equivalent of `$ORIGIN/../lib`). Shared lib inter-dependencies use `@loader_path` (equivalent of `$ORIGIN`). Use `install_name_tool` to fix paths if CMake doesn't set them correctly, or configure via `CMAKE_INSTALL_RPATH` at build time (preferred, same as Linux).
+RPATH: Binary uses `@loader_path/../lib`. Shared lib inter-dependencies use `@loader_path`. Configured via `CMAKE_INSTALL_RPATH=@loader_path` + `CMAKE_BUILD_WITH_INSTALL_RPATH=ON`.
 
-#### VAD Backends
+### Performance on Apple Silicon
 
-- **TEN-VAD GGML** (`--vad ten`) — fully portable. Pure Zig + GGML, no platform dependencies. FFT via submodule C code. Works as-is on macOS.
-- **TEN-VAD Native** (`--vad ten-native`) — prebuilt `libten_vad.so` is Linux-specific. Would need a macOS `.dylib` build of the TEN-VAD submodule. Low priority since the GGML port exists.
-- **Silero** (`--vad silero`) — via whisper.cpp, platform-agnostic. Works as-is.
+Published benchmarks for large-v3-turbo (Metal):
+
+| Chip | Encode | Decode/step |
+|---|---|---|
+| M2 Ultra (76-core GPU) | 147 ms | 1.31 ms |
+| M4 Max (40-core GPU) | 250 ms | 1.65 ms |
+| M2/M3/M4 Pro (est.) | 300-500 ms | 2-4 ms |
+
+Decoder step time matters most for streaming. Apple Silicon is significantly faster per step than CUDA on mid-range GPUs.
+
+**Word error rate should be identical** — same model, same pipeline code, same mel spectrogram (computed in Zig), different GPU backend for encode/decode. The CI macOS runner can validate this by running regression tests.
+
+### VAD Backends on macOS
+
+- **TEN-VAD GGML** (`--vad ten`) — fully portable, works as-is
+- **Silero** (`--vad silero`) — via whisper.cpp, works as-is
+- **TEN-VAD Native** (`--vad ten-native`) — Linux-only (`libten_vad.so`). Error on macOS.
+
+### Zig Code Changes for Metal
+
+Minimal:
+- `main.zig:requireGpu()` — change "CUDA" error message to "Metal" via comptime
+- `main.zig:469` — warmup log mentions "CUDA kernel compilation", change to "Metal shader compilation" via comptime
+- Everything else is backend-agnostic
 
 ---
 
@@ -555,69 +329,38 @@ RPATH: `@executable_path/../lib` (macOS equivalent of `$ORIGIN/../lib`). Shared 
 
 | Permission | What Needs It | How to Grant |
 |---|---|---|
-| **Accessibility** | CGEventTap (keyboard interception) + CGEventPost (text injection) | System Settings → Privacy & Security → Accessibility → add capsper |
-| **Microphone** | Core Audio AUHAL capture | TCC dialog on first `AVCaptureDevice.requestAccess(for: .audio)` call |
-| **Input Monitoring** | `hidutil` key remap (macOS 15+) | Covered by Accessibility permission (superset) |
+| **Accessibility** | CGEventTap + CGEventPost | System Settings → Privacy & Security → Accessibility → add capsper |
+| **Microphone** | Core Audio AUHAL | TCC dialog on first launch (requires hardened runtime + entitlement) |
 
-Two permissions total from the user's perspective: Accessibility and Microphone.
+Two permissions from the user's perspective.
 
-### Code Signing for Development
-
-Ad-hoc signing is sufficient for local dev and friend distribution:
+### Ad-hoc Code Signing
 
 ```bash
-# Create entitlements file
-cat > capsper.entitlements << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
+codesign --force --sign - --options runtime --entitlements capsper.entitlements dist/bin/capsper
+```
+
+`--sign -` = ad-hoc (no cert). `--options runtime` = hardened runtime (needed for TCC mic prompt).
+
+Entitlements file:
+```xml
 <dict>
     <key>com.apple.security.device.audio-input</key>
     <true/>
 </dict>
-</plist>
-EOF
-
-# Ad-hoc sign with microphone entitlement and hardened runtime
-codesign --force --sign - \
-    --options runtime \
-    --entitlements capsper.entitlements \
-    dist/bin/capsper
 ```
 
-`--sign -` = ad-hoc (no Apple Developer cert). `--options runtime` = hardened runtime (required for TCC to show the microphone permission dialog).
+### Gatekeeper: Not an Issue via Homebrew
 
-### First-Launch Flow
+Homebrew downloads tarballs via `curl`, which does not set the quarantine xattr. Gatekeeper never triggers. No signing or notarization needed for Homebrew formula distribution.
 
-1. User runs `capsper` for the first time
-2. macOS shows "capsper wants to access the microphone" → user clicks Allow
-3. User must manually add capsper to Accessibility in System Settings (no programmatic prompt for this — `AXIsProcessTrusted()` returns false, we print instructions)
-4. User restarts capsper → fully functional
-
-On subsequent launches, permissions are cached in the TCC database. No re-prompting.
-
-### Gatekeeper for Friend Distribution
-
-Friends receiving a pre-built binary will see "capsper can't be opened because it is from an unidentified developer." Solutions:
-
-1. **Right-click → Open** — bypasses Gatekeeper for that binary (one-time)
-2. **`xattr -cr /path/to/capsper`** — removes the quarantine flag
-3. **System Settings → Privacy & Security → "Allow Anyway"** — appears after a blocked launch attempt
-
-All are one-time operations. Power users won't have trouble.
+For direct downloads (GitHub Releases), users need one of: right-click → Open, `xattr -cr`, or System Settings → Allow Anyway.
 
 ---
 
-## Subsystem 5: Service Management
+## Subsystem 5: Service Management & Auto-Update
 
-### Current Linux Architecture
-
-- systemd user service (`capsper.service`)
-- `ExecStartPre` runs `apply-update.sh` (symlink swap for updates)
-- `capsper-update.sh` downloads from GitHub Releases, verifies SHA256
-
-### macOS Approach: LaunchAgent
+### LaunchAgent (systemd equivalent)
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -627,25 +370,25 @@ All are one-time operations. Power users won't have trouble.
 <dict>
     <key>Label</key>
     <string>com.capsper.dictation</string>
-
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/USERNAME/.local/share/capsper/bin/capsper</string>
+        <string>INSTALL_DIR/bin/capsper</string>
         <string>--trigger</string>
         <string>capslock</string>
     </array>
-
     <key>RunAtLoad</key>
     <true/>
-
     <key>KeepAlive</key>
     <true/>
-
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DYLD_LIBRARY_PATH</key>
+        <string>INSTALL_DIR/lib</string>
+    </dict>
     <key>StandardOutPath</key>
-    <string>/Users/USERNAME/.local/share/capsper/capsper.log</string>
-
+    <string>INSTALL_DIR/capsper.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/USERNAME/.local/share/capsper/capsper.log</string>
+    <string>INSTALL_DIR/capsper.log</string>
 </dict>
 </plist>
 ```
@@ -653,208 +396,419 @@ All are one-time operations. Power users won't have trouble.
 Installed to `~/Library/LaunchAgents/com.capsper.dictation.plist`.
 
 ```bash
-# Load and start
-launchctl load ~/Library/LaunchAgents/com.capsper.dictation.plist
-
-# Stop and unload
-launchctl unload ~/Library/LaunchAgents/com.capsper.dictation.plist
-
-# View status
-launchctl list | grep capsper
+launchctl load ~/Library/LaunchAgents/com.capsper.dictation.plist    # start
+launchctl unload ~/Library/LaunchAgents/com.capsper.dictation.plist  # stop
+launchctl list | grep capsper                                        # status
 ```
 
-**`hidutil` remap persistence:** Add a second LaunchAgent or make capsper apply the `hidutil` remap on startup before setting up the CGEventTap. Prefer the latter — keeps everything self-contained.
+### Auto-Update Options
+
+Three viable approaches, from simplest to most integrated:
+
+**Option A: Homebrew-native updates (recommended for Homebrew installs)**
+- User runs `brew upgrade capsper` manually, or enables `brew autoupdate`
+- Formula points to GitHub Release URL with sha256 — update the formula when releasing
+- Can automate formula updates in CI: after uploading release assets, commit new sha256 to the tap repo
+- No custom update infrastructure needed
+
+**Option B: Version check on startup**
+- capsper checks GitHub Releases API on startup (or daily via cached timestamp)
+- If newer version available, prints: `"capsper vX.Y.Z available — run 'brew upgrade capsper' to update"`
+- Lightweight, non-intrusive, works for both Homebrew and direct installs
+
+**Option C: LaunchAgent update timer (mirrors Linux pattern)**
+- Second LaunchAgent (`com.capsper.update.plist`) with `StartCalendarInterval` (daily/weekly)
+- Runs `capsper-update-macos.sh` — downloads from GitHub Releases, verifies SHA256, stages update
+- Next capsper restart picks up new binary (same `apply-update.sh` pattern as Linux)
+- More complex but works for non-Homebrew installs
+
+**Recommendation:** Start with Option A (Homebrew-native) + Option B (startup version check). Add Option C later if needed for non-Homebrew users.
+
+### `hidutil` Remap Persistence
+
+The `hidutil` remap is session-scoped (lost on reboot). Two options:
+
+1. **capsper applies it on startup** (preferred) — self-contained, no extra LaunchAgent
+2. **Separate LaunchAgent** — runs `hidutil` at login before capsper starts
+
+Option 1 is simpler. capsper's `init()` calls `hidutil` via `posix.execve` or the C helper before creating the CGEventTap.
 
 ---
 
 ## Build System
 
-### Zig Cross-Compilation: Not Possible
+### `build.zig` Platform Branching
 
-Two blockers prevent building macOS capsper on Linux:
+```zig
+const is_macos = target.result.os.tag == .macos;
 
-1. **Metal shaders** — `xcrun metal` compiler only exists on macOS
-2. **Apple frameworks** — linking against CoreAudio, CoreGraphics, ApplicationServices requires the macOS SDK (Xcode-only distribution)
+// Platform-specific linking
+if (is_macos) {
+    exe.linkFramework("CoreAudio");
+    exe.linkFramework("CoreFoundation");
+    exe.linkFramework("ApplicationServices");
+    exe.root_module.addCSourceFile(.{ .file = b.path("src/ca_helpers.c"), .flags = &.{} });
+    exe.root_module.addCSourceFile(.{ .file = b.path("src/input_helpers_macos.c"), .flags = &.{} });
+    exe.root_module.addLibraryPath(b.path("dist/lib-macos"));
+    exe.root_module.addRPathSpecial("@loader_path/../lib");
+} else {
+    exe.linkSystemLibrary("libpipewire-0.3");
+    exe.root_module.addCSourceFile(.{ .file = b.path("src/pw_helpers.c"), .flags = &.{...} });
+    exe.root_module.addLibraryPath(b.path("dist/lib"));
+    exe.root_module.addRPathSpecial("$ORIGIN/../lib");
+}
 
-Must build on macOS.
+// Whisper/ggml — both platforms, different GPU backend
+exe.linkSystemLibrary("whisper");
+exe.linkSystemLibrary("ggml");
+exe.linkSystemLibrary("ggml-base");
+exe.linkSystemLibrary("ggml-cpu");
+if (is_macos) {
+    exe.linkSystemLibrary("ggml-metal");
+} else {
+    exe.linkSystemLibrary("ggml-cuda");
+}
+```
 
-### CI
+### `rebuild-libs` Step
 
-GitHub Actions provides macOS runners including Apple Silicon:
+```zig
+if (is_macos) {
+    cmake_configure.addArg("-DGGML_METAL=ON");
+    cmake_configure.addArg("-DGGML_METAL_EMBED_LIBRARY=ON");
+    // output to dist/lib-macos/
+} else {
+    cmake_configure.addArg("-DGGML_CUDA=ON");
+    cmake_configure.addArg("-DCMAKE_CUDA_ARCHITECTURES=75-virtual;86-virtual;89-virtual;120a-virtual");
+    // output to dist/lib/
+}
+```
+
+### `run.ts` Platform Detection
+
+```typescript
+const IS_MACOS = process.platform === "darwin";
+
+async function ensureDeps(opts?: { gpu_libs?: boolean }) {
+    if (IS_MACOS) {
+        if (!await which("brew")) { console.error("Homebrew required"); process.exit(1); }
+        // Verify Xcode for Metal shader compilation
+        if (opts?.gpu_libs) {
+            const { exitCode } = await $`xcrun metal --version`.quiet().nothrow();
+            if (exitCode !== 0) {
+                console.error("Full Xcode.app required for Metal shader compilation.");
+                console.error("Install from: https://developer.apple.com/xcode/");
+                process.exit(1);
+            }
+        }
+    } else {
+        // existing Linux dep checks (apt, pkg-config, nvcc, etc.)
+    }
+}
+```
+
+Build flags:
+```typescript
+const cpu_flag = IS_MACOS ? [] : ["-Dcpu=x86_64_v3"];  // macOS uses default aarch64
+```
+
+Dist validation:
+```typescript
+if (IS_MACOS) {
+    // otool -L for dylib deps, otool -l for RPATH, file for Mach-O check
+} else {
+    // readelf for RPATH, objdump for AVX-512 check
+}
+```
+
+### `dist/` Layout
+
+```
+dist/
+├── bin/capsper                    (gitignored — built by zig)
+├── lib/                           (Linux .so files — committed via LFS)
+│   ├── libwhisper.so.1.8.3
+│   ├── libggml-cuda.so.0.9.6
+│   └── ...
+├── lib-macos/                     (macOS .dylib files — built by CI, gitignored)
+│   ├── libwhisper.dylib
+│   ├── libggml-metal.dylib
+│   └── ...
+├── models/
+│   ├── ten-vad-ggml.bin
+│   ├── ggml-silero-v5.1.2.bin
+│   └── ggml-large-v3-turbo-q5_0.bin  (gitignored)
+├── install.sh                     (Linux installer)
+└── install-macos.sh               (macOS installer)
+```
+
+Release tarballs:
+- `capsper-linux-x86_64.tar.gz` — contains `bin/`, `lib/` (from `dist/lib/`), `models/`, `install.sh`
+- `capsper-macos-arm64.tar.gz` — contains `bin/`, `lib/` (from `dist/lib-macos/`, renamed to `lib/`), `models/`, `install-macos.sh`
+
+Both tarballs have the same internal layout (`bin/`, `lib/`, `models/`) so RPATH (`@loader_path/../lib` / `$ORIGIN/../lib`) works identically.
+
+---
+
+## CI
+
+### GitHub Actions macOS Runners
+
+**Free M1 runners (`macos-14`, `macos-15`) are available for public repos.** Specs: 3 vCPU, 7 GB RAM, Metal GPU support.
+
+**Xcode is preinstalled** on the runner image (Xcode 16.4 on `macos-15`). No need to install via `mas` or download — `xcrun metal` works out of the box. This is NOT installed via the App Store; it's baked into the runner image by GitHub.
+
+**Note:** Xcode 26+ dropped the Metal toolchain as a separate download. Runners currently have Xcode 16.x which includes Metal tools. If runner images upgrade to Xcode 26+, add `xcodebuild -downloadComponent MetalToolchain` (without sudo) to CI before the build step.
+
+This is significant — we can:
+1. Build Metal dylibs from source on CI (no LFS for macOS libs)
+2. Run unit tests and property tests
+3. Run regression tests (same WAV files, same model) to validate WER parity with Linux/CUDA
+4. Create release assets automatically
+
+### Workflow Structure
 
 ```yaml
-# .github/workflows/ci.yml
 jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive, lfs: true }
       - run: ./run.ts ci
 
   macos:
-    runs-on: macos-15      # Apple Silicon (M-series)
+    runs-on: macos-15
     steps:
-      - run: ./run.ts ci   # Same task runner, platform-detected build flags
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      # Xcode + xcrun metal preinstalled on runner — no setup needed
+      - run: ./run.ts ci
 ```
 
-### Platform Detection in `run.ts`
+`run.ts ci` auto-detects platform and runs the appropriate build + test + dist + release steps.
 
-`run.ts` detects platform and sets build flags accordingly:
+### macOS CI Build Steps
 
-```typescript
-const isMacOS = process.platform === 'darwin';
-const zigBuildFlags = isMacOS
-    ? ['-Dbackend=metal']
-    : ['-Dbackend=cuda', `-Dcpu=x86_64_v3`];
-```
-
-### build.zig Changes
-
-The Zig build script needs platform-conditional linking:
-
-```zig
-if (target.result.os.tag == .macos) {
-    // Link Apple frameworks
-    exe.linkFramework("CoreAudio");
-    exe.linkFramework("CoreGraphics");
-    exe.linkFramework("ApplicationServices");
-    exe.linkFramework("CoreFoundation");
-
-    // Link Metal-backend whisper.cpp
-    exe.addLibraryPath(.{ .cwd_relative = "dist/lib" });
-    exe.linkSystemLibrary("whisper");
-    exe.linkSystemLibrary("ggml");
-    exe.linkSystemLibrary("ggml-metal");
-
-    // Compile macOS-specific C helpers
-    exe.addCSourceFile(.{ .file = .{ .cwd_relative = "src/ca_helpers.c" } });
-    exe.addCSourceFile(.{ .file = .{ .cwd_relative = "src/cg_helpers.c" } });
-} else {
-    // Linux: existing PipeWire + CUDA path
-    exe.addCSourceFile(.{ .file = .{ .cwd_relative = "src/pw_helpers.c" } });
-    // ... existing Linux linking
-}
-```
-
-### Source File Organization
-
-Platform-specific code isolated in separate files:
-
-```
-src/
-├── main.zig              # Entry point (platform-conditional wiring)
-├── server.zig            # Platform-agnostic 2-state machine
-├── pipeline.zig          # Platform-agnostic whisper pipeline
-├── alignatt.zig          # Platform-agnostic attention analysis
-├── mel.zig               # Platform-agnostic mel buffer (if extracted)
-├── vad.zig               # Platform-agnostic VAD
-├── auto_gain.zig         # Platform-agnostic gain math
-├── utils.zig             # Platform-agnostic utilities
-│
-├── input.zig             # CURRENT: evdev/uinput (Linux)
-├── input_macos.zig       # NEW: CGEventTap/CGEventPost (macOS)
-│
-├── audio_capture.zig     # CURRENT: PipeWire (Linux)
-├── audio_capture_macos.zig  # NEW: Core Audio AUHAL (macOS)
-│
-├── pw_helpers.c          # CURRENT: PipeWire C wrappers (Linux)
-├── pw_detect.zig         # CURRENT: PipeWire setup wizard (Linux)
-│
-├── ca_helpers.c          # NEW: Core Audio C wrappers (macOS)
-├── ca_helpers.h          # NEW: Header for Zig @cImport
-├── cg_helpers.c          # NEW: CoreGraphics C wrappers (macOS)
-├── cg_helpers.h          # NEW: Header for Zig @cImport
-├── ca_detect.zig         # NEW: Core Audio setup wizard (macOS)
-│
-├── whisper_c.zig         # Unchanged: whisper.cpp C bridge
-├── pipewire_c.zig        # CURRENT: PipeWire C bridge (Linux-only)
-├── coreaudio_c.zig       # NEW: Core Audio C bridge (macOS-only)
-├── coregraphics_c.zig    # NEW: CoreGraphics C bridge (macOS-only)
-```
-
-The server, pipeline, VAD, and utility layers don't change at all. The platform boundary is at the input and audio capture layers — same as how it's currently structured, just with macOS alternatives.
+1. `ensureDeps()` — verify `xcrun metal` works (preinstalled), install cmake via brew if needed
+2. `rebuild-libs` — CMake with `-DGGML_METAL=ON`, output to `dist/lib-macos/`
+3. `build` — zig build linking against `dist/lib-macos/`
+4. `test` — unit tests + property tests (no GPU needed)
+5. `short-test` / `medium-test` — regression tests via `--stream-wav` (validates Metal transcription quality)
+6. `dist` — create `capsper-macos-arm64.tar.gz`, validate with `otool`
+7. Release upload (on tag)
 
 ---
 
-## Apple's Built-in Dictation vs Capsper
+## Homebrew Distribution
 
-For context on why this port is worth doing — Apple's built-in dictation is not a competitor:
+### Tap Repository
 
-| | Apple Dictation | Capsper |
-|---|---|---|
-| **Model** | Small on-device model (opt-in) or server-side (default) | Whisper large-v3-turbo (573 MB, fully local) |
-| **Accuracy** | Good for conversational speech. Struggles with technical terms, code, mixed languages, proper nouns | Significantly better across all domains. Domain term prompting via `<|startofprev|>` |
-| **Privacy** | Default sends audio to Apple servers | Fully local, never leaves the machine |
-| **UX** | Takes over input focus, shows dictation UI, dedicated dictation mode | Push-to-talk into any focused field, no UI takeover, seamless |
-| **Customization** | None | Trigger key, domain terms, VAD thresholds, gain calibration |
-| **Integration** | System feature, not extensible | Keystroke injection works in every app identically |
+Create `github.com/OWNER/homebrew-capsper` with:
 
-The fundamental UX difference: Apple's dictation is a modal input method. Capsper is transparent keystroke injection — the receiving app doesn't know the text came from speech.
+```
+Formula/
+└── capsper.rb
+```
+
+### Formula
+
+```ruby
+class Capsper < Formula
+  desc "Push-to-talk voice dictation (Metal GPU, fully local)"
+  homepage "https://github.com/OWNER/capsper"
+  version "X.Y.Z"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/OWNER/capsper/releases/download/vX.Y.Z/capsper-macos-arm64.tar.gz"
+      sha256 "..."
+    end
+  end
+
+  def install
+    libexec.install "bin/capsper"
+    (libexec/"lib").install Dir["lib/*.dylib"]
+    (libexec/"models").install Dir["models/*.bin"]
+
+    # Wrapper script (DYLD_LIBRARY_PATH for dylib resolution)
+    (bin/"capsper").write_env_script libexec/"bin/capsper",
+      DYLD_LIBRARY_PATH: "#{libexec}/lib"
+  end
+
+  def caveats
+    <<~EOS
+      Capsper requires two permissions:
+
+      1. Accessibility (for keyboard interception + text injection):
+         System Settings → Privacy & Security → Accessibility → add capsper
+
+      2. Microphone (prompted automatically on first run)
+
+      To download the Whisper model (~574 MB), run:
+         capsper --dry-run
+
+      To set up as a background service:
+         capsper --setup
+    EOS
+  end
+end
+```
+
+### Installation Flow
+
+```bash
+brew tap OWNER/capsper
+brew install capsper
+capsper --dry-run          # downloads model, validates Metal GPU
+capsper --trigger capslock  # run interactively
+```
+
+### Formula Update Automation
+
+In `run.ts ci()`, after uploading release assets:
+```typescript
+if (process.env.GH_TOKEN && tag) {
+    // Update homebrew-capsper formula with new version + sha256
+    // Can use gh api or direct git commit to the tap repo
+}
+```
+
+---
+
+## macOS Installer (`install-macos.sh`)
+
+For non-Homebrew installs (direct tarball download):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="${HOME}/.local/share/capsper"
+PLIST_DIR="${HOME}/Library/LaunchAgents"
+PLIST_NAME="com.capsper.dictation.plist"
+
+# Check brew is available (for future deps if needed)
+command -v brew >/dev/null || { echo "Homebrew required: https://brew.sh"; exit 1; }
+
+# Copy files
+mkdir -p "$INSTALL_DIR"/{bin,lib,models}
+cp bin/capsper "$INSTALL_DIR/bin/"
+cp lib/*.dylib "$INSTALL_DIR/lib/"
+cp models/*.bin "$INSTALL_DIR/models/" 2>/dev/null || true
+
+# Ad-hoc code sign with hardened runtime + mic entitlement
+codesign --force --sign - --options runtime --entitlements capsper.entitlements "$INSTALL_DIR/bin/capsper"
+
+# Download whisper model if not present
+if [ ! -f "$INSTALL_DIR/models/ggml-large-v3-turbo-q5_0.bin" ]; then
+    echo "Downloading Whisper model (~574 MB)..."
+    curl -L -o "$INSTALL_DIR/models/ggml-large-v3-turbo-q5_0.bin" \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
+fi
+
+# Install LaunchAgent
+mkdir -p "$PLIST_DIR"
+sed "s|INSTALL_DIR|$INSTALL_DIR|g" com.capsper.dictation.plist > "$PLIST_DIR/$PLIST_NAME"
+
+# Accessibility permission check
+echo ""
+echo "=== Permissions Setup ==="
+echo "Capsper needs Accessibility permission to intercept keyboard events."
+echo "Go to: System Settings → Privacy & Security → Accessibility"
+echo "Click '+' and add: $INSTALL_DIR/bin/capsper"
+echo ""
+echo "Microphone permission will be prompted on first run."
+echo ""
+echo "To start: launchctl load ~/Library/LaunchAgents/$PLIST_NAME"
+echo "To stop:  launchctl unload ~/Library/LaunchAgents/$PLIST_NAME"
+```
 
 ---
 
 ## Implementation Phases
 
-### Phase 1: Keyboard + Text Injection (macOS `input_macos.zig`)
+### Phase 1: Validate Metal Transcription (Minimal — prove feasibility)
 
-Start here because it's the simplest subsystem and the most novel (no Linux code to reuse).
+**Goal:** Prove whisper.cpp Metal backend produces correct transcriptions on M4.
 
-1. `hidutil` CapsLock→F19 remap on startup
-2. CGEventTap intercepts F19, signals PTT state
-3. CGEventPost + CGEventKeyboardSetUnicodeString injects text (batched, 20 chars/event)
-4. Watchdog health check (`CGEventTapIsEnabled()` polling)
-5. Undo `hidutil` remap on clean exit
+Steps:
+1. Install full Xcode on Mac
+2. Update `bootstrap.sh` / mise to work on macOS (Zig + Bun)
+3. Build whisper.cpp with Metal: `cmake -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DBUILD_SHARED_LIBS=ON`
+4. Place dylibs in `dist/lib-macos/`
+5. Create platform shim files (`audio_capture_platform.zig`, `input_platform.zig`, `audio_detect_platform.zig`)
+6. Update `build.zig` for platform-conditional linking
+7. Stub out macOS platform modules (enough to compile `--stream-wav` mode, which bypasses audio capture and input entirely)
+8. Build capsper on macOS
+9. Run `--stream-wav` with known test WAV files
+10. Compare transcription output to Linux/CUDA baseline
 
-**Test:** Manual — run binary, press CapsLock, verify no LED toggle and no F19 reaches apps. Type text programmatically, verify it appears in TextEdit/Terminal/VS Code.
+**Success criteria:** `--stream-wav` produces identical (or near-identical) transcription to Linux. Unit tests pass.
 
-### Phase 2: Audio Capture (macOS `audio_capture_macos.zig` + `ca_helpers.c`)
+**What this validates:** Metal GPU works, whisper.cpp C API is portable, pipeline/mel/alignatt/vad are truly platform-agnostic, build system works cross-platform.
 
-1. AUHAL setup for 16kHz mono S16_LE capture
-2. Channel selection via `kAudioOutputUnitProperty_ChannelMap`
-3. Device enumeration and selection
-4. Callback feeds PCM to server.zig (same interface as PipeWire callback)
-5. Sample rate conversion if hardware doesn't support 16kHz natively
+### Phase 2: Audio Capture (Medium — local mic works)
 
-**Test:** Capture audio, write to WAV, verify with existing regression test infrastructure (can feed WAV to server via TCP socket).
+**Goal:** Capture audio from Mac microphone, feed to streaming pipeline.
 
-### Phase 3: Whisper.cpp Metal Build
+Steps:
+1. Implement `ca_helpers.c` (AUHAL setup, device enumeration)
+2. Implement `audio_capture_macos.zig` (pipe-based handoff, same interface)
+3. Implement `audio_detect_macos.zig` (device wizard)
+4. Update `server.zig` to use platform shim
+5. Test: `--input local` with default mic, verify transcription works
 
-1. CMake configure with `-DGGML_METAL=ON`
-2. Build shared `.dylib` libraries
-3. Verify RPATH (`@executable_path/../lib`, `@loader_path`)
-4. Run existing pipeline unit tests (platform-agnostic)
-5. Benchmark encode/decode latency on target hardware
+**Success criteria:** Speaking into Mac mic produces correct transcription via the streaming pipeline.
 
-**Test:** Feed known audio via TCP, compare transcription output to Linux CUDA output. Should be identical (same model, same pipeline code, different backend).
+### Phase 3: Keyboard & Text Injection (Medium — full PTT flow)
 
-### Phase 4: Integration + Service
+**Goal:** CapsLock push-to-talk with text injection into focused app.
 
-1. Wire all subsystems together in `main.zig` (platform-conditional)
-2. End-to-end PTT flow: CapsLock → audio capture → transcription → keystroke injection
-3. LaunchAgent plist for service management
-4. `install.sh` macOS path (detect platform, install LaunchAgent instead of systemd service)
-5. `ca_detect.zig` setup wizard (device/channel/gain calibration)
+Steps:
+1. Implement `input_helpers_macos.c` (CGEventTap, CGEventPost, hidutil)
+2. Implement `input_macos.zig` (InputHandler, parseTriggerKey)
+3. Test: `--trigger capslock` end-to-end PTT flow
 
-### Phase 5: Polish
+**Success criteria:** Press CapsLock → speak → release → text appears in focused app.
 
-1. Permission prompting UX (detect missing permissions, print clear instructions)
-2. Auto-gain runtime adjustment (same math, Core Audio gain API)
-3. Device hotplug listener
-4. Typing cancel on PTT release
-5. `run.ts` platform-conditional build/test/CI targets
+### Phase 4: Build & CI (Full — automated)
+
+**Goal:** Fully automated build, test, and release pipeline.
+
+Steps:
+1. Update `run.ts` for macOS (deps, build, dist validation)
+2. Update `bootstrap.sh` for macOS
+3. Add `ci-macos` job to GitHub Actions
+4. Run regression tests on macOS CI (validate WER parity)
+5. Create dual-platform release assets
+
+**Success criteria:** CI produces `capsper-macos-arm64.tar.gz` alongside Linux tarball. Regression tests pass on both platforms.
+
+### Phase 5: Installation & Distribution (Full — user-facing)
+
+**Goal:** Users can install via Homebrew or direct download.
+
+Steps:
+1. Create `install-macos.sh`
+2. Create Homebrew tap with formula
+3. LaunchAgent for background service
+4. Permission setup guidance
+5. Auto-update mechanism (formula update + version check)
+
+**Success criteria:** `brew install OWNER/capsper/capsper` works end-to-end.
 
 ---
 
 ## Open Questions
 
-1. **Sample rate conversion strategy:** Build an `AudioConverter` chain, use AVAudioConverter, or do SRC in Zig? The AUHAL doesn't auto-resample. Need to check what sample rates the built-in Mac mic actually supports — if it supports 16kHz natively, this is moot.
+1. **Sample rate conversion:** AUHAL doesn't auto-resample. Need to check what sample rates the built-in Mac mic supports natively. If 16kHz is supported, this is a non-issue. If not, need `AudioConverterRef` for 48k→16k SRC.
 
-2. **Metal shader embedding vs external files:** `GGML_METAL_EMBED_LIBRARY=ON` embeds shaders in the dylib (simpler distribution). Verify this works with our RPATH layout.
+2. **TEN-VAD FFT on macOS:** `ten-vad/src/fftw.c` is plain C but check for any Linux assumptions.
 
-3. **TEN-VAD FFT on macOS:** The GGML VAD backend calls `ten-vad/src/fftw.c` via `@cImport`. Need to verify this compiles on macOS (it's plain C, should be fine, but check for any POSIX assumptions).
+3. **macOS CI regression test model:** The 574 MB whisper model would need to be cached on CI. GitHub Actions cache has a 10 GB limit — check if this is practical, or if we need a smaller model for CI-only regression tests.
 
-4. **CPU target for macOS:** Linux targets `x86_64_v3`. macOS targets `aarch64` (Apple Silicon). Do we need any specific ARM feature flags, or is the default `aarch64-macos` target sufficient?
-
-5. **Test infrastructure:** Regression tests use TCP socket to feed audio. This is platform-agnostic and should work as-is. Unit tests and property tests are also platform-agnostic. May need macOS-specific integration tests for CGEventTap and Core Audio.
+4. **Homebrew formula auto-update:** Best mechanism for automatically updating the tap formula when a new release is tagged. Options: GitHub Action in the tap repo triggered by release webhook, or `run.ts ci` pushes directly.
 
 ---
 
@@ -865,22 +819,17 @@ Start here because it's the simplest subsystem and the most novel (no Linux code
 - [Apple QA1519: Detecting the Caps Lock Key](https://developer.apple.com/library/archive/qa/qa1519/_index.html)
 - [CGEventTapCreate documentation](https://developer.apple.com/documentation/coregraphics/cgevent/tapcreate)
 - [Karabiner-Elements source (reference architecture)](https://github.com/pqrs-org/Karabiner-Elements)
-- [Karabiner-DriverKit-VirtualHIDDevice](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice)
 
 ### Audio
 - [Apple TN2091: Device Input using AUHAL](https://developer.apple.com/library/archive/technotes/tn2091/_index.html)
 - [Core Audio Overview](https://developer.apple.com/library/archive/documentation/MusicAudio/Conceptual/CoreAudioOverview/WhatisCoreAudio/WhatisCoreAudio.html)
-- [Audio APIs Part 1: Core Audio (practitioner comparison)](https://bastibe.de/2017-06-17-audio-apis-coreaudio.html)
 - [It's Over, AVAudioEngine (bug documentation)](https://supermegaultragroovy.com/2021/01/26/it-s-over-avaudioengine/)
 
 ### Transcription
 - [whisper.cpp repository](https://github.com/ggml-org/whisper.cpp)
 - [whisper.cpp release benchmarks (Metal)](https://github.com/ggml-org/whisper.cpp/releases)
-- [Core ML encoder PR #566](https://github.com/ggml-org/whisper.cpp/pull/566)
-- [ANE architecture discussion #548](https://github.com/ggml-org/whisper.cpp/discussions/548)
-- [WhisperKit paper (streaming on ANE)](https://arxiv.org/html/2507.10860v1)
-- [mac-whisper-speedtest (M4 benchmarks)](https://github.com/anvanvan/mac-whisper-speedtest)
 
-### Permissions & Distribution
+### Distribution
+- [Homebrew Formula Cookbook](https://docs.brew.sh/Formula-Cookbook)
+- [Creating a Homebrew Tap](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap)
 - [Hardened Runtime documentation](https://developer.apple.com/documentation/security/hardened-runtime)
-- [HIDDriverKit documentation](https://developer.apple.com/documentation/hiddriverkit)

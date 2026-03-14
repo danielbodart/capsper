@@ -11,6 +11,46 @@ export PATH="$MISE_DATA_DIR:$PATH"
 
 http() { curl --progress-bar "$@" || wget -qO- "$@"; }
 
+# ─── macOS prerequisites ──────────────────────────────────────────────────
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    if ! command -v brew &>/dev/null; then
+        echo "ERROR: Homebrew is required on macOS. Install from https://brew.sh"
+        [[ "${BASH_SOURCE[0]}" == "${0}" ]] && exit 1 || return 1
+    fi
+
+    # Ensure git-lfs and cmake are available
+    _brew_missing=()
+    command -v git-lfs &>/dev/null || _brew_missing+=(git-lfs)
+    command -v cmake &>/dev/null || _brew_missing+=(cmake)
+    if (( ${#_brew_missing[@]} )); then
+        echo "Installing missing brew packages: ${_brew_missing[*]}"
+        brew install "${_brew_missing[@]}"
+    fi
+
+    # Check for full Xcode (needed for Metal shader compilation)
+    if ! xcrun metal --version &>/dev/null; then
+        echo ""
+        echo "=== Xcode Required ==="
+        echo "Full Xcode.app is needed for Metal shader compilation."
+        echo ""
+        echo "Option 1: App Store GUI or website (required for first-time install)"
+        echo "  Open App Store → search 'Xcode' → Install"
+        echo "  Or download from: https://developer.apple.com/xcode/"
+        echo ""
+        echo "Option 2: Command line (only works if Xcode was previously installed)"
+        echo "  brew install mas && mas install 497799835"
+        echo ""
+        echo "After installing Xcode:"
+        echo "  sudo xcodebuild -license accept"
+        echo "  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+        echo "  xcodebuild -downloadComponent MetalToolchain  (NO sudo — per-user install)"
+        echo ""
+        # Don't abort — Xcode is only needed for rebuild-libs, not for building
+        # against pre-built dylibs
+    fi
+fi
+
+# ─── Common setup ─────────────────────────────────────────────────────────
 [[ -f "$MISE_INSTALL_PATH" ]] || http https://mise.run | sh
 git -C "$SCRIPT_DIR" submodule update --init --recursive --quiet
 command -v git-lfs &>/dev/null && git lfs install --local && git -C "$SCRIPT_DIR" lfs pull
