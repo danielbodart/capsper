@@ -439,35 +439,19 @@ Option 1 is simpler. capsper's `init()` calls `hidutil` via `posix.execve` or th
 
 ### `build.zig` Platform Branching
 
+Implemented via helper functions to avoid duplication across exe, test, and tool targets:
+
 ```zig
 const is_macos = target.result.os.tag == .macos;
 
-// Platform-specific linking
-if (is_macos) {
-    exe.linkFramework("CoreAudio");
-    exe.linkFramework("CoreFoundation");
-    exe.linkFramework("ApplicationServices");
-    exe.root_module.addCSourceFile(.{ .file = b.path("src/ca_helpers.c"), .flags = &.{} });
-    exe.root_module.addCSourceFile(.{ .file = b.path("src/input_helpers_macos.c"), .flags = &.{} });
-    exe.root_module.addLibraryPath(b.path("dist/lib-macos"));
-    exe.root_module.addRPathSpecial("@loader_path/../lib");
-} else {
-    exe.linkSystemLibrary("libpipewire-0.3");
-    exe.root_module.addCSourceFile(.{ .file = b.path("src/pw_helpers.c"), .flags = &.{...} });
-    exe.root_module.addLibraryPath(b.path("dist/lib"));
-    exe.root_module.addRPathSpecial("$ORIGIN/../lib");
-}
+// Helper functions: addWhisperIncludes, addTenVad, addPlatformDeps,
+// addWhisperLibs, addLibPath — each takes *Compile (not *Module,
+// because Module.linkSystemLibrary requires an options struct in Zig 0.15).
 
-// Whisper/ggml — both platforms, different GPU backend
-exe.linkSystemLibrary("whisper");
-exe.linkSystemLibrary("ggml");
-exe.linkSystemLibrary("ggml-base");
-exe.linkSystemLibrary("ggml-cpu");
-if (is_macos) {
-    exe.linkSystemLibrary("ggml-metal");
-} else {
-    exe.linkSystemLibrary("ggml-cuda");
-}
+addWhisperIncludes(b, exe);
+addTenVad(b, exe, ten_vad_flags);
+addPlatformDeps(b, exe, is_macos);   // CoreAudio+frameworks or PipeWire
+addWhisperLibs(b, exe, is_macos);    // ggml-metal+ggml-blas or ggml-cuda
 ```
 
 ### `rebuild-libs` Step
@@ -728,7 +712,7 @@ echo "To stop:  launchctl unload ~/Library/LaunchAgents/$PLIST_NAME"
 
 ## Implementation Phases
 
-### Phase 1: Validate Metal Transcription (Minimal — prove feasibility)
+### Phase 1: Validate Metal Transcription (Minimal — prove feasibility) ✅ COMPLETE
 
 **Goal:** Prove whisper.cpp Metal backend produces correct transcriptions on M4.
 
@@ -747,6 +731,20 @@ Steps:
 **Success criteria:** `--stream-wav` produces identical (or near-identical) transcription to Linux. Unit tests pass.
 
 **What this validates:** Metal GPU works, whisper.cpp C API is portable, pipeline/mel/alignatt/vad are truly platform-agnostic, build system works cross-platform.
+
+**Results (2026-03-14):**
+- Apple M4 detected: Metal GPU Family Apple9, unified memory, 11.4 GB
+- JFK warmup: 1.7s (including first-run Metal shader compilation)
+- `--stream-wav test/jfk.wav` streaming output matches Linux/CUDA: correct word-level deltas
+- `build.zig` refactored with helper functions (`addWhisperIncludes`, `addTenVad`, `addPlatformDeps`, `addWhisperLibs`, `addLibPath`) — eliminates previous duplication across exe/test/vad targets
+- Metal build also links `ggml-blas` (Accelerate/BLAS framework) — not present in Linux build
+- RPATH: `@loader_path/../lib-macos` (dev), `@loader_path/../lib` (release tarball)
+- Platform shims use `const impl = if (builtin.os.tag == .macos) ... else ...` pattern (not `usingnamespace` — that doesn't work with comptime `if` in Zig 0.15)
+
+**Gotchas discovered:**
+- Xcode 26+ requires separate `xcodebuild -downloadComponent MetalToolchain` — and it MUST run without sudo (per-user install, Apple bug)
+- `mas install` (Mac App Store CLI) only works for apps previously installed via the App Store — first-time Xcode must go through the GUI
+- Zig 0.15 `Module.linkSystemLibrary` takes an options struct; `Compile.linkSystemLibrary` takes just a string — helpers must take `*Compile`, not `*Module`
 
 ### Phase 2: Audio Capture (Medium — local mic works)
 
