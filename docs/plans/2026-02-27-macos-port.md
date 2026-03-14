@@ -746,18 +746,36 @@ Steps:
 - `mas install` (Mac App Store CLI) only works for apps previously installed via the App Store — first-time Xcode must go through the GUI
 - Zig 0.15 `Module.linkSystemLibrary` takes an options struct; `Compile.linkSystemLibrary` takes just a string — helpers must take `*Compile`, not `*Module`
 
-### Phase 2: Audio Capture (Medium — local mic works)
+### Phase 2: Audio Capture (Medium — local mic works) ✅ COMPLETE (loopback), ⏳ Real mic pending
 
 **Goal:** Capture audio from Mac microphone, feed to streaming pipeline.
 
 Steps:
-1. Implement `ca_helpers.c` (AUHAL setup, device enumeration)
-2. Implement `audio_capture_macos.zig` (pipe-based handoff, same interface)
-3. Implement `audio_detect_macos.zig` (device wizard)
-4. Update `server.zig` to use platform shim
-5. Test: `--input local` with default mic, verify transcription works
+1. ~~Implement `ca_helpers.c` (AUHAL setup, device enumeration)~~ — Not needed, pure Zig `@cImport` works
+2. ✅ Implement `audio_capture_macos.zig` (pipe-based handoff, same interface)
+3. ⏳ Implement `audio_detect_macos.zig` (device wizard) — deferred
+4. ✅ Update `server.zig` to use platform shim
+5. ✅ Test: `--pw-target "BlackHole 2ch"` loopback transcription works
+6. ⏳ Test: `--input local` with real mic — blocked on user interaction for mic permission
 
-**Success criteria:** Speaking into Mac mic produces correct transcription via the streaming pipeline.
+**Results (2026-03-14):**
+- AUHAL captures at device native rate (48kHz), mono S16 — channel mixing + float→int works
+- AUHAL CANNOT do sample rate conversion — silently returns zeros if you request a different rate
+- AudioConverterFillComplexBuffer handles 48kHz→16kHz SRC with max quality anti-aliasing
+- AudioConverterConvertBuffer does NOT support SRC (documented limitation)
+- BlackHole loopback: 19 words, 3 VAD segments from JFK — matches Linux quality
+- Automated test (`ca-stream.test.ts`) uses LaunchAgent for GUI session TCC context
+- Device lookup by name (device IDs change on reboot)
+- `test/macos-audio-helpers.c` provides CLI for device enumeration + output switching
+
+**Gotchas discovered:**
+- macOS TCC blocks microphone from SSH sessions — there is NO workaround via database manipulation (tried: system TCC with csreq blobs, all process identities, Full Disk Access grants, auth_reason variants, tccd restart). TCC validates by audit session, not just process identity.
+- LaunchAgent (launchctl load) is the ONLY way to get GUI session TCC context from SSH
+- Each new binary that accesses the mic needs its own TCC grant (user must click Allow on desktop)
+- AVFoundation returns "undetermined" even when CoreAudio HAL delivers zeros — they use different check paths but both enforce TCC
+- BlackHole device needs default output set before afplay to route audio through loopback
+
+**Success criteria:** ✅ BlackHole loopback transcription passes automated test. ⏳ Real mic transcription needs user to grant permission interactively.
 
 ### Phase 3: Keyboard & Text Injection (Medium — full PTT flow)
 
