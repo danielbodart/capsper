@@ -31,6 +31,11 @@ export function trackProc(proc: ReturnType<typeof spawn>): void {
 }
 
 export async function hasGpu(): Promise<boolean> {
+    if (process.platform === "darwin") {
+        // macOS: check for Metal GPU via system_profiler
+        const { exitCode } = await $`system_profiler SPDisplaysDataType 2>/dev/null | grep -q Metal`.quiet().nothrow();
+        return exitCode === 0;
+    }
     const { exitCode } = await $`nvidia-smi`.quiet().nothrow();
     return exitCode === 0;
 }
