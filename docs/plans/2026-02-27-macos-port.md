@@ -777,54 +777,101 @@ Steps:
 
 **Success criteria:** ✅ BlackHole loopback transcription passes automated test. ⏳ Real mic transcription needs user to grant permission interactively.
 
-### Phase 3: Keyboard & Text Injection (Medium — full PTT flow)
+### Phase 3: Keyboard & Text Injection (Medium — full PTT flow) ✅ CODE COMPLETE, ⏳ needs Accessibility TCC grant
 
 **Goal:** CapsLock push-to-talk with text injection into focused app.
 
 Steps:
-1. Implement `input_helpers_macos.c` (CGEventTap, CGEventPost, hidutil)
-2. Implement `input_macos.zig` (InputHandler, parseTriggerKey)
-3. Test: `--trigger capslock` end-to-end PTT flow
+1. ✅ Implement `input_helpers_macos.c` (CGEventTap, CGEventPost, hidutil)
+2. ✅ Implement `input_macos.zig` (InputHandler, parseTriggerKey)
+3. ⏳ Test: `--trigger capslock` end-to-end PTT flow — needs Accessibility permission granted via System Settings
 
-**Success criteria:** Press CapsLock → speak → release → text appears in focused app.
+**Results (2026-03-15):**
+- `hidutil` CapsLock → F19 remap works (verified — prevents LED toggle)
+- CGEventTap creation works but requires Accessibility TCC permission
+- CGEventPost text injection via `CGEventKeyboardSetUnicodeString` — handles all Unicode, batches 20 chars/event
+- Dedicated thread runs CFRunLoop for the event tap
+- Clean shutdown: restores CapsLock remap, stops tap, joins thread
+- Error messages are platform-specific ("Accessibility permission" on macOS vs "input group" on Linux)
 
-### Phase 4: Build & CI (Full — automated)
+**What's needed to complete:**
+- User grants Accessibility permission: System Settings → Privacy & Security → Accessibility → add capsper
+- Or use `test/grant-tcc-mic.sh dist/bin/capsper kTCCServiceAccessibility` (requires SIP disabled)
+- End-to-end PTT test: CapsLock → speak → release → text appears in focused app
+
+### Phase 4: Build & CI (Full — automated) ✅ MOSTLY COMPLETE, ⏳ CI workflow pending
 
 **Goal:** Fully automated build, test, and release pipeline.
 
 Steps:
-1. Update `run.ts` for macOS (deps, build, dist validation)
-2. Update `bootstrap.sh` for macOS
-3. Add `ci-macos` job to GitHub Actions
-4. Run regression tests on macOS CI (validate WER parity)
-5. Create dual-platform release assets
+1. ✅ Update `run.ts` for macOS (deps, build, dist validation, platform-specific tarballs)
+2. ✅ Update `bootstrap.sh` for macOS (brew deps, Xcode detection)
+3. ⏳ Add `ci-macos` job to `.github/workflows/ci.yml`
+4. ⏳ Run regression tests on macOS CI (validate WER parity)
+5. ⏳ Create dual-platform release assets
 
-**Success criteria:** CI produces `capsper-macos-arm64.tar.gz` alongside Linux tarball. Regression tests pass on both platforms.
+**Results (2026-03-15):**
+- `run.ts` fully platform-aware: auto-detects macOS, uses brew, builds without `-Dcpu=x86_64_v3`, runs `ca-stream.test.ts` instead of `pw-stream.test.ts`, `dist()` validates with `otool` and creates `capsper-macos-arm64.tar.gz`
+- `./run.ts build` works end-to-end on macOS
+- `./run.ts test` passes (unit + property tests, Linux input tests guarded with comptime check)
+- `ensureMacOSLibs()` auto-builds Metal dylibs if `dist/lib-macos/` is empty
+- `dist()` creates macOS tarball with `lib-macos/` renamed to `lib/` for consistent RPATH
 
-### Phase 5: Installation & Distribution (Full — user-facing)
+**What's needed to complete:**
+- Add `ci-macos` job to GitHub Actions workflow (use `macos-15` runner)
+- CI needs: BlackHole install + `launchctl kickstart` coreaudiod (no reboot on CI)
+- Cache the whisper model on CI (574 MB, fits in GitHub Actions 10 GB cache)
+- Run regression tests via `--stream-wav` (doesn't need audio devices)
+- Run `ca-stream.test.ts` BlackHole loopback test on CI
+
+### Phase 5: Installation & Distribution (Full — user-facing) ⏳ NOT STARTED
 
 **Goal:** Users can install via Homebrew or direct download.
 
 Steps:
-1. Create `install-macos.sh`
-2. Create Homebrew tap with formula
-3. LaunchAgent for background service
-4. Permission setup guidance
-5. Auto-update mechanism (formula update + version check)
+1. ⏳ Create `install-macos.sh` (LaunchAgent, permissions guidance, model download)
+2. ⏳ Create Homebrew tap with formula
+3. ⏳ LaunchAgent plist for background service
+4. ⏳ Permission setup guidance (Accessibility + Microphone)
+5. ⏳ Auto-update mechanism (formula update + version check)
 
 **Success criteria:** `brew install OWNER/capsper/capsper` works end-to-end.
 
 ---
 
+## Deferred Items
+
+Items explicitly deferred during implementation, to be addressed later:
+
+1. **Device detection wizard (`audio_detect_macos.zig`)** — the interactive `--pw-detect` equivalent for macOS. Needs CoreAudio device enumeration, multi-channel RMS analysis, gain calibration. Deferred because default mic + auto-gain is sufficient for initial use.
+
+2. **Channel selection** — `--audio-channel` / `--pw-channel` on macOS. Currently hardcoded to mono channel 0. Deferred because most Mac mics are mono.
+
+3. **Real microphone testing** — EarPods mic was very quiet in testing (2-3 blips in system settings). Needs investigation: may be a channel issue (2-channel device, mic might be on channel 1), or just a quiet mic that needs auto-gain to ramp up. Blocked on user granting mic permission interactively from desktop.
+
+4. **Device hotplug** — `AudioObjectAddPropertyListener` for detecting mic connect/disconnect. Not needed for initial use.
+
+5. **TEN-VAD native backend** — `--vad ten-native` uses Linux-only `libten_vad.so`. Not available on macOS. Should print error if selected. (Currently handled in `main.zig` via comptime check possibility, but not yet implemented.)
+
+---
+
+## Resolved Questions
+
+1. **Sample rate conversion:** ✅ RESOLVED — AUHAL cannot do SRC. Confirmed with controlled test: format set + init succeed but AudioUnitRender returns errors (379/379 callbacks failed). `AudioConverterFillComplexBuffer` with max quality is the correct solution. `AudioConverterConvertBuffer` also cannot do SRC (documented limitation).
+
+2. **TEN-VAD FFT on macOS:** ✅ RESOLVED — `ten-vad/src/fftw.c` compiles and works on macOS. All 46 property tests pass including TEN-VAD related tests.
+
+3. **TCC permissions from SSH:** ✅ RESOLVED — macOS TCC validates by audit session, not process identity. Database manipulation alone does not work. Solution: LaunchAgent for GUI session context + `test/grant-tcc-mic.sh` for programmatic TCC grants with cdhash-based csreq. Requires SIP disabled for the grant script.
+
 ## Open Questions
 
-1. **Sample rate conversion:** AUHAL doesn't auto-resample. Need to check what sample rates the built-in Mac mic supports natively. If 16kHz is supported, this is a non-issue. If not, need `AudioConverterRef` for 48k→16k SRC.
+1. **macOS CI regression test model:** The 574 MB whisper model would need to be cached on CI. GitHub Actions cache has a 10 GB limit — check if this is practical, or if we need a smaller model for CI-only regression tests.
 
-2. **TEN-VAD FFT on macOS:** `ten-vad/src/fftw.c` is plain C but check for any Linux assumptions.
+2. **Homebrew formula auto-update:** Best mechanism for automatically updating the tap formula when a new release is tagged. Options: GitHub Action in the tap repo triggered by release webhook, or `run.ts ci` pushes directly.
 
-3. **macOS CI regression test model:** The 574 MB whisper model would need to be cached on CI. GitHub Actions cache has a 10 GB limit — check if this is practical, or if we need a smaller model for CI-only regression tests.
+3. **CI BlackHole installation:** BlackHole normally requires reboot, but `sudo launchctl kickstart -kp system/com.apple.audio.coreaudiod` should suffice on CI. Needs testing on a macOS runner.
 
-4. **Homebrew formula auto-update:** Best mechanism for automatically updating the tap formula when a new release is tagged. Options: GitHub Action in the tap repo triggered by release webhook, or `run.ts ci` pushes directly.
+4. **CI TCC grants:** GitHub Actions macOS runners may have different TCC restrictions. Need to verify if `test/grant-tcc-mic.sh` works on CI, or if runners already have mic/accessibility permissions.
 
 ---
 
