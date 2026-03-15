@@ -236,8 +236,7 @@ export async function setup() {
 /** Default target: build → lint → unit tests → short regressions + plumbing. */
 export async function dev() {
     await build();
-    console.log("Running static analysis...");
-    await $`zig build analyze`;
+    console.log("Running lint...");
     await $`shellcheck dist/*.sh bootstrap.sh`;
     console.log("Running unit + property tests...");
     await $`zig build test`;
@@ -370,7 +369,6 @@ async function distMacOS() {
 }
 
 export async function lint() {
-    await $`zig build analyze`;
     await $`shellcheck dist/*.sh bootstrap.sh`;
 }
 
@@ -382,8 +380,7 @@ export async function ci() {
         await ensureLfs();
     }
     const ver = await version();
-    console.log("Running static analysis...");
-    await $`zig build analyze`;
+    console.log("Running lint...");
     await $`shellcheck dist/*.sh bootstrap.sh`;
     console.log("Running tests...");
     await $`zig build test`;

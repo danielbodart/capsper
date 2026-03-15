@@ -55,12 +55,10 @@ pub const AudioCapture = struct {
     pub fn init(target: ?[:0]const u8, channel_position: u32) !AudioCapture {
         // Create pipe for passing PCM from PipeWire thread to main thread
         const pipe_fds = try posix.pipe();
-        // zwanzig-disable: store-violations-engine
         errdefer {
             posix.close(pipe_fds[0]);
             posix.close(pipe_fds[1]);
         }
-        // zwanzig-enable: store-violations-engine
 
         // Initialize PipeWire library
         pw.pw_init(null, null);

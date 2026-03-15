@@ -52,7 +52,6 @@ fn computeDctTable() [NB_BANDS * NB_BANDS]f32 {
             if (j == 0) table[i * NB_BANDS + j] *= @sqrt(0.5);
         }
     }
-    // zwanzig-disable-next-line: stack-escape-engine
     return table;
 }
 

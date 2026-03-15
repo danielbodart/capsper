@@ -286,7 +286,6 @@ fn computeHannWindow() [N_FFT]f32 {
         const x: f64 = 2.0 * math.pi * @as(f64, @floatFromInt(i)) / n_f;
         w[i] = @floatCast(0.5 * (1.0 - @cos(x)));
     }
-    // zwanzig-disable-next-line: stack-escape-engine
     return w;
 }
 

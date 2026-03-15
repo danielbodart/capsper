@@ -58,7 +58,6 @@ fn computeBandTable() [NB_BANDS - 1]BandInfo {
             .index_offset = @intFromFloat(@round(@as(f32, @floatFromInt(BAND_START_INDEX[i])) * index_conv)),
         };
     }
-    // zwanzig-disable-next-line: stack-escape-engine
     return table;
 }
 

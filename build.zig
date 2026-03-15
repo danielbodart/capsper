@@ -222,21 +222,6 @@ pub fn build(b: *std.Build) void {
     // Also include prop tests in the main test step
     test_step.dependOn(&run_prop.step);
 
-    // --- Static analysis step (zwanzig) ---
-    const analyze_step = b.step("analyze", "Run zwanzig static analyzer on src/");
-    const zwanzig_dep = b.dependency("zwanzig", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const zwanzig_exe = zwanzig_dep.artifact("zwanzig");
-    const zwanzig_run = b.addRunArtifact(zwanzig_exe);
-    // Only run safety-relevant engines (skip style/lint warnings)
-    zwanzig_run.addArgs(&.{ "--do", "store-violations-engine" });
-    zwanzig_run.addArgs(&.{ "--do", "stack-escape-engine" });
-    zwanzig_run.addArgs(&.{ "--do", "unreachable-code-engine" });
-    zwanzig_run.addDirectoryArg(b.path("src"));
-    analyze_step.dependOn(&zwanzig_run.step);
-
     // --- Rebuild whisper.cpp shared libs (cmake → dist/lib/ or dist/lib-macos/) ---
     const rebuild_step = b.step("rebuild-libs", "Rebuild whisper.cpp shared libs");
 

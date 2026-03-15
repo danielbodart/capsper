@@ -81,9 +81,11 @@ pub const AudioCapture = struct {
 
         // Create pipe for passing PCM from CoreAudio thread to main thread
         const pipe_fds = try posix.pipe();
+        const pipe_read = pipe_fds[0];
+        const pipe_write = pipe_fds[1];
         errdefer {
-            posix.close(pipe_fds[0]);
-            posix.close(pipe_fds[1]);
+            posix.close(pipe_read);
+            posix.close(pipe_write);
         }
 
         // Find AUHAL audio unit
@@ -123,10 +125,10 @@ pub const AudioCapture = struct {
         // Find input device — by name if target specified, otherwise system default
         var device_id: ca.AudioDeviceID = ca.kAudioObjectUnknown;
         if (target) |t| {
-            device_id = findDeviceByName(t) orelse {
+            if (!findDeviceByName(t, &device_id)) {
                 log.err("Input device not found: {s}", .{t});
                 return error.AudioInitFailed;
-            };
+            }
         } else {
             var device_size: ca.UInt32 = @sizeOf(ca.AudioDeviceID);
             var device_addr = ca.AudioObjectPropertyAddress{
@@ -208,7 +210,7 @@ pub const AudioCapture = struct {
         const callback_data = try std.heap.page_allocator.create(CallbackData);
         callback_data.* = .{
             .au_unit = au_unit,
-            .pipe_write_fd = pipe_fds[1],
+            .pipe_write_fd = pipe_write,
             .gain = std.atomic.Value(f32).init(1.0),
             .converter = if (needs_src) converter else null,
         };
@@ -250,8 +252,8 @@ pub const AudioCapture = struct {
             .callback_data = callback_data,
             .device_id = device_id,
             .converter = if (needs_src) converter else null,
-            .pipe_read_fd = pipe_fds[0],
-            .pipe_write_fd = pipe_fds[1],
+            .pipe_read_fd = pipe_read,
+            .pipe_write_fd = pipe_write,
             .active = false,
             .has_hardware_gain = has_hw_gain,
         };
@@ -366,19 +368,19 @@ fn makePcmFormat(rate: f64, channels: u32) ca.AudioStreamBasicDescription {
 }
 
 /// Find an audio device by name.
-fn findDeviceByName(name: [:0]const u8) ?ca.AudioDeviceID {
+fn findDeviceByName(name: [:0]const u8, result: *ca.AudioDeviceID) bool {
     var size: ca.UInt32 = 0;
     var addr = ca.AudioObjectPropertyAddress{
         .mSelector = ca.kAudioHardwarePropertyDevices,
         .mScope = ca.kAudioObjectPropertyScopeGlobal,
         .mElement = ca.kAudioObjectPropertyElementMain,
     };
-    if (ca.AudioObjectGetPropertyDataSize(ca.kAudioObjectSystemObject, &addr, 0, null, &size) != ca.noErr) return null;
+    if (ca.AudioObjectGetPropertyDataSize(ca.kAudioObjectSystemObject, &addr, 0, null, &size) != ca.noErr) return false;
     const count = size / @sizeOf(ca.AudioDeviceID);
-    if (count == 0 or count > 64) return null;
+    if (count == 0 or count > 64) return false;
 
     var devices: [64]ca.AudioDeviceID = undefined;
-    if (ca.AudioObjectGetPropertyData(ca.kAudioObjectSystemObject, &addr, 0, null, &size, @ptrCast(&devices)) != ca.noErr) return null;
+    if (ca.AudioObjectGetPropertyData(ca.kAudioObjectSystemObject, &addr, 0, null, &size, @ptrCast(&devices)) != ca.noErr) return false;
 
     for (0..count) |i| {
         var name_ref: ca.CFStringRef = undefined;
@@ -393,14 +395,15 @@ fn findDeviceByName(name: [:0]const u8) ?ca.AudioDeviceID {
             if (ca.CFStringGetCString(name_ref, &name_buf, name_buf.len, ca.kCFStringEncodingUTF8) != 0) {
                 const dev_name = std.mem.sliceTo(&name_buf, 0);
                 if (std.mem.eql(u8, dev_name, name)) {
+                    result.* = devices[i];
                     ca.CFRelease(@ptrCast(name_ref));
-                    return devices[i];
+                    return true;
                 }
             }
             ca.CFRelease(@ptrCast(name_ref));
         }
     }
-    return null;
+    return false;
 }
 
 /// State passed to the AudioConverter data supplier callback.

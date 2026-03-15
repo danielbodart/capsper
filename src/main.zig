@@ -317,7 +317,6 @@ pub fn main() !void {
         prompt_tokens = try allocator.dupe(c.whisper_token, token_buf[0..@intCast(n_tokens)]);
         std.debug.print("Domain terms: {d} tokens from {s}\n", .{ n_tokens, dpath });
     }
-    // zwanzig-disable-next-line: store-violations-engine
     defer if (prompt_tokens.len > 0) allocator.free(prompt_tokens);
 
     // Read drop terms file (newline-separated, one term per line)
@@ -346,12 +345,10 @@ pub fn main() !void {
         drop_terms = try terms_list.toOwnedSlice(allocator);
         std.debug.print("Drop terms: {d} terms from {s}\n", .{ drop_terms.len, dpath });
     }
-    // zwanzig-disable: store-violations-engine
     defer {
         for (drop_terms) |term| allocator.free(term);
         if (drop_terms.len > 0) allocator.free(drop_terms);
     }
-    // zwanzig-enable: store-violations-engine
 
     // --transcribe: batch transcription using whisper_full (non-streaming) and exit
     if (transcribe_file) |tfile| {

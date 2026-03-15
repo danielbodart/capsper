@@ -32,7 +32,6 @@ pub fn detectChannel(allocator: std.mem.Allocator, target: ?[:0]const u8, durati
 
     // Device selection
     var owned_target: ?[:0]const u8 = null;
-    // zwanzig-disable-next-line: store-violations-engine
     defer if (owned_target) |t| allocator.free(t);
 
     var chosen_target: ?[:0]const u8 = target;
@@ -245,12 +244,10 @@ fn calibrateGain(target: ?[:0]const u8, channel_position: u32, duration_secs: u3
     const expected_bytes: usize = sample_rate * 2 * duration_secs; // mono S16_LE
 
     const pipe_fds = try posix.pipe();
-    // zwanzig-disable: store-violations-engine
     errdefer {
         posix.close(pipe_fds[0]);
         posix.close(pipe_fds[1]);
     }
-    // zwanzig-enable: store-violations-engine
 
     pw.pw_init(null, null);
 
@@ -337,7 +334,6 @@ fn calibrateGain(target: ?[:0]const u8, channel_position: u32, duration_secs: u3
     pw.pw_stream_destroy(stream);
     pw.pw_thread_loop_destroy(thread_loop);
     posix.close(pipe_fds[0]);
-    // zwanzig-disable-next-line: store-violations-engine
     posix.close(pipe_fds[1]);
     std.heap.page_allocator.destroy(stream_data);
     pw.pw_deinit();
@@ -387,12 +383,10 @@ fn captureMultiChannel(
     const expected_bytes = sample_rate * bytes_per_frame * duration_secs;
 
     const pipe_fds = try posix.pipe();
-    // zwanzig-disable: store-violations-engine
     errdefer {
         posix.close(pipe_fds[0]);
         posix.close(pipe_fds[1]);
     }
-    // zwanzig-enable: store-violations-engine
 
     pw.pw_init(null, null);
 
@@ -449,7 +443,6 @@ fn captureMultiChannel(
     if (start_result < 0) return error.PipeWireInitFailed;
 
     var buf = try allocator.alloc(u8, expected_bytes);
-    // zwanzig-disable-next-line: store-violations-engine
     errdefer allocator.free(buf);
     var total_read: usize = 0;
 
@@ -472,7 +465,6 @@ fn captureMultiChannel(
     pw.pw_stream_destroy(stream);
     pw.pw_thread_loop_destroy(thread_loop);
     posix.close(pipe_fds[0]);
-    // zwanzig-disable-next-line: store-violations-engine
     posix.close(pipe_fds[1]);
     std.heap.page_allocator.destroy(stream_data);
     pw.pw_deinit();

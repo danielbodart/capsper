@@ -122,7 +122,6 @@ pub fn runConvs(w: *const ConvWeights, features: *const [CONTEXT_LEN * FEA_LEN]f
             out[col * 16 + ch] = pw2_out[ch * 5 + col];
         }
     }
-    // zwanzig-disable-next-line: stack-escape-engine
     return out;
 }
 

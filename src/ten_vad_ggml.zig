@@ -79,7 +79,6 @@ fn computeHannWindow() [WINDOW_SIZE]f32 {
         const n: f32 = @floatFromInt(WINDOW_SIZE);
         w[i] = 0.5 * (1.0 - @cos(2.0 * std.math.pi * fi / n));
     }
-    // zwanzig-disable-next-line: stack-escape-engine
     return w;
 }
 
@@ -98,7 +97,6 @@ fn computeMelBins() [MEL_BANDS + 2]i32 {
         const hz = 700.0 * (@exp(@log(@as(f32, 10.0)) * mel / 2595.0) - 1.0);
         bins[i] = @intFromFloat((FFT_SIZE + 1.0) * hz / @as(f32, FS));
     }
-    // zwanzig-disable-next-line: stack-escape-engine
     return bins;
 }
 
@@ -123,7 +121,6 @@ fn computeMelFilterbank() [MEL_BANDS * N_BINS]f32 {
                 @as(f32, @floatFromInt(hi - mid));
         }
     }
-    // zwanzig-disable-next-line: stack-escape-engine
     return fb;
 }
 
@@ -282,9 +279,7 @@ pub const TenVadGgmlCtx = struct {
         // Allocate context
         var ctx = try allocator.create(TenVadGgmlCtx);
         ctx.allocator = allocator;
-        // zwanzig-disable: store-violations-engine
         errdefer allocator.destroy(ctx);
-        // zwanzig-enable: store-violations-engine
 
         // Initialize feature extraction
         ctx.feat = .{};

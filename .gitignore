@@ -16,3 +16,4 @@ dist/lib-macos/
 test/results/vad-segments/
 test/macos-audio-helpers
 .playwright-mcp
+dist/.DS_Store
