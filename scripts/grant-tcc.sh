@@ -15,9 +15,9 @@ set -euo pipefail
 #   grant-tcc.sh --help
 #
 # Examples:
-#   grant-tcc.sh dist/bin/capsper Microphone
-#   grant-tcc.sh dist/bin/capsper Microphone Accessibility
-#   grant-tcc.sh dist/bin/capsper ScreenCapture Camera
+#   grant-tcc.sh /path/to/myapp Microphone
+#   grant-tcc.sh /path/to/myapp Microphone Accessibility
+#   grant-tcc.sh /path/to/myapp ScreenCapture Camera
 #
 # Service names (case-insensitive, kTCCService prefix optional):
 #   Accessibility       — CGEventTap keyboard interception + CGEventPost injection

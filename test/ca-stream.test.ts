@@ -38,7 +38,7 @@ async function getDefaultOutput(): Promise<string> {
 // Grant microphone TCC permission using the shared script.
 // Must be called before every test run — cdhash changes on rebuild.
 async function grantMicPermission(binaryPath: string): Promise<void> {
-    await $`test/grant-tcc.sh ${binaryPath} Microphone`.quiet().nothrow();
+    await $`scripts/grant-tcc.sh ${binaryPath} Microphone`.quiet().nothrow();
 }
 
 // Launch capsper via launchctl LaunchAgent — this runs in the GUI session
