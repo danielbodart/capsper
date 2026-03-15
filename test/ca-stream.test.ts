@@ -35,6 +35,53 @@ async function getDefaultOutput(): Promise<string> {
     return stdout.toString().trim().split("\t")[0];
 }
 
+// Grant microphone TCC permission to a binary by inserting its cdhash-based
+// code signing requirement into the user TCC database. This avoids the
+// interactive permission dialog that would otherwise block AudioUnitInitialize.
+async function grantMicPermission(binaryPath: string): Promise<void> {
+    const TCC_DB = `${process.env.HOME}/Library/Application Support/com.apple.TCC/TCC.db`;
+
+    // Check if already granted
+    const { stdout: existing } = await $`sqlite3 ${TCC_DB} "SELECT auth_value FROM access WHERE service='kTCCServiceMicrophone' AND client='${binaryPath}' AND client_type=1;"`.quiet().nothrow();
+    if (existing.toString().trim() === "2") return; // Already granted
+
+    // Get the designated requirement (cdhash for ad-hoc signed binaries)
+    const { stdout: csInfo } = await $`codesign -dr- ${binaryPath}`.quiet().nothrow();
+    const reqLine = csInfo.toString().split("\n").find(l => l.includes("designated =>") || l.includes("cdhash"));
+    if (!reqLine) {
+        console.error("Warning: Could not get code signing info for", binaryPath);
+        return;
+    }
+    const req = reqLine.replace(/^.*designated => /, "").replace(/^# /, "").trim();
+
+    // Generate csreq binary blob
+    const csreqFile = `/tmp/capsper-test-csreq-${Date.now()}.bin`;
+    await $`echo ${req} | csreq -r- -b ${csreqFile}`.quiet().nothrow();
+    const { stdout: hexOut } = await $`xxd -p ${csreqFile}`.quiet().nothrow();
+    const hex = hexOut.toString().replace(/\s/g, "");
+    unlinkSync(csreqFile);
+
+    if (!hex || hex.length < 10) {
+        console.error("Warning: Could not generate csreq for", binaryPath);
+        return;
+    }
+
+    // Reset pending mic dialogs, then immediately insert our grant.
+    // The reset clears any pending TCC prompts that would block AudioUnitInitialize.
+    // We must re-insert immediately after reset since it clears all mic entries.
+    await $`tccutil reset Microphone`.quiet().nothrow();
+    await $`sqlite3 ${TCC_DB} "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, indirect_object_identifier, flags) VALUES ('kTCCServiceMicrophone', '${binaryPath}', 1, 2, 3, 1, X'${hex}', 'UNUSED', 0);"`.quiet();
+
+    // Force tccd to reload and dismiss any pending permission dialogs
+    await $`killall tccd`.quiet().nothrow();
+    await $`killall UserNotificationCenter`.quiet().nothrow();
+    await Bun.sleep(2000);
+
+    // Verify the insert survived
+    const { stdout: verify } = await $`sqlite3 ${TCC_DB} "SELECT auth_value, length(csreq) FROM access WHERE service='kTCCServiceMicrophone' AND client='${binaryPath}';"`.quiet().nothrow();
+    console.error(`TCC: Granted microphone permission to ${binaryPath} (verify: ${verify.toString().trim()})`);
+}
+
 // Launch capsper via launchctl LaunchAgent — this runs in the GUI session
 // which has TCC microphone permission (SSH sessions don't).
 function createPlist(args: string[], outFile: string, logFile: string): string {
@@ -128,6 +175,12 @@ describe.skipIf(!isMacOS || !hasBinary || !hasModel || !blackhole)("ca-stream", 
         }
         // Save current default output to restore later
         originalOutput = await getDefaultOutput();
+
+        // Grant microphone TCC permission to capsper binary.
+        // LaunchAgent runs in GUI session but still needs a TCC entry.
+        // We insert capsper's cdhash-based code requirement into the user TCC database.
+        const { stdout: realPath } = await $`realpath ${BINARY}`.quiet();
+        await grantMicPermission(realPath.toString().trim());
     });
 
     test("streams wav file via BlackHole loopback", async () => {
