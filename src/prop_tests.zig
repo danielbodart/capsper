@@ -3,6 +3,7 @@
 // that hand-written unit tests might miss.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const minish = @import("minish");
 const mgen = minish.gen;
 const utils = @import("utils.zig");
@@ -1012,31 +1013,30 @@ pub fn main() !void {
     std.debug.print("prop: analyzeAttention peak preserved... ", .{});
     try minish.check(allocator, small_frame_gen, prop_analyzeAttention_peak_preserved, .{ .num_runs = runs });
 
-    // input.zig: eventsForChar
-    std.debug.print("prop: eventsForChar event count... ", .{});
-    try minish.check(allocator, ascii_byte_gen, prop_eventsForChar_count, .{ .num_runs = runs });
-    std.debug.print("prop: eventsForChar SYN placement... ", .{});
-    try minish.check(allocator, ascii_byte_gen, prop_eventsForChar_syn_placement, .{ .num_runs = runs });
-    std.debug.print("prop: eventsForChar balanced down/up... ", .{});
-    try minish.check(allocator, ascii_byte_gen, prop_eventsForChar_balanced, .{ .num_runs = runs });
+    // input.zig: Linux-specific tests (evdev event generation, panic detector, etc.)
+    // These test functions that only exist on Linux — skipped on macOS.
+    if (builtin.os.tag != .macos) {
+        std.debug.print("prop: eventsForChar event count... ", .{});
+        try minish.check(allocator, ascii_byte_gen, prop_eventsForChar_count, .{ .num_runs = runs });
+        std.debug.print("prop: eventsForChar SYN placement... ", .{});
+        try minish.check(allocator, ascii_byte_gen, prop_eventsForChar_syn_placement, .{ .num_runs = runs });
+        std.debug.print("prop: eventsForChar balanced down/up... ", .{});
+        try minish.check(allocator, ascii_byte_gen, prop_eventsForChar_balanced, .{ .num_runs = runs });
 
-    // input.zig: PanicDetector
-    std.debug.print("prop: PanicDetector no false trigger... ", .{});
-    try minish.check(allocator, keycode_gen, prop_panic_no_false_trigger, .{ .num_runs = runs });
-    std.debug.print("prop: PanicDetector release disarms... ", .{});
-    try minish.check(allocator, keycode_gen, prop_panic_release_disarms, .{ .num_runs = runs });
+        std.debug.print("prop: PanicDetector no false trigger... ", .{});
+        try minish.check(allocator, keycode_gen, prop_panic_no_false_trigger, .{ .num_runs = runs });
+        std.debug.print("prop: PanicDetector release disarms... ", .{});
+        try minish.check(allocator, keycode_gen, prop_panic_release_disarms, .{ .num_runs = runs });
 
-    // input.zig: TriggerState
-    std.debug.print("prop: TriggerState press-release-press cycle... ", .{});
-    try minish.check(allocator, frame_gen, prop_trigger_press_release_press, .{ .num_runs = runs });
+        std.debug.print("prop: TriggerState press-release-press cycle... ", .{});
+        try minish.check(allocator, frame_gen, prop_trigger_press_release_press, .{ .num_runs = runs });
 
-    // input.zig: hasKeyBit
-    std.debug.print("prop: hasKeyBit roundtrip... ", .{});
-    try minish.check(allocator, keycode_gen, prop_hasKeyBit_roundtrip, .{ .num_runs = runs });
+        std.debug.print("prop: hasKeyBit roundtrip... ", .{});
+        try minish.check(allocator, keycode_gen, prop_hasKeyBit_roundtrip, .{ .num_runs = runs });
 
-    // input.zig: eventsForText count consistency
-    std.debug.print("prop: eventsForText count consistency... ", .{});
-    try minish.check(allocator, ascii_text_gen, prop_eventsForText_count, .{ .num_runs = runs });
+        std.debug.print("prop: eventsForText count consistency... ", .{});
+        try minish.check(allocator, ascii_text_gen, prop_eventsForText_count, .{ .num_runs = runs });
+    }
 
     // channelRms / rmsToDb
     std.debug.print("prop: channelRms non-negative... ", .{});
