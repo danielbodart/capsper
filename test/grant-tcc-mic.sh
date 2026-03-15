@@ -61,11 +61,10 @@ fi
 # 1. Dismiss any pending TCC dialogs
 killall UserNotificationCenter 2>/dev/null || true
 
-# 2. Reset the service to clear stale entries
-tccutil reset "$(echo "$SERVICE" | sed 's/kTCCService//')" 2>/dev/null || true
-sleep 0.5
+# 2. Remove only THIS binary's stale entry (not all apps' permissions)
+sqlite3 "$TCC_DB" "DELETE FROM access WHERE service='$SERVICE' AND client='$BINARY';" 2>/dev/null || true
 
-# 3. Restart tccd
+# 3. Restart tccd so it drops any cached state for the old entry
 killall tccd 2>/dev/null || true
 sleep 1
 
