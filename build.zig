@@ -352,6 +352,11 @@ fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
             .file = b.path("src/mic_permission_macos.m"),
             .flags = &.{"-fobjc-arc"},
         });
+        // C helper for CGEventTap/CGEventPost keyboard input
+        exe.root_module.addCSourceFile(.{
+            .file = b.path("src/input_helpers_macos.c"),
+            .flags = &.{},
+        });
     } else {
         exe.linkSystemLibrary("libpipewire-0.3");
         exe.root_module.addCSourceFile(.{

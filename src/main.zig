@@ -420,13 +420,13 @@ pub fn main() !void {
         return;
     }
 
-    // Initialize evdev input handler (if --trigger specified, skip in dry-run)
+    // Initialize input handler (if --trigger specified, skip in dry-run)
     var input_handler: ?InputHandler = null;
     var type_callback: ?TypeCallback = null;
 
     if (!dry_run) {
         if (trigger_key) |tkey| {
-            std.debug.print("Initializing evdev input handler (trigger=keycode {d})\n", .{tkey});
+            std.debug.print("Initializing input handler (trigger=keycode {d})\n", .{tkey});
             input_handler = InputHandler.init(.{
                 .trigger_key = tkey,
                 .trigger_passthrough = trigger_passthrough,
@@ -434,7 +434,11 @@ pub fn main() !void {
                 .live_fn = &server_mod.setLive,
             }) catch |err| {
                 std.debug.print("Failed to init input handler: {}\n", .{err});
-                std.debug.print("Check: is user in 'input' group? Is /dev/uinput accessible?\n", .{});
+                if (builtin.os.tag == .macos) {
+                    std.debug.print("Check: is Accessibility permission granted in System Settings?\n", .{});
+                } else {
+                    std.debug.print("Check: is user in 'input' group? Is /dev/uinput accessible?\n", .{});
+                }
                 return;
             };
             type_callback = .{
