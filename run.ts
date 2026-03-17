@@ -359,6 +359,7 @@ export async function lint() {
 export async function ci() {
     const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
 
+    await ensureDeps();
     await ensureSubmodule();
     await ensureLfs();
     const ver = await version();
