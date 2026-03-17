@@ -37,6 +37,7 @@ async function ensureDepsMacOS(opts?: { metal?: boolean }) {
 
     const missing: string[] = [];
     if (!await which("git-lfs")) missing.push("git-lfs");
+    if (!await which("shellcheck")) missing.push("shellcheck");
     if (!await which("cmake") && opts?.metal) missing.push("cmake");
 
     if (missing.length > 0) {
