@@ -113,14 +113,11 @@ async function ensureSubmodule() {
 }
 
 async function ensureLfs() {
-    if (IS_MACOS) {
-        // macOS dylibs are built by CI, not committed to LFS — skip LFS check
-        return;
-    }
-    // Check if any versioned .so files are LFS pointers instead of real binaries
-    const { stdout } = await $`head -c 20 dist/lib/*.so.*.*.* 2>/dev/null || true`.quiet();
+    // Check if any versioned shared libs are LFS pointers instead of real binaries
+    const libGlob = IS_MACOS ? "dist/lib-macos/*.*.*.*.dylib" : "dist/lib/*.so.*.*.*";
+    const { stdout } = await $`head -c 20 ${libGlob} 2>/dev/null || true`.quiet();
     if (stdout.toString().includes("version https://git-lfs")) {
-        console.log("LFS pointer files detected in dist/lib/ — pulling real binaries...");
+        console.log(`LFS pointer files detected in ${LIB_DIR}/ — pulling real binaries...`);
         await $`git lfs install`;
         await $`git lfs pull`;
     }
@@ -162,15 +159,6 @@ function ensureBinary() {
     }
 }
 
-// On macOS, build Metal dylibs if dist/lib-macos/ is empty
-async function ensureMacOSLibs() {
-    if (!IS_MACOS) return;
-    const { exitCode } = await $`ls dist/lib-macos/*.dylib 2>/dev/null`.quiet().nothrow();
-    if (exitCode !== 0) {
-        console.log("macOS dylibs not found — building whisper.cpp with Metal...");
-        await rebuildWhisper();
-    }
-}
 
 // ─── Version ────────────────────────────────────────────────────────────────
 
@@ -189,7 +177,6 @@ export async function build() {
     await ensureDeps();
     await ensureSubmodule();
     await ensureLfs();
-    await ensureMacOSLibs();
     if (!process.env.CI) await ensureModels();
     const ver = await version();
     console.log(`Building v${ver}...`);
@@ -209,11 +196,7 @@ export async function rebuildWhisper(...args: string[]) {
     await ensureSubmodule();
     console.log(`Building whisper.cpp shared libs (${IS_MACOS ? "Metal" : "CUDA"})...`);
     await $`zig build rebuild-libs --prefix dist`;
-    if (IS_MACOS) {
-        console.log("Done. macOS dylibs in dist/lib-macos/ (not committed — built by CI).");
-    } else {
-        console.log("Done. Commit dist/lib/ to check in the updated libraries.");
-    }
+    console.log(`Done. Commit ${LIB_DIR}/ to check in the updated libraries.`);
 }
 
 export async function clean() {
@@ -331,7 +314,7 @@ async function distLinux() {
 
 async function distMacOS() {
     // Validate dylibs are real Mach-O binaries
-    const { stdout } = await $`file dist/lib-macos/*.dylib.*.*.*`.quiet().nothrow();
+    const { stdout } = await $`file dist/lib-macos/*.*.*.*.dylib`.quiet().nothrow();
     if (stdout.toString().length > 0) {
         const lines = stdout.toString().trim().split("\n");
         const bad = lines.filter(l => !l.includes("Mach-O"));
@@ -343,7 +326,7 @@ async function distMacOS() {
     }
 
     // Validate RPATH on dylibs uses @loader_path
-    const { stdout: rpathOut } = await $`otool -l dist/lib-macos/*.dylib.*.*.* 2>/dev/null | grep -A2 LC_RPATH`.quiet().nothrow();
+    const { stdout: rpathOut } = await $`otool -l dist/lib-macos/*.*.*.*.dylib 2>/dev/null | grep -A2 LC_RPATH`.quiet().nothrow();
     const rpathStr = rpathOut.toString();
     if (rpathStr.length > 0 && !rpathStr.includes("@loader_path")) {
         console.error("ERROR: dylibs missing @loader_path RPATH");
@@ -377,11 +360,7 @@ export async function ci() {
     const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
 
     await ensureSubmodule();
-    if (IS_MACOS) {
-        await ensureMacOSLibs();
-    } else {
-        await ensureLfs();
-    }
+    await ensureLfs();
     const ver = await version();
     console.log("Running lint...");
     await $`shellcheck dist/*.sh bootstrap.sh`;

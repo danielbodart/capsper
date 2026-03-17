@@ -10,7 +10,6 @@ capsper-linux-x86_64.tar.gz
 capsper-linux-x86_64.tar.gz.sha256
 capsper-macos-arm64.tar.gz
 capsper-macos-arm64.tar.gz.sha256
-dist/lib-macos/
 .claude/worktrees/
 .worktrees/
 test/results/vad-segments/

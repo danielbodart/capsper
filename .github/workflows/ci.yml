@@ -44,22 +44,17 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-          lfs: true
-      - name: Compute submodule cache key
-        run: echo "WHISPER_REV=$(git rev-parse HEAD:whisper.cpp)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: .git/lfs
+          key: lfs-macos-${{ hashFiles('dist/lib-macos/*.dylib', 'dist/models/ten-vad-ggml.bin') }}
+          restore-keys: lfs-macos-
+      - run: git lfs pull
       - uses: actions/cache@v4
         with:
           path: tools
           key: mise-tools-macos-${{ hashFiles('.mise.toml') }}
           restore-keys: mise-tools-macos-
-      - name: Cache Metal dylibs
-        uses: actions/cache@v4
-        with:
-          path: |
-            dist/lib-macos
-            .zig-cache/cmake-macos
-          key: metal-dylibs-${{ env.WHISPER_REV }}
-          restore-keys: metal-dylibs-
       - name: CI
         run: ./run ci
         env:
