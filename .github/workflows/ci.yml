@@ -5,7 +5,7 @@ on:
 permissions:
   contents: write
 jobs:
-  ci:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - name: Install system deps
@@ -25,7 +25,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: tools
-          key: mise-tools-${{ hashFiles('.mise.toml') }}
+          key: mise-tools-linux-${{ hashFiles('.mise.toml') }}
+          restore-keys: mise-tools-linux-
       - name: CI
         run: ./run ci
         env:
@@ -34,4 +35,38 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: capsper-linux-x86_64
+          path: dist/
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          lfs: true
+      - name: Compute submodule cache key
+        run: echo "WHISPER_REV=$(git rev-parse HEAD:whisper.cpp)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: tools
+          key: mise-tools-macos-${{ hashFiles('.mise.toml') }}
+          restore-keys: mise-tools-macos-
+      - name: Cache Metal dylibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist/lib-macos
+            .zig-cache/cmake-macos
+          key: metal-dylibs-${{ env.WHISPER_REV }}
+          restore-keys: metal-dylibs-
+      - name: CI
+        run: ./run ci
+        env:
+          CI: "true"
+          NO_CREATE_RELEASE: "true"
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capsper-macos-arm64
           path: dist/

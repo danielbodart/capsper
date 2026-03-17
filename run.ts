@@ -373,6 +373,8 @@ export async function lint() {
 }
 
 export async function ci() {
+    const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
+
     await ensureSubmodule();
     if (IS_MACOS) {
         await ensureMacOSLibs();
@@ -389,9 +391,23 @@ export async function ci() {
     await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe ${cpuFlag}`;
     await dist();
     if (process.env.GH_TOKEN) {
-        const commitMsg = (await $`git log -1 --format=%B`.quiet()).text().trim();
-        console.log(`Creating release v${ver}...`);
-        await $`gh release create v${ver} ${TARBALL} ${TARBALL}.sha256 --title v${ver} --notes ${commitMsg}`;
+        if (noCreateRelease) {
+            console.log(`Uploading assets to release v${ver}...`);
+            for (let attempt = 1; attempt <= 10; attempt++) {
+                const { exitCode } = await $`gh release upload v${ver} ${TARBALL} ${TARBALL}.sha256 --clobber`.nothrow();
+                if (exitCode === 0) break;
+                if (attempt === 10) {
+                    console.error(`Failed to upload after ${attempt} attempts`);
+                    process.exit(1);
+                }
+                console.log(`Release not ready yet (attempt ${attempt}/10), waiting 30s...`);
+                await Bun.sleep(30_000);
+            }
+        } else {
+            const commitMsg = (await $`git log -1 --format=%B`.quiet()).text().trim();
+            console.log(`Creating release v${ver}...`);
+            await $`gh release create v${ver} ${TARBALL} ${TARBALL}.sha256 --title v${ver} --notes ${commitMsg}`;
+        }
     }
 }
 
