@@ -354,8 +354,8 @@ async function distMacOS() {
     await Bun.write("dist/VERSION", ver);
 
     // Create tarball with lib-macos/ renamed to lib/ for consistent RPATH
+    await $`rm -rf /tmp/capsper-dist-macos`;
     await $`mkdir -p /tmp/capsper-dist-macos`;
-    await $`rm -rf /tmp/capsper-dist-macos/*`;
     await $`cp -r dist/bin /tmp/capsper-dist-macos/`;
     await $`cp -r dist/lib-macos /tmp/capsper-dist-macos/lib`;
     await $`cp -r dist/models /tmp/capsper-dist-macos/`;
