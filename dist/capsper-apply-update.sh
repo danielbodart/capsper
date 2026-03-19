@@ -34,6 +34,20 @@ main() {
         rm -f "$recordings_dir"/*.wav "$recordings_dir"/*.log 2>/dev/null || true
     fi
 
+    # Symlink shared models (e.g. whisper) into the new release so the binary
+    # can find them via its default relative path (bin/../models/).
+    local shared_models_dir="$INSTALL_DIR/models"
+    local release_models_dir="$release_dir/models"
+    if [ -d "$shared_models_dir" ] && [ -d "$release_models_dir" ]; then
+        for model in "$shared_models_dir"/*; do
+            [ -f "$model" ] || continue
+            local name
+            name=$(basename "$model")
+            [ -e "$release_models_dir/$name" ] && continue
+            ln -sf "$model" "$release_models_dir/$name"
+        done
+    fi
+
     # Atomic symlink swap: ln creates new symlink, mv atomically replaces via rename(2)
     ln -sfn "releases/$pending" "$INSTALL_DIR/current.tmp"
     mv -T "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
