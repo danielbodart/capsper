@@ -9,6 +9,10 @@ const TenVadNative = vad_mod.TenVadNative;
 const VadBackend = vad_mod.VadBackend;
 const VadFilter = vad_mod.VadFilter;
 const Pipeline = @import("pipeline.zig").Pipeline;
+const asr_mod = @import("asr_backend.zig");
+const AsrBackend = asr_mod.AsrBackend;
+const AsrInstance = asr_mod.AsrInstance;
+const sherpa_c = if (build_options.asr_sherpa) @import("sherpa_c.zig") else struct {};
 const server_mod = @import("server.zig");
 const Server = server_mod.Server;
 const InputMode = server_mod.InputMode;
@@ -30,6 +34,8 @@ pub fn main() !void {
 
     var model_path: [:0]const u8 = "../models/ggml-large-v3-turbo-q5_0.bin";
     var model_path_is_default = true;
+    const AsrChoice = enum { whisper, sherpa };
+    var asr_choice: AsrChoice = .whisper;
     const VadChoice = enum { ten, silero, ten_native };
     var vad_choice: VadChoice = .silero;
     var port: u16 = 43007;
@@ -183,6 +189,18 @@ pub fn main() !void {
                     return;
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--asr")) {
+            i += 1;
+            if (i < args.len) {
+                if (std.mem.eql(u8, args[i], "whisper")) {
+                    asr_choice = .whisper;
+                } else if (std.mem.eql(u8, args[i], "sherpa")) {
+                    asr_choice = .sherpa;
+                } else {
+                    std.debug.print("Invalid --asr value '{s}', expected 'whisper' or 'sherpa'\n", .{args[i]});
+                    return;
+                }
+            }
         } else {
             printUsage();
             return;
@@ -219,21 +237,87 @@ pub fn main() !void {
     };
     defer if (resolved_model_path.ptr != model_path.ptr) allocator.free(resolved_model_path);
 
-    // Load whisper model
-    std.debug.print("Loading model: {s}\n", .{resolved_model_path});
-    var cparams = c.whisper_context_default_params();
-    cparams.use_gpu = true;
-    cparams.flash_attn = false;
-    cparams.dtw_token_timestamps = true;
-    cparams.dtw_aheads_preset = c.WHISPER_AHEADS_LARGE_V3_TURBO;
-
-    const ctx = c.whisper_init_from_file_with_params(resolved_model_path.ptr, cparams) orelse {
-        std.debug.print("Failed to load model\n", .{});
+    // Validate sherpa build support
+    if (asr_choice == .sherpa and !build_options.asr_sherpa) {
+        std.debug.print("Error: --asr sherpa requires building with -Dasr-sherpa=true\n", .{});
         return;
-    };
-    defer c.whisper_free(ctx);
+    }
 
-    if (!requireGpu()) std.process.exit(1);
+    // Load ASR model
+    var whisper_ctx: ?*c.whisper_context = null;
+    var sherpa_recognizer: if (build_options.asr_sherpa) ?*const sherpa_c.SherpaOnnxOnlineRecognizer else ?*const anyopaque = null;
+
+    switch (asr_choice) {
+        .whisper => {
+            std.debug.print("Loading whisper model: {s}\n", .{resolved_model_path});
+            var cparams = c.whisper_context_default_params();
+            cparams.use_gpu = true;
+            cparams.flash_attn = false;
+            cparams.dtw_token_timestamps = true;
+            cparams.dtw_aheads_preset = c.WHISPER_AHEADS_LARGE_V3_TURBO;
+
+            whisper_ctx = c.whisper_init_from_file_with_params(resolved_model_path.ptr, cparams) orelse {
+                std.debug.print("Failed to load whisper model\n", .{});
+                return;
+            };
+
+            if (!requireGpu()) std.process.exit(1);
+        },
+        .sherpa => {
+            if (!build_options.asr_sherpa) unreachable;
+            std.debug.print("Loading sherpa-onnx model from: {s}\n", .{resolved_model_path});
+
+            // Build paths to encoder/decoder/joiner/tokens within the model directory.
+            // Support both naming conventions: encoder.onnx and encoder.int8.onnx
+            const encoder_path = findModelFile(allocator, resolved_model_path, "encoder") orelse {
+                std.debug.print("Failed to find encoder model in {s}\n", .{resolved_model_path});
+                return;
+            };
+            defer allocator.free(encoder_path);
+            const decoder_path = findModelFile(allocator, resolved_model_path, "decoder") orelse {
+                std.debug.print("Failed to find decoder model in {s}\n", .{resolved_model_path});
+                return;
+            };
+            defer allocator.free(decoder_path);
+            const joiner_path = findModelFile(allocator, resolved_model_path, "joiner") orelse {
+                std.debug.print("Failed to find joiner model in {s}\n", .{resolved_model_path});
+                return;
+            };
+            defer allocator.free(joiner_path);
+            const tokens_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "tokens.txt" }) catch {
+                std.debug.print("Failed to build sherpa model paths\n", .{});
+                return;
+            };
+            defer allocator.free(tokens_path);
+
+            var config: sherpa_c.SherpaOnnxOnlineRecognizerConfig = std.mem.zeroes(sherpa_c.SherpaOnnxOnlineRecognizerConfig);
+            config.feat_config.sample_rate = 16000;
+            config.feat_config.feature_dim = 80;
+            config.model_config.transducer.encoder = encoder_path.ptr;
+            config.model_config.transducer.decoder = decoder_path.ptr;
+            config.model_config.transducer.joiner = joiner_path.ptr;
+            config.model_config.tokens = tokens_path.ptr;
+            config.model_config.num_threads = 4;
+            config.model_config.provider = "cuda";
+            config.model_config.debug = if (verbose) 1 else 0;
+            config.decoding_method = "greedy_search";
+            config.enable_endpoint = 0; // our VAD handles segmentation
+
+            sherpa_recognizer = sherpa_c.SherpaOnnxCreateOnlineRecognizer(&config) orelse {
+                std.debug.print("Failed to create sherpa-onnx recognizer. Check model files in {s}\n", .{resolved_model_path});
+                return;
+            };
+            std.debug.print("Sherpa-onnx recognizer created successfully\n", .{});
+        },
+    }
+    defer if (whisper_ctx) |ctx| c.whisper_free(ctx);
+    defer {
+        if (build_options.asr_sherpa) {
+            if (@as(?*const sherpa_c.SherpaOnnxOnlineRecognizer, sherpa_recognizer)) |rec| {
+                sherpa_c.SherpaOnnxDestroyOnlineRecognizer(rec);
+            }
+        }
+    }
 
     // Load VAD backend
     var silero_vad: SileroVad = undefined;
@@ -289,33 +373,37 @@ pub fn main() !void {
         .ten_native => ten_vad_native.deinit(),
     };
 
-    // Tokenize domain terms (requires whisper context)
+    // Tokenize domain terms (requires whisper context — skip for sherpa)
     var prompt_tokens: []c.whisper_token = &.{};
     if (domain_terms_path) |dpath| {
-        const terms_file = std.fs.cwd().openFile(dpath, .{}) catch |err| {
-            std.debug.print("Failed to open domain terms file '{s}': {}\n", .{ dpath, err });
-            return;
-        };
-        defer terms_file.close();
+        if (asr_choice != .whisper) {
+            std.debug.print("Warning: --domain-terms ignored for --asr {s} (whisper-only feature)\n", .{@tagName(asr_choice)});
+        } else if (whisper_ctx) |ctx| {
+            const terms_file = std.fs.cwd().openFile(dpath, .{}) catch |err| {
+                std.debug.print("Failed to open domain terms file '{s}': {}\n", .{ dpath, err });
+                return;
+            };
+            defer terms_file.close();
 
-        const terms_raw = terms_file.readToEndAlloc(allocator, 8192) catch |err| {
-            std.debug.print("Failed to read domain terms file: {}\n", .{err});
-            return;
-        };
-        defer allocator.free(terms_raw);
+            const terms_raw = terms_file.readToEndAlloc(allocator, 8192) catch |err| {
+                std.debug.print("Failed to read domain terms file: {}\n", .{err});
+                return;
+            };
+            defer allocator.free(terms_raw);
 
-        // Null-terminate for whisper_tokenize (C API)
-        const terms_text = try allocator.dupeZ(u8, terms_raw);
-        defer allocator.free(terms_text);
+            // Null-terminate for whisper_tokenize (C API)
+            const terms_text = try allocator.dupeZ(u8, terms_raw);
+            defer allocator.free(terms_text);
 
-        var token_buf: [224]c.whisper_token = undefined;
-        const n_tokens = c.whisper_tokenize(ctx, terms_text.ptr, &token_buf, token_buf.len);
-        if (n_tokens < 0) {
-            std.debug.print("Failed to tokenize domain terms (file may be too long or contain invalid text)\n", .{});
-            return;
+            var token_buf: [224]c.whisper_token = undefined;
+            const n_tokens = c.whisper_tokenize(ctx, terms_text.ptr, &token_buf, token_buf.len);
+            if (n_tokens < 0) {
+                std.debug.print("Failed to tokenize domain terms (file may be too long or contain invalid text)\n", .{});
+                return;
+            }
+            prompt_tokens = try allocator.dupe(c.whisper_token, token_buf[0..@intCast(n_tokens)]);
+            std.debug.print("Domain terms: {d} tokens from {s}\n", .{ n_tokens, dpath });
         }
-        prompt_tokens = try allocator.dupe(c.whisper_token, token_buf[0..@intCast(n_tokens)]);
-        std.debug.print("Domain terms: {d} tokens from {s}\n", .{ n_tokens, dpath });
     }
     defer if (prompt_tokens.len > 0) allocator.free(prompt_tokens);
 
@@ -352,6 +440,10 @@ pub fn main() !void {
 
     // --transcribe: batch transcription using whisper_full (non-streaming) and exit
     if (transcribe_file) |tfile| {
+        const ctx = whisper_ctx orelse {
+            std.debug.print("Error: --transcribe requires whisper backend (--asr whisper)\n", .{});
+            return;
+        };
         const samples = loadWav(allocator, tfile) catch |err| {
             std.debug.print("Failed to load WAV file '{s}': {}\n", .{ tfile, err });
             return;
@@ -384,6 +476,24 @@ pub fn main() !void {
         return;
     }
 
+    // Build ASR backend union
+    const asr_backend: AsrBackend = switch (asr_choice) {
+        .whisper => .{ .whisper = .{
+            .ctx = whisper_ctx orelse {
+                std.debug.print("Error: whisper model failed to load\n", .{});
+                return;
+            },
+            .prompt_tokens = prompt_tokens,
+        } },
+        .sherpa => .{ .sherpa = if (build_options.asr_sherpa) .{
+            .recognizer = @as(?*const sherpa_c.SherpaOnnxOnlineRecognizer, sherpa_recognizer) orelse {
+                std.debug.print("Error: sherpa recognizer failed to load\n", .{});
+                return;
+            },
+        } else .{} },
+    };
+    std.debug.print("ASR backend: {s}\n", .{asr_backend.name()});
+
     // --stream-wav: feed WAV through the streaming pipeline (VAD → speech_buf → transcribe → trim)
     // Same code path as live PipeWire/TCP but with deterministic byte-for-byte audio delivery.
     // Opens the WAV file directly and seeks past the header — the ChunkedReader reads
@@ -408,7 +518,7 @@ pub fn main() !void {
         const resolved_min_silence_ms2 = min_silence_ms orelse defaults.min_silence_ms;
         const resolved_min_silence_bytes2: usize = @as(usize, resolved_min_silence_ms2) * 32000 / 1000;
 
-        var server2 = Server.init(allocator, ctx, vad_backend, 0, .tcp, null, 0, verbose, false, null, prompt_tokens, drop_terms, null, 1.0, true, resolved_threshold2, resolved_threshold_off2, resolved_min_silence_bytes2, max_tokens_per_second);
+        var server2 = Server.init(allocator, asr_backend, vad_backend, 0, .tcp, null, 0, verbose, false, null, drop_terms, null, 1.0, true, resolved_threshold2, resolved_threshold_off2, resolved_min_silence_bytes2, max_tokens_per_second);
         server_mod.setLive(true);
         server2.handleConnection(file.handle, 1, null) catch |err| {
             std.debug.print("Stream error: {}\n", .{err});
@@ -480,10 +590,13 @@ pub fn main() !void {
         };
         defer allocator.free(samples);
 
-        var pipeline = try Pipeline.init(allocator, ctx, .{}, 4, verbose, prompt_tokens);
-        defer pipeline.deinit();
+        var asr_inst = AsrInstance.create(asr_backend, allocator, verbose, max_tokens_per_second) catch |err| {
+            std.debug.print("Warning: warmup failed to create ASR instance: {}\n", .{err});
+            break :warmup;
+        };
+        defer asr_inst.deinit(allocator);
 
-        if (try pipeline.transcribe(samples, true, null)) |result| {
+        if (try asr_inst.transcribe(samples, true)) |result| {
             std.debug.print("Warmup result: \"{s}\"\n", .{result.text});
             allocator.free(result.text);
             allocator.free(result.words);
@@ -525,10 +638,23 @@ pub fn main() !void {
     std.debug.print("VAD: backend={s}  onset={d:.2}  offset={d:.2}  min_silence={d}ms\n", .{
         vad_backend.name(), resolved_threshold, resolved_threshold_off, resolved_min_silence_ms,
     });
-    var server = Server.init(allocator, ctx, vad_backend, port, input_mode, pw_target, audio_channel, verbose, low_latency, type_callback, prompt_tokens, drop_terms, recorder, pw_gain, no_auto_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes, max_tokens_per_second);
+    var server = Server.init(allocator, asr_backend, vad_backend, port, input_mode, pw_target, audio_channel, verbose, low_latency, type_callback, drop_terms, recorder, pw_gain, no_auto_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes, max_tokens_per_second);
     try server.run();
 }
 
+/// Find a sherpa model file in a directory, trying "name.int8.onnx" then "name.onnx".
+fn findModelFile(allocator: std.mem.Allocator, dir: [:0]const u8, comptime name: []const u8) ?[:0]const u8 {
+    // Try name.int8.onnx first (preferred — quantized, uses tensor cores)
+    const int8_path = std.fs.path.joinZ(allocator, &.{ dir, name ++ ".int8.onnx" }) catch return null;
+    if (std.fs.cwd().access(int8_path, .{})) |_| {
+        return int8_path;
+    } else |_| {
+        allocator.free(int8_path);
+    }
+
+    // Fall back to name.onnx
+    return std.fs.path.joinZ(allocator, &.{ dir, name ++ ".onnx" }) catch null;
+}
 fn requireGpu() bool {
     const dev_count = c.ggml_backend_dev_count();
     var i: usize = 0;

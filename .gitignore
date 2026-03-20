@@ -1,5 +1,9 @@
 dist/bin/
 dist/models/ggml-large-v3-turbo-q5_0.bin
+dist/models/sherpa-nemotron-en/
+dist/models/sherpa-nemotron-600m/
+dist/models/sherpa-nemotron-600m-int8/
+zig-out/
 dist/VERSION
 .zig-cache/
 whisper.cpp/build-zig/

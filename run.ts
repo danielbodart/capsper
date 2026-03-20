@@ -8,6 +8,8 @@ process.env.FORCE_COLOR = "1";
 const IS_MACOS = process.platform === "darwin";
 const BINARY = "./dist/bin/capsper";
 const MODEL = "dist/models/ggml-large-v3-turbo-q5_0.bin";
+const SHERPA_MODEL_DIR = "dist/models/sherpa-nemotron-600m-int8";
+const SHERPA_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-2026-01-14.tar.bz2";
 const SCRIPT_DIR = import.meta.dir;
 const TARBALL = IS_MACOS ? "capsper-macos-arm64.tar.gz" : "capsper-linux-x86_64.tar.gz";
 const LIB_DIR = IS_MACOS ? "dist/lib-macos" : "dist/lib";
@@ -149,6 +151,25 @@ async function ensureModels() {
 
     console.log("Downloading Whisper model...");
     await $`curl -L --progress-bar -o ${MODEL} https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin`;
+}
+
+async function ensureSherpaModels() {
+    if (existsSync(join(SHERPA_MODEL_DIR, "encoder.onnx"))) return;
+
+    console.log("Missing model: Sherpa-onnx NeMo streaming transducer");
+    if (!await confirm("Download now?")) {
+        console.error("Model required for --asr sherpa. Download manually from:");
+        console.error(`  ${SHERPA_MODEL_URL}`);
+        process.exit(1);
+    }
+
+    console.log("Downloading sherpa-onnx NeMo streaming model...");
+    await $`mkdir -p dist/models`;
+    await $`curl -L --progress-bar -o /tmp/sherpa-nemo-streaming.tar.bz2 ${SHERPA_MODEL_URL}`;
+    await $`tar xf /tmp/sherpa-nemo-streaming.tar.bz2 -C dist/models/`;
+    await $`mv dist/models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-2026-01-14 ${SHERPA_MODEL_DIR}`;
+    await $`rm /tmp/sherpa-nemo-streaming.tar.bz2`;
+    console.log(`Sherpa model installed to ${SHERPA_MODEL_DIR}`);
 }
 
 function ensureBinary() {
@@ -398,6 +419,10 @@ async function printVersion() {
     console.log(await version());
 }
 
+export async function downloadSherpaModel() {
+    await ensureSherpaModels();
+}
+
 const commands: Record<string, Function> = {
     dev, build, clean, setup, test, lint, dist, ci, version: printVersion,
     "short-test": shortTest,
@@ -406,6 +431,7 @@ const commands: Record<string, Function> = {
     "slow-test": slowTest,
     "vad-test": vadTest,
     "rebuild-whisper": rebuildWhisper,
+    "download-sherpa-model": downloadSherpaModel,
 };
 
 const command = process.argv[2] || "dev";

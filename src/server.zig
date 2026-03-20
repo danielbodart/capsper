@@ -1,9 +1,10 @@
 const std = @import("std");
-const c = @import("whisper_c.zig");
 const vad_mod = @import("vad.zig");
 const VadBackend = vad_mod.VadBackend;
 const VadFilter = vad_mod.VadFilter;
-const Pipeline = @import("pipeline.zig").Pipeline;
+const asr_mod = @import("asr_backend.zig");
+const AsrBackend = asr_mod.AsrBackend;
+const AsrInstance = asr_mod.AsrInstance;
 const AudioCapture = @import("audio_capture_platform.zig").AudioCapture;
 const AutoGain = @import("auto_gain.zig").AutoGain;
 const utils = @import("utils.zig");
@@ -169,7 +170,7 @@ pub const InputMode = enum { tcp, local };
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
-    ctx: *c.whisper_context,
+    asr_backend: AsrBackend,
     vad_backend: VadBackend,
     port: u16,
     input_mode: InputMode,
@@ -178,7 +179,6 @@ pub const Server = struct {
     verbose: bool,
     low_latency: bool,
     type_callback: ?TypeCallback,
-    prompt_tokens: []const c.whisper_token,
     drop_terms: []const []const u8,
     recorder: ?*Recorder,
     initial_gain: f32,
@@ -190,7 +190,7 @@ pub const Server = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        ctx: *c.whisper_context,
+        asr_backend: AsrBackend,
         vad_backend: VadBackend,
         port: u16,
         input_mode: InputMode,
@@ -199,7 +199,6 @@ pub const Server = struct {
         verbose: bool,
         low_latency: bool,
         type_callback: ?TypeCallback,
-        prompt_tokens: []const c.whisper_token,
         drop_terms: []const []const u8,
         recorder: ?*Recorder,
         initial_gain: f32,
@@ -211,7 +210,7 @@ pub const Server = struct {
     ) Server {
         return .{
             .allocator = allocator,
-            .ctx = ctx,
+            .asr_backend = asr_backend,
             .vad_backend = vad_backend,
             .port = port,
             .input_mode = input_mode,
@@ -220,7 +219,6 @@ pub const Server = struct {
             .verbose = verbose,
             .low_latency = low_latency,
             .type_callback = type_callback,
-            .prompt_tokens = prompt_tokens,
             .drop_terms = drop_terms,
             .recorder = recorder,
             .initial_gain = initial_gain,
@@ -322,9 +320,8 @@ pub const Server = struct {
     }
 
     pub fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
-        var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4, self.verbose, self.prompt_tokens);
-        pipeline.max_tokens_per_second = self.max_tokens_per_second;
-        defer pipeline.deinit();
+        var asr = try AsrInstance.create(self.asr_backend, self.allocator, self.verbose, self.max_tokens_per_second);
+        defer asr.deinit(self.allocator);
 
         var auto_gain = AutoGain{ .current_gain = self.initial_gain };
 
@@ -373,7 +370,7 @@ pub const Server = struct {
                 // VadFilter onset edge: idle → speaking
                 if (!was_triggered and vad_filter.triggered and vad_state == .idle) {
                     vad_state = .speaking;
-                    pipeline.resetSegment();
+                    asr.resetSegment();
                     try speech_buf.appendSlice(self.allocator, audio);
                     bytes_since_last_cycle += audio.len;
                     var ts_buf: [32]u8 = undefined;
@@ -408,7 +405,7 @@ pub const Server = struct {
                     }
                     if (speech_buf.items.len >= min_transcribe_bytes) {
                         cycle_count += 1;
-                        const flush_emit = try self.transcribeAndEmit(&pipeline, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "vad-flush");
+                        const flush_emit = try self.transcribeAndEmit(asr, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "vad-flush");
                         if (flush_emit.emitted and ptt_tracking_press_ns != 0) {
                             std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
                             ptt_tracking_press_ns = 0;
@@ -416,7 +413,7 @@ pub const Server = struct {
                     }
                     var ts_buf: [32]u8 = undefined;
                     std.debug.print("[{s}s] flush → idle\n", .{formatAudioTime(&ts_buf, total_audio_bytes)});
-                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter);
+                    self.resetUtterance(asr, &speech_buf, &speech_trim_total, &vad_filter);
                     vad_state = .idle;
                     cycle_count = 0;
                     bytes_since_last_cycle = 0;
@@ -438,14 +435,14 @@ pub const Server = struct {
                     // Flush active speech immediately on PTT release
                     if (speech_buf.items.len >= min_transcribe_bytes) {
                         cycle_count += 1;
-                        const flush_emit = try self.transcribeAndEmit(&pipeline, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "ptt-release");
+                        const flush_emit = try self.transcribeAndEmit(asr, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "ptt-release");
                         if (flush_emit.emitted and ptt_tracking_press_ns != 0) {
                             std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
                         }
                     }
                     var ts_buf: [32]u8 = undefined;
                     std.debug.print("[{s}s] flush → idle\n", .{formatAudioTime(&ts_buf, total_audio_bytes)});
-                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter);
+                    self.resetUtterance(asr, &speech_buf, &speech_trim_total, &vad_filter);
                 } else {
                     speech_trim_total += speech_buf.items.len;
                     speech_buf.clearRetainingCapacity();
@@ -512,12 +509,12 @@ pub const Server = struct {
                 reader.logSummary();
                 if (vad_state == .speaking and speech_buf.items.len >= min_transcribe_bytes) {
                     cycle_count += 1;
-                    const flush_emit = try self.transcribeAndEmit(&pipeline, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "client-eof");
+                    const flush_emit = try self.transcribeAndEmit(asr, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "client-eof");
                     if (flush_emit.emitted and ptt_tracking_press_ns != 0) {
                         std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
                         ptt_tracking_press_ns = 0;
                     }
-                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter);
+                    self.resetUtterance(asr, &speech_buf, &speech_trim_total, &vad_filter);
                 }
                 if (self.recorder) |rec| rec.endRecording() catch |err| {
                     std.debug.print("[rec] write error: {}\n", .{err});
@@ -530,7 +527,7 @@ pub const Server = struct {
             if (vad_state == .speaking and bytes_since_last_cycle >= transcribe_interval_bytes) {
                 bytes_since_last_cycle = 0;
                 cycle_count += 1;
-                const emit_result = try self.transcribeAndEmit(&pipeline, speech_buf.items, false, output_fd, total_audio_bytes, type_cb, cycle_count, "speaking");
+                const emit_result = try self.transcribeAndEmit(asr, speech_buf.items, false, output_fd, total_audio_bytes, type_cb, cycle_count, "speaking");
                 if (emit_result.emitted and ptt_tracking_press_ns != 0) {
                     std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
                     ptt_tracking_press_ns = 0;
@@ -539,7 +536,7 @@ pub const Server = struct {
                 // Rate limit recovery: decoder went haywire, discard its output
                 // and reset to just the untranscribed audio after last_attend_frame.
                 if (emit_result.rate_limited) {
-                    const keep_from = if (pipeline.last_attend_frame) |laf|
+                    const keep_from = if (asr.lastAttendFrame()) |laf|
                         @min(laf * 640, speech_buf.items.len)
                     else
                         0;
@@ -549,7 +546,7 @@ pub const Server = struct {
                     }
                     speech_trim_total += keep_from;
                     speech_buf.items.len = keep_bytes;
-                    pipeline.resetSegment();
+                    asr.resetSegment();
                     var ts_buf3: [32]u8 = undefined;
                     std.debug.print("[{s}s] RATE RESET: kept {d}ms of untranscribed audio, dropped {d}ms\n", .{
                         formatAudioTime(&ts_buf3, total_audio_bytes),
@@ -573,7 +570,7 @@ pub const Server = struct {
                         trimmed * 1000 / 32000,
                         cycle_count,
                     });
-                    try pipeline.handleTrim(trimmed);
+                    try asr.handleTrim(trimmed);
                 }
             }
         }
@@ -585,7 +582,7 @@ pub const Server = struct {
 
     fn transcribeAndEmit(
         self: *Server,
-        pipeline: *Pipeline,
+        asr: AsrInstance,
         speech_buf: []const u8,
         flush: bool,
         output_fd: posix.fd_t,
@@ -599,9 +596,9 @@ pub const Server = struct {
         const samples = try utils.pcmToFloat(self.allocator, speech_buf);
         defer self.allocator.free(samples);
 
-        const result = try pipeline.transcribe(samples, flush, null) orelse {
-            if (pipeline.rate_limited) {
-                pipeline.rate_limited = false;
+        const result = try asr.transcribe(samples, flush) orelse {
+            if (asr.isRateLimited()) {
+                asr.clearRateLimited();
                 if (self.verbose) {
                     var ts_buf: [32]u8 = undefined;
                     const ts = formatAudioTime(&ts_buf, total_audio_bytes);
@@ -659,7 +656,7 @@ pub const Server = struct {
         defer self.allocator.free(delta);
 
         emitDelta(output_fd, total_audio_bytes, delta, type_cb, self.recorder) catch return error.BrokenPipe;
-        try pipeline.commitTokens(result.tokens, result.token_frames);
+        try asr.commitTokens(result.tokens, result.token_frames);
 
         if (self.verbose) {
             var ts_buf: [32]u8 = undefined;
@@ -679,13 +676,13 @@ pub const Server = struct {
 
     fn resetUtterance(
         self: *Server,
-        pipeline: *Pipeline,
+        asr: AsrInstance,
         speech_buf: *std.ArrayListUnmanaged(u8),
         speech_trim_total: *usize,
         vad_filter: *VadFilter,
     ) void {
         _ = self;
-        pipeline.resetSegment();
+        asr.resetSegment();
         vad_filter.reset();
         speech_trim_total.* += speech_buf.items.len;
         speech_buf.clearRetainingCapacity();

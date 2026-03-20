@@ -7,8 +7,10 @@ pub fn build(b: *std.Build) void {
 
     // --- Build options ---
     const version_str = b.option([]const u8, "version", "Version string") orelse "0.0.0";
+    const asr_sherpa = b.option(bool, "asr-sherpa", "Include sherpa-onnx ASR backend") orelse false;
     const options = b.addOptions();
     options.addOption([]const u8, "version", version_str);
+    options.addOption(bool, "asr_sherpa", asr_sherpa);
 
     // --- Shared build config ---
     const ten_vad_flags: []const []const u8 = &.{};
@@ -27,6 +29,14 @@ pub fn build(b: *std.Build) void {
     addTenVad(b, exe, ten_vad_flags);
     addPlatformDeps(b, exe, is_macos);
     addWhisperLibs(b, exe, is_macos);
+
+    // Sherpa-onnx: optional ASR backend (pre-built shared libs in dist/lib/)
+    if (asr_sherpa) {
+        exe.root_module.addIncludePath(b.path("dist/include/sherpa-onnx"));
+        exe.linkSystemLibrary("sherpa-onnx-c-api");
+        exe.linkSystemLibrary("onnxruntime");
+    }
+
     exe.linkLibC();
     b.installArtifact(exe);
 
