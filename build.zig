@@ -160,6 +160,13 @@ fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
             .file = b.path("src/input_helpers_macos.c"),
             .flags = &.{},
         });
+        // CoreML inference bridge for Nemotron RNNT
+        exe.linkFramework("CoreML");
+        exe.linkFramework("Foundation");
+        exe.root_module.addCSourceFile(.{
+            .file = b.path("src/coreml_helpers.m"),
+            .flags = &.{"-fobjc-arc"},
+        });
     } else {
         exe.linkSystemLibrary("libpipewire-0.3");
         exe.root_module.addCSourceFile(.{
