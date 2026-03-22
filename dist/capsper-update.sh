@@ -9,6 +9,8 @@ set -euo pipefail
 REPO="danielbodart/capsper"
 ASSET="capsper-linux-x86_64.tar.gz"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
+HF_REPO="danielbodart/nemotron-speech-600m-onnx"
+HF_BASE="https://huggingface.co/${HF_REPO}/resolve/main"
 TMP_DIR=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -17,6 +19,35 @@ trap cleanup EXIT
 
 current_version() {
     cat "$INSTALL_DIR/current/VERSION" 2>/dev/null || echo "unknown"
+}
+
+detect_model_variant() {
+    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+        echo "fp16"
+    elif [ "$(uname -m)" = "arm64" ] && [ "$(uname -s)" = "Darwin" ]; then
+        echo "fp16"
+    else
+        echo "int8"
+    fi
+}
+
+download_nemotron_model() {
+    local target_dir="$1"
+    mkdir -p "$target_dir"
+
+    local variant
+    variant=$(detect_model_variant)
+    echo "Downloading Nemotron model ($variant)..."
+
+    curl -fsSL -o "$target_dir/encoder_model.onnx" "$HF_BASE/$variant/encoder_model.onnx" || return 1
+    curl -fsSL -o "$target_dir/encoder_model.onnx.data" "$HF_BASE/$variant/encoder_model.onnx.data" || return 1
+    curl -fsSL -o "$target_dir/decoder_model.onnx" "$HF_BASE/$variant/decoder_model.onnx" || return 1
+    curl -fsSL -o "$target_dir/decoder_model.onnx.data" "$HF_BASE/$variant/decoder_model.onnx.data" || return 1
+    curl -fsSL -o "$target_dir/filterbank.bin" "$HF_BASE/shared/filterbank.bin" || return 1
+    curl -fsSL -o "$target_dir/tokens.txt" "$HF_BASE/shared/tokens.txt" || return 1
+    curl -fsSL -o "$target_dir/config.json" "$HF_BASE/config.json" || return 1
+
+    echo "Nemotron model downloaded ($variant)."
 }
 
 main() {
@@ -82,6 +113,12 @@ main() {
             chmod +x "$INSTALL_DIR/$script"
         fi
     done
+
+    # Download Nemotron model if not present (first update from whisper → nemotron)
+    local model_dir="$INSTALL_DIR/models/nemotron"
+    if [ ! -f "$model_dir/encoder_model.onnx" ]; then
+        download_nemotron_model "$model_dir"
+    fi
 
     # Clean up old releases (keep current + previous + newly staged)
     local keep_current keep_previous

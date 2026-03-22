@@ -6,8 +6,6 @@ set -euo pipefail
 # Only acts if .update-pending exists.
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
-HF_REPO="danielbodart/nemotron-speech-600m-onnx"
-HF_BASE="https://huggingface.co/${HF_REPO}/resolve/main"
 
 main() {
     local pending_file="$INSTALL_DIR/.update-pending"
@@ -52,15 +50,6 @@ main() {
     fi
 
     # Download Nemotron model if not present (first update from whisper → nemotron)
-    if [ ! -d "$shared_models_dir/nemotron" ] || [ ! -f "$shared_models_dir/nemotron/encoder_model.onnx" ]; then
-        echo "Downloading Nemotron model (first-time migration from whisper)..."
-        download_nemotron_model "$shared_models_dir"
-        # Symlink into release
-        if [ -d "$shared_models_dir/nemotron" ]; then
-            ln -sf "$shared_models_dir/nemotron" "$release_models_dir/nemotron" 2>/dev/null || true
-        fi
-    fi
-
     # Migrate systemd service file: update model path, strip removed flags
     migrate_service_config
 
@@ -71,41 +60,6 @@ main() {
     rm -f "$pending_file"
 
     echo "Applied update: $pending"
-}
-
-detect_model_variant() {
-    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-        echo "fp16"
-    elif [ "$(uname -m)" = "arm64" ] && [ "$(uname -s)" = "Darwin" ]; then
-        echo "fp16"
-    else
-        echo "int8"
-    fi
-}
-
-download_nemotron_model() {
-    local models_dir="$1"
-    local target_dir="$models_dir/nemotron"
-    mkdir -p "$target_dir"
-
-    local variant
-    variant=$(detect_model_variant)
-    echo "Detected hardware → $variant precision"
-
-    if ! command -v curl &>/dev/null; then
-        echo "WARNING: curl not found, cannot download model" >&2
-        return 1
-    fi
-
-    curl -fsSL -o "$target_dir/encoder_model.onnx" "$HF_BASE/$variant/encoder_model.onnx" || return 1
-    curl -fsSL -o "$target_dir/encoder_model.onnx.data" "$HF_BASE/$variant/encoder_model.onnx.data" || return 1
-    curl -fsSL -o "$target_dir/decoder_model.onnx" "$HF_BASE/$variant/decoder_model.onnx" || return 1
-    curl -fsSL -o "$target_dir/decoder_model.onnx.data" "$HF_BASE/$variant/decoder_model.onnx.data" || return 1
-    curl -fsSL -o "$target_dir/filterbank.bin" "$HF_BASE/shared/filterbank.bin" || return 1
-    curl -fsSL -o "$target_dir/tokens.txt" "$HF_BASE/shared/tokens.txt" || return 1
-    curl -fsSL -o "$target_dir/config.json" "$HF_BASE/config.json" || return 1
-
-    echo "Nemotron model downloaded ($variant)."
 }
 
 migrate_service_config() {
