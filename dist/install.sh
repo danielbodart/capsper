@@ -106,7 +106,8 @@ download_models() {
     mkdir -p "$target_dir"
 
     # Check if already downloaded
-    if [ -f "$target_dir/encoder_model.onnx" ] && [ -f "$target_dir/decoder_model.onnx" ]; then
+    if [ -f "$target_dir/encoder_model.onnx" ] && [ -f "$target_dir/decoder_model.onnx" ] \
+       && [ -f "$target_dir/filterbank.bin" ] && [ -f "$target_dir/tokens.txt" ]; then
         echo "Nemotron model already present."
         return
     fi

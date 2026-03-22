@@ -114,9 +114,10 @@ main() {
         fi
     done
 
-    # Download Nemotron model if not present (first update from whisper → nemotron)
+    # Download Nemotron model if not present or incomplete
     local model_dir="$INSTALL_DIR/models/nemotron"
-    if [ ! -f "$model_dir/encoder_model.onnx" ]; then
+    if [ ! -f "$model_dir/encoder_model.onnx" ] || [ ! -f "$model_dir/decoder_model.onnx" ] \
+       || [ ! -f "$model_dir/filterbank.bin" ] || [ ! -f "$model_dir/tokens.txt" ]; then
         download_nemotron_model "$model_dir"
     fi
 
