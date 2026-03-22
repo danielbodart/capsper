@@ -49,7 +49,16 @@ main() {
         done
     fi
 
-    # Download Nemotron model if not present (first update from whisper → nemotron)
+    # Abort if Nemotron model is missing — the update script should have downloaded it.
+    # Don't attempt download here: ExecStartPre has a 90s timeout, model is ~500MB.
+    local model_dir="$INSTALL_DIR/models/nemotron"
+    if [ ! -f "$model_dir/encoder_model.onnx" ] || [ ! -f "$model_dir/decoder_model.onnx" ] \
+       || [ ! -f "$model_dir/filterbank.bin" ] || [ ! -f "$model_dir/tokens.txt" ]; then
+        echo "ERROR: Nemotron model not found in $model_dir" >&2
+        echo "Run: ~/.local/share/capsper/capsper-update.sh" >&2
+        exit 1
+    fi
+
     # Migrate systemd service file: update model path, strip removed flags
     migrate_service_config
 

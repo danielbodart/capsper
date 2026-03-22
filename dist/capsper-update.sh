@@ -31,6 +31,14 @@ detect_model_variant() {
     fi
 }
 
+ensure_nemotron_model() {
+    local model_dir="$INSTALL_DIR/models/nemotron"
+    if [ ! -f "$model_dir/encoder_model.onnx" ] || [ ! -f "$model_dir/decoder_model.onnx" ] \
+       || [ ! -f "$model_dir/filterbank.bin" ] || [ ! -f "$model_dir/tokens.txt" ]; then
+        download_nemotron_model "$model_dir"
+    fi
+}
+
 download_nemotron_model() {
     local target_dir="$1"
     mkdir -p "$target_dir"
@@ -77,6 +85,9 @@ main() {
         local pending
         pending=$(cat "$INSTALL_DIR/.update-pending")
         if [ "$pending" = "$latest_tag" ]; then
+            # Ensure model is downloaded even if a previous run staged the
+            # release but was missing the download logic (whisper → nemotron transition)
+            ensure_nemotron_model
             echo "Update $latest_tag already staged, pending restart."
             exit 0
         fi
@@ -115,11 +126,7 @@ main() {
     done
 
     # Download Nemotron model if not present or incomplete
-    local model_dir="$INSTALL_DIR/models/nemotron"
-    if [ ! -f "$model_dir/encoder_model.onnx" ] || [ ! -f "$model_dir/decoder_model.onnx" ] \
-       || [ ! -f "$model_dir/filterbank.bin" ] || [ ! -f "$model_dir/tokens.txt" ]; then
-        download_nemotron_model "$model_dir"
-    fi
+    ensure_nemotron_model
 
     # Clean up old releases (keep current + previous + newly staged)
     local keep_current keep_previous
