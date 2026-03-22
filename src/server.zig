@@ -1,9 +1,7 @@
 const std = @import("std");
-const c = @import("whisper_c.zig");
-const vad_mod = @import("vad.zig");
-const VadBackend = vad_mod.VadBackend;
-const VadFilter = vad_mod.VadFilter;
-const Pipeline = @import("pipeline.zig").Pipeline;
+const asr_mod = @import("asr_backend.zig");
+const AsrConfig = asr_mod.AsrConfig;
+const AsrPipeline = asr_mod.AsrPipeline;
 const AudioCapture = @import("audio_capture_platform.zig").AudioCapture;
 const AutoGain = @import("auto_gain.zig").AutoGain;
 const utils = @import("utils.zig");
@@ -28,11 +26,16 @@ var capture_ptr = std.atomic.Value(?*AudioCapture).init(null);
 var use_cork_mode = std.atomic.Value(bool).init(false);
 
 // PTT latency tracking — set by input thread via setLive(), read by server loop.
-var ptt_press_ns = std.atomic.Value(i128).init(0);
-var pw_connect_done_ns = std.atomic.Value(i128).init(0);
+// Use i64 (not i128) for atomic compatibility — nanoTimestamp fits in i64 for ~292 years.
+var ptt_press_ns = std.atomic.Value(i64).init(0);
+var pw_connect_done_ns = std.atomic.Value(i64).init(0);
+
+fn nanoTimestampI64() i64 {
+    return @intCast(std.time.nanoTimestamp());
+}
 
 pub fn setLive(live: bool) void {
-    if (live) ptt_press_ns.store(std.time.nanoTimestamp(), .monotonic);
+    if (live) ptt_press_ns.store(nanoTimestampI64(), .monotonic);
     is_live.store(live, .monotonic);
     if (capture_ptr.load(.monotonic)) |cap| {
         if (use_cork_mode.load(.monotonic)) {
@@ -40,7 +43,7 @@ pub fn setLive(live: bool) void {
         } else {
             cap.setActive(live);
         }
-        if (live) pw_connect_done_ns.store(std.time.nanoTimestamp(), .monotonic);
+        if (live) pw_connect_done_ns.store(nanoTimestampI64(), .monotonic);
     }
 }
 
@@ -56,8 +59,7 @@ pub const TypeCallback = struct {
 
 /// Chunked audio reader. Buffers raw reads and yields exactly `chunk_size`
 /// bytes at a time, ensuring every transport (TCP, PipeWire pipe, etc.)
-/// delivers identical chunk boundaries to the VAD and server loop.
-/// This makes VAD edge detection deterministic regardless of read() granularity.
+/// delivers identical chunk boundaries to the server loop.
 const ChunkedReader = struct {
     fd: posix.fd_t,
     chunk_size: usize,
@@ -156,21 +158,11 @@ const ChunkedReader = struct {
     }
 };
 
-// Streaming constants (S16_LE at 16kHz = 32000 bytes/sec)
-const bytes_per_second: usize = 16000 * 2; // sample_rate * bytes_per_sample
-const transcribe_interval_bytes: usize = bytes_per_second; // 1s — re-transcribe cadence during speech
-const max_buffer_bytes: usize = bytes_per_second * 30; // 30s — sliding window cap
-const min_transcribe_bytes: usize = bytes_per_second / 2; // 0.5s — minimum audio worth transcribing
-
-// VadFilter drives all segmentation. No hasSpeech polling — only two states.
-const VadState = enum { idle, speaking };
-
 pub const InputMode = enum { tcp, local };
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
-    ctx: *c.whisper_context,
-    vad_backend: VadBackend,
+    asr_config: AsrConfig,
     port: u16,
     input_mode: InputMode,
     pw_target: ?[:0]const u8,
@@ -178,20 +170,14 @@ pub const Server = struct {
     verbose: bool,
     low_latency: bool,
     type_callback: ?TypeCallback,
-    prompt_tokens: []const c.whisper_token,
     drop_terms: []const []const u8,
     recorder: ?*Recorder,
     initial_gain: f32,
     no_auto_gain: bool,
-    vad_threshold: f32,
-    vad_threshold_off: f32,
-    min_silence_bytes: usize,
-    max_tokens_per_second: usize,
 
     pub fn init(
         allocator: std.mem.Allocator,
-        ctx: *c.whisper_context,
-        vad_backend: VadBackend,
+        asr_config: AsrConfig,
         port: u16,
         input_mode: InputMode,
         pw_target: ?[:0]const u8,
@@ -199,20 +185,14 @@ pub const Server = struct {
         verbose: bool,
         low_latency: bool,
         type_callback: ?TypeCallback,
-        prompt_tokens: []const c.whisper_token,
         drop_terms: []const []const u8,
         recorder: ?*Recorder,
         initial_gain: f32,
         no_auto_gain: bool,
-        vad_threshold: f32,
-        vad_threshold_off: f32,
-        min_silence_bytes: usize,
-        max_tokens_per_second: usize,
     ) Server {
         return .{
             .allocator = allocator,
-            .ctx = ctx,
-            .vad_backend = vad_backend,
+            .asr_config = asr_config,
             .port = port,
             .input_mode = input_mode,
             .pw_target = pw_target,
@@ -220,15 +200,10 @@ pub const Server = struct {
             .verbose = verbose,
             .low_latency = low_latency,
             .type_callback = type_callback,
-            .prompt_tokens = prompt_tokens,
             .drop_terms = drop_terms,
             .recorder = recorder,
             .initial_gain = initial_gain,
             .no_auto_gain = no_auto_gain,
-            .vad_threshold = vad_threshold,
-            .vad_threshold_off = vad_threshold_off,
-            .min_silence_bytes = min_silence_bytes,
-            .max_tokens_per_second = max_tokens_per_second,
         };
     }
 
@@ -321,395 +296,163 @@ pub const Server = struct {
         };
     }
 
+    /// PTT-gated streaming loop. Audio chunks go directly to the pipeline
+    /// for incremental processing. No VAD — PTT press/release drives segmentation.
     pub fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
-        var pipeline = try Pipeline.init(self.allocator, self.ctx, .{}, 4, self.verbose, self.prompt_tokens);
-        pipeline.max_tokens_per_second = self.max_tokens_per_second;
-        defer pipeline.deinit();
+        var asr = try AsrPipeline.init(self.allocator, self.asr_config, self.verbose);
+        defer asr.deinit();
 
         var auto_gain = AutoGain{ .current_gain = self.initial_gain };
 
-        var vad_filter = VadFilter.init(self.allocator, self.vad_backend, .{
-            .threshold = self.vad_threshold,
-            .threshold_off = self.vad_threshold_off,
-            .min_silence_bytes = self.min_silence_bytes,
-        });
-        defer vad_filter.deinit();
-
-        // Speech buffer — only contains audio during confirmed speech (after VadFilter onset).
-        // Never contains silence. Fed to pipeline.transcribe().
-        var speech_buf = std.ArrayListUnmanaged(u8){};
-        defer speech_buf.deinit(self.allocator);
-
-        var speech_trim_total: usize = 0; // cumulative bytes trimmed (for absolute frame calc)
-
-        // Real audio always has a noise floor — exact digital zero is never real
-        // audio. Discard all-zero chunks to strip synthetic silence (PipeWire
-        // pipeline latency, loopback teardown, etc.) regardless of transport.
-        var reader = ChunkedReader.init(audio_fd, vad_filter.chunk_size, true);
-        var vad_state: VadState = .idle;
-        var bytes_since_last_cycle: usize = 0;
-        var cycle_count: usize = 0;
+        // 560ms chunks = 56 mel frames × 160 hop × 2 bytes/sample = 17920 bytes
+        const streaming_chunk_bytes: usize = 17920;
+        var reader = ChunkedReader.init(audio_fd, streaming_chunk_bytes, true);
         var was_live: bool = is_live.load(.monotonic);
-        var ptt_tracking_press_ns: i128 = 0;
-        var total_audio_bytes: usize = 0; // audio-position clock (32000 bytes/sec)
-        var audio_hash: u32 = 0; // running FNV hash of all audio bytes for determinism checks
+        var total_audio_bytes: usize = 0;
 
         while (true) {
             const audio = try reader.read();
             const n = audio.len;
-            total_audio_bytes += n;
 
-            // --- Audio input processing ---
-            if (n > 0) {
-                if (self.recorder) |rec| rec.recordPcm(audio);
-
-                // Running hash of all audio bytes for determinism verification
-                audio_hash = hashAudio(audio_hash, audio);
-
-                // VadFilter: run on raw audio for edge detection (handles any size via pcm_partial)
-                const was_triggered = vad_filter.triggered;
-                const vad_event = vad_filter.filterAudio(audio);
-
-                // VadFilter onset edge: idle → speaking
-                if (!was_triggered and vad_filter.triggered and vad_state == .idle) {
-                    vad_state = .speaking;
-                    pipeline.resetSegment();
-                    try speech_buf.appendSlice(self.allocator, audio);
-                    bytes_since_last_cycle += audio.len;
-                    var ts_buf: [32]u8 = undefined;
-                    std.debug.print("[{s}s] idle → speaking (buf={d} hash=0x{x:0>8})\n", .{ formatAudioTime(&ts_buf, total_audio_bytes), speech_buf.items.len, audio_hash });
-                    if (self.recorder) |rec| rec.logEvent(total_audio_bytes, "idle → speaking");
-                } else if (vad_state == .speaking) {
-                    try speech_buf.appendSlice(self.allocator, audio);
-                    bytes_since_last_cycle += audio.len;
-                }
-
-                // Auto-gain: only in PipeWire mode (measures capture audio, adjusts gain)
-                if (vad_state == .speaking and !self.no_auto_gain) {
-                    if (capture_ptr.load(.monotonic)) |cap| {
-                        const rms = utils.channelRms(audio, 1, 0);
-                        if (auto_gain.update(rms)) |new_gain| {
-                            cap.setGain(new_gain);
-                            if (self.verbose) {
-                                std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
-                            }
+            // EOF
+            if (n == 0) {
+                if (was_live) {
+                    // Flush any remaining audio
+                    const samples = try utils.pcmToFloat(self.allocator, &.{});
+                    defer self.allocator.free(samples);
+                    if (try asr.transcribe(samples, true, null)) |result| {
+                        defer self.allocator.free(result.text);
+                        defer self.allocator.free(result.words);
+                        defer self.allocator.free(result.tokens);
+                        defer self.allocator.free(result.token_frames);
+                        if (result.text.len > 0 and !result.was_rewind) {
+                            self.emitDelta(output_fd, total_audio_bytes, result.text, type_cb) catch {};
                         }
                     }
+                    asr.resetSegment();
                 }
-
-                // VadFilter offset edge: speaking → flush → idle
-                if (was_triggered and !vad_filter.triggered and vad_state == .speaking) {
-                    // Trim trailing silence, but keep 375ms safety buffer for whisper context
-                    const safety_buffer: usize = 12000; // 375ms at 32000 bytes/sec
-                    const silence_trim = vad_event.trailing_silence_bytes;
-                    const trim_amount = if (silence_trim > safety_buffer) silence_trim - safety_buffer else 0;
-                    if (trim_amount > 0 and trim_amount < speech_buf.items.len) {
-                        speech_buf.items.len -= trim_amount;
-                    }
-                    if (speech_buf.items.len >= min_transcribe_bytes) {
-                        cycle_count += 1;
-                        const flush_emit = try self.transcribeAndEmit(&pipeline, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "vad-flush");
-                        if (flush_emit.emitted and ptt_tracking_press_ns != 0) {
-                            std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
-                            ptt_tracking_press_ns = 0;
-                        }
-                    }
-                    var ts_buf: [32]u8 = undefined;
-                    std.debug.print("[{s}s] flush → idle\n", .{formatAudioTime(&ts_buf, total_audio_bytes)});
-                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter);
-                    vad_state = .idle;
-                    cycle_count = 0;
-                    bytes_since_last_cycle = 0;
-                    continue;
-                }
-            }
-
-            const client_closed = (n == 0);
-
-            // --- PTT gating ---
-            const live = is_live.load(.monotonic);
-
-            // PTT release edge
-            if (was_live and !live) {
-                was_live = false;
-                ptt_tracking_press_ns = 0;
-                if (self.recorder) |rec| rec.logEvent(total_audio_bytes, "PTT released");
-                if (vad_state == .speaking) {
-                    // Flush active speech immediately on PTT release
-                    if (speech_buf.items.len >= min_transcribe_bytes) {
-                        cycle_count += 1;
-                        const flush_emit = try self.transcribeAndEmit(&pipeline, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "ptt-release");
-                        if (flush_emit.emitted and ptt_tracking_press_ns != 0) {
-                            std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
-                        }
-                    }
-                    var ts_buf: [32]u8 = undefined;
-                    std.debug.print("[{s}s] flush → idle\n", .{formatAudioTime(&ts_buf, total_audio_bytes)});
-                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter);
-                } else {
-                    speech_trim_total += speech_buf.items.len;
-                    speech_buf.clearRetainingCapacity();
-                    vad_filter.reset();
-                }
-                if (self.recorder) |rec| rec.endRecording() catch |err| {
-                    std.debug.print("[rec] write error: {}\n", .{err});
-                };
-                vad_state = .idle;
-                cycle_count = 0;
-                bytes_since_last_cycle = 0;
-                continue;
-            }
-
-            // Not live and idle: discard, wait for key press
-            if (!live and vad_state == .idle) {
-                if (speech_buf.items.len > 0) {
-                    speech_trim_total += speech_buf.items.len;
-                    speech_buf.clearRetainingCapacity();
-                    vad_filter.reset();
-                }
-                if (client_closed) return;
-                continue;
-            }
-
-            // PTT press edge: go live
-            if (!was_live and live) {
-                const live_detected_ns = std.time.nanoTimestamp();
-                var ts_buf2: [32]u8 = undefined;
-                const ts2 = formatAudioTime(&ts_buf2, total_audio_bytes);
-                const press = ptt_press_ns.load(.monotonic);
-                const connect = pw_connect_done_ns.load(.monotonic);
-                if (press > 0 and connect > 0) {
-                    ptt_tracking_press_ns = press;
-                    std.debug.print("[{s}s] LIVE (press→connect={d:.0}ms connect→audio={d:.0}ms)\n", .{
-                        ts2, nsToF64Ms(connect - press), nsToF64Ms(live_detected_ns - connect),
-                    });
-                } else {
-                    std.debug.print("[{s}s] LIVE\n", .{ts2});
-                }
-                vad_state = .idle;
-                cycle_count = 0;
-                bytes_since_last_cycle = 0;
-                was_live = true;
-                vad_filter.reset();
-                speech_trim_total += speech_buf.items.len;
-                speech_buf.clearRetainingCapacity();
-                if (self.recorder) |rec| {
-                    rec.startRecording();
-                    rec.logEvent(total_audio_bytes, "PTT pressed");
-                }
-            }
-
-            // --- Final flush on client disconnect (TCP EOF or PipeWire pipe close) ---
-            if (client_closed) {
-                var ts_eof: [32]u8 = undefined;
-                std.debug.print("[{s}s] EOF: vad={s} speech_buf={d}ms total_audio={d}ms hash=0x{x:0>8}\n", .{
-                    formatAudioTime(&ts_eof, total_audio_bytes),
-                    if (vad_state == .speaking) "speaking" else "idle",
-                    speech_buf.items.len * 1000 / 32000,
-                    total_audio_bytes * 1000 / 32000,
-                    audio_hash,
-                });
-                reader.logSummary();
-                if (vad_state == .speaking and speech_buf.items.len >= min_transcribe_bytes) {
-                    cycle_count += 1;
-                    const flush_emit = try self.transcribeAndEmit(&pipeline, speech_buf.items, true, output_fd, total_audio_bytes, type_cb, cycle_count, "client-eof");
-                    if (flush_emit.emitted and ptt_tracking_press_ns != 0) {
-                        std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
-                        ptt_tracking_press_ns = 0;
-                    }
-                    self.resetUtterance(&pipeline, &speech_buf, &speech_trim_total, &vad_filter);
-                }
-                if (self.recorder) |rec| rec.endRecording() catch |err| {
-                    std.debug.print("[rec] write error: {}\n", .{err});
-                };
                 std.debug.print("handleConnection returning (EOF path)\n", .{});
+                reader.logSummary();
                 return;
             }
 
-            // --- Periodic transcription during speech ---
-            if (vad_state == .speaking and bytes_since_last_cycle >= transcribe_interval_bytes) {
-                bytes_since_last_cycle = 0;
-                cycle_count += 1;
-                const emit_result = try self.transcribeAndEmit(&pipeline, speech_buf.items, false, output_fd, total_audio_bytes, type_cb, cycle_count, "speaking");
-                if (emit_result.emitted and ptt_tracking_press_ns != 0) {
-                    std.debug.print("  PTT first-emit: {d:.0}ms total\n", .{nsToF64Ms(std.time.nanoTimestamp() - ptt_tracking_press_ns)});
-                    ptt_tracking_press_ns = 0;
-                }
+            total_audio_bytes += n;
+            const live = is_live.load(.monotonic);
 
-                // Rate limit recovery: decoder went haywire, discard its output
-                // and reset to just the untranscribed audio after last_attend_frame.
-                if (emit_result.rate_limited) {
-                    const keep_from = if (pipeline.last_attend_frame) |laf|
-                        @min(laf * 640, speech_buf.items.len)
-                    else
-                        0;
-                    const keep_bytes = speech_buf.items.len - keep_from;
-                    if (keep_from > 0 and keep_bytes > 0) {
-                        std.mem.copyForwards(u8, speech_buf.items[0..keep_bytes], speech_buf.items[keep_from..speech_buf.items.len]);
+            // PTT release edge: flush + reset
+            if (was_live and !live) {
+                // Flush pipeline
+                const samples = try utils.pcmToFloat(self.allocator, audio);
+                defer self.allocator.free(samples);
+                if (try asr.transcribe(samples, true, null)) |result| {
+                    defer self.allocator.free(result.text);
+                    defer self.allocator.free(result.words);
+                    defer self.allocator.free(result.tokens);
+                    defer self.allocator.free(result.token_frames);
+                    if (result.text.len > 0 and !result.was_rewind) {
+                        self.emitDelta(output_fd, total_audio_bytes, result.text, type_cb) catch return error.BrokenPipe;
                     }
-                    speech_trim_total += keep_from;
-                    speech_buf.items.len = keep_bytes;
-                    pipeline.resetSegment();
-                    var ts_buf3: [32]u8 = undefined;
-                    std.debug.print("[{s}s] RATE RESET: kept {d}ms of untranscribed audio, dropped {d}ms\n", .{
-                        formatAudioTime(&ts_buf3, total_audio_bytes),
-                        keep_bytes * 1000 / 32000,
-                        keep_from * 1000 / 32000,
-                    });
-                    continue;
+                    if (self.verbose) {
+                        var ts_buf: [32]u8 = undefined;
+                        std.debug.print("[{s}s] PTT release — flush: \"{s}\" ({d:.0}ms)\n", .{
+                            formatAudioTime(&ts_buf, total_audio_bytes),
+                            utils.textPreview(result.text),
+                            result.timing.total_ms,
+                        });
+                    }
                 }
-
-                // Sliding window trim
-                const old_len = speech_buf.items.len;
-                utils.trimBuffer(&speech_buf, max_buffer_bytes);
-                const trimmed = old_len - speech_buf.items.len;
-                speech_trim_total += trimmed;
-                if (trimmed > 0) {
-                    var ts_buf2: [32]u8 = undefined;
-                    std.debug.print("[{s}s] TRIM: buf={d}ms→{d}ms trimmed={d}ms cycle={d}\n", .{
-                        formatAudioTime(&ts_buf2, total_audio_bytes),
-                        old_len * 1000 / 32000,
-                        speech_buf.items.len * 1000 / 32000,
-                        trimmed * 1000 / 32000,
-                        cycle_count,
-                    });
-                    try pipeline.handleTrim(trimmed);
-                }
+                asr.resetSegment();
+                if (self.recorder) |rec| rec.endRecording() catch {};
+                was_live = false;
+                continue;
             }
-        }
-    }
-    const TranscribeResult = struct {
-        emitted: bool,
-        rate_limited: bool = false,
-    };
 
-    fn transcribeAndEmit(
-        self: *Server,
-        pipeline: *Pipeline,
-        speech_buf: []const u8,
-        flush: bool,
-        output_fd: posix.fd_t,
-        total_audio_bytes: usize,
-        type_cb: ?TypeCallback,
-        cycle_count: usize,
-        state_name: []const u8,
-    ) !TranscribeResult {
-        if (speech_buf.len < min_transcribe_bytes) return .{ .emitted = false };
+            // Not live: discard audio
+            if (!live) {
+                was_live = false;
+                continue;
+            }
 
-        const samples = try utils.pcmToFloat(self.allocator, speech_buf);
-        defer self.allocator.free(samples);
-
-        const result = try pipeline.transcribe(samples, flush, null) orelse {
-            if (pipeline.rate_limited) {
-                pipeline.rate_limited = false;
+            // PTT press edge: start fresh
+            if (!was_live and live) {
+                asr.resetSegment();
+                was_live = true;
+                if (self.recorder) |rec| rec.startRecording();
                 if (self.verbose) {
                     var ts_buf: [32]u8 = undefined;
-                    const ts = formatAudioTime(&ts_buf, total_audio_bytes);
-                    std.debug.print("    [{s}s] cycle={d} RATE LIMITED buf={d}ms — decoder reset\n", .{
-                        ts, cycle_count, speech_buf.len * 1000 / 32000,
-                    });
+                    std.debug.print("[{s}s] PTT press — streaming start\n", .{formatAudioTime(&ts_buf, total_audio_bytes)});
                 }
-                return .{ .emitted = false, .rate_limited = true };
             }
-            if (self.verbose) {
-                var ts_buf: [32]u8 = undefined;
-                const ts = formatAudioTime(&ts_buf, total_audio_bytes);
-                std.debug.print("    [{s}s] cycle={d} NULL buf={d}ms\n", .{
-                    ts, cycle_count, speech_buf.len * 1000 / 32000,
-                });
-            }
-            return .{ .emitted = false };
-        };
-        defer self.allocator.free(result.text);
-        defer self.allocator.free(result.words);
-        defer self.allocator.free(result.tokens);
-        defer self.allocator.free(result.token_frames);
 
-        if (result.text.len == 0 or result.was_rewind) {
-            if (self.verbose) {
-                var ts_buf: [32]u8 = undefined;
-                const ts = formatAudioTime(&ts_buf, total_audio_bytes);
-                std.debug.print("    [{s}s] cycle={d} {s} buf={d}ms\n", .{
-                    ts, cycle_count, if (result.was_rewind) "REWIND" else "empty", speech_buf.len * 1000 / 32000,
-                });
-            }
-            return .{ .emitted = false };
-        }
+            // Live: process chunk
+            if (self.recorder) |rec| rec.recordPcm(audio);
 
-        // Drop terms: check if full result text matches any drop term
-        // Whisper prepends a leading space, so compare " " ++ term against result.text
-        if (self.drop_terms.len > 0) {
-            const text = result.text;
-            for (self.drop_terms) |term| {
-                // Match " <term>" (whisper's leading space + the drop term)
-                if (text.len == term.len + 1 and text[0] == ' ' and std.mem.eql(u8, text[1..], term)) {
-                    std.debug.print("  [drop] suppressed: \"{s}\"\n", .{text});
-                    return .{ .emitted = false };
+            // Auto-gain (PipeWire only)
+            if (!self.no_auto_gain) {
+                if (capture_ptr.load(.monotonic)) |cap| {
+                    const rms = utils.channelRms(audio, 1, 0);
+                    if (auto_gain.update(rms)) |new_gain| {
+                        cap.setGain(new_gain);
+                        if (self.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
+                    }
+                }
+            }
+
+            const samples = try utils.pcmToFloat(self.allocator, audio);
+            defer self.allocator.free(samples);
+
+            if (try asr.transcribe(samples, false, null)) |result| {
+                defer self.allocator.free(result.text);
+                defer self.allocator.free(result.words);
+                defer self.allocator.free(result.tokens);
+                defer self.allocator.free(result.token_frames);
+                if (result.text.len > 0 and !result.was_rewind) {
+                    // Drop terms: check if full result text matches any drop term
+                    if (!self.isDropTerm(result.text)) {
+                        self.emitDelta(output_fd, total_audio_bytes, result.text, type_cb) catch return error.BrokenPipe;
+                        if (self.verbose) {
+                            var ts_buf: [32]u8 = undefined;
+                            std.debug.print("    [{s}s] emit: \"{s}\" ({d:.0}ms)\n", .{
+                                formatAudioTime(&ts_buf, total_audio_bytes),
+                                utils.textPreview(result.text),
+                                result.timing.total_ms,
+                            });
+                        }
+                    }
                 }
             }
         }
-
-        const buf_duration_ms = speech_buf.len * 1000 / 32000;
-        const t = result.timing;
-
-        // Use result.text as-is: whisper BPE tokens include leading spaces for
-        // word-initial tokens. Continuation tokens (no space) should concatenate
-        // directly with the previous emission (e.g. "duplic" + "ation").
-        const delta = try self.allocator.dupe(u8, result.text);
-        defer self.allocator.free(delta);
-
-        emitDelta(output_fd, total_audio_bytes, delta, type_cb, self.recorder) catch return error.BrokenPipe;
-        try pipeline.commitTokens(result.tokens, result.token_frames);
-
-        if (self.verbose) {
-            var ts_buf: [32]u8 = undefined;
-            const ts = formatAudioTime(&ts_buf, total_audio_bytes);
-            std.debug.print("    [{s}s] cycle={d} {s} words={d} buf={d}ms | {s} state={d:.0}ms mel={d:.0}ms enc={d:.0}ms dec={d:.0}ms({d}tok/{s}) total={d:.0}ms EMIT\n", .{
-                ts, cycle_count, state_name, result.words.len, buf_duration_ms,
-                utils.textPreview(result.text), t.state_init_ms, t.mel_ms, t.encode_ms, t.decode_ms, t.tokens_generated, t.stop_reason, t.total_ms,
-            });
-        }
-
-        if (self.recorder) |rec| {
-            rec.logCycle(total_audio_bytes, cycle_count, state_name, buf_duration_ms, result.words.len, result.text);
-        }
-
-        return .{ .emitted = true };
     }
 
-    fn resetUtterance(
-        self: *Server,
-        pipeline: *Pipeline,
-        speech_buf: *std.ArrayListUnmanaged(u8),
-        speech_trim_total: *usize,
-        vad_filter: *VadFilter,
-    ) void {
-        _ = self;
-        pipeline.resetSegment();
-        vad_filter.reset();
-        speech_trim_total.* += speech_buf.items.len;
-        speech_buf.clearRetainingCapacity();
+    fn isDropTerm(self: *Server, text: []const u8) bool {
+        if (self.drop_terms.len == 0) return false;
+        for (self.drop_terms) |term| {
+            if (std.mem.eql(u8, text, term)) return true;
+            // Also match with leading space (some tokenizers prepend one)
+            if (text.len == term.len + 1 and text[0] == ' ' and std.mem.eql(u8, text[1..], term)) return true;
+        }
+        return false;
+    }
+
+    /// Write a timestamped delta to the output fd (or type callback) and log it.
+    fn emitDelta(self: *Server, output_fd: posix.fd_t, total_audio_bytes: usize, delta: []const u8, type_cb: ?TypeCallback) error{BrokenPipe}!void {
+        var ts_buf: [32]u8 = undefined;
+        const ts = formatAudioTime(&ts_buf, total_audio_bytes);
+
+        if (type_cb) |cb| {
+            // Inject text as keystrokes (evdev mode)
+            cb.call(delta);
+        } else {
+            // Write wire protocol to fd
+            _ = posix.write(output_fd, ts) catch return error.BrokenPipe;
+            _ = posix.write(output_fd, "\t") catch return error.BrokenPipe;
+            _ = posix.write(output_fd, delta) catch return error.BrokenPipe;
+            _ = posix.write(output_fd, "\n") catch return error.BrokenPipe;
+        }
+        std.debug.print("  [{s}s] >> {s}\n", .{ ts, delta });
+        if (self.recorder) |rec| rec.logEmit(delta);
     }
 };
-
-/// Simple FNV-1a hash for audio determinism verification.
-fn hashAudio(prev: u32, data: []const u8) u32 {
-    var h: u32 = if (prev == 0) 0x811c9dc5 else prev;
-    for (data) |b| {
-        h ^= b;
-        h *%= 0x01000193;
-    }
-    return h;
-}
-
-fn nsToF64Ms(ns: i128) f64 {
-    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-}
-
-fn msFromNs(start: i128) f64 {
-    const elapsed: i128 = std.time.nanoTimestamp() - start;
-    return @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
-}
 
 /// Format audio-position timestamp as "{s}.{tenths}" into buf.
 /// Uses total audio bytes received (at 32000 bytes/sec) instead of wall-clock,
@@ -717,23 +460,4 @@ fn msFromNs(start: i128) f64 {
 fn formatAudioTime(buf: []u8, total_audio_bytes: usize) []u8 {
     const elapsed_ms: u64 = total_audio_bytes * 1000 / 32000;
     return std.fmt.bufPrint(buf, "{d}.{d}", .{ elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch buf[0..3];
-}
-
-/// Write a timestamped delta to the output fd (or type callback) and log it.
-fn emitDelta(output_fd: posix.fd_t, total_audio_bytes: usize, delta: []const u8, type_cb: ?TypeCallback, recorder: ?*Recorder) error{BrokenPipe}!void {
-    var ts_buf: [32]u8 = undefined;
-    const ts = formatAudioTime(&ts_buf, total_audio_bytes);
-
-    if (type_cb) |cb| {
-        // Inject text as keystrokes (evdev mode)
-        cb.call(delta);
-    } else {
-        // Write wire protocol to fd
-        _ = posix.write(output_fd, ts) catch return error.BrokenPipe;
-        _ = posix.write(output_fd, "\t") catch return error.BrokenPipe;
-        _ = posix.write(output_fd, delta) catch return error.BrokenPipe;
-        _ = posix.write(output_fd, "\n") catch return error.BrokenPipe;
-    }
-    std.debug.print("  [{s}s] >> {s}\n", .{ ts, delta });
-    if (recorder) |rec| rec.logEmit(delta);
 }

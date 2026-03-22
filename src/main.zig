@@ -1,14 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const c = @import("whisper_c.zig");
-const vad_mod = @import("vad.zig");
-const SileroVad = vad_mod.SileroVad;
-const TenVadGgml = vad_mod.TenVadGgml;
-const TenVadNative = vad_mod.TenVadNative;
-const VadBackend = vad_mod.VadBackend;
-const VadFilter = vad_mod.VadFilter;
-const Pipeline = @import("pipeline.zig").Pipeline;
+const ort_c = @import("ort_c.zig");
+const nemo_mel = @import("nemo_mel.zig");
+const nemotron_tokenizer = @import("tokenizer.zig");
+const ContextGraph = @import("context_graph.zig").ContextGraph;
+const asr_mod = @import("asr_backend.zig");
+const AsrConfig = asr_mod.AsrConfig;
+const AsrPipeline = asr_mod.AsrPipeline;
 const server_mod = @import("server.zig");
 const Server = server_mod.Server;
 const InputMode = server_mod.InputMode;
@@ -28,13 +27,9 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var model_path: [:0]const u8 = "../models/ggml-large-v3-turbo-q5_0.bin";
+    var model_path: [:0]const u8 = "../models/nemotron";
     var model_path_is_default = true;
-    const VadChoice = enum { ten, silero, ten_native };
-    var vad_choice: VadChoice = .silero;
     var port: u16 = 43007;
-    var warmup_file: ?[:0]const u8 = "jfk.wav";
-    var warmup_file_is_default = true;
     var input_mode: InputMode = .tcp;
     var pw_target: ?[:0]const u8 = null;
     var audio_channel: u32 = AudioCapture.default_channel;
@@ -45,19 +40,15 @@ pub fn main() !void {
     var dry_run: bool = false;
     var do_pw_detect: bool = false;
     var detect_duration: u32 = 5;
-    var domain_terms_path: ?[:0]const u8 = null;
     var drop_terms_path: ?[:0]const u8 = null;
     var record_dir: ?[:0]const u8 = null;
     var record_keep: usize = 10;
-    var transcribe_file: ?[:0]const u8 = null;
     var stream_wav_file: ?[:0]const u8 = null;
+    var transcribe_file: ?[:0]const u8 = null;
     var low_latency: bool = false;
     var pw_gain: f32 = 1.0;
-    var vad_threshold: ?f32 = null;
-    var vad_threshold_off: ?f32 = null;
-    var min_silence_ms: ?u32 = null;
     var no_auto_gain: bool = false;
-    var max_tokens_per_second: usize = 15;
+    var no_cuda: bool = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -79,14 +70,6 @@ pub fn main() !void {
                 std.log.warn("invalid --port value '{s}': {}, using default {d}", .{ args[i], err, 43007 });
                 break :blk 43007;
             };
-        } else if (std.mem.eql(u8, arg, "--warmup-file")) {
-            i += 1;
-            if (i < args.len) {
-                warmup_file = args[i];
-                warmup_file_is_default = false;
-            }
-        } else if (std.mem.eql(u8, arg, "--no-warmup")) {
-            warmup_file = null;
         } else if (std.mem.eql(u8, arg, "--input")) {
             i += 1;
             if (i < args.len) {
@@ -133,8 +116,15 @@ pub fn main() !void {
             i += 1;
             if (i < args.len) detect_duration = std.fmt.parseInt(u32, args[i], 10) catch 5;
         } else if (std.mem.eql(u8, arg, "--domain-terms")) {
+            // Deprecated: accept and skip for backwards compatibility with existing service files.
             i += 1;
-            if (i < args.len) domain_terms_path = args[i];
+            std.debug.print("Warning: --domain-terms is no longer supported and will be ignored\n", .{});
+        } else if (std.mem.eql(u8, arg, "--warmup-file")) {
+            // Deprecated: Nemotron doesn't need warmup. Accept and skip for backwards compatibility.
+            i += 1;
+            std.debug.print("Warning: --warmup-file is no longer supported and will be ignored\n", .{});
+        } else if (std.mem.eql(u8, arg, "--no-warmup")) {
+            // Deprecated: no-op (warmup was removed).
         } else if (std.mem.eql(u8, arg, "--drop-terms")) {
             i += 1;
             if (i < args.len) drop_terms_path = args[i];
@@ -144,45 +134,21 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--record-keep")) {
             i += 1;
             if (i < args.len) record_keep = std.fmt.parseInt(usize, args[i], 10) catch 10;
-        } else if (std.mem.eql(u8, arg, "--transcribe")) {
-            i += 1;
-            if (i < args.len) transcribe_file = args[i];
         } else if (std.mem.eql(u8, arg, "--stream-wav")) {
             i += 1;
             if (i < args.len) stream_wav_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--transcribe")) {
+            i += 1;
+            if (i < args.len) transcribe_file = args[i];
         } else if (std.mem.eql(u8, arg, "--pw-gain")) {
             i += 1;
             if (i < args.len) pw_gain = std.fmt.parseFloat(f32, args[i]) catch 1.0;
         } else if (std.mem.eql(u8, arg, "--low-latency")) {
             low_latency = true;
-        } else if (std.mem.eql(u8, arg, "--vad-threshold")) {
-            i += 1;
-            if (i < args.len) vad_threshold = std.fmt.parseFloat(f32, args[i]) catch null;
-        } else if (std.mem.eql(u8, arg, "--vad-threshold-off")) {
-            i += 1;
-            if (i < args.len) vad_threshold_off = std.fmt.parseFloat(f32, args[i]) catch null;
-        } else if (std.mem.eql(u8, arg, "--min-silence-ms")) {
-            i += 1;
-            if (i < args.len) min_silence_ms = std.fmt.parseInt(u32, args[i], 10) catch null;
         } else if (std.mem.eql(u8, arg, "--no-auto-gain")) {
             no_auto_gain = true;
-        } else if (std.mem.eql(u8, arg, "--max-tokens-per-sec")) {
-            i += 1;
-            if (i < args.len) max_tokens_per_second = std.fmt.parseInt(usize, args[i], 10) catch 15;
-        } else if (std.mem.eql(u8, arg, "--vad")) {
-            i += 1;
-            if (i < args.len) {
-                if (std.mem.eql(u8, args[i], "ten")) {
-                    vad_choice = .ten;
-                } else if (std.mem.eql(u8, args[i], "silero")) {
-                    vad_choice = .silero;
-                } else if (std.mem.eql(u8, args[i], "ten-native")) {
-                    vad_choice = .ten_native;
-                } else {
-                    std.debug.print("Invalid --vad value '{s}', expected 'ten', 'silero', or 'ten-native'\n", .{args[i]});
-                    return;
-                }
-            }
+        } else if (std.mem.eql(u8, arg, "--no-cuda")) {
+            no_cuda = true;
         } else {
             printUsage();
             return;
@@ -219,105 +185,93 @@ pub fn main() !void {
     };
     defer if (resolved_model_path.ptr != model_path.ptr) allocator.free(resolved_model_path);
 
-    // Load whisper model
-    std.debug.print("Loading model: {s}\n", .{resolved_model_path});
-    var cparams = c.whisper_context_default_params();
-    cparams.use_gpu = true;
-    cparams.flash_attn = false;
-    cparams.dtw_token_timestamps = true;
-    cparams.dtw_aheads_preset = c.WHISPER_AHEADS_LARGE_V3_TURBO;
+    // Load Nemotron model
+    std.debug.print("Loading Nemotron model from: {s}\n", .{resolved_model_path});
 
-    const ctx = c.whisper_init_from_file_with_params(resolved_model_path.ptr, cparams) orelse {
-        std.debug.print("Failed to load model\n", .{});
+    const api = ort_c.getApi();
+
+    // Create ORT environment
+    var nemo_env: ?*ort_c.OrtEnv = null;
+    try ort_c.check(api, api.CreateEnv.?(ort_c.ORT_LOGGING_LEVEL_WARNING, "nemotron", @ptrCast(&nemo_env)));
+
+    // Session options + CUDA
+    var session_opts: ?*ort_c.OrtSessionOptions = null;
+    try ort_c.check(api, api.CreateSessionOptions.?(&session_opts));
+    defer api.ReleaseSessionOptions.?(session_opts.?);
+
+    if (no_cuda) {
+        std.debug.print("Nemotron: using CPU (--no-cuda)\n", .{});
+    } else {
+        var cuda_opts: ort_c.OrtCUDAProviderOptions = std.mem.zeroes(ort_c.OrtCUDAProviderOptions);
+        const cuda_status = api.SessionOptionsAppendExecutionProvider_CUDA.?(session_opts.?, &cuda_opts);
+        if (cuda_status) |s| {
+            api.ReleaseStatus.?(s);
+            std.debug.print("Nemotron: using CPU\n", .{});
+        } else {
+            std.debug.print("Nemotron: using CUDA\n", .{});
+        }
+    }
+
+    // Load encoder
+    const enc_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "encoder_model.onnx" }) catch {
+        std.debug.print("Failed to build encoder model path\n", .{});
         return;
     };
-    defer c.whisper_free(ctx);
+    defer allocator.free(enc_path);
+    var nemo_enc_session: ?*ort_c.OrtSession = null;
+    try ort_c.check(api, api.CreateSession.?(nemo_env.?, enc_path.ptr, session_opts.?, @ptrCast(&nemo_enc_session)));
 
-    if (!requireGpu()) std.process.exit(1);
+    // Load decoder
+    const dec_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "decoder_model.onnx" }) catch {
+        std.debug.print("Failed to build decoder model path\n", .{});
+        return;
+    };
+    defer allocator.free(dec_path);
+    var nemo_dec_session: ?*ort_c.OrtSession = null;
+    try ort_c.check(api, api.CreateSession.?(nemo_env.?, dec_path.ptr, session_opts.?, @ptrCast(&nemo_dec_session)));
 
-    // Load VAD backend
-    var silero_vad: SileroVad = undefined;
-    var ten_vad_ggml: TenVadGgml = undefined;
-    var ten_vad_native: TenVadNative = undefined;
-    var vad_backend: VadBackend = undefined;
+    // Memory info
+    var nemo_mem_info: ?*ort_c.OrtMemoryInfo = null;
+    try ort_c.check(api, api.CreateCpuMemoryInfo.?(0, 0, @ptrCast(&nemo_mem_info)));
 
-    switch (vad_choice) {
-        .ten => {
-            const vad_rel_path: [:0]const u8 = "../models/ten-vad-ggml.bin";
-            const vad_path: [:0]const u8 = blk: {
-                if (exe_dir) |d| {
-                    break :blk std.fs.path.joinZ(allocator, &.{ d, vad_rel_path }) catch break :blk vad_rel_path;
-                }
-                break :blk vad_rel_path;
-            };
-            defer if (vad_path.ptr != vad_rel_path.ptr) allocator.free(vad_path);
-            std.debug.print("Loading VAD model (ten-vad): {s}\n", .{vad_path});
-            ten_vad_ggml = TenVadGgml.init(allocator, vad_path) catch |err| {
-                std.debug.print("Failed to init TEN-VAD: {}\n", .{err});
-                return;
-            };
-            vad_backend = .{ .ten_vad_ggml = &ten_vad_ggml };
-        },
-        .silero => {
-            const vad_rel_path: [:0]const u8 = "../models/ggml-silero-v5.1.2.bin";
-            const vad_path: [:0]const u8 = blk: {
-                if (exe_dir) |d| {
-                    break :blk std.fs.path.joinZ(allocator, &.{ d, vad_rel_path }) catch break :blk vad_rel_path;
-                }
-                break :blk vad_rel_path;
-            };
-            defer if (vad_path.ptr != vad_rel_path.ptr) allocator.free(vad_path);
-            std.debug.print("Loading VAD model (silero): {s}\n", .{vad_path});
-            silero_vad = SileroVad.init(vad_path) catch |err| {
-                std.debug.print("Failed to init Silero VAD: {}\n", .{err});
-                return;
-            };
-            vad_backend = .{ .silero = &silero_vad };
-        },
-        .ten_native => {
-            std.debug.print("Loading VAD (ten-native): prebuilt libten_vad.so (with pitch)\n", .{});
-            ten_vad_native = TenVadNative.init() catch |err| {
-                std.debug.print("Failed to init TEN-VAD native: {}\n", .{err});
-                return;
-            };
-            vad_backend = .{ .ten_native = &ten_vad_native };
-        },
-    }
-    defer switch (vad_choice) {
-        .ten => ten_vad_ggml.deinit(),
-        .silero => silero_vad.deinit(),
-        .ten_native => ten_vad_native.deinit(),
+    // Load filterbank
+    const fb_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "filterbank.bin" }) catch {
+        std.debug.print("Failed to build filterbank path\n", .{});
+        return;
+    };
+    defer allocator.free(fb_path);
+    const nemo_filterbank = nemo_mel.loadFilterbank(allocator, fb_path) catch |err| {
+        std.debug.print("Failed to load filterbank: {}\n", .{err});
+        return;
     };
 
-    // Tokenize domain terms (requires whisper context)
-    var prompt_tokens: []c.whisper_token = &.{};
-    if (domain_terms_path) |dpath| {
-        const terms_file = std.fs.cwd().openFile(dpath, .{}) catch |err| {
-            std.debug.print("Failed to open domain terms file '{s}': {}\n", .{ dpath, err });
-            return;
-        };
-        defer terms_file.close();
+    // Load token map
+    const tok_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "tokens.txt" }) catch {
+        std.debug.print("Failed to build tokens path\n", .{});
+        return;
+    };
+    defer allocator.free(tok_path);
+    const tok_file = std.fs.cwd().openFile(tok_path, .{}) catch |err| {
+        std.debug.print("Failed to open tokens.txt: {}\n", .{err});
+        return;
+    };
+    defer tok_file.close();
+    const nemo_tokens_data = tok_file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        std.debug.print("Failed to read tokens.txt: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(nemo_tokens_data);
+    var nemo_token_map = nemotron_tokenizer.loadTokenMap(nemo_tokens_data);
 
-        const terms_raw = terms_file.readToEndAlloc(allocator, 8192) catch |err| {
-            std.debug.print("Failed to read domain terms file: {}\n", .{err});
-            return;
-        };
-        defer allocator.free(terms_raw);
-
-        // Null-terminate for whisper_tokenize (C API)
-        const terms_text = try allocator.dupeZ(u8, terms_raw);
-        defer allocator.free(terms_text);
-
-        var token_buf: [224]c.whisper_token = undefined;
-        const n_tokens = c.whisper_tokenize(ctx, terms_text.ptr, &token_buf, token_buf.len);
-        if (n_tokens < 0) {
-            std.debug.print("Failed to tokenize domain terms (file may be too long or contain invalid text)\n", .{});
-            return;
-        }
-        prompt_tokens = try allocator.dupe(c.whisper_token, token_buf[0..@intCast(n_tokens)]);
-        std.debug.print("Domain terms: {d} tokens from {s}\n", .{ n_tokens, dpath });
+    std.debug.print("Nemotron model loaded successfully\n", .{});
+    defer {
+        if (nemo_dec_session) |s| api.ReleaseSession.?(s);
+        if (nemo_enc_session) |s| api.ReleaseSession.?(s);
+        if (nemo_mem_info) |m| api.ReleaseMemoryInfo.?(m);
+        if (nemo_env) |e| api.ReleaseEnv.?(e);
+        // filterbank: reinterpreted from u8, free the u8 allocation
+        allocator.free(@as([*]u8, @ptrCast(@constCast(nemo_filterbank.ptr)))[0 .. nemo_filterbank.len * @sizeOf(f32)]);
     }
-    defer if (prompt_tokens.len > 0) allocator.free(prompt_tokens);
 
     // Read drop terms file (newline-separated, one term per line)
     var drop_terms: []const []const u8 = &.{};
@@ -350,44 +304,49 @@ pub fn main() !void {
         if (drop_terms.len > 0) allocator.free(drop_terms);
     }
 
-    // --transcribe: batch transcription using whisper_full (non-streaming) and exit
-    if (transcribe_file) |tfile| {
-        const samples = loadWav(allocator, tfile) catch |err| {
-            std.debug.print("Failed to load WAV file '{s}': {}\n", .{ tfile, err });
-            return;
-        };
-        defer allocator.free(samples);
-
-        var params = c.whisper_full_default_params(c.WHISPER_SAMPLING_GREEDY);
-        params.language = "en";
-        params.n_threads = 4;
-        params.no_timestamps = true;
-        params.print_progress = false;
-        params.print_realtime = false;
-        params.print_special = false;
-        params.print_timestamps = false;
-
-        if (c.whisper_full(ctx, params, samples.ptr, @intCast(samples.len)) != 0) {
-            std.debug.print("Transcription failed\n", .{});
-            return;
+    // Build context graph for drop terms (filler suppression via negative bias)
+    var nemo_context_graph: ?*ContextGraph = null;
+    if (drop_terms.len > 0) {
+        var bias_scores = std.ArrayListUnmanaged(f32){};
+        defer bias_scores.deinit(allocator);
+        for (0..drop_terms.len) |_| {
+            try bias_scores.append(allocator, -4.0);
         }
 
-        const n_segments = c.whisper_full_n_segments(ctx);
-        var seg: c_int = 0;
-        while (seg < n_segments) : (seg += 1) {
-            const text = c.whisper_full_get_segment_text(ctx, seg);
-            if (text != null) {
-                _ = std.posix.write(1, std.mem.span(text)) catch {};
-            }
-        }
-        _ = std.posix.write(1, "\n") catch {};
-        return;
+        const cg = try allocator.create(ContextGraph);
+        cg.* = try ContextGraph.init(
+            allocator,
+            &nemo_token_map,
+            drop_terms,
+            bias_scores.items,
+            4.0, // context_score (base penalty magnitude)
+            2.0, // depth_scaling (TurboBias recommended for RNNT)
+            verbose,
+        );
+        nemo_context_graph = cg;
+        std.debug.print("Context graph: {d} suppression phrases\n", .{drop_terms.len});
     }
 
-    // --stream-wav: feed WAV through the streaming pipeline (VAD → speech_buf → transcribe → trim)
-    // Same code path as live PipeWire/TCP but with deterministic byte-for-byte audio delivery.
-    // Opens the WAV file directly and seeks past the header — the ChunkedReader reads
-    // 1024-byte chunks from the file fd identically to how it reads from a socket or pipe.
+    const asr_config: AsrConfig = .{
+        .api = api,
+        .enc_session = nemo_enc_session orelse {
+            std.debug.print("Error: nemotron encoder session failed to load\n", .{});
+            return;
+        },
+        .dec_session = nemo_dec_session orelse {
+            std.debug.print("Error: nemotron decoder session failed to load\n", .{});
+            return;
+        },
+        .mem_info = nemo_mem_info orelse {
+            std.debug.print("Error: nemotron memory info failed\n", .{});
+            return;
+        },
+        .filterbank = nemo_filterbank,
+        .token_map = &nemo_token_map,
+        .context_graph = nemo_context_graph,
+    };
+
+    // --stream-wav: feed WAV through the streaming pipeline (no PTT, no VAD)
     if (stream_wav_file) |swf| {
         const file = std.fs.cwd().openFile(swf, .{}) catch |err| {
             std.debug.print("Failed to open WAV file '{s}': {}\n", .{ swf, err });
@@ -401,19 +360,56 @@ pub fn main() !void {
             return;
         };
 
-        // Resolve VAD thresholds
-        const defaults = vad_backend.defaultThresholds();
-        const resolved_threshold2 = vad_threshold orelse defaults.onset;
-        const resolved_threshold_off2 = vad_threshold_off orelse defaults.offset;
-        const resolved_min_silence_ms2 = min_silence_ms orelse defaults.min_silence_ms;
-        const resolved_min_silence_bytes2: usize = @as(usize, resolved_min_silence_ms2) * 32000 / 1000;
-
-        var server2 = Server.init(allocator, ctx, vad_backend, 0, .tcp, null, 0, verbose, false, null, prompt_tokens, drop_terms, null, 1.0, true, resolved_threshold2, resolved_threshold_off2, resolved_min_silence_bytes2, max_tokens_per_second);
-        server_mod.setLive(true);
+        var server2 = Server.init(allocator, asr_config, 0, .tcp, null, 0, verbose, false, null, drop_terms, null, 1.0, true);
+        server_mod.is_live.store(true, .monotonic);
         server2.handleConnection(file.handle, 1, null) catch |err| {
             std.debug.print("Stream error: {}\n", .{err});
         };
         file.close();
+        return;
+    }
+
+    // --transcribe: feed WAV through the streaming pipeline, output plain text
+    if (transcribe_file) |tfile| {
+        const file = std.fs.cwd().openFile(tfile, .{}) catch |err| {
+            std.debug.print("Failed to open WAV file '{s}': {}\n", .{ tfile, err });
+            return;
+        };
+        defer file.close();
+
+        const data = file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch |err| {
+            std.debug.print("Failed to read WAV file: {}\n", .{err});
+            return;
+        };
+        defer allocator.free(data);
+
+        const header = utils.parseWavHeader(data) catch |err| {
+            std.debug.print("Failed to parse WAV header: {}\n", .{err});
+            return;
+        };
+        const samples = utils.wavToFloat(allocator, data, header) catch |err| {
+            std.debug.print("Failed to convert WAV to float: {}\n", .{err});
+            return;
+        };
+        defer allocator.free(samples);
+
+        var pipeline = AsrPipeline.init(allocator, asr_config, verbose) catch |err| {
+            std.debug.print("Failed to create pipeline: {}\n", .{err});
+            return;
+        };
+        defer pipeline.deinit();
+
+        if (pipeline.transcribe(samples, true, null) catch |err| {
+            std.debug.print("Transcription failed: {}\n", .{err});
+            return;
+        }) |result| {
+            defer allocator.free(result.text);
+            defer allocator.free(result.words);
+            defer allocator.free(result.tokens);
+            defer allocator.free(result.token_frames);
+            _ = std.posix.write(1, result.text) catch {};
+            _ = std.posix.write(1, "\n") catch {};
+        }
         return;
     }
 
@@ -456,44 +452,6 @@ pub fn main() !void {
         if (input_handler != null) input_handler.?.deinit();
     }
 
-    // Warmup
-    if (warmup_file) |wf| warmup: {
-        // Default warmup file lives next to the binary; user-provided paths resolve from CWD
-        const resolved_path = blk: {
-            if (!warmup_file_is_default or std.fs.path.isAbsolute(wf)) break :blk wf;
-            if (exe_dir) |d| {
-                break :blk std.fs.path.joinZ(allocator, &.{ d, wf }) catch break :blk wf;
-            }
-            break :blk wf;
-        };
-        defer if (resolved_path.ptr != wf.ptr) allocator.free(resolved_path);
-
-        if (builtin.os.tag == .macos) {
-            std.debug.print("Warming up with: {s} (first run may be slow due to Metal shader compilation)\n", .{resolved_path});
-        } else {
-            std.debug.print("Warming up with: {s} (first run may be slow due to CUDA kernel compilation)\n", .{resolved_path});
-        }
-        const warmup_start = std.time.nanoTimestamp();
-        const samples = loadWav(allocator, resolved_path) catch |err| {
-            std.debug.print("Warning: warmup file not found ({s}), skipping warmup: {}\n", .{ resolved_path, err });
-            break :warmup;
-        };
-        defer allocator.free(samples);
-
-        var pipeline = try Pipeline.init(allocator, ctx, .{}, 4, verbose, prompt_tokens);
-        defer pipeline.deinit();
-
-        if (try pipeline.transcribe(samples, true, null)) |result| {
-            std.debug.print("Warmup result: \"{s}\"\n", .{result.text});
-            allocator.free(result.text);
-            allocator.free(result.words);
-            allocator.free(result.tokens);
-            allocator.free(result.token_frames);
-        }
-        const warmup_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - warmup_start, 1_000_000));
-        std.debug.print("Warmup complete ({d}.{d:0>1}s)\n", .{ warmup_ms / 1000, (warmup_ms % 1000) / 100 });
-    }
-
     if (dry_run) {
         std.debug.print("Dry run complete\n", .{});
         return;
@@ -516,63 +474,20 @@ pub fn main() !void {
         try input_handler.?.start();
     }
 
-    // Start server — resolve VAD thresholds from backend defaults if not explicitly set
-    const defaults = vad_backend.defaultThresholds();
-    const resolved_threshold = vad_threshold orelse defaults.onset;
-    const resolved_threshold_off = vad_threshold_off orelse defaults.offset;
-    const resolved_min_silence_ms = min_silence_ms orelse defaults.min_silence_ms;
-    const resolved_min_silence_bytes: usize = @as(usize, resolved_min_silence_ms) * 32000 / 1000;
-    std.debug.print("VAD: backend={s}  onset={d:.2}  offset={d:.2}  min_silence={d}ms\n", .{
-        vad_backend.name(), resolved_threshold, resolved_threshold_off, resolved_min_silence_ms,
-    });
-    var server = Server.init(allocator, ctx, vad_backend, port, input_mode, pw_target, audio_channel, verbose, low_latency, type_callback, prompt_tokens, drop_terms, recorder, pw_gain, no_auto_gain, resolved_threshold, resolved_threshold_off, resolved_min_silence_bytes, max_tokens_per_second);
+    // Start server
+    var server = Server.init(allocator, asr_config, port, input_mode, pw_target, audio_channel, verbose, low_latency, type_callback, drop_terms, recorder, pw_gain, no_auto_gain);
     try server.run();
-}
-
-fn requireGpu() bool {
-    const dev_count = c.ggml_backend_dev_count();
-    var i: usize = 0;
-    while (i < dev_count) : (i += 1) {
-        const dev = c.ggml_backend_dev_get(i);
-        if (c.ggml_backend_dev_type(dev) == c.GGML_BACKEND_DEVICE_TYPE_GPU) {
-            std.debug.print("GPU: {s} ({s})\n", .{
-                std.mem.span(c.ggml_backend_dev_description(dev)),
-                std.mem.span(c.ggml_backend_dev_name(dev)),
-            });
-            return true;
-        }
-    }
-    std.debug.print("GPU: none\n", .{});
-    if (builtin.os.tag == .macos) {
-        std.debug.print("ERROR: No Metal GPU detected. Capsper requires a Metal-capable GPU.\n", .{});
-    } else {
-        std.debug.print("ERROR: No CUDA GPU detected. Capsper requires a CUDA-capable GPU.\n", .{});
-    }
-    std.debug.print("CPU inference is too slow for real-time dictation.\n", .{});
-    return false;
 }
 
 fn printUsage() void {
     std.debug.print("Usage: capsper [--model PATH] [--port PORT]\n", .{});
-    std.debug.print("       [--warmup-file PATH] [--no-warmup] [--verbose|-v]\n", .{});
+    std.debug.print("       [--verbose|-v] [--no-cuda]\n", .{});
     std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
-    std.debug.print("       [--domain-terms FILE] [--drop-terms FILE]\n", .{});
+    std.debug.print("       [--drop-terms FILE]\n", .{});
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
     std.debug.print("       [--transcribe FILE] [--stream-wav FILE]\n", .{});
-    std.debug.print("       [--pw-gain FACTOR] [--no-auto-gain] [--max-tokens-per-sec N]\n", .{});
-    std.debug.print("       [--vad ten|silero|ten-native] [--vad-threshold F] [--vad-threshold-off F] [--min-silence-ms MS]\n", .{});
+    std.debug.print("       [--pw-gain FACTOR] [--no-auto-gain] [--low-latency]\n", .{});
     std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
-}
-
-pub fn loadWav(allocator: std.mem.Allocator, path: [:0]const u8) ![]f32 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    const data = try file.readToEndAlloc(allocator, 100 * 1024 * 1024);
-    defer allocator.free(data);
-
-    const header = try utils.parseWavHeader(data);
-    return utils.wavToFloat(allocator, data, header);
 }

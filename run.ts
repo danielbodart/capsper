@@ -7,7 +7,6 @@ process.env.FORCE_COLOR = "1";
 
 const IS_MACOS = process.platform === "darwin";
 const BINARY = "./dist/bin/capsper";
-const MODEL = "dist/models/ggml-large-v3-turbo-q5_0.bin";
 const SCRIPT_DIR = import.meta.dir;
 const TARBALL = IS_MACOS ? "capsper-macos-arm64.tar.gz" : "capsper-linux-x86_64.tar.gz";
 const LIB_DIR = IS_MACOS ? "dist/lib-macos" : "dist/lib";
@@ -21,45 +20,30 @@ async function which(cmd: string): Promise<boolean> {
 
 // ─── Prerequisites ─────────────────────────────────────────────────────────
 
-async function ensureDeps(opts?: { cuda?: boolean; metal?: boolean }) {
+async function ensureDeps() {
     if (IS_MACOS) {
-        await ensureDepsMacOS(opts);
+        await ensureDepsMacOS();
     } else {
-        await ensureDepsLinux(opts);
+        await ensureDepsLinux();
     }
 }
 
-async function ensureDepsMacOS(opts?: { metal?: boolean }) {
+async function ensureDepsMacOS() {
     if (!await which("brew")) {
         console.error("ERROR: Homebrew is required on macOS. Install from https://brew.sh");
         process.exit(1);
     }
 
     const missing: string[] = [];
-    if (!await which("git-lfs")) missing.push("git-lfs");
     if (!await which("shellcheck")) missing.push("shellcheck");
-    if (!await which("cmake") && opts?.metal) missing.push("cmake");
 
     if (missing.length > 0) {
         console.log(`Installing missing brew packages: ${missing.join(", ")}`);
         await $`brew install ${missing}`;
     }
-
-    // Verify Xcode Metal tools (only for rebuild-whisper)
-    if (opts?.metal) {
-        const { exitCode } = await $`xcrun metal --version`.quiet().nothrow();
-        if (exitCode !== 0) {
-            console.error("ERROR: Metal shader compiler not found.");
-            console.error("Install Xcode from the App Store, then:");
-            console.error("  sudo xcodebuild -license accept");
-            console.error("  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer");
-            console.error("  xcodebuild -downloadComponent MetalToolchain  (NO sudo)");
-            process.exit(1);
-        }
-    }
 }
 
-async function ensureDepsLinux(opts?: { cuda?: boolean }) {
+async function ensureDepsLinux() {
     const missing: string[] = [];
 
     // Core build deps
@@ -69,86 +53,14 @@ async function ensureDepsLinux(opts?: { cuda?: boolean }) {
     const { exitCode: pwCheck } = await $`pkg-config --exists libpipewire-0.3`.quiet().nothrow();
     if (pwCheck !== 0) missing.push("libpipewire-0.3-dev");
 
-    // Git LFS (needed to pull real shared libs from LFS)
-    if (!await which("git-lfs")) missing.push("git-lfs");
-
     // Streaming test deps
     if (!await which("pv")) missing.push("pv");
     if (!await which("nc") && !await which("ncat")) missing.push("ncat");
-
-    // CUDA deps (only for rebuild-whisper)
-    if (opts?.cuda) {
-        if (!await which("cmake")) missing.push("cmake");
-        if (!await which("nvcc")) {
-            console.error("ERROR: nvcc not found. CUDA toolkit required for rebuild-whisper.");
-            console.error("       Install with: sudo apt install nvidia-cuda-toolkit");
-            process.exit(1);
-        }
-        // Verify CUDA 12.x toolkit (not 13+ which requires bleeding-edge drivers)
-        const nvccOut = await $`nvcc --version`.text();
-        const cudaVer = nvccOut.match(/release (\d+)\./)?.[1];
-        if (cudaVer !== "12") {
-            console.error(`ERROR: CUDA 12 toolkit required (found CUDA ${cudaVer ?? "unknown"}).`);
-            console.error("       Install with: sudo apt install nvidia-cuda-toolkit");
-            process.exit(1);
-        }
-        if (!await which("nvidia-smi")) {
-            console.error("ERROR: nvidia-smi not found. CUDA driver required for rebuild-whisper.");
-            process.exit(1);
-        }
-    }
 
     if (missing.length > 0) {
         console.log(`Installing missing packages: ${missing.join(", ")}`);
         await $`sudo apt install -y ${missing}`;
     }
-}
-
-async function ensureSubmodule() {
-    // Check if submodules are populated
-    if (!existsSync("whisper.cpp/CMakeLists.txt")) {
-        console.log("Initializing submodules...");
-        await $`git submodule update --init --recursive`;
-    }
-}
-
-async function ensureLfs() {
-    // Check if any versioned shared libs are LFS pointers instead of real binaries
-    const libGlob = IS_MACOS ? "dist/lib-macos/*.*.*.*.dylib" : "dist/lib/*.so.*.*.*";
-    const { stdout } = await $`head -c 20 ${libGlob} 2>/dev/null || true`.quiet();
-    if (stdout.toString().includes("version https://git-lfs")) {
-        console.log(`LFS pointer files detected in ${LIB_DIR}/ — pulling real binaries...`);
-        await $`git lfs install`;
-        await $`git lfs pull`;
-    }
-}
-
-async function confirm(message: string): Promise<boolean> {
-    process.stdout.write(`${message} [Y/n] `);
-    return new Promise<boolean>(resolve => {
-        const onData = (chunk: Buffer) => {
-            process.stdin.removeListener("data", onData);
-            process.stdin.pause();
-            const answer = chunk.toString().trim().toLowerCase();
-            resolve(answer === "" || answer === "y" || answer === "yes");
-        };
-        process.stdin.resume();
-        process.stdin.on("data", onData);
-    });
-}
-
-async function ensureModels() {
-    if (existsSync(MODEL)) return;
-
-    console.log("Missing model: Whisper large-v3-turbo-q5_0 (~574 MB)");
-    if (!await confirm("Download now?")) {
-        console.error("Model required. Download manually:");
-        console.error("  curl -L -o dist/models/ggml-large-v3-turbo-q5_0.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin");
-        process.exit(1);
-    }
-
-    console.log("Downloading Whisper model...");
-    await $`curl -L --progress-bar -o ${MODEL} https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin`;
 }
 
 function ensureBinary() {
@@ -158,7 +70,6 @@ function ensureBinary() {
         process.exit(1);
     }
 }
-
 
 // ─── Version ────────────────────────────────────────────────────────────────
 
@@ -175,28 +86,10 @@ async function version(): Promise<string> {
 
 export async function build() {
     await ensureDeps();
-    await ensureSubmodule();
-    await ensureLfs();
-    if (!process.env.CI) await ensureModels();
     const ver = await version();
     console.log(`Building v${ver}...`);
     const cpuFlag = IS_MACOS ? [] : ["-Dcpu=x86_64_v3"];
     await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe ${cpuFlag}`;
-}
-
-export async function rebuildWhisper(...args: string[]) {
-    if (args.includes("--clean")) {
-        await $`rm -rf .zig-cache/cmake .zig-cache/cmake-macos`;
-    }
-    if (IS_MACOS) {
-        await ensureDeps({ metal: true });
-    } else {
-        await ensureDeps({ cuda: true });
-    }
-    await ensureSubmodule();
-    console.log(`Building whisper.cpp shared libs (${IS_MACOS ? "Metal" : "CUDA"})...`);
-    await $`zig build rebuild-libs --prefix dist`;
-    console.log(`Done. Commit ${LIB_DIR}/ to check in the updated libraries.`);
 }
 
 export async function clean() {
@@ -259,12 +152,6 @@ export async function slowTest() {
     await $`bun test test/`;
 }
 
-export async function vadTest(...args: string[]) {
-    await build();
-    const input = args[0] || "test/long-pause.wav";
-    await $`./dist/bin/vad-filter-test ${input} ${args.slice(1)}`;
-}
-
 export async function dist() {
     ensureBinary();
 
@@ -276,24 +163,13 @@ export async function dist() {
 }
 
 async function distLinux() {
-    // Validate that versioned shared libs are real ELF binaries, not LFS pointers
-    const { stdout } = await $`file dist/lib/*.so.*.*.*`.quiet();
+    // Validate that ORT libs are real ELF binaries
+    const { stdout } = await $`file dist/lib/*.so`.quiet();
     const lines = stdout.toString().trim().split("\n");
-    const bad = lines.filter(l => !l.includes("ELF"));
+    const bad = lines.filter(l => !l.includes("ELF") && !l.includes("symbolic link"));
     if (bad.length > 0) {
-        console.error("ERROR: dist/lib/ contains non-ELF files (likely LFS pointers):");
+        console.error("ERROR: dist/lib/ contains non-ELF files:");
         bad.forEach(l => console.error(`  ${l}`));
-        console.error("Run: git lfs pull");
-        process.exit(1);
-    }
-
-    // Validate no shared lib has a hardcoded absolute RUNPATH
-    const { stdout: rpathOut } = await $`readelf -d dist/lib/*.so.*.*.* 2>/dev/null`.quiet();
-    const rpathLines = rpathOut.toString().split("\n").filter(l => l.includes("RUNPATH") || l.includes("RPATH"));
-    const absolutePaths = rpathLines.filter(l => l.includes("Library") && !l.includes("$ORIGIN") && /\/[a-zA-Z]/.test(l));
-    if (absolutePaths.length > 0) {
-        console.error("ERROR: shared libs have hardcoded absolute RUNPATH:");
-        absolutePaths.forEach(l => console.error(`  ${l.trim()}`));
         process.exit(1);
     }
 
@@ -307,14 +183,14 @@ async function distLinux() {
 
     const ver = await version();
     await Bun.write("dist/VERSION", ver);
-    await $`tar -czf ${TARBALL} -C dist --exclude='models/ggml-large-v3-turbo-q5_0.bin' bin/ lib/ models/ install.sh capsper-update.sh capsper-apply-update.sh capsper-rollback.sh VERSION`;
+    await $`tar -czf ${TARBALL} -C dist bin/ lib/ install.sh capsper-update.sh capsper-apply-update.sh capsper-rollback.sh VERSION`;
     await $`sha256sum ${TARBALL} > ${TARBALL}.sha256`;
     console.log(`Tarball: ${TARBALL} (v${ver})`);
 }
 
 async function distMacOS() {
     // Validate dylibs are real Mach-O binaries
-    const { stdout } = await $`file dist/lib-macos/*.*.*.*.dylib`.quiet().nothrow();
+    const { stdout } = await $`file dist/lib-macos/*.dylib`.quiet().nothrow();
     if (stdout.toString().length > 0) {
         const lines = stdout.toString().trim().split("\n");
         const bad = lines.filter(l => !l.includes("Mach-O"));
@@ -325,14 +201,6 @@ async function distMacOS() {
         }
     }
 
-    // Validate RPATH on dylibs uses @loader_path
-    const { stdout: rpathOut } = await $`otool -l dist/lib-macos/*.*.*.*.dylib 2>/dev/null | grep -A2 LC_RPATH`.quiet().nothrow();
-    const rpathStr = rpathOut.toString();
-    if (rpathStr.length > 0 && !rpathStr.includes("@loader_path")) {
-        console.error("ERROR: dylibs missing @loader_path RPATH");
-        process.exit(1);
-    }
-
     const ver = await version();
     await Bun.write("dist/VERSION", ver);
 
@@ -341,12 +209,11 @@ async function distMacOS() {
     await $`mkdir -p /tmp/capsper-dist-macos`;
     await $`cp -r dist/bin /tmp/capsper-dist-macos/`;
     await $`cp -r dist/lib-macos /tmp/capsper-dist-macos/lib`;
-    await $`cp -r dist/models /tmp/capsper-dist-macos/`;
     await $`cp dist/VERSION /tmp/capsper-dist-macos/`;
     if (existsSync("dist/install-macos.sh")) {
         await $`cp dist/install-macos.sh /tmp/capsper-dist-macos/`;
     }
-    await $`tar -czf ${TARBALL} -C /tmp/capsper-dist-macos --exclude='models/ggml-large-v3-turbo-q5_0.bin' .`;
+    await $`tar -czf ${TARBALL} -C /tmp/capsper-dist-macos .`;
     await $`shasum -a 256 ${TARBALL} > ${TARBALL}.sha256`;
     await $`rm -rf /tmp/capsper-dist-macos`;
     console.log(`Tarball: ${TARBALL} (v${ver})`);
@@ -357,11 +224,7 @@ export async function lint() {
 }
 
 export async function ci() {
-    const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
-
     await ensureDeps();
-    await ensureSubmodule();
-    await ensureLfs();
     const ver = await version();
     console.log("Running lint...");
     await $`shellcheck dist/*.sh bootstrap.sh`;
@@ -372,6 +235,7 @@ export async function ci() {
     await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe ${cpuFlag}`;
     await dist();
     if (process.env.GH_TOKEN) {
+        const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
         if (noCreateRelease) {
             console.log(`Uploading assets to release v${ver}...`);
             for (let attempt = 1; attempt <= 10; attempt++) {
@@ -404,8 +268,6 @@ const commands: Record<string, Function> = {
     "medium-test": mediumTest,
     "long-test": longTest,
     "slow-test": slowTest,
-    "vad-test": vadTest,
-    "rebuild-whisper": rebuildWhisper,
 };
 
 const command = process.argv[2] || "dev";

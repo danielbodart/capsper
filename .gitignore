@@ -1,8 +1,8 @@
 dist/bin/
-dist/models/ggml-large-v3-turbo-q5_0.bin
+dist/models/nemotron/
+zig-out/
 dist/VERSION
 .zig-cache/
-whisper.cpp/build-zig/
 tools/
 .idea/
 CLAUDE.local.md
@@ -12,7 +12,7 @@ capsper-macos-arm64.tar.gz
 capsper-macos-arm64.tar.gz.sha256
 .claude/worktrees/
 .worktrees/
-test/results/vad-segments/
+test/results/
 test/macos-audio-helpers
 .playwright-mcp
 dist/.DS_Store

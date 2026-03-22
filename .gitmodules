@@ -1,7 +1,0 @@
-[submodule "whisper.cpp"]
-	path = whisper.cpp
-	url = git@github.com:danielbodart/whisper.cpp.git
-[submodule "ten-vad"]
-	path = ten-vad
-	url = git@github.com:TEN-framework/ten-vad.git
-	shallow = true

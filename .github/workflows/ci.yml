@@ -14,12 +14,11 @@ jobs:
           sudo apt-get install -y pkg-config pv ncat libpipewire-0.3-dev
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
       - uses: actions/cache@v4
         with:
           path: .git/lfs
-          key: lfs-${{ hashFiles('dist/lib/*.so.*', 'dist/models/ten-vad-ggml.bin') }}
+          key: lfs-${{ hashFiles('dist/lib/*.so') }}
           restore-keys: lfs-
       - run: git lfs pull
       - uses: actions/cache@v4
@@ -42,12 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
       - uses: actions/cache@v4
         with:
           path: .git/lfs
-          key: lfs-macos-${{ hashFiles('dist/lib-macos/*.dylib', 'dist/models/ten-vad-ggml.bin') }}
+          key: lfs-macos-${{ hashFiles('dist/lib-macos/*.dylib') }}
           restore-keys: lfs-macos-
       - run: git lfs pull
       - uses: actions/cache@v4

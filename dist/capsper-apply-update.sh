@@ -34,13 +34,14 @@ main() {
         rm -f "$recordings_dir"/*.wav "$recordings_dir"/*.log 2>/dev/null || true
     fi
 
-    # Symlink shared models (e.g. whisper) into the new release so the binary
-    # can find them via its default relative path (bin/../models/).
+    # Symlink shared models into the new release so the binary can find them
+    # via its default relative path (bin/../models/).
     local shared_models_dir="$INSTALL_DIR/models"
     local release_models_dir="$release_dir/models"
-    if [ -d "$shared_models_dir" ] && [ -d "$release_models_dir" ]; then
+    if [ -d "$shared_models_dir" ]; then
+        mkdir -p "$release_models_dir"
         for model in "$shared_models_dir"/*; do
-            [ -f "$model" ] || continue
+            [ -e "$model" ] || continue
             local name
             name=$(basename "$model")
             [ -e "$release_models_dir/$name" ] && continue

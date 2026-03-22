@@ -13,8 +13,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
 
-WHISPER_MODEL_NAME="ggml-large-v3-turbo-q5_0.bin"
-WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${WHISPER_MODEL_NAME}"
+HF_REPO="danielbodart/nemotron-speech-600m-onnx"
+HF_BASE="https://huggingface.co/${HF_REPO}/resolve/main"
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 RECORDINGS_DIR="$INSTALL_DIR/recordings"
@@ -81,30 +81,71 @@ check_permissions() {
     fi
 }
 
+# ─── Hardware Detection ──────────────────────────────────────────────────────
+
+detect_model_variant() {
+    # NVIDIA GPU → fp16 (tensor cores)
+    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+        echo "fp16"
+        return
+    fi
+    # Apple Silicon → fp16
+    if [ "$(uname -m)" = "arm64" ] && [ "$(uname -s)" = "Darwin" ]; then
+        echo "fp16"
+        return
+    fi
+    # CPU-only → int8 (optimized for Intel VNNI/AMX)
+    echo "int8"
+}
+
 # ─── Model Download ──────────────────────────────────────────────────────────
 
 download_models() {
     local model_dir="$1"
-    mkdir -p "$model_dir"
+    local target_dir="$model_dir/nemotron"
+    mkdir -p "$target_dir"
 
-    if [ -f "$model_dir/$WHISPER_MODEL_NAME" ]; then
-        echo "Whisper model already present."
+    # Check if already downloaded
+    if [ -f "$target_dir/encoder_model.onnx" ] && [ -f "$target_dir/decoder_model.onnx" ]; then
+        echo "Nemotron model already present."
         return
     fi
 
-    echo "Missing: Whisper model (large-v3-turbo-q5_0, ~574 MB)"
+    local variant
+    variant=$(detect_model_variant)
+    echo "Detected hardware → $variant precision"
+    echo "Model: Nemotron Speech 600M ONNX ($variant)"
 
     if ! confirm "Download now?"; then
         echo ""
-        echo "Models directory: $model_dir"
-        echo "Copy $WHISPER_MODEL_NAME there before starting capsper."
+        echo "Models directory: $target_dir"
+        echo "Download manually from: https://huggingface.co/$HF_REPO"
         return
     fi
 
     require_cmd curl "Install curl to download models."
-    echo "Downloading Whisper model..."
-    curl -L --progress-bar -o "$model_dir/$WHISPER_MODEL_NAME" "$WHISPER_MODEL_URL"
-    echo "Model downloaded."
+
+    echo "Downloading Nemotron model ($variant)..."
+
+    # Variant-specific ONNX files
+    curl -L --progress-bar -o "$target_dir/encoder_model.onnx" \
+        "$HF_BASE/$variant/encoder_model.onnx"
+    curl -L --progress-bar -o "$target_dir/encoder_model.onnx.data" \
+        "$HF_BASE/$variant/encoder_model.onnx.data"
+    curl -L --progress-bar -o "$target_dir/decoder_model.onnx" \
+        "$HF_BASE/$variant/decoder_model.onnx"
+    curl -L --progress-bar -o "$target_dir/decoder_model.onnx.data" \
+        "$HF_BASE/$variant/decoder_model.onnx.data"
+
+    # Shared files (filterbank, vocabulary, config)
+    curl -L --progress-bar -o "$target_dir/filterbank.bin" \
+        "$HF_BASE/shared/filterbank.bin"
+    curl -L --progress-bar -o "$target_dir/tokens.txt" \
+        "$HF_BASE/shared/tokens.txt"
+    curl -L --progress-bar -o "$target_dir/config.json" \
+        "$HF_BASE/config.json"
+
+    echo "Model downloaded ($variant)."
 }
 
 # ─── PipeWire Channel Detection & Gain Calibration ───────────────────────────
@@ -127,22 +168,20 @@ install_service() {
     local target="${5:-}"
     local with_updates="${6:-false}"
 
+    local drop_terms="${7:-}"
+    local enable_recordings="${8:-false}"
+    local low_latency="${9:-false}"
+    local gain="${10:-1.0}"
+
     local service_dir="$HOME/.config/systemd/user"
     mkdir -p "$service_dir"
-
-    local domain_terms="${7:-}"
-    local drop_terms="${8:-}"
-    local enable_recordings="${9:-false}"
-    local low_latency="${10:-false}"
-    local gain="${11:-1.0}"
 
     local exec_start="$binary --trigger capslock --pw-channel $channel"
     if [ -n "$gain" ] && [ "$gain" != "1.0" ] && [ "$gain" != "1" ]; then
         exec_start="$exec_start --pw-gain $gain"
     fi
-    exec_start="$exec_start --model $model_dir/$WHISPER_MODEL_NAME"
+    exec_start="$exec_start --model $model_dir/nemotron"
     [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
-    [ -n "$domain_terms" ] && exec_start="$exec_start --domain-terms $domain_terms"
     [ -n "$drop_terms" ] && exec_start="$exec_start --drop-terms $drop_terms"
     if $enable_recordings; then
         mkdir -p "$RECORDINGS_DIR"
@@ -227,9 +266,7 @@ extract_service_config() {
     SAVED_TARGET=$(echo "$exec_start" | sed -n 's/.*--pw-target \([^ ]*\).*/\1/p')
     SAVED_TARGET="${SAVED_TARGET:-}"
 
-    SAVED_DOMAIN_TERMS=$(echo "$exec_start" | sed -n 's/.*--domain-terms \([^ ]*\).*/\1/p')
-    SAVED_DOMAIN_TERMS="${SAVED_DOMAIN_TERMS:-}"
-
+    # Drop terms survive migration
     SAVED_DROP_TERMS=$(echo "$exec_start" | sed -n 's/.*--drop-terms \([^ ]*\).*/\1/p')
     SAVED_DROP_TERMS="${SAVED_DROP_TERMS:-}"
 
@@ -241,6 +278,11 @@ extract_service_config() {
 
     SAVED_GAIN=$(echo "$exec_start" | sed -n 's/.*--pw-gain \([^ ]*\).*/\1/p')
     SAVED_GAIN="${SAVED_GAIN:-1.0}"
+
+    # Migration: strip removed flags that may exist in old service files
+    # --domain-terms, --asr, --vad, --vad-threshold, --vad-threshold-off,
+    # --min-silence-ms, --max-tokens-per-sec are no longer supported.
+    # The new install_service() won't include them.
 }
 
 install_update_timer() {
@@ -295,7 +337,7 @@ EOF
 install_files() {
     echo "Installing to $INSTALL_DIR ..."
 
-    [ -d "$SCRIPT_DIR/lib" ] || die "dist/lib/ not found. If this is a git checkout, run: git lfs pull"
+    [ -d "$SCRIPT_DIR/lib" ] || die "dist/lib/ not found."
     [ -f "$SCRIPT_DIR/VERSION" ] || die "VERSION file not found in dist."
 
     local ver
@@ -304,11 +346,13 @@ install_files() {
 
     mkdir -p "$release_dir"
 
-    # Copy bin/, lib/, and models/ into versioned directory
+    # Copy bin/ and lib/ into versioned directory
     cp -a "$SCRIPT_DIR/bin" "$release_dir/"
     cp -a "$SCRIPT_DIR/lib" "$release_dir/"
-    [ -d "$SCRIPT_DIR/models" ] && cp -a "$SCRIPT_DIR/models" "$release_dir/"
     cp "$SCRIPT_DIR/VERSION" "$release_dir/"
+
+    # Create models/ dir in release for symlinks
+    mkdir -p "$release_dir/models"
 
     # Save current version for rollback (if upgrading)
     local current_target
@@ -423,26 +467,12 @@ cmd_install() {
                 echo "Using default channel: FL, gain: 1.0"
             fi
 
-            # Domain terms
-            local domain_terms=""
-            echo ""
-            echo "=== Domain Terms (optional) ==="
-            echo "Improve accuracy for jargon and technical terms by providing a text file"
-            echo "of words you use often (e.g. tool names, project names, acronyms)."
-            if confirm_default_no "Do you have a domain terms file?"; then
-                printf 'Path to terms file: '
-                read -r domain_terms
-                if [ -n "$domain_terms" ] && [ ! -f "$domain_terms" ]; then
-                    echo "WARNING: File not found: $domain_terms (continuing anyway)"
-                fi
-            fi
-
             # Drop terms
             local drop_terms=""
             echo ""
             echo "=== Drop Terms (optional) ==="
-            echo "Suppress hallucinated phrases (e.g. \"Thank you.\", \"I love you\") that"
-            echo "Whisper sometimes emits on silence. One phrase per line in a text file."
+            echo "Suppress filler phrases (e.g. \"Thank you.\", \"you know\") that"
+            echo "may appear in transcription. One phrase per line in a text file."
             if confirm_default_no "Do you have a drop terms file?"; then
                 printf 'Path to drop terms file: '
                 read -r drop_terms
@@ -473,14 +503,13 @@ cmd_install() {
                 low_latency=true
             fi
 
-            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$SCRIPT_DIR/models" "" false "$domain_terms" "$drop_terms" $enable_recordings $low_latency "$gain"
+            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$SCRIPT_DIR/models" "" false "$drop_terms" $enable_recordings $low_latency "$gain"
         fi
     else
         echo "=== Capsper Installer ==="
         echo ""
 
-        # Check runtime deps (always, even on upgrade)
-        require_cmd nvidia-smi "NVIDIA driver required. Install with: sudo ubuntu-drivers autoinstall"
+        # Check runtime deps
         command -v pw-cli >/dev/null 2>&1 || echo "WARNING: pw-cli not found. PipeWire may not be installed."
 
         # Copy files to ~/.local/share/capsper/ (always, this is the upgrade)
@@ -509,26 +538,12 @@ cmd_install() {
                 echo "Using default channel: FL, gain: 1.0"
             fi
 
-            # Domain terms
-            local domain_terms=""
-            echo ""
-            echo "=== Domain Terms (optional) ==="
-            echo "Improve accuracy for jargon and technical terms by providing a text file"
-            echo "of words you use often (e.g. tool names, project names, acronyms)."
-            if confirm_default_no "Do you have a domain terms file?"; then
-                printf 'Path to terms file: '
-                read -r domain_terms
-                if [ -n "$domain_terms" ] && [ ! -f "$domain_terms" ]; then
-                    echo "WARNING: File not found: $domain_terms (continuing anyway)"
-                fi
-            fi
-
             # Drop terms
             local drop_terms=""
             echo ""
             echo "=== Drop Terms (optional) ==="
-            echo "Suppress hallucinated phrases (e.g. \"Thank you.\", \"I love you\") that"
-            echo "Whisper sometimes emits on silence. One phrase per line in a text file."
+            echo "Suppress filler phrases (e.g. \"Thank you.\", \"you know\") that"
+            echo "may appear in transcription. One phrase per line in a text file."
             if confirm_default_no "Do you have a drop terms file?"; then
                 printf 'Path to drop terms file: '
                 read -r drop_terms
@@ -566,19 +581,19 @@ cmd_install() {
                 enable_updates=false
             fi
 
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "" $enable_updates "$domain_terms" "$drop_terms" $enable_recordings $low_latency "$gain"
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "" $enable_updates "$drop_terms" $enable_recordings $low_latency "$gain"
 
             if $enable_updates; then
                 install_update_timer
                 install_rollback_service
             fi
         else
-            # Upgrade without config change: preserve audio settings, update paths
+            # Upgrade without config change: preserve audio settings, migrate config
             extract_service_config
 
             if has_auto_update; then
                 # Auto-update already configured: keep it, just update paths
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DOMAIN_TERMS" "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
             else
                 # Pre-auto-update install: offer to enable
                 local enable_updates=true
@@ -587,7 +602,7 @@ cmd_install() {
                     enable_updates=false
                 fi
 
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DOMAIN_TERMS" "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
 
                 if $enable_updates; then
                     install_update_timer

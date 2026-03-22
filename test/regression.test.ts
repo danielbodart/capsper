@@ -29,13 +29,11 @@ console.error(`Test mode: ${testMode}`);
 const wavDir = process.env.TEST_WAV_DIR ?? "test";
 const wavPath = (name: string) => `${wavDir}/${name}.wav`;
 
-// --- VAD overrides ---
-const vadBackend = process.env.VAD_BACKEND;
+// --- Extra server args from env ---
+const dropTerms = process.env.DROP_TERMS ?? "test/drop-terms-nemotron.txt";
 const extraServerArgs: string[] = [
-    ...(vadBackend ? ["--vad", vadBackend] : []),
-    ...(process.env.VAD_THRESHOLD ? ["--vad-threshold", process.env.VAD_THRESHOLD] : []),
-    ...(process.env.VAD_THRESHOLD_OFF ? ["--vad-threshold-off", process.env.VAD_THRESHOLD_OFF] : []),
-    ...(process.env.VAD_MIN_SILENCE_MS ? ["--min-silence-ms", process.env.VAD_MIN_SILENCE_MS] : []),
+    ...(process.env.ASR_MODEL ? ["--model", process.env.ASR_MODEL] : []),
+    "--drop-terms", dropTerms,
 ];
 
 // --- Load test cases from .test.json files ---

@@ -6,8 +6,6 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 export const BINARY = "./dist/bin/capsper";
-export const MODEL = "dist/models/ggml-large-v3-turbo-q5_0.bin";
-export const WARMUP_FILE = "test/jfk.wav";
 
 // Track all spawned child processes so we can kill them on exit/signal.
 // Prevents orphaned capsper processes holding GPU memory after Ctrl+C.
@@ -65,7 +63,7 @@ export async function waitForLog(logFile: string, pattern: RegExp, proc: ReturnT
 export async function startServer(args: string[]): Promise<{ proc: ReturnType<typeof spawn>; port: number; logFile: string; kill: () => void }> {
     const logFile = tmpFile("whisper-server", ".log");
 
-    const proc = spawn([BINARY, "--warmup-file", WARMUP_FILE, ...args], {
+    const proc = spawn([BINARY, ...args], {
         stdout: Bun.file(logFile),
         stderr: Bun.file(logFile),
     });
@@ -94,7 +92,7 @@ export async function startLocalServer(args: string[]): Promise<{ proc: ReturnTy
     const logFile = tmpFile("whisper-server", ".log");
     const outputFile = tmpFile("whisper-pw-stream", ".txt");
 
-    const proc = spawn([BINARY, "--warmup-file", WARMUP_FILE, ...args], {
+    const proc = spawn([BINARY, ...args], {
         stdout: Bun.file(outputFile),
         stderr: Bun.file(logFile),
     });
@@ -355,7 +353,7 @@ export async function streamWavDirect(
 ): Promise<{ output: string; logFile: string }> {
     const logFile = tmpFile("whisper-stream-wav", ".log");
 
-    const proc = spawn([BINARY, "--warmup-file", WARMUP_FILE, "--stream-wav", wavFile, ...serverArgs], {
+    const proc = spawn([BINARY, "--stream-wav", wavFile, ...serverArgs], {
         stdout: "pipe",
         stderr: Bun.file(logFile),
     });
@@ -453,7 +451,7 @@ export function assertTranscript(
 ): TranscriptResult {
     const t = { ...DEFAULT_THRESHOLDS, ...thresholds };
     const emissions = parseEmissions(rawOutput);
-    const streamText = emissions.map(e => e.text).join(" ").replace(/\s+/g, " ").trim();
+    const streamText = emissions.map(e => e.text).join("").replace(/\s+/g, " ").trim();
     const streamWords = normalize(streamText).split(" ").filter(Boolean);
 
     // Gap analysis

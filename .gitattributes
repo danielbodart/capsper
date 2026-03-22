@@ -1,3 +1,4 @@
-dist/lib/*.so.* filter=lfs diff=lfs merge=lfs -text
-dist/models/ten-vad-ggml.bin filter=lfs diff=lfs merge=lfs -text
+dist/lib/libonnxruntime.so filter=lfs diff=lfs merge=lfs -text
+dist/lib/libonnxruntime_providers_cuda.so filter=lfs diff=lfs merge=lfs -text
+dist/lib/libonnxruntime_providers_shared.so filter=lfs diff=lfs merge=lfs -text
 dist/lib-macos/*.dylib filter=lfs diff=lfs merge=lfs -text
