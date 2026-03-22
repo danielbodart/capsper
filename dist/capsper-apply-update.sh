@@ -124,29 +124,27 @@ migrate_service_config() {
     local new_exec_start="$exec_start"
 
     # Replace old whisper model path with nemotron
-    new_exec_start=$(echo "$new_exec_start" | sed 's|--model [^ ]*|--model '"$INSTALL_DIR"'/models/nemotron|')
+    # shellcheck disable=SC2001
+    new_exec_start=$(sed 's|--model [^ ]*|--model '"$INSTALL_DIR"'/models/nemotron|' <<< "$new_exec_start")
 
     # Strip removed flags (with their arguments)
-    new_exec_start=$(echo "$new_exec_start" | sed 's/--domain-terms [^ ]* *//g')
-    new_exec_start=$(echo "$new_exec_start" | sed 's/--warmup-file [^ ]* *//g')
-    new_exec_start=$(echo "$new_exec_start" | sed 's/--asr [^ ]* *//g')
-    new_exec_start=$(echo "$new_exec_start" | sed 's/--vad [^ ]* *//g')
-    new_exec_start=$(echo "$new_exec_start" | sed 's/--vad-threshold [^ ]* *//g')
-    new_exec_start=$(echo "$new_exec_start" | sed 's/--vad-threshold-off [^ ]* *//g')
-    new_exec_start=$(echo "$new_exec_start" | sed 's/--min-silence-ms [^ ]* *//g')
-    new_exec_start=$(echo "$new_exec_start" | sed 's/--max-tokens-per-sec [^ ]* *//g')
+    local flag
+    for flag in --domain-terms --warmup-file --asr --vad --vad-threshold --vad-threshold-off --min-silence-ms --max-tokens-per-sec; do
+        new_exec_start="${new_exec_start//$flag [^ ]* /}"
+        new_exec_start="${new_exec_start//$flag [^ ]*/}"
+    done
 
     # Strip flags without arguments
-    new_exec_start=$(echo "$new_exec_start" | sed 's/--no-warmup *//g')
+    new_exec_start="${new_exec_start//--no-warmup /}"
+    new_exec_start="${new_exec_start//--no-warmup/}"
 
-    # Clean up double spaces
-    new_exec_start=$(echo "$new_exec_start" | sed 's/  */ /g; s/ *$//')
+    # Clean up double spaces and trailing space
+    while [[ "$new_exec_start" == *"  "* ]]; do
+        new_exec_start="${new_exec_start//  / }"
+    done
+    new_exec_start="${new_exec_start% }"
 
     if [ "$new_exec_start" != "$exec_start" ]; then
-        # Escape sed delimiter in paths
-        local escaped_old escaped_new
-        escaped_old=$(printf '%s\n' "$exec_start" | sed 's/[&/\]/\\&/g')
-        escaped_new=$(printf '%s\n' "$new_exec_start" | sed 's/[&/\]/\\&/g')
         sed -i "s|^ExecStart=.*|ExecStart=$new_exec_start|" "$service_file"
         systemctl --user daemon-reload 2>/dev/null || true
         echo "Service config migrated."
