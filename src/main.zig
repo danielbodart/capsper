@@ -199,7 +199,20 @@ pub fn main() !void {
     try ort_c.check(api, api.CreateSessionOptions.?(&session_opts));
     defer api.ReleaseSessionOptions.?(session_opts.?);
 
-    if (no_cuda) {
+    if (builtin.os.tag == .macos) {
+        // CoreML execution provider — routes compute to Apple Neural Engine + CPU
+        const coreml_keys = [_][*:0]const u8{"MLComputeUnits"};
+        const coreml_vals = [_][*:0]const u8{"CPUAndNeuralEngine"};
+        const coreml_status = api.SessionOptionsAppendExecutionProvider.?(
+            session_opts.?, "CoreML", &coreml_keys, &coreml_vals, 1,
+        );
+        if (coreml_status) |s| {
+            api.ReleaseStatus.?(s);
+            std.debug.print("Nemotron: CoreML not available, using CPU\n", .{});
+        } else {
+            std.debug.print("Nemotron: using CoreML (ANE + CPU)\n", .{});
+        }
+    } else if (no_cuda) {
         std.debug.print("Nemotron: using CPU (--no-cuda)\n", .{});
     } else {
         var cuda_opts: ort_c.OrtCUDAProviderOptions = std.mem.zeroes(ort_c.OrtCUDAProviderOptions);

@@ -9,7 +9,7 @@ Analyze captured debug recordings to find transcription issues and create regres
 2. **For each recording**:
    - Read the `.log` file and extract the "Emitted Text" section (what streaming mode produced)
    - Batch-transcribe the `.wav` file using: `./dist/bin/capsper --transcribe <file> --model <model> 2>/dev/null`
-     - Model path: check the systemd service file at `~/.config/systemd/user/capsper.service` for the `--model` path, or fall back to `dist/models/ggml-large-v3-turbo-q5_0.bin`
+     - Model path: check the systemd service file at `~/.config/systemd/user/capsper.service` for the `--model` path, or fall back to `dist/models/nemotron`
    - Compare streaming vs batch output, normalizing both (lowercase, strip punctuation except apostrophes)
    - Calculate the WAV duration: `(file_size - 44) / 32000` seconds
 

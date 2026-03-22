@@ -15,12 +15,12 @@ WORKTREE_DIR="$CWD/.claude/worktrees/$NAME"
 # Create the git worktree with a new branch based on HEAD
 git -C "$CWD" worktree add -b "$NAME" "$WORKTREE_DIR" HEAD >&2
 
-# Symlink the large whisper model (574 MB, not in git)
-MAIN_MODEL="$CWD/dist/models/ggml-large-v3-turbo-q5_0.bin"
-WT_MODEL="$WORKTREE_DIR/dist/models/ggml-large-v3-turbo-q5_0.bin"
-if [ -f "$MAIN_MODEL" ] && [ ! -e "$WT_MODEL" ]; then
-    mkdir -p "$(dirname "$WT_MODEL")"
-    ln -s "$MAIN_MODEL" "$WT_MODEL" >&2 && echo "Symlinked whisper model" >&2
+# Symlink the Nemotron model directory (not in git, downloaded at install time)
+MAIN_MODEL_DIR="$CWD/dist/models/nemotron"
+WT_MODEL_DIR="$WORKTREE_DIR/dist/models/nemotron"
+if [ -d "$MAIN_MODEL_DIR" ] && [ ! -e "$WT_MODEL_DIR" ]; then
+    mkdir -p "$(dirname "$WT_MODEL_DIR")"
+    ln -s "$MAIN_MODEL_DIR" "$WT_MODEL_DIR" >&2 && echo "Symlinked nemotron model" >&2
 fi
 
 # Run the standard setup (LFS, mise, dependencies, build, tests)

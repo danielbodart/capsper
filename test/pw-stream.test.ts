@@ -12,8 +12,8 @@ describe.skipIf(!gpu)("pw-stream", () => {
         ensureFile(wavFile);
         const duration = wavDuration(wavFile);
 
-        const LOOPBACK_SINK = "test-whisper-loopback-sink";
-        const LOOPBACK_SOURCE = "test-whisper-loopback-source";
+        const LOOPBACK_SINK = "test-capsper-loopback-sink";
+        const LOOPBACK_SOURCE = "test-capsper-loopback-source";
 
         // Start pw-loopback: creates a virtual sink + source bridge.
         // audio.rate=16000 prevents double resampling through the 48kHz graph.

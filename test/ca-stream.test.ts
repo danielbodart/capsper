@@ -5,14 +5,13 @@ import { ensureBinary, ensureFile, wavDuration, trackProc, saveLog } from "./hel
 
 const HELPERS = "test/macos-audio-helpers";
 const BINARY = "./dist/bin/capsper";
-const MODEL = "dist/models/ggml-large-v3-turbo-q5_0.bin";
-const WARMUP_FILE = "test/jfk.wav";
+const MODEL_DIR = "dist/models/nemotron";
 const PLIST_NAME = "com.capsper.test";
 const PLIST_PATH = `/tmp/${PLIST_NAME}.plist`;
 
 const isMacOS = process.platform === "darwin";
 const hasBinary = existsSync(BINARY);
-const hasModel = existsSync(MODEL);
+const hasModel = existsSync(`${MODEL_DIR}/encoder_model.onnx`);
 
 async function hasBlackHole(): Promise<boolean> {
     if (!isMacOS) return false;
@@ -47,7 +46,6 @@ function createPlist(args: string[], outFile: string, logFile: string): string {
     const cwd = process.cwd();
     const progArgs = [
         `${cwd}/${BINARY}`,
-        "--warmup-file", `${cwd}/${WARMUP_FILE}`,
         ...args,
     ];
 
@@ -153,7 +151,6 @@ describe.skipIf(!isMacOS || !hasBinary || !hasModel || !blackhole)("ca-stream", 
             "--input", "local",
             "--pw-target", "BlackHole 2ch",
             "--no-auto-gain",
-            "--vad", "silero",
             "--verbose",
         ]);
 
@@ -184,16 +181,11 @@ describe.skipIf(!isMacOS || !hasBinary || !hasModel || !blackhole)("ca-stream", 
             console.error("=== Streaming Output ===");
             console.error(output);
 
-            // Check for VAD transitions
-            const speakingCount = (log.match(/idle → speaking/g) || []).length;
-            console.error(`\nVAD speaking segments: ${speakingCount}`);
-
             const wordCount = output.split("\n").filter(Boolean)
                 .map(line => line.split("\t").slice(1).join("\t"))
                 .join(" ").split(/\s+/).filter(Boolean).length;
             console.error(`Total words emitted: ${wordCount}`);
 
-            expect(speakingCount).toBeGreaterThan(0);
             expect(wordCount).toBeGreaterThan(0);
         } finally {
             await setDefaultOutput(originalOutput);

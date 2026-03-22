@@ -210,9 +210,6 @@ async function distMacOS() {
     await $`cp -r dist/bin /tmp/capsper-dist-macos/`;
     await $`cp -r dist/lib-macos /tmp/capsper-dist-macos/lib`;
     await $`cp dist/VERSION /tmp/capsper-dist-macos/`;
-    if (existsSync("dist/install-macos.sh")) {
-        await $`cp dist/install-macos.sh /tmp/capsper-dist-macos/`;
-    }
     await $`tar -czf ${TARBALL} -C /tmp/capsper-dist-macos .`;
     await $`shasum -a 256 ${TARBALL} > ${TARBALL}.sha256`;
     await $`rm -rf /tmp/capsper-dist-macos`;

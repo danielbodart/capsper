@@ -23,6 +23,7 @@ pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT = cimport.ONNX_TENSOR_ELEMENT_DATA
 pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 = cimport.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
 pub const ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 = cimport.ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
 pub const OrtCUDAProviderOptions = cimport.OrtCUDAProviderOptions;
+pub const ORT_API_VERSION = cimport.ORT_API_VERSION;
 
 // Entry point
 pub const OrtGetApiBase = cimport.OrtGetApiBase;

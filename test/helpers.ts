@@ -61,7 +61,7 @@ export async function waitForLog(logFile: string, pattern: RegExp, proc: ReturnT
 
 /** Start the capsper server with given args, wait for ready, return handle. */
 export async function startServer(args: string[]): Promise<{ proc: ReturnType<typeof spawn>; port: number; logFile: string; kill: () => void }> {
-    const logFile = tmpFile("whisper-server", ".log");
+    const logFile = tmpFile("capsper-server", ".log");
 
     const proc = spawn([BINARY, ...args], {
         stdout: Bun.file(logFile),
@@ -89,8 +89,8 @@ export async function startServer(args: string[]): Promise<{ proc: ReturnType<ty
 
 /** Start the server in local PipeWire capture mode, wait for "Capturing audio". */
 export async function startLocalServer(args: string[]): Promise<{ proc: ReturnType<typeof spawn>; outputFile: string; logFile: string; kill: () => void }> {
-    const logFile = tmpFile("whisper-server", ".log");
-    const outputFile = tmpFile("whisper-pw-stream", ".txt");
+    const logFile = tmpFile("capsper-server", ".log");
+    const outputFile = tmpFile("capsper-pw-stream", ".txt");
 
     const proc = spawn([BINARY, ...args], {
         stdout: Bun.file(outputFile),
@@ -351,7 +351,7 @@ export async function streamWavDirect(
     wavFile: string,
     serverArgs: string[],
 ): Promise<{ output: string; logFile: string }> {
-    const logFile = tmpFile("whisper-stream-wav", ".log");
+    const logFile = tmpFile("capsper-stream-wav", ".log");
 
     const proc = spawn([BINARY, "--stream-wav", wavFile, ...serverArgs], {
         stdout: "pipe",

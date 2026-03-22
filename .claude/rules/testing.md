@@ -9,7 +9,7 @@ globs:
 
 ## Unit Tests
 
-Add unit tests for any pure functions (functions that don't depend on whisper.cpp C types). Keep testable logic in modules that don't import `whisper_c.zig` so tests run fast without requiring the GPU or model. Unit tests live inline in their source files (see `src/utils.zig`, `src/alignatt.zig`).
+Add unit tests for any pure functions (functions that don't depend on onnxruntime C types). Keep testable logic in modules that don't import `ort_c.zig` so tests run fast without requiring the model. Unit tests live inline in their source files (see `src/utils.zig`, `src/nemo_mel.zig`).
 
 ## Property Tests
 
