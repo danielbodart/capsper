@@ -1,9 +1,33 @@
-/// ASR backend — platform dispatch between CoreML (macOS) and ONNX (Linux).
-const builtin = @import("builtin");
+/// ASR backend — runtime interface for speech recognition pipelines.
+///
+/// Uses a vtable pattern (like std.mem.Allocator) so the backend selection
+/// is a one-time runtime decision at startup. No comptime platform branching
+/// leaks beyond the init call.
+const std = @import("std");
+const asr_types = @import("asr_types.zig");
 
-const coreml = if (builtin.os.tag == .macos) @import("pipeline_coreml.zig") else struct {};
-const nemotron = @import("nemotron_pipeline.zig");
+pub const TranscribeResult = asr_types.TranscribeResult;
+pub const Timing = asr_types.Timing;
 
-pub const AsrConfig = if (builtin.os.tag == .macos) coreml.CoreMLConfig else nemotron.NemotronConfig;
-pub const AsrPipeline = if (builtin.os.tag == .macos) coreml.CoreMLPipeline else nemotron.NemotronPipeline;
-pub const TranscribeResult = @import("asr_types.zig").TranscribeResult;
+pub const AsrPipeline = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        transcribe: *const fn (ptr: *anyopaque, samples: []const f32, flush: bool, max_tokens: ?usize) anyerror!?TranscribeResult,
+        resetSegment: *const fn (ptr: *anyopaque) void,
+        deinit: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn transcribe(self: AsrPipeline, samples: []const f32, flush: bool, max_tokens: ?usize) !?TranscribeResult {
+        return self.vtable.transcribe(self.ptr, samples, flush, max_tokens);
+    }
+
+    pub fn resetSegment(self: AsrPipeline) void {
+        self.vtable.resetSegment(self.ptr);
+    }
+
+    pub fn deinit(self: AsrPipeline) void {
+        self.vtable.deinit(self.ptr);
+    }
+};

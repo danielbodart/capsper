@@ -140,6 +140,7 @@ CapsperCoreMLModels *capsper_coreml_load(const char *model_dir) {
                                              configuration:config
                                                      error:&error];
         if (error || !encoder) {
+            NSError *firstError = error;
             // Try .mlmodelc (compiled) format
             enc_path = [dir stringByAppendingPathComponent:@"encoder.mlmodelc"];
             enc_url = [NSURL fileURLWithPath:enc_path];
@@ -148,7 +149,8 @@ CapsperCoreMLModels *capsper_coreml_load(const char *model_dir) {
                                         configuration:config
                                                 error:&error];
             if (error || !encoder) {
-                NSLog(@"capsper_coreml: failed to load encoder: %@", error);
+                NSLog(@"capsper_coreml: failed to load encoder.mlpackage: %@", firstError);
+                NSLog(@"capsper_coreml: failed to load encoder.mlmodelc: %@", error);
                 return NULL;
             }
         }

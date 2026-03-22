@@ -14,6 +14,7 @@ const context_graph_mod = @import("context_graph.zig");
 const ContextGraph = context_graph_mod.ContextGraph;
 const ContextState = context_graph_mod.ContextState;
 
+const AsrPipeline = @import("asr_backend.zig").AsrPipeline;
 pub const TranscribeResult = asr_types.TranscribeResult;
 pub const Timing = asr_types.Timing;
 
@@ -105,6 +106,32 @@ pub const CoreMLPipeline = struct {
         }
         return pipeline;
     }
+
+    /// Return the type-erased AsrPipeline interface.
+    pub fn asrPipeline(self: *CoreMLPipeline) AsrPipeline {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = AsrPipeline.VTable{
+        .transcribe = struct {
+            fn f(ptr: *anyopaque, samples: []const f32, flush: bool, max_tokens: ?usize) anyerror!?TranscribeResult {
+                const self: *CoreMLPipeline = @ptrCast(@alignCast(ptr));
+                return self.transcribe(samples, flush, max_tokens);
+            }
+        }.f,
+        .resetSegment = struct {
+            fn f(ptr: *anyopaque) void {
+                const self: *CoreMLPipeline = @ptrCast(@alignCast(ptr));
+                self.resetSegment();
+            }
+        }.f,
+        .deinit = struct {
+            fn f(ptr: *anyopaque) void {
+                const self: *CoreMLPipeline = @ptrCast(@alignCast(ptr));
+                self.deinit();
+            }
+        }.f,
+    };
 
     pub fn deinit(self: *CoreMLPipeline) void {
         self.allocator.free(self.dec_state1);

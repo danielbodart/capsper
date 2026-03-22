@@ -1,15 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const ort_c = @import("ort_c.zig");
 const nemo_mel = @import("nemo_mel.zig");
 const nemotron_tokenizer = @import("tokenizer.zig");
 const ContextGraph = @import("context_graph.zig").ContextGraph;
-const asr_mod = @import("asr_backend.zig");
-const AsrConfig = asr_mod.AsrConfig;
-const AsrPipeline = asr_mod.AsrPipeline;
+const AsrPipeline = @import("asr_backend.zig").AsrPipeline;
 const server_mod = @import("server.zig");
 const Server = server_mod.Server;
+const PipelineFactory = server_mod.PipelineFactory;
 const InputMode = server_mod.InputMode;
 const TypeCallback = server_mod.TypeCallback;
 const AudioCapture = @import("audio_capture_platform.zig").AudioCapture;
@@ -188,85 +186,7 @@ pub fn main() !void {
     // Load Nemotron model
     std.debug.print("Loading Nemotron model from: {s}\n", .{resolved_model_path});
 
-    // --- Platform-specific model loading ---
-    const is_macos = builtin.os.tag == .macos;
-
-    // CoreML models (macOS only)
-    const coreml = if (is_macos) @import("pipeline_coreml.zig") else struct {
-        const CapsperCoreMLModels = opaque {};
-    };
-    const coreml_models: ?*coreml.CapsperCoreMLModels = if (is_macos) blk: {
-        const capsper_coreml_load = @extern(*const fn ([*:0]const u8) callconv(.c) ?*coreml.CapsperCoreMLModels, .{ .name = "capsper_coreml_load" });
-        const coreml_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "../nemotron-coreml" }) catch {
-            std.debug.print("Failed to build CoreML model path\n", .{});
-            return;
-        };
-        defer allocator.free(coreml_path);
-        const models = capsper_coreml_load(coreml_path.ptr);
-        if (models == null) {
-            std.debug.print("Failed to load CoreML models\n", .{});
-            return;
-        }
-        std.debug.print("Nemotron: using CoreML (ANE + CPU)\n", .{});
-        break :blk models;
-    } else null;
-    defer if (is_macos) {
-        if (coreml_models) |m| {
-            const capsper_coreml_release = @extern(*const fn (?*coreml.CapsperCoreMLModels) callconv(.c) void, .{ .name = "capsper_coreml_release" });
-            capsper_coreml_release(m);
-        }
-    };
-
-    // ONNX sessions (Linux only)
-    const api = if (!is_macos) ort_c.getApi() else undefined;
-    var nemo_env: ?*ort_c.OrtEnv = null;
-    var nemo_enc_session: ?*ort_c.OrtSession = null;
-    var nemo_dec_session: ?*ort_c.OrtSession = null;
-    var nemo_mem_info: ?*ort_c.OrtMemoryInfo = null;
-    var session_opts: ?*ort_c.OrtSessionOptions = null;
-
-    if (!is_macos) {
-        try ort_c.check(api, api.CreateEnv.?(ort_c.ORT_LOGGING_LEVEL_WARNING, "nemotron", @ptrCast(&nemo_env)));
-        try ort_c.check(api, api.CreateSessionOptions.?(&session_opts));
-
-        if (no_cuda) {
-            std.debug.print("Nemotron: using CPU (--no-cuda)\n", .{});
-        } else {
-            var cuda_opts: ort_c.OrtCUDAProviderOptions = std.mem.zeroes(ort_c.OrtCUDAProviderOptions);
-            const cuda_status = api.SessionOptionsAppendExecutionProvider_CUDA.?(session_opts.?, &cuda_opts);
-            if (cuda_status) |s| {
-                api.ReleaseStatus.?(s);
-                std.debug.print("Nemotron: using CPU\n", .{});
-            } else {
-                std.debug.print("Nemotron: using CUDA\n", .{});
-            }
-        }
-
-        const enc_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "encoder_model.onnx" }) catch {
-            std.debug.print("Failed to build encoder model path\n", .{});
-            return;
-        };
-        defer allocator.free(enc_path);
-        try ort_c.check(api, api.CreateSession.?(nemo_env.?, enc_path.ptr, session_opts.?, @ptrCast(&nemo_enc_session)));
-
-        const dec_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "decoder_model.onnx" }) catch {
-            std.debug.print("Failed to build decoder model path\n", .{});
-            return;
-        };
-        defer allocator.free(dec_path);
-        try ort_c.check(api, api.CreateSession.?(nemo_env.?, dec_path.ptr, session_opts.?, @ptrCast(&nemo_dec_session)));
-
-        try ort_c.check(api, api.CreateCpuMemoryInfo.?(0, 0, @ptrCast(&nemo_mem_info)));
-    }
-    defer if (!is_macos) {
-        if (session_opts) |s| api.ReleaseSessionOptions.?(s);
-        if (nemo_dec_session) |s| api.ReleaseSession.?(s);
-        if (nemo_enc_session) |s| api.ReleaseSession.?(s);
-        if (nemo_mem_info) |m| api.ReleaseMemoryInfo.?(m);
-        if (nemo_env) |e| api.ReleaseEnv.?(e);
-    };
-
-    // Load filterbank
+    // Load shared resources (filterbank, tokenizer, context graph)
     const fb_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "filterbank.bin" }) catch {
         std.debug.print("Failed to build filterbank path\n", .{});
         return;
@@ -276,8 +196,8 @@ pub fn main() !void {
         std.debug.print("Failed to load filterbank: {}\n", .{err});
         return;
     };
+    defer allocator.free(@as([*]u8, @ptrCast(@constCast(nemo_filterbank.ptr)))[0 .. nemo_filterbank.len * @sizeOf(f32)]);
 
-    // Load token map
     const tok_path = std.fs.path.joinZ(allocator, &.{ resolved_model_path, "tokens.txt" }) catch {
         std.debug.print("Failed to build tokens path\n", .{});
         return;
@@ -294,12 +214,6 @@ pub fn main() !void {
     };
     defer allocator.free(nemo_tokens_data);
     var nemo_token_map = nemotron_tokenizer.loadTokenMap(nemo_tokens_data);
-
-    std.debug.print("Nemotron model loaded successfully\n", .{});
-    defer {
-        // filterbank: reinterpreted from u8, free the u8 allocation
-        allocator.free(@as([*]u8, @ptrCast(@constCast(nemo_filterbank.ptr)))[0 .. nemo_filterbank.len * @sizeOf(f32)]);
-    }
 
     // Read drop terms file (newline-separated, one term per line)
     var drop_terms: []const []const u8 = &.{};
@@ -355,32 +269,11 @@ pub fn main() !void {
         std.debug.print("Context graph: {d} suppression phrases\n", .{drop_terms.len});
     }
 
-    const asr_config: AsrConfig = if (is_macos) .{
-        .models = coreml_models orelse {
-            std.debug.print("Error: CoreML models failed to load\n", .{});
-            return;
-        },
-        .filterbank = nemo_filterbank,
-        .token_map = &nemo_token_map,
-        .context_graph = nemo_context_graph,
-    } else .{
-        .api = api,
-        .enc_session = nemo_enc_session orelse {
-            std.debug.print("Error: nemotron encoder session failed to load\n", .{});
-            return;
-        },
-        .dec_session = nemo_dec_session orelse {
-            std.debug.print("Error: nemotron decoder session failed to load\n", .{});
-            return;
-        },
-        .mem_info = nemo_mem_info orelse {
-            std.debug.print("Error: nemotron memory info failed\n", .{});
-            return;
-        },
-        .filterbank = nemo_filterbank,
-        .token_map = &nemo_token_map,
-        .context_graph = nemo_context_graph,
-    };
+    // Load platform-specific ASR backend
+    const backend = @import("asr_init.zig");
+    var backend_state = backend.load(allocator, resolved_model_path, nemo_filterbank, &nemo_token_map, nemo_context_graph, no_cuda, verbose) orelse return;
+    defer backend_state.deinit();
+    const pipeline_factory = backend_state.factory();
 
     // --stream-wav: feed WAV through the streaming pipeline (no PTT, no VAD)
     if (stream_wav_file) |swf| {
@@ -396,7 +289,7 @@ pub fn main() !void {
             return;
         };
 
-        var server2 = Server.init(allocator, asr_config, 0, .tcp, null, 0, verbose, false, null, drop_terms, null, 1.0, true);
+        var server2 = Server.init(allocator, pipeline_factory, 0, .tcp, null, 0, verbose, false, null, drop_terms, null, 1.0, true);
         server_mod.is_live.store(true, .monotonic);
         server2.handleConnection(file.handle, 1, null) catch |err| {
             std.debug.print("Stream error: {}\n", .{err});
@@ -429,7 +322,7 @@ pub fn main() !void {
         };
         defer allocator.free(samples);
 
-        var pipeline = AsrPipeline.init(allocator, asr_config, verbose) catch |err| {
+        var pipeline = pipeline_factory.create(allocator) catch |err| {
             std.debug.print("Failed to create pipeline: {}\n", .{err});
             return;
         };
@@ -511,7 +404,7 @@ pub fn main() !void {
     }
 
     // Start server
-    var server = Server.init(allocator, asr_config, port, input_mode, pw_target, audio_channel, verbose, low_latency, type_callback, drop_terms, recorder, pw_gain, no_auto_gain);
+    var server = Server.init(allocator, pipeline_factory, port, input_mode, pw_target, audio_channel, verbose, low_latency, type_callback, drop_terms, recorder, pw_gain, no_auto_gain);
     try server.run();
 }
 

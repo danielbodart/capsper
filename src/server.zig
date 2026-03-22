@@ -1,7 +1,5 @@
 const std = @import("std");
-const asr_mod = @import("asr_backend.zig");
-const AsrConfig = asr_mod.AsrConfig;
-const AsrPipeline = asr_mod.AsrPipeline;
+const AsrPipeline = @import("asr_backend.zig").AsrPipeline;
 const AudioCapture = @import("audio_capture_platform.zig").AudioCapture;
 const AutoGain = @import("auto_gain.zig").AutoGain;
 const utils = @import("utils.zig");
@@ -160,9 +158,19 @@ const ChunkedReader = struct {
 
 pub const InputMode = enum { tcp, local };
 
+/// Creates a fresh AsrPipeline for each connection.
+pub const PipelineFactory = struct {
+    ctx: *anyopaque,
+    createFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!AsrPipeline,
+
+    pub fn create(self: PipelineFactory, allocator: std.mem.Allocator) !AsrPipeline {
+        return self.createFn(self.ctx, allocator);
+    }
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
-    asr_config: AsrConfig,
+    pipeline_factory: PipelineFactory,
     port: u16,
     input_mode: InputMode,
     pw_target: ?[:0]const u8,
@@ -177,7 +185,7 @@ pub const Server = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        asr_config: AsrConfig,
+        pipeline_factory: PipelineFactory,
         port: u16,
         input_mode: InputMode,
         pw_target: ?[:0]const u8,
@@ -192,7 +200,7 @@ pub const Server = struct {
     ) Server {
         return .{
             .allocator = allocator,
-            .asr_config = asr_config,
+            .pipeline_factory = pipeline_factory,
             .port = port,
             .input_mode = input_mode,
             .pw_target = pw_target,
@@ -299,7 +307,7 @@ pub const Server = struct {
     /// PTT-gated streaming loop. Audio chunks go directly to the pipeline
     /// for incremental processing. No VAD — PTT press/release drives segmentation.
     pub fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
-        var asr = try AsrPipeline.init(self.allocator, self.asr_config, self.verbose);
+        var asr = try self.pipeline_factory.create(self.allocator);
         defer asr.deinit();
 
         var auto_gain = AutoGain{ .current_gain = self.initial_gain };

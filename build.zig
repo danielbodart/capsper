@@ -21,7 +21,9 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("build_options", options);
     exe.root_module.addIncludePath(b.path("dist/include/onnxruntime"));
-    exe.linkSystemLibrary("onnxruntime");
+    if (!is_macos) {
+        exe.linkSystemLibrary("onnxruntime");
+    }
     addPlatformDeps(b, exe, is_macos);
     exe.linkLibC();
     b.installArtifact(exe);
