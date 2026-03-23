@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const Backend = enum { coreml, ort_cuda, ort_cpu };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -7,12 +9,23 @@ pub fn build(b: *std.Build) void {
 
     // --- Build options ---
     const version_str = b.option([]const u8, "version", "Version string") orelse "0.0.0";
+    const default_backend: Backend = if (is_macos) .coreml else .ort_cuda;
+    const backend = b.option(Backend, "backend", "ASR backend") orelse default_backend;
+
     const options = b.addOptions();
     options.addOption([]const u8, "version", version_str);
+    options.addOption(Backend, "backend", backend);
+
+    // --- Binary name ---
+    const exe_name: []const u8 = switch (backend) {
+        .coreml => "capsper",
+        .ort_cuda => "capsper-cuda",
+        .ort_cpu => "capsper-cpu",
+    };
 
     // --- Zig executable ---
     const exe = b.addExecutable(.{
-        .name = "capsper",
+        .name = exe_name,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -20,10 +33,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", options);
-    exe.root_module.addIncludePath(b.path("dist/include/onnxruntime"));
-    if (!is_macos) {
-        exe.linkSystemLibrary("onnxruntime");
-    }
+    addBackendDeps(b, exe, backend);
     addPlatformDeps(b, exe, is_macos);
     exe.linkLibC();
     b.installArtifact(exe);
@@ -42,12 +52,12 @@ pub fn build(b: *std.Build) void {
 
     // Pure Zig tests (no C deps, no platform deps)
     inline for (.{
-        "src/utils.zig",
-        "src/auto_gain.zig",
-        "src/nemo_mel.zig",
-        "src/tokenizer.zig",
-        "src/context_graph.zig",
-        "src/nemo_mel_state.zig",
+        "src/shared/utils.zig",
+        "src/shared/auto_gain.zig",
+        "src/shared/nemo_mel.zig",
+        "src/shared/tokenizer.zig",
+        "src/shared/context_graph.zig",
+        "src/shared/nemo_mel_state.zig",
     }) |src| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -64,7 +74,7 @@ pub fn build(b: *std.Build) void {
         // Linux: input.zig tests need libc for @cImport of linux/input-event-codes.h
         const input_tests = b.addTest(.{
             .root_module = b.createModule(.{
-                .root_source_file = b.path("src/input.zig"),
+                .root_source_file = b.path("src/platform/linux/input.zig"),
                 .target = target,
                 .optimize = optimize,
             }),
@@ -85,12 +95,12 @@ pub fn build(b: *std.Build) void {
         &.{
             .{ .name = "minish", .module = minish_dep.module("minish") },
             .{ .name = "utils.zig", .module = b.createModule(.{
-                .root_source_file = b.path("src/utils.zig"),
+                .root_source_file = b.path("src/shared/utils.zig"),
                 .target = target,
                 .optimize = optimize,
             }) },
             .{ .name = "input.zig", .module = b.createModule(.{
-                .root_source_file = b.path("src/input_macos.zig"),
+                .root_source_file = b.path("src/platform/macos/input.zig"),
                 .target = target,
                 .optimize = optimize,
             }) },
@@ -99,12 +109,12 @@ pub fn build(b: *std.Build) void {
         &.{
             .{ .name = "minish", .module = minish_dep.module("minish") },
             .{ .name = "utils.zig", .module = b.createModule(.{
-                .root_source_file = b.path("src/utils.zig"),
+                .root_source_file = b.path("src/shared/utils.zig"),
                 .target = target,
                 .optimize = optimize,
             }) },
             .{ .name = "input.zig", .module = b.createModule(.{
-                .root_source_file = b.path("src/input.zig"),
+                .root_source_file = b.path("src/platform/linux/input.zig"),
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
@@ -114,7 +124,7 @@ pub fn build(b: *std.Build) void {
     const prop_exe = b.addExecutable(.{
         .name = "prop-tests",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/prop_tests.zig"),
+            .root_source_file = b.path("src/shared/prop_tests.zig"),
             .target = target,
             .optimize = optimize,
             .imports = prop_imports,
@@ -142,6 +152,23 @@ fn addLibPath(b: *std.Build, exe: *Exe, is_macos: bool) void {
     }
 }
 
+fn addBackendDeps(b: *std.Build, exe: *Exe, backend: Backend) void {
+    switch (backend) {
+        .coreml => {
+            exe.linkFramework("CoreML");
+            exe.linkFramework("Foundation");
+            exe.root_module.addCSourceFile(.{
+                .file = b.path("src/backend/coreml/helpers.m"),
+                .flags = &.{"-fobjc-arc"},
+            });
+        },
+        .ort_cuda, .ort_cpu => {
+            exe.root_module.addIncludePath(b.path("dist/include/onnxruntime"));
+            exe.linkSystemLibrary("onnxruntime");
+        },
+    }
+}
+
 fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
     addLibPath(b, exe, is_macos);
     exe.each_lib_rpath = false;
@@ -152,27 +179,18 @@ fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
         exe.linkFramework("CoreFoundation");
         exe.linkFramework("ApplicationServices");
         exe.linkFramework("AVFoundation");
-        // Objective-C helper for microphone permission (AVCaptureDevice)
         exe.root_module.addCSourceFile(.{
-            .file = b.path("src/mic_permission_macos.m"),
+            .file = b.path("src/platform/macos/mic_permission.m"),
             .flags = &.{"-fobjc-arc"},
         });
-        // C helper for CGEventTap/CGEventPost keyboard input
         exe.root_module.addCSourceFile(.{
-            .file = b.path("src/input_helpers_macos.c"),
+            .file = b.path("src/platform/macos/input_helpers.c"),
             .flags = &.{},
-        });
-        // CoreML inference bridge for Nemotron RNNT
-        exe.linkFramework("CoreML");
-        exe.linkFramework("Foundation");
-        exe.root_module.addCSourceFile(.{
-            .file = b.path("src/coreml_helpers.m"),
-            .flags = &.{"-fobjc-arc"},
         });
     } else {
         exe.linkSystemLibrary("libpipewire-0.3");
         exe.root_module.addCSourceFile(.{
-            .file = b.path("src/pw_helpers.c"),
+            .file = b.path("src/platform/linux/pw_helpers.c"),
             .flags = &.{
                 "-I/usr/include/pipewire-0.3",
                 "-I/usr/include/spa-0.2",

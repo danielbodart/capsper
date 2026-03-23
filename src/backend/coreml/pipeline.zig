@@ -4,17 +4,16 @@
 /// coreml_helpers.m instead of onnxruntime. Mel computation and RNNT
 /// greedy decode logic are identical — only the model invocation differs.
 const std = @import("std");
-const nemo_mel = @import("nemo_mel.zig");
-const mel_state_mod = @import("nemo_mel_state.zig");
+const nemo_mel = @import("../../shared/nemo_mel.zig");
+const mel_state_mod = @import("../../shared/nemo_mel_state.zig");
 const NemoMelState = mel_state_mod.NemoMelState;
-const tokenizer = @import("tokenizer.zig");
-const asr_types = @import("asr_types.zig");
-const utils = @import("utils.zig");
-const context_graph_mod = @import("context_graph.zig");
+const tokenizer = @import("../../shared/tokenizer.zig");
+const asr_types = @import("../../shared/asr_types.zig");
+const utils = @import("../../shared/utils.zig");
+const context_graph_mod = @import("../../shared/context_graph.zig");
 const ContextGraph = context_graph_mod.ContextGraph;
 const ContextState = context_graph_mod.ContextState;
 
-const AsrPipeline = @import("asr_backend.zig").AsrPipeline;
 pub const TranscribeResult = asr_types.TranscribeResult;
 pub const Timing = asr_types.Timing;
 
@@ -106,32 +105,6 @@ pub const CoreMLPipeline = struct {
         }
         return pipeline;
     }
-
-    /// Return the type-erased AsrPipeline interface.
-    pub fn asrPipeline(self: *CoreMLPipeline) AsrPipeline {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable = AsrPipeline.VTable{
-        .transcribe = struct {
-            fn f(ptr: *anyopaque, samples: []const f32, flush: bool, max_tokens: ?usize) anyerror!?TranscribeResult {
-                const self: *CoreMLPipeline = @ptrCast(@alignCast(ptr));
-                return self.transcribe(samples, flush, max_tokens);
-            }
-        }.f,
-        .resetSegment = struct {
-            fn f(ptr: *anyopaque) void {
-                const self: *CoreMLPipeline = @ptrCast(@alignCast(ptr));
-                self.resetSegment();
-            }
-        }.f,
-        .deinit = struct {
-            fn f(ptr: *anyopaque) void {
-                const self: *CoreMLPipeline = @ptrCast(@alignCast(ptr));
-                self.deinit();
-            }
-        }.f,
-    };
 
     pub fn deinit(self: *CoreMLPipeline) void {
         self.allocator.free(self.dec_state1);

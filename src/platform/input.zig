@@ -1,8 +1,8 @@
 const builtin = @import("builtin");
 const impl = if (builtin.os.tag == .macos)
-    @import("input_macos.zig")
+    @import("macos/input.zig")
 else
-    @import("input.zig");
+    @import("linux/input.zig");
 
 pub const InputHandler = impl.InputHandler;
 pub const parseTriggerKey = impl.parseTriggerKey;

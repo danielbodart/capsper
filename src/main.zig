@@ -1,21 +1,23 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const nemo_mel = @import("nemo_mel.zig");
-const nemotron_tokenizer = @import("tokenizer.zig");
-const ContextGraph = @import("context_graph.zig").ContextGraph;
-const AsrPipeline = @import("asr_backend.zig").AsrPipeline;
-const server_mod = @import("server.zig");
+const nemo_mel = @import("shared/nemo_mel.zig");
+const nemotron_tokenizer = @import("shared/tokenizer.zig");
+const ContextGraph = @import("shared/context_graph.zig").ContextGraph;
+const backend = @import("backend/init.zig");
+const pipeline_mod = @import("backend/pipeline.zig");
+const Pipeline = pipeline_mod.Pipeline;
+const server_mod = @import("shared/server.zig");
 const Server = server_mod.Server;
 const PipelineFactory = server_mod.PipelineFactory;
 const InputMode = server_mod.InputMode;
 const TypeCallback = server_mod.TypeCallback;
-const AudioCapture = @import("audio_capture_platform.zig").AudioCapture;
-const input_mod = @import("input_platform.zig");
+const AudioCapture = @import("platform/audio.zig").AudioCapture;
+const input_mod = @import("platform/input.zig");
 const InputHandler = input_mod.InputHandler;
-const utils = @import("utils.zig");
-const audio_detect = @import("audio_detect_platform.zig");
-const Recorder = @import("recorder.zig").Recorder;
+const utils = @import("shared/utils.zig");
+const audio_detect = @import("platform/detect.zig");
+const Recorder = @import("shared/recorder.zig").Recorder;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
@@ -46,7 +48,7 @@ pub fn main() !void {
     var low_latency: bool = false;
     var pw_gain: f32 = 1.0;
     var no_auto_gain: bool = false;
-    var no_cuda: bool = false;
+    // (no_cuda removed — binary variant determines backend)
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -145,8 +147,6 @@ pub fn main() !void {
             low_latency = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-gain")) {
             no_auto_gain = true;
-        } else if (std.mem.eql(u8, arg, "--no-cuda")) {
-            no_cuda = true;
         } else {
             printUsage();
             return;
@@ -269,11 +269,10 @@ pub fn main() !void {
         std.debug.print("Context graph: {d} suppression phrases\n", .{drop_terms.len});
     }
 
-    // Load platform-specific ASR backend
-    const backend = @import("asr_init.zig");
-    var backend_state = backend.load(allocator, resolved_model_path, nemo_filterbank, &nemo_token_map, nemo_context_graph, no_cuda, verbose) orelse return;
+    // Load ASR backend (selected at compile time via -Dbackend)
+    var backend_state = backend.load(allocator, resolved_model_path, nemo_filterbank, &nemo_token_map, nemo_context_graph, verbose) orelse return;
     defer backend_state.deinit();
-    const pipeline_factory = backend_state.factory();
+    const pipeline_factory = PipelineFactory{ .backend = backend_state };
 
     // --stream-wav: feed WAV through the streaming pipeline (no PTT, no VAD)
     if (stream_wav_file) |swf| {
@@ -322,11 +321,14 @@ pub fn main() !void {
         };
         defer allocator.free(samples);
 
-        var pipeline = pipeline_factory.create(allocator) catch |err| {
+        const pipeline = pipeline_factory.create(allocator) catch |err| {
             std.debug.print("Failed to create pipeline: {}\n", .{err});
             return;
         };
-        defer pipeline.deinit();
+        defer {
+            pipeline.deinit();
+            allocator.destroy(pipeline);
+        }
 
         if (pipeline.transcribe(samples, true, null) catch |err| {
             std.debug.print("Transcription failed: {}\n", .{err});
@@ -410,7 +412,7 @@ pub fn main() !void {
 
 fn printUsage() void {
     std.debug.print("Usage: capsper [--model PATH] [--port PORT]\n", .{});
-    std.debug.print("       [--verbose|-v] [--no-cuda]\n", .{});
+    std.debug.print("       [--verbose|-v]\n", .{});
     std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
     std.debug.print("       [--drop-terms FILE]\n", .{});

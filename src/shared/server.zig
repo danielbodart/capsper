@@ -1,6 +1,8 @@
 const std = @import("std");
-const AsrPipeline = @import("asr_backend.zig").AsrPipeline;
-const AudioCapture = @import("audio_capture_platform.zig").AudioCapture;
+const pipeline_mod = @import("../backend/pipeline.zig");
+const Pipeline = pipeline_mod.Pipeline;
+const backend_init = @import("../backend/init.zig");
+const AudioCapture = @import("../platform/audio.zig").AudioCapture;
 const AutoGain = @import("auto_gain.zig").AutoGain;
 const utils = @import("utils.zig");
 const recorder_mod = @import("recorder.zig");
@@ -158,13 +160,12 @@ const ChunkedReader = struct {
 
 pub const InputMode = enum { tcp, local };
 
-/// Creates a fresh AsrPipeline for each connection.
+/// Creates a fresh Pipeline for each connection.
 pub const PipelineFactory = struct {
-    ctx: *anyopaque,
-    createFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!AsrPipeline,
+    backend: *backend_init.BackendState,
 
-    pub fn create(self: PipelineFactory, allocator: std.mem.Allocator) !AsrPipeline {
-        return self.createFn(self.ctx, allocator);
+    pub fn create(self: PipelineFactory, allocator: std.mem.Allocator) !*Pipeline {
+        return self.backend.createPipeline(allocator);
     }
 };
 
@@ -307,8 +308,11 @@ pub const Server = struct {
     /// PTT-gated streaming loop. Audio chunks go directly to the pipeline
     /// for incremental processing. No VAD — PTT press/release drives segmentation.
     pub fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
-        var asr = try self.pipeline_factory.create(self.allocator);
-        defer asr.deinit();
+        const asr = try self.pipeline_factory.create(self.allocator);
+        defer {
+            asr.deinit();
+            self.allocator.destroy(asr);
+        }
 
         var auto_gain = AutoGain{ .current_gain = self.initial_gain };
 

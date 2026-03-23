@@ -1,7 +1,7 @@
 const builtin = @import("builtin");
 const impl = if (builtin.os.tag == .macos)
-    @import("audio_capture_macos.zig")
+    @import("macos/audio.zig")
 else
-    @import("audio_capture.zig");
+    @import("linux/audio.zig");
 
 pub const AudioCapture = impl.AudioCapture;

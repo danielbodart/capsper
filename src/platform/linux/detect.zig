@@ -1,6 +1,6 @@
 const std = @import("std");
 const pw = @import("pipewire_c.zig");
-const utils = @import("utils.zig");
+const utils = @import("../../shared/utils.zig");
 const posix = std.posix;
 
 const log = std.log.scoped(.pw_detect);
