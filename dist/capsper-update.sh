@@ -9,8 +9,8 @@ set -euo pipefail
 REPO="danielbodart/capsper"
 ASSET="capsper-linux-x86_64.tar.gz"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
-HF_REPO="danielbodart/nemotron-speech-600m-onnx"
-HF_BASE="https://huggingface.co/${HF_REPO}/resolve/main"
+HF_ONNX_REPO="danielbodart/nemotron-speech-600m-onnx"
+HF_ONNX_BASE="https://huggingface.co/${HF_ONNX_REPO}/resolve/main"
 TMP_DIR=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -23,11 +23,9 @@ current_version() {
 
 detect_model_variant() {
     if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-        echo "fp16"
-    elif [ "$(uname -m)" = "arm64" ] && [ "$(uname -s)" = "Darwin" ]; then
-        echo "fp16"
+        echo "int8-static"
     else
-        echo "int8"
+        echo "int8-dynamic"
     fi
 }
 
@@ -47,13 +45,13 @@ download_nemotron_model() {
     variant=$(detect_model_variant)
     echo "Downloading Nemotron model ($variant)..."
 
-    curl -fsSL -o "$target_dir/encoder_model.onnx" "$HF_BASE/$variant/encoder_model.onnx" || return 1
-    curl -fsSL -o "$target_dir/encoder_model.onnx.data" "$HF_BASE/$variant/encoder_model.onnx.data" || return 1
-    curl -fsSL -o "$target_dir/decoder_model.onnx" "$HF_BASE/$variant/decoder_model.onnx" || return 1
-    curl -fsSL -o "$target_dir/decoder_model.onnx.data" "$HF_BASE/$variant/decoder_model.onnx.data" || return 1
-    curl -fsSL -o "$target_dir/filterbank.bin" "$HF_BASE/shared/filterbank.bin" || return 1
-    curl -fsSL -o "$target_dir/tokens.txt" "$HF_BASE/shared/tokens.txt" || return 1
-    curl -fsSL -o "$target_dir/config.json" "$HF_BASE/config.json" || return 1
+    curl -fsSL -o "$target_dir/encoder_model.onnx" "$HF_ONNX_BASE/$variant/encoder_model.onnx" || return 1
+    curl -fsSL -o "$target_dir/encoder_model.onnx.data" "$HF_ONNX_BASE/$variant/encoder_model.onnx.data" || return 1
+    curl -fsSL -o "$target_dir/decoder_model.onnx" "$HF_ONNX_BASE/$variant/decoder_model.onnx" || return 1
+    curl -fsSL -o "$target_dir/decoder_model.onnx.data" "$HF_ONNX_BASE/$variant/decoder_model.onnx.data" || return 1
+    curl -fsSL -o "$target_dir/filterbank.bin" "$HF_ONNX_BASE/shared/filterbank.bin" || return 1
+    curl -fsSL -o "$target_dir/tokens.txt" "$HF_ONNX_BASE/shared/tokens.txt" || return 1
+    curl -fsSL -o "$target_dir/config.json" "$HF_ONNX_BASE/config.json" || return 1
 
     echo "Nemotron model downloaded ($variant)."
 }
@@ -113,8 +111,8 @@ main() {
     mkdir -p "$release_dir"
     tar -xzf "$TMP_DIR/$ASSET" -C "$release_dir"
 
-    # Validate critical files exist
-    [ -f "$release_dir/bin/capsper" ] || die "Extracted release is missing capsper binary"
+    # Validate critical files exist (bin/capsper is the launcher script on Linux)
+    [ -f "$release_dir/bin/capsper" ] || die "Extracted release is missing capsper launcher"
     [ -d "$release_dir/lib" ] || die "Extracted release is missing lib/ directory"
 
     # Update top-level scripts from staged release
