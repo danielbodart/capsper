@@ -40,7 +40,8 @@ main() {
 
     # Atomic symlink swap back
     ln -sfn "releases/$prev" "$INSTALL_DIR/current.tmp"
-    mv -T "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
+    rm -f "$INSTALL_DIR/current"
+    mv "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
 
     # Clean up markers
     rm -f "$prev_file" "$timestamp_file" "$INSTALL_DIR/.update-pending"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Self-contained installer for capsper.
+# Linux installer for capsper.
 # Ships in the dist tarball alongside the binary and shared libs.
 #
 # In a git checkout (dev mode), installs in-situ pointing at the source tree.
@@ -11,58 +11,14 @@ set -euo pipefail
 #   ./install.sh              Full interactive setup (download models, permissions, systemd)
 #   ./install.sh pw-detect    Detect best PipeWire microphone channel (delegates to capsper --pw-detect)
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
+# shellcheck source=install-common.sh
+source "$(cd "$(dirname "$0")" >/dev/null && pwd)/install-common.sh"
 
-HF_ONNX_REPO="danielbodart/nemotron-speech-600m-onnx"
-HF_ONNX_BASE="https://huggingface.co/${HF_ONNX_REPO}/resolve/main"
-HF_COREML_REPO="danielbodart/nemotron-speech-600m-coreml"
-HF_COREML_BASE="https://huggingface.co/${HF_COREML_REPO}/resolve/main"
-
-IS_MACOS=false
-[ "$(uname -s)" = "Darwin" ] && IS_MACOS=true
-
-INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
-RECORDINGS_DIR="$INSTALL_DIR/recordings"
 NEEDS_REBOOT=false
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-die() { echo "ERROR: $*" >&2; exit 1; }
-
-confirm() {
-    local prompt="$1"
-    printf '%s [Y/n] ' "$prompt"
-    read -r answer
-    case "${answer,,}" in
-        ""|y|yes) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-confirm_default_no() {
-    local prompt="$1"
-    printf '%s [y/N] ' "$prompt"
-    read -r answer
-    case "${answer,,}" in
-        y|yes) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "$1 not found. $2"
-}
-
-is_dev_mode() {
-    [ -d "$SCRIPT_DIR/../.git" ]
-}
 
 # ─── Permissions ──────────────────────────────────────────────────────────────
 
 check_permissions() {
-    # Linux-only: evdev/uinput permissions
-    $IS_MACOS && return
-
     # Check input group membership
     if ! id -nG | grep -qw input; then
         echo ""
@@ -89,142 +45,8 @@ check_permissions() {
     fi
 }
 
-# ─── Hardware Detection ──────────────────────────────────────────────────────
-
-detect_model_variant() {
-    # macOS → CoreML (separate download path)
-    if $IS_MACOS; then
-        echo "coreml"
-        return
-    fi
-    # NVIDIA GPU → int8-static (QDQ format, ~45% less VRAM than fp16)
-    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-        echo "int8-static"
-        return
-    fi
-    # CPU-only → int8-dynamic (optimized for Intel VNNI/AMX)
-    echo "int8-dynamic"
-}
-
-# ─── Model Download ──────────────────────────────────────────────────────────
-
-download_models() {
-    local model_dir="$1"
-    local variant
-    variant=$(detect_model_variant)
-
-    if [ "$variant" = "coreml" ]; then
-        download_coreml_models "$model_dir"
-    else
-        download_onnx_models "$model_dir" "$variant"
-    fi
-}
-
-download_coreml_models() {
-    local model_dir="$1"
-    local onnx_dir="$model_dir/nemotron"
-    local coreml_dir="$model_dir/nemotron-coreml"
-    mkdir -p "$onnx_dir" "$coreml_dir"
-
-    # Check if already downloaded
-    if [ -d "$coreml_dir/encoder.mlmodelc" ] && [ -d "$coreml_dir/decoder.mlmodelc" ] \
-       && [ -f "$onnx_dir/filterbank.bin" ] && [ -f "$onnx_dir/tokens.txt" ]; then
-        echo "CoreML models already present."
-        return
-    fi
-
-    echo "Detected hardware → Apple Silicon (CoreML)"
-    echo "Model: Nemotron Speech 600M CoreML (FP16, 93% ANE)"
-
-    if ! confirm "Download now?"; then
-        echo ""
-        echo "Models directory: $coreml_dir"
-        echo "Download manually from: https://huggingface.co/$HF_COREML_REPO"
-        return
-    fi
-
-    require_cmd curl "Install curl to download models."
-
-    echo "Downloading CoreML models..."
-
-    # CoreML compiled models (.mlmodelc directories — download individual files)
-    for model in encoder decoder; do
-        local mlmodelc_dir="$coreml_dir/${model}.mlmodelc"
-        mkdir -p "$mlmodelc_dir/weights" "$mlmodelc_dir/analytics"
-        curl -L --progress-bar -o "$mlmodelc_dir/model.mil" \
-            "$HF_COREML_BASE/fp16/${model}.mlmodelc/model.mil"
-        curl -L --progress-bar -o "$mlmodelc_dir/coremldata.bin" \
-            "$HF_COREML_BASE/fp16/${model}.mlmodelc/coremldata.bin"
-        curl -L --progress-bar -o "$mlmodelc_dir/metadata.json" \
-            "$HF_COREML_BASE/fp16/${model}.mlmodelc/metadata.json"
-        curl -L --progress-bar -o "$mlmodelc_dir/weights/weight.bin" \
-            "$HF_COREML_BASE/fp16/${model}.mlmodelc/weights/weight.bin"
-        curl -L --progress-bar -o "$mlmodelc_dir/analytics/coremldata.bin" \
-            "$HF_COREML_BASE/fp16/${model}.mlmodelc/analytics/coremldata.bin"
-    done
-
-    # Shared files (filterbank + vocabulary from ONNX repo)
-    curl -L --progress-bar -o "$onnx_dir/filterbank.bin" \
-        "$HF_ONNX_BASE/shared/filterbank.bin"
-    curl -L --progress-bar -o "$onnx_dir/tokens.txt" \
-        "$HF_ONNX_BASE/shared/tokens.txt"
-
-    echo "CoreML models downloaded."
-}
-
-download_onnx_models() {
-    local model_dir="$1"
-    local variant="$2"
-    local target_dir="$model_dir/nemotron"
-    mkdir -p "$target_dir"
-
-    # Check if already downloaded
-    if [ -f "$target_dir/encoder_model.onnx" ] && [ -f "$target_dir/decoder_model.onnx" ] \
-       && [ -f "$target_dir/filterbank.bin" ] && [ -f "$target_dir/tokens.txt" ]; then
-        echo "ONNX models already present."
-        return
-    fi
-
-    echo "Detected hardware → $variant precision"
-    echo "Model: Nemotron Speech 600M ONNX ($variant)"
-
-    if ! confirm "Download now?"; then
-        echo ""
-        echo "Models directory: $target_dir"
-        echo "Download manually from: https://huggingface.co/$HF_ONNX_REPO"
-        return
-    fi
-
-    require_cmd curl "Install curl to download models."
-
-    echo "Downloading ONNX model ($variant)..."
-
-    # Variant-specific ONNX files
-    curl -L --progress-bar -o "$target_dir/encoder_model.onnx" \
-        "$HF_ONNX_BASE/$variant/encoder_model.onnx"
-    curl -L --progress-bar -o "$target_dir/encoder_model.onnx.data" \
-        "$HF_ONNX_BASE/$variant/encoder_model.onnx.data"
-    curl -L --progress-bar -o "$target_dir/decoder_model.onnx" \
-        "$HF_ONNX_BASE/$variant/decoder_model.onnx"
-    curl -L --progress-bar -o "$target_dir/decoder_model.onnx.data" \
-        "$HF_ONNX_BASE/$variant/decoder_model.onnx.data"
-
-    # Shared files (filterbank, vocabulary, config)
-    curl -L --progress-bar -o "$target_dir/filterbank.bin" \
-        "$HF_ONNX_BASE/shared/filterbank.bin"
-    curl -L --progress-bar -o "$target_dir/tokens.txt" \
-        "$HF_ONNX_BASE/shared/tokens.txt"
-    curl -L --progress-bar -o "$target_dir/config.json" \
-        "$HF_ONNX_BASE/config.json"
-
-    echo "ONNX model downloaded ($variant)."
-}
-
 # ─── PipeWire Channel Detection & Gain Calibration ───────────────────────────
 
-# Run the interactive setup wizard. Device selection, channel detection, and
-# gain calibration all happen inside the binary. Parseable output (CHANNEL=,
-# GAIN=) goes to stdout; interactive prompts go to stderr.
 pw_detect() {
     local binary="$1"
     "$binary" --pw-detect
@@ -239,7 +61,6 @@ install_service() {
     local model_dir="$4"
     local target="${5:-}"
     local with_updates="${6:-false}"
-
     local drop_terms="${7:-}"
     local enable_recordings="${8:-false}"
     local low_latency="${9:-false}"
@@ -292,38 +113,7 @@ install_service() {
     echo "capsper.service installed."
 }
 
-run_dry_run() {
-    local service_file="$HOME/.config/systemd/user/capsper.service"
-    local exec_start
-    exec_start=$(grep '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
-
-    if [ -z "$exec_start" ]; then
-        echo "WARNING: Could not read service file, skipping validation."
-        return 0
-    fi
-
-    echo ""
-    echo "=== Validating Setup ==="
-    echo ""
-
-    local exit_code=0
-    $exec_start --dry-run 2>&1 || exit_code=$?
-
-    echo ""
-
-    if [ $exit_code -ne 0 ]; then
-        echo "Setup validation failed. Fix the issues above before starting the service."
-        return 1
-    fi
-
-    echo "Setup validated successfully."
-}
-
-# ─── Update Infrastructure ─────────────────────────────────────────────────
-
-has_auto_update() {
-    [ -f "$HOME/.config/systemd/user/capsper-update.timer" ]
-}
+# ─── Config Extraction (for upgrades) ────────────────────────────────────────
 
 extract_service_config() {
     local service_file="$HOME/.config/systemd/user/capsper.service"
@@ -338,7 +128,6 @@ extract_service_config() {
     SAVED_TARGET=$(echo "$exec_start" | sed -n 's/.*--pw-target \([^ ]*\).*/\1/p')
     SAVED_TARGET="${SAVED_TARGET:-}"
 
-    # Drop terms survive migration
     SAVED_DROP_TERMS=$(echo "$exec_start" | sed -n 's/.*--drop-terms \([^ ]*\).*/\1/p')
     SAVED_DROP_TERMS="${SAVED_DROP_TERMS:-}"
 
@@ -350,11 +139,12 @@ extract_service_config() {
 
     SAVED_GAIN=$(echo "$exec_start" | sed -n 's/.*--pw-gain \([^ ]*\).*/\1/p')
     SAVED_GAIN="${SAVED_GAIN:-1.0}"
+}
 
-    # Migration: strip removed flags that may exist in old service files
-    # --domain-terms, --asr, --vad, --vad-threshold, --vad-threshold-off,
-    # --min-silence-ms, --max-tokens-per-sec are no longer supported.
-    # The new install_service() won't include them.
+# ─── Auto-Update Infrastructure ──────────────────────────────────────────────
+
+has_auto_update() {
+    [ -f "$HOME/.config/systemd/user/capsper-update.timer" ]
 }
 
 install_update_timer() {
@@ -404,97 +194,43 @@ EOF
     echo "capsper-rollback.service installed."
 }
 
-# ─── Install Files ────────────────────────────────────────────────────────
+# ─── Dry-Run Validation (Linux) ──────────────────────────────────────────────
 
-install_files() {
-    echo "Installing to $INSTALL_DIR ..."
+run_dry_run_linux() {
+    local service_file="$HOME/.config/systemd/user/capsper.service"
+    local exec_start
+    exec_start=$(grep '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
 
-    [ -d "$SCRIPT_DIR/lib" ] || die "dist/lib/ not found."
-    [ -f "$SCRIPT_DIR/VERSION" ] || die "VERSION file not found in dist."
-
-    local ver
-    ver=$(cat "$SCRIPT_DIR/VERSION")
-    local release_dir="$INSTALL_DIR/releases/v$ver"
-
-    mkdir -p "$release_dir"
-
-    # Copy bin/ and lib/ into versioned directory
-    cp -a "$SCRIPT_DIR/bin" "$release_dir/"
-    cp -a "$SCRIPT_DIR/lib" "$release_dir/"
-    cp "$SCRIPT_DIR/VERSION" "$release_dir/"
-
-    # Create models/ dir in release for symlinks
-    mkdir -p "$release_dir/models"
-
-    # Save current version for rollback (if upgrading)
-    local current_target
-    current_target=$(readlink "$INSTALL_DIR/current" 2>/dev/null || true)
-    if [ -n "$current_target" ]; then
-        local current_name
-        current_name=$(basename "$current_target")
-        if [ "$current_name" != "v$ver" ]; then
-            echo "$current_name" > "$INSTALL_DIR/.previous-version"
-            date +%s > "$INSTALL_DIR/.update-applied-at"
-        fi
+    if [ -z "$exec_start" ]; then
+        echo "WARNING: Could not read service file, skipping validation."
+        return 0
     fi
 
-    # Atomic symlink swap
-    ln -sfn "releases/v$ver" "$INSTALL_DIR/current.tmp"
-    mv -T "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
+    echo ""
+    echo "=== Validating Setup ==="
+    echo ""
 
-    # Install update scripts
-    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh; do
-        if [ -f "$SCRIPT_DIR/$script" ]; then
-            cp "$SCRIPT_DIR/$script" "$INSTALL_DIR/"
-            chmod +x "$INSTALL_DIR/$script"
-        fi
-    done
+    local exit_code=0
+    $exec_start --dry-run 2>&1 || exit_code=$?
 
-    # Clean up old flat layout (migration from pre-versioned installs)
-    if [ -d "$INSTALL_DIR/bin" ] && [ ! -L "$INSTALL_DIR/bin" ]; then
-        rm -rf "${INSTALL_DIR:?}/bin" "${INSTALL_DIR:?}/lib"
-        echo "Migrated from flat layout to versioned directories."
+    echo ""
+
+    if [ $exit_code -ne 0 ]; then
+        echo "Setup validation failed. Fix the issues above before starting the service."
+        return 1
     fi
 
-    # Clean up old releases (keep current + previous)
-    local prev
-    prev=$(cat "$INSTALL_DIR/.previous-version" 2>/dev/null || true)
-    for dir in "$INSTALL_DIR/releases"/v*; do
-        [ -d "$dir" ] || continue
-        local name
-        name=$(basename "$dir")
-        [ "$name" = "v$ver" ] && continue
-        [ "$name" = "$prev" ] && continue
-        echo "Removing old release: $name"
-        rm -rf "$dir"
-    done
-
-    # Symlink into ~/.local/bin so capsper is on PATH
-    mkdir -p "$HOME/.local/bin"
-    ln -sf "$INSTALL_DIR/current/bin/capsper" "$HOME/.local/bin/capsper"
-
-    echo "Installed v$ver. Binary: $INSTALL_DIR/current/bin/capsper"
-    echo "Symlink:  ~/.local/bin/capsper"
-
-    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
-        echo ""
-        echo "NOTE: ~/.local/bin is not on your PATH."
-        echo "Add to your shell rc file:"
-        # shellcheck disable=SC2016
-        echo '  export PATH="$HOME/.local/bin:$PATH"'
-    fi
+    echo "Setup validated successfully."
 }
 
-# ─── Subcommands ──────────────────────────────────────────────────────────────
+# ─── Main Install ─────────────────────────────────────────────────────────────
 
 cmd_install() {
-    # Verify we're in a dist directory with the binary
     [ -f "$SCRIPT_DIR/bin/capsper" ] || die "capsper binary not found in $SCRIPT_DIR/bin"
 
     local service_file="$HOME/.config/systemd/user/capsper.service"
     local is_upgrade=false
     local update_config=false
-
     local was_active=false
 
     if [ -f "$service_file" ]; then
@@ -539,12 +275,10 @@ cmd_install() {
                 echo "Using default channel: FL, gain: 1.0"
             fi
 
-            # Drop terms
             local drop_terms=""
             echo ""
             echo "=== Drop Terms (optional) ==="
-            echo "Suppress filler phrases (e.g. \"Thank you.\", \"you know\") that"
-            echo "may appear in transcription. One phrase per line in a text file."
+            echo "Suppress filler phrases (e.g. \"Thank you.\", \"you know\")."
             if confirm_default_no "Do you have a drop terms file?"; then
                 printf 'Path to drop terms file: '
                 read -r drop_terms
@@ -553,18 +287,14 @@ cmd_install() {
                 fi
             fi
 
-            # Debug recordings
             local enable_recordings=false
             echo ""
             echo "=== Debug Recordings (optional) ==="
             echo "Record audio snippets and transcription logs for troubleshooting."
-            echo "Keeps the last 50 utterances in: $RECORDINGS_DIR"
-            echo "Recordings are cleared automatically on version updates."
             if confirm_default_no "Enable debug recordings?"; then
                 enable_recordings=true
             fi
 
-            # Low-latency mode
             local low_latency=false
             echo ""
             echo "=== Low-Latency Mode (optional) ==="
@@ -581,20 +311,13 @@ cmd_install() {
         echo "=== Capsper Installer ==="
         echo ""
 
-        # Check runtime deps
         command -v pw-cli >/dev/null 2>&1 || echo "WARNING: pw-cli not found. PipeWire may not be installed."
 
-        # Copy files to ~/.local/share/capsper/ (always, this is the upgrade)
         install_files
-
-        # Download models (always, in case new models are needed)
         download_models "$INSTALL_DIR/models"
-
-        # Permissions (always, even on upgrade)
         check_permissions
 
         if ! $is_upgrade || $update_config; then
-            # Audio configuration
             local channel="FL"
             local gain="1.0"
             echo ""
@@ -610,12 +333,10 @@ cmd_install() {
                 echo "Using default channel: FL, gain: 1.0"
             fi
 
-            # Drop terms
             local drop_terms=""
             echo ""
             echo "=== Drop Terms (optional) ==="
-            echo "Suppress filler phrases (e.g. \"Thank you.\", \"you know\") that"
-            echo "may appear in transcription. One phrase per line in a text file."
+            echo "Suppress filler phrases (e.g. \"Thank you.\", \"you know\")."
             if confirm_default_no "Do you have a drop terms file?"; then
                 printf 'Path to drop terms file: '
                 read -r drop_terms
@@ -624,18 +345,14 @@ cmd_install() {
                 fi
             fi
 
-            # Debug recordings
             local enable_recordings=false
             echo ""
             echo "=== Debug Recordings (optional) ==="
             echo "Record audio snippets and transcription logs for troubleshooting."
-            echo "Keeps the last 50 utterances in: $RECORDINGS_DIR"
-            echo "Recordings are cleared automatically on version updates."
             if confirm_default_no "Enable debug recordings?"; then
                 enable_recordings=true
             fi
 
-            # Low-latency mode
             local low_latency=false
             echo ""
             echo "=== Low-Latency Mode (optional) ==="
@@ -646,7 +363,6 @@ cmd_install() {
                 low_latency=true
             fi
 
-            # Auto-updates
             local enable_updates=true
             echo ""
             if ! confirm "Enable automatic updates?"; then
@@ -660,14 +376,11 @@ cmd_install() {
                 install_rollback_service
             fi
         else
-            # Upgrade without config change: preserve audio settings, migrate config
             extract_service_config
 
             if has_auto_update; then
-                # Auto-update already configured: keep it, just update paths
                 install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
             else
-                # Pre-auto-update install: offer to enable
                 local enable_updates=true
                 echo ""
                 if ! confirm "Enable automatic updates?"; then
@@ -691,7 +404,7 @@ cmd_install() {
         echo "The service is enabled and will start automatically on boot."
         echo ""
         echo "Reboot now, and capsper will be ready when you log back in."
-    elif run_dry_run; then
+    elif run_dry_run_linux; then
         if $is_upgrade && $was_active; then
             echo "Restarting service..."
             systemctl --user restart capsper.service

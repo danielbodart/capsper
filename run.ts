@@ -212,32 +212,24 @@ fi
 
     const ver = await version();
     await Bun.write("dist/VERSION", ver);
-    await $`tar -czf ${TARBALL} -C dist bin/ lib/ install.sh capsper-update.sh capsper-apply-update.sh capsper-rollback.sh VERSION`;
+    await $`tar -czf ${TARBALL} -C dist bin/ lib/ install.sh install-common.sh capsper-update.sh capsper-apply-update.sh capsper-rollback.sh VERSION`;
     await $`sha256sum ${TARBALL} > ${TARBALL}.sha256`;
     console.log(`Tarball: ${TARBALL} (v${ver})`);
 }
 
 async function distMacOS() {
-    // Validate dylibs are real Mach-O binaries
-    const { stdout } = await $`file dist/lib-macos/*.dylib`.quiet().nothrow();
-    if (stdout.toString().length > 0) {
-        const lines = stdout.toString().trim().split("\n");
-        const bad = lines.filter(l => !l.includes("Mach-O"));
-        if (bad.length > 0) {
-            console.error("ERROR: dist/lib-macos/ contains non-Mach-O files:");
-            bad.forEach(l => console.error(`  ${l}`));
-            process.exit(1);
-        }
-    }
-
     const ver = await version();
     await Bun.write("dist/VERSION", ver);
 
-    // Create tarball with lib-macos/ renamed to lib/ for consistent RPATH
     await $`rm -rf /tmp/capsper-dist-macos`;
     await $`mkdir -p /tmp/capsper-dist-macos`;
     await $`cp -r dist/bin /tmp/capsper-dist-macos/`;
-    await $`cp -r dist/lib-macos /tmp/capsper-dist-macos/lib`;
+    // Rename install-macos.sh → install.sh so same instructions work on both platforms
+    await $`cp dist/install-macos.sh /tmp/capsper-dist-macos/install.sh`;
+    await $`cp dist/install-common.sh /tmp/capsper-dist-macos/`;
+    await $`cp dist/capsper-update.sh /tmp/capsper-dist-macos/`;
+    await $`cp dist/capsper-apply-update.sh /tmp/capsper-dist-macos/`;
+    await $`cp dist/capsper-rollback.sh /tmp/capsper-dist-macos/`;
     await $`cp dist/VERSION /tmp/capsper-dist-macos/`;
     await $`tar -czf ${TARBALL} -C /tmp/capsper-dist-macos .`;
     await $`shasum -a 256 ${TARBALL} > ${TARBALL}.sha256`;

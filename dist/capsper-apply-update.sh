@@ -62,9 +62,10 @@ main() {
     # Migrate systemd service file: update model path, strip removed flags
     migrate_service_config
 
-    # Atomic symlink swap: ln creates new symlink, mv atomically replaces via rename(2)
+    # Atomic symlink swap
     ln -sfn "releases/$pending" "$INSTALL_DIR/current.tmp"
-    mv -T "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
+    rm -f "$INSTALL_DIR/current"
+    mv "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
 
     rm -f "$pending_file"
 
