@@ -85,37 +85,80 @@ static MLMultiArray *make_zeros(NSArray<NSNumber *> *shape, MLMultiArrayDataType
         return nil;
     }
     // MLMultiArray is not guaranteed to be zero-initialized
-    memset(arr.dataPointer, 0, arr.count * (dtype == MLMultiArrayDataTypeFloat32 ? 4 : 4));
+    NSInteger elem_size = (dtype == MLMultiArrayDataTypeFloat16) ? 2 : 4;
+    memset(arr.dataPointer, 0, arr.count * elem_size);
     return arr;
 }
 
-/// Copy MLMultiArray float data into a flat f32 buffer.
-/// Handles f16→f32 conversion if the MLMultiArray is Float16.
-static void copy_to_f32(MLMultiArray *src, float *dst, NSInteger count) {
-    if (src.dataType == MLMultiArrayDataTypeFloat32) {
-        memcpy(dst, src.dataPointer, count * sizeof(float));
-    } else if (src.dataType == MLMultiArrayDataTypeFloat16) {
-        // vImage f16→f32 conversion
-        const uint16_t *f16 = (const uint16_t *)src.dataPointer;
-        for (NSInteger i = 0; i < count; i++) {
-            // Use ARM NEON half-precision conversion
-            __fp16 h;
-            memcpy(&h, &f16[i], sizeof(__fp16));
-            dst[i] = (float)h;
-        }
+/// Check if an MLMultiArray has contiguous (C-order) strides.
+static bool is_contiguous(MLMultiArray *arr) {
+    NSInteger expected = 1;
+    for (NSInteger i = arr.shape.count - 1; i >= 0; i--) {
+        if (arr.strides[i].integerValue != expected) return false;
+        expected *= arr.shape[i].integerValue;
+    }
+    return true;
+}
+
+/// Read one f32 value from an MLMultiArray at a physical offset.
+/// Handles FP16 and FP32 source types.
+static inline float read_element(const void *base, MLMultiArrayDataType dtype, NSInteger offset) {
+    if (dtype == MLMultiArrayDataTypeFloat16) {
+        __fp16 h;
+        memcpy(&h, (const uint16_t *)base + offset, sizeof(__fp16));
+        return (float)h;
     } else {
-        NSLog(@"capsper_coreml: unexpected dtype %ld", (long)src.dataType);
-        memset(dst, 0, count * sizeof(float));
+        return ((const float *)base)[offset];
     }
 }
 
-/// Copy MLMultiArray to another MLMultiArray (for cache updates).
-static void copy_array(MLMultiArray *src, MLMultiArray *dst) {
-    NSInteger bytes = src.count;
-    if (src.dataType == MLMultiArrayDataTypeFloat32) bytes *= 4;
-    else if (src.dataType == MLMultiArrayDataTypeFloat16) bytes *= 2;
-    else if (src.dataType == MLMultiArrayDataTypeInt32) bytes *= 4;
-    memcpy(dst.dataPointer, src.dataPointer, bytes);
+/// Copy MLMultiArray to a flat contiguous f32 buffer.
+/// Handles f16→f32 conversion AND non-contiguous strides (CoreML pads
+/// output arrays for ANE alignment, e.g. stride=32 for a dimension of size 7).
+static void copy_to_f32(MLMultiArray *src, float *dst, NSInteger count) {
+    if (src.dataType != MLMultiArrayDataTypeFloat32 &&
+        src.dataType != MLMultiArrayDataTypeFloat16) {
+        NSLog(@"capsper_coreml: unexpected dtype %ld", (long)src.dataType);
+        memset(dst, 0, count * sizeof(float));
+        return;
+    }
+
+    // Fast path: contiguous layout — flat copy
+    if (is_contiguous(src)) {
+        if (src.dataType == MLMultiArrayDataTypeFloat32) {
+            memcpy(dst, src.dataPointer, count * sizeof(float));
+        } else {
+            const uint16_t *f16 = (const uint16_t *)src.dataPointer;
+            for (NSInteger i = 0; i < count; i++) {
+                __fp16 h;
+                memcpy(&h, &f16[i], sizeof(__fp16));
+                dst[i] = (float)h;
+            }
+        }
+        return;
+    }
+
+    // Slow path: non-contiguous strides (ANE-padded output).
+    // Convert flat index → multi-dim index → physical offset using strides.
+    NSInteger rank = src.shape.count;
+    NSInteger shapes[8], strides[8]; // max rank 8
+    for (NSInteger d = 0; d < rank; d++) {
+        shapes[d] = src.shape[d].integerValue;
+        strides[d] = src.strides[d].integerValue;
+    }
+    const void *base = src.dataPointer;
+    MLMultiArrayDataType dtype = src.dataType;
+
+    for (NSInteger flat = 0; flat < count; flat++) {
+        NSInteger remaining = flat;
+        NSInteger physical = 0;
+        for (NSInteger d = rank - 1; d >= 0; d--) {
+            NSInteger idx = remaining % shapes[d];
+            remaining /= shapes[d];
+            physical += idx * strides[d];
+        }
+        dst[flat] = read_element(base, dtype, physical);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,24 +176,25 @@ CapsperCoreMLModels *capsper_coreml_load(const char *model_dir) {
 
         NSError *error = nil;
 
-        // Load encoder
-        NSString *enc_path = [dir stringByAppendingPathComponent:@"encoder.mlpackage"];
+        // Load encoder — try .mlmodelc (pre-compiled), fall back to .mlpackage
+        NSString *enc_path = [dir stringByAppendingPathComponent:@"encoder.mlmodelc"];
         NSURL *enc_url = [NSURL fileURLWithPath:enc_path];
         MLModel *encoder = [MLModel modelWithContentsOfURL:enc_url
                                              configuration:config
                                                      error:&error];
         if (error || !encoder) {
-            NSError *firstError = error;
-            // Try .mlmodelc (compiled) format
-            enc_path = [dir stringByAppendingPathComponent:@"encoder.mlmodelc"];
-            enc_url = [NSURL fileURLWithPath:enc_path];
+            // Fall back to .mlpackage (compile at runtime)
             error = nil;
-            encoder = [MLModel modelWithContentsOfURL:enc_url
-                                        configuration:config
-                                                error:&error];
+            enc_path = [dir stringByAppendingPathComponent:@"encoder.mlpackage"];
+            enc_url = [NSURL fileURLWithPath:enc_path];
+            NSURL *compiled = [MLModel compileModelAtURL:enc_url error:&error];
+            if (compiled && !error) {
+                encoder = [MLModel modelWithContentsOfURL:compiled
+                                             configuration:config
+                                                     error:&error];
+            }
             if (error || !encoder) {
-                NSLog(@"capsper_coreml: failed to load encoder.mlpackage: %@", firstError);
-                NSLog(@"capsper_coreml: failed to load encoder.mlmodelc: %@", error);
+                NSLog(@"capsper_coreml: failed to load encoder: %@", error);
                 return NULL;
             }
         }
@@ -159,19 +203,23 @@ CapsperCoreMLModels *capsper_coreml_load(const char *model_dir) {
         MLModelConfiguration *dec_config = [[MLModelConfiguration alloc] init];
         dec_config.computeUnits = MLComputeUnitsCPUOnly;
 
-        NSString *dec_path = [dir stringByAppendingPathComponent:@"decoder.mlpackage"];
+        // Load decoder — try .mlmodelc, fall back to .mlpackage
+        NSString *dec_path = [dir stringByAppendingPathComponent:@"decoder.mlmodelc"];
         NSURL *dec_url = [NSURL fileURLWithPath:dec_path];
         error = nil;
         MLModel *decoder = [MLModel modelWithContentsOfURL:dec_url
                                              configuration:dec_config
                                                      error:&error];
         if (error || !decoder) {
-            dec_path = [dir stringByAppendingPathComponent:@"decoder.mlmodelc"];
-            dec_url = [NSURL fileURLWithPath:dec_path];
             error = nil;
-            decoder = [MLModel modelWithContentsOfURL:dec_url
-                                        configuration:dec_config
-                                                error:&error];
+            dec_path = [dir stringByAppendingPathComponent:@"decoder.mlpackage"];
+            dec_url = [NSURL fileURLWithPath:dec_path];
+            NSURL *compiled = [MLModel compileModelAtURL:dec_url error:&error];
+            if (compiled && !error) {
+                decoder = [MLModel modelWithContentsOfURL:compiled
+                                             configuration:dec_config
+                                                     error:&error];
+            }
             if (error || !decoder) {
                 NSLog(@"capsper_coreml: failed to load decoder: %@", error);
                 return NULL;
@@ -292,10 +340,15 @@ int capsper_coreml_run_encoder(
             *out_encoded_len = (int32_t)[[enc_len objectAtIndexedSubscript:0] intValue];
         }
 
-        // Update caches in-place
-        copy_array(new_ch, cache_ch);
-        copy_array(new_time, cache_time);
-        copy_array(new_len, cache_len);
+        // Update caches in-place (output caches are FP16, resident arrays are FP32)
+        copy_to_f32(new_ch, cache_ch.dataPointer, new_ch.count);
+        copy_to_f32(new_time, cache_time.dataPointer, new_time.count);
+        // cache_len: guard dtype like we do for enc_len
+        if (new_len.dataType == MLMultiArrayDataTypeInt32) {
+            memcpy(cache_len.dataPointer, new_len.dataPointer, new_len.count * sizeof(int32_t));
+        } else {
+            ((int32_t *)cache_len.dataPointer)[0] = [[new_len objectAtIndexedSubscript:0] intValue];
+        }
 
         return 0;
     }

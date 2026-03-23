@@ -81,30 +81,32 @@ for both comptime branches (even dead code), so nemotron_pipeline.zig → ort_c.
 → OrtGetApiBase gets pulled in. The dylib must be present but is not used for
 inference. The ORT warnings in the log are cosmetic.
 
-### Phase 4: Runtime Bug -- CURRENT BLOCKER
+### Phase 4: Runtime Bug -- FIXED
 
-**Compiled .mlmodelc models produce empty output.** The Python validation (via
-.mlpackage in coremltools) works perfectly, but when compiled to .mlmodelc via
-`xcrun coremlcompiler compile` and loaded via MLModel in Obj-C, the encoder
-runs without error but the RNNT decode loop emits no tokens.
+**Root cause: CoreML output MLMultiArrays have non-contiguous strides (ANE
+padding).** For example, the encoder output [1, 1024, 7] has strides
+[32768, 32, 1] instead of C-contiguous [7168, 7, 1]. Each row of 7 elements
+is padded to 32 in physical storage. The original `copy_to_f32` did a flat
+`memcpy` that treated the padded storage as contiguous data, copying garbage
+padding bytes as if they were real tensor values.
 
-Likely causes to investigate:
-1. **FP16/FP32 format mismatch** -- convert.py specifies `dtype=np.float32` for
-   encoder inputs but `compute_precision=FLOAT16`. The compiled model may expect
-   or return different types than the .mlpackage version.
-2. **encoded_length output format** -- may come back as FP16 instead of int32
-   after compilation, causing the frame count to be misread as 0.
-3. **Cache state format** -- the Obj-C bridge manages caches as f32 MLMultiArrays
-   but the compiled model may use f16 internally and return f16 caches.
+**Fix:** Rewrote `copy_to_f32` to detect non-contiguous strides via
+`is_contiguous()` and use stride-aware indexing (flat → multi-dim → physical
+offset) when needed. The contiguous fast path is preserved for inputs and
+any outputs that happen to be contiguous.
 
-Debug approach: add logging in coreml_helpers.m to print encoder output values,
-encoded_length, and a few sample values to verify data is actually flowing.
+**Additional fixes in the same change:**
+- Cache output copies now use `copy_to_f32` (FP16→FP32 with stride handling)
+  instead of raw `memcpy` which also had a dtype mismatch (FP16 src → FP32 dst)
+- `make_zeros` memset size now correctly handles FP16 (was hardcoded to 4 bytes)
+- `cache_len` copy now guards dtype like `enc_len` does
+- Model loading prefers .mlmodelc, falls back to runtime .mlpackage compilation
 
-**Important:** `.mlpackage` cannot be loaded by MLModel at runtime -- CoreML
-runtime requires compiled `.mlmodelc`. Must compile with
-`xcrun coremlcompiler compile encoder.mlpackage output_dir/`.
+**Note:** `.mlpackage` CAN be loaded at runtime via `MLModel.compileModel(at:)`
+-- it just requires compilation first (unlike .mlmodelc which is pre-compiled).
+The loader tries .mlmodelc first for speed, falls back to .mlpackage.
 
-### Phase 5: Validation and Testing -- BLOCKED on Phase 4
+### Phase 5: Validation and Testing -- READY
 
 Once runtime inference works:
 - Run full regression suite (./run.ts) with CoreML backend
@@ -212,7 +214,8 @@ dist/models/nemotron-coreml/    # macOS only
 
 6. ~~**Data format bridge**~~ RESOLVED: Zig stays f32, coreml_helpers.m
    handles f32↔f16 conversion via copy_to_f32() which checks MLMultiArray
-   dataType and converts FP16→FP32 using ARM NEON __fp16 casts.
+   dataType and converts FP16→FP32 using ARM NEON __fp16 casts. Also handles
+   non-contiguous strides (CoreML pads output arrays for ANE alignment).
 
 7. **onnxruntime link on macOS**: Zig evaluates @import for both comptime
    branches, pulling in ORT symbols. The dylib must be present. Options:
