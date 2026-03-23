@@ -11,7 +11,7 @@ set -euo pipefail
 #   ./install.sh              Full interactive setup (download models, permissions, systemd)
 #   ./install.sh pw-detect    Detect best PipeWire microphone channel (delegates to capsper --pw-detect)
 
-# shellcheck source=install-common.sh
+# shellcheck source=dist/install-common.sh
 source "$(cd "$(dirname "$0")" >/dev/null && pwd)/install-common.sh"
 
 NEEDS_REBOOT=false

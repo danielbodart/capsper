@@ -10,7 +10,7 @@ set -euo pipefail
 # Usage:
 #   ./install.sh              Full interactive setup (download models, permissions, LaunchAgent)
 
-# shellcheck source=install-common.sh
+# shellcheck source=dist/install-common.sh
 source "$(cd "$(dirname "$0")" >/dev/null && pwd)/install-common.sh"
 
 PLIST_LABEL="com.capsper.capsper"

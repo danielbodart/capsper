@@ -48,7 +48,8 @@ pub fn main() !void {
     var low_latency: bool = false;
     var pw_gain: f32 = 1.0;
     var no_auto_gain: bool = false;
-    // (no_cuda removed — binary variant determines backend)
+    var warmup_file: ?[:0]const u8 = "jfk.wav";
+    var warmup_file_is_default = true;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -147,6 +148,14 @@ pub fn main() !void {
             low_latency = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-gain")) {
             no_auto_gain = true;
+        } else if (std.mem.eql(u8, arg, "--warmup-file")) {
+            i += 1;
+            if (i < args.len) {
+                warmup_file = args[i];
+                warmup_file_is_default = false;
+            }
+        } else if (std.mem.eql(u8, arg, "--no-warmup")) {
+            warmup_file = null;
         } else {
             printUsage();
             return;
@@ -273,6 +282,56 @@ pub fn main() !void {
     var backend_state = backend.load(allocator, resolved_model_path, nemo_filterbank, &nemo_token_map, nemo_context_graph, verbose) orelse return;
     defer backend_state.deinit();
     const pipeline_factory = PipelineFactory{ .backend = backend_state };
+
+    // Warmup: transcribe a short audio file to prime the pipeline (CoreML ANE, CUDA kernels, etc.)
+    if (warmup_file) |wf| {
+        // Resolve default warmup file relative to binary (ships next to it in dist/bin/)
+        const wf_path = if (warmup_file_is_default) blk: {
+            const bin_dir = std.fs.selfExeDirPathAlloc(allocator) catch break :blk @as(?[:0]const u8, null);
+            defer allocator.free(bin_dir);
+            break :blk std.fs.path.joinZ(allocator, &.{ bin_dir, wf }) catch null;
+        } else blk: {
+            break :blk @as(?[:0]const u8, wf);
+        };
+
+        if (wf_path) |path| {
+            defer if (warmup_file_is_default) allocator.free(path);
+
+            if (std.fs.cwd().openFile(path, .{})) |file| {
+                defer file.close();
+                const data = file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch null;
+                if (data) |d| {
+                    defer allocator.free(d);
+                    if (utils.parseWavHeader(d)) |header| {
+                        if (utils.wavToFloat(allocator, d, header)) |samples| {
+                            defer allocator.free(samples);
+                            const warmup_start = std.time.nanoTimestamp();
+                            const warmup_pipeline = pipeline_factory.create(allocator) catch null;
+                            if (warmup_pipeline) |wp| {
+                                defer {
+                                    wp.deinit();
+                                    allocator.destroy(wp);
+                                }
+                                if (wp.transcribe(samples, true, null) catch null) |result| {
+                                    allocator.free(result.text);
+                                    allocator.free(result.words);
+                                    allocator.free(result.tokens);
+                                    allocator.free(result.token_frames);
+                                }
+                                const warmup_ns = std.time.nanoTimestamp() - warmup_start;
+                                const warmup_ms: u64 = @intCast(@divTrunc(warmup_ns, 1_000_000));
+                                std.debug.print("Warmup complete ({d}.{d:0>1}s)\n", .{ warmup_ms / 1000, (warmup_ms % 1000) / 100 });
+                            }
+                        } else |_| {}
+                    } else |_| {}
+                }
+            } else |_| {
+                if (!warmup_file_is_default) {
+                    std.debug.print("WARNING: warmup file not found: {s}\n", .{path});
+                }
+            }
+        }
+    }
 
     // --stream-wav: feed WAV through the streaming pipeline (no PTT, no VAD)
     if (stream_wav_file) |swf| {
@@ -420,5 +479,6 @@ fn printUsage() void {
     std.debug.print("       [--transcribe FILE] [--stream-wav FILE]\n", .{});
     std.debug.print("       [--pw-gain FACTOR] [--no-auto-gain] [--low-latency]\n", .{});
     std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
+    std.debug.print("       [--warmup-file FILE] [--no-warmup]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
 }

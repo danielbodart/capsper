@@ -38,6 +38,9 @@ pub fn build(b: *std.Build) void {
     exe.linkLibC();
     b.installArtifact(exe);
 
+    // Install warmup file next to the binary (dist/bin/jfk.wav)
+    b.installFile("test/jfk.wav", "bin/jfk.wav");
+
     // --- Run step ---
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
