@@ -84,9 +84,9 @@ check_permissions() {
 # ─── Hardware Detection ──────────────────────────────────────────────────────
 
 detect_model_variant() {
-    # NVIDIA GPU → fp16 (tensor cores)
+    # NVIDIA GPU → int8-static (QDQ format, ~45% less VRAM than fp16)
     if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-        echo "fp16"
+        echo "int8-static"
         return
     fi
     # Apple Silicon → fp16
@@ -94,8 +94,8 @@ detect_model_variant() {
         echo "fp16"
         return
     fi
-    # CPU-only → int8 (optimized for Intel VNNI/AMX)
-    echo "int8"
+    # CPU-only → int8-dynamic (optimized for Intel VNNI/AMX)
+    echo "int8-dynamic"
 }
 
 # ─── Model Download ──────────────────────────────────────────────────────────
