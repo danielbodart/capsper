@@ -56,30 +56,31 @@ Deferred until after profiling ANE utilization with Instruments. The optimizatio
 to the conversion pipeline. Profile first to see if the coremltools compiler
 already routes enough ops to ANE without manual transforms.
 
-### Phase 3: Zig Integration -- DONE (runtime bug)
+### Phase 3: Zig Integration -- DONE
 
-**Architecture: vtable-based runtime dispatch (not comptime branching).**
+**Architecture: per-platform build variants with comptime dispatch.**
 
-The original plan proposed comptime `if` dispatch. This was replaced with a
-vtable pattern (like std.mem.Allocator) because comptime branching polluted
-every file with conditional imports. The runtime dispatch cost (one fn pointer
-call) is negligible vs milliseconds of model inference.
+build.zig provides `-Dbackend=coreml|ort_cuda|ort_cpu`. Comptime dispatch
+files (`src/backend/pipeline.zig`, `src/backend/init.zig`) switch on the
+build option -- only the active backend's `@import` is evaluated, so the
+macOS binary has zero ORT symbols and Linux binaries have no CoreML deps.
 
-**Files created/modified:**
-- `src/coreml_helpers.m` -- Obj-C bridge: model load, encoder/decoder predict,
-  cache state management. Uses void* + CFBridgingRetain/Release for ARC-safe
-  C structs. Tries .mlpackage first, falls back to .mlmodelc.
-- `src/pipeline_coreml.zig` -- CoreML streaming pipeline (same structure as
-  nemotron_pipeline.zig: mel → encoder chunks → RNNT greedy decode)
-- `src/asr_backend.zig` -- pure interface: AsrPipeline = {ptr, vtable}
-- `src/asr_init.zig` -- platform-specific model loading, returns PipelineFactory
-- `src/server.zig` -- takes PipelineFactory instead of backend-specific config
-- `build.zig` -- links CoreML.framework + Foundation.framework, adds coreml_helpers.m
+Source tree reorganized into `src/shared/`, `src/backend/{ort,coreml}/`,
+`src/platform/{linux,macos}/` with consistent naming. Server.zig calls the
+concrete pipeline type directly (no vtable, no runtime dispatch).
 
-**Known issue: onnxruntime dylib still linked on macOS.** Zig evaluates @import()
-for both comptime branches (even dead code), so nemotron_pipeline.zig → ort_c.zig
-→ OrtGetApiBase gets pulled in. The dylib must be present but is not used for
-inference. The ORT warnings in the log are cosmetic.
+**Files:**
+- `src/backend/coreml/helpers.m` -- Obj-C bridge: model load, encoder/decoder
+  predict, cache state management. Tries .mlmodelc first, falls back to
+  runtime-compiled .mlpackage.
+- `src/backend/coreml/pipeline.zig` -- CoreML streaming pipeline
+- `src/backend/coreml/init.zig` -- CoreML model loading
+- `src/backend/ort/pipeline.zig` -- ORT streaming pipeline
+- `src/backend/ort/init.zig` -- ORT model loading (CUDA fatal in ort_cuda,
+  skipped in ort_cpu)
+- `src/backend/pipeline.zig` -- comptime switch to concrete Pipeline type
+- `src/backend/init.zig` -- comptime switch to backend-specific init
+- `build.zig` -- `-Dbackend` option, per-backend linking and binary naming
 
 ### Phase 4: Runtime Bug -- FIXED
 
@@ -119,6 +120,9 @@ Once runtime inference works:
 - Upload to HuggingFace (separate repo from ONNX models)
 - Update install.sh to download CoreML models on macOS
 - distMacOS() in run.ts packages CoreML models in tarball
+- Update run.ts for dual Linux builds (capsper-cuda + capsper-cpu)
+- Create Linux launcher script (bin/capsper → detects GPU → exec sub-binary)
+- Update install.sh for new binary variant structure
 
 ---
 
@@ -134,7 +138,7 @@ Once runtime inference works:
 The decoder and joint are fused into a single model to match the existing Zig
 ONNX dec_session interface (one call per decode step, not two).
 
-Mel spectrogram stays in Zig (nemo_mel_state.zig) -- no CoreML preprocessor.
+Mel spectrogram stays in Zig (shared/nemo_mel_state.zig) -- no CoreML preprocessor.
 
 ### 560ms Chunk Math
 
@@ -163,21 +167,21 @@ batch-first [B, L, ...] for CoreML.
 | lstm_h | [2, 1, 640] |
 | lstm_c | [2, 1, 640] |
 
-### Zig Architecture: Vtable Runtime Dispatch
+### Zig Architecture: Comptime Backend Dispatch
 
 ```
-AsrPipeline = { ptr: *anyopaque, vtable: *const VTable }
+// build.zig: -Dbackend=coreml|ort_cuda|ort_cpu
 
-VTable = {
-    transcribe: fn(ptr, samples, flush, max_tokens) -> ?TranscribeResult
-    resetSegment: fn(ptr) -> void
-    deinit: fn(ptr) -> void
-}
+// src/backend/pipeline.zig (comptime switch):
+Pipeline = switch (build_options.backend) {
+    .coreml => CoreMLPipeline,
+    .ort_cuda, .ort_cpu => NemotronPipeline,
+};
 ```
 
-Both backends implement `asrPipeline()` returning this interface. Server and
-main.zig are fully backend-agnostic. Backend selection is a one-time decision
-at startup in asr_init.zig.
+Server.zig uses the concrete `Pipeline` type directly -- no vtable, no
+runtime dispatch. Backend selection happens at compile time via the build
+option. Each binary variant contains only the code for its backend.
 
 ### Model Paths
 
@@ -204,7 +208,8 @@ dist/models/nemotron-coreml/    # macOS only
    encoder size. Benchmark after FP16 works.
 
 3. ~~**First-load compilation**~~ RESOLVED: ship pre-compiled .mlmodelc.
-   CoreML runtime cannot load .mlpackage -- must be compiled.
+   Loader tries .mlmodelc first, falls back to runtime .mlpackage compilation
+   via `MLModel.compileModel(at:)`.
 
 4. **Relative positional encoding**: Profile to check if dynamic gather ops
    cause ANE->CPU transitions. Precompute positional bias if so.
@@ -217,10 +222,9 @@ dist/models/nemotron-coreml/    # macOS only
    dataType and converts FP16→FP32 using ARM NEON __fp16 casts. Also handles
    non-contiguous strides (CoreML pads output arrays for ANE alignment).
 
-7. **onnxruntime link on macOS**: Zig evaluates @import for both comptime
-   branches, pulling in ORT symbols. The dylib must be present. Options:
-   make ort_c.zig use @extern() lazy resolution, or accept the cosmetic
-   dependency. Low priority.
+7. ~~**onnxruntime link on macOS**~~ RESOLVED: per-platform build variants
+   (`-Dbackend=coreml`) mean the macOS binary never imports ORT code at all.
+   Zero ORT symbols in the macOS binary.
 
 ---
 

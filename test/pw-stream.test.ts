@@ -2,9 +2,9 @@ import { describe, test, expect, beforeAll } from "bun:test";
 import { $, spawn, file } from "bun";
 import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, trackProc, saveLog } from "./helpers";
 
-const gpu = await hasGpu();
+const isLinux = process.platform === "linux";
 
-describe.skipIf(!gpu)("pw-stream", () => {
+describe.skipIf(!isLinux)("pw-stream", () => {
     beforeAll(() => ensureBinary());
 
     test("streams wav file via PipeWire loopback", async () => {

@@ -13,8 +13,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
 
-HF_REPO="danielbodart/nemotron-speech-600m-onnx"
-HF_BASE="https://huggingface.co/${HF_REPO}/resolve/main"
+HF_ONNX_REPO="danielbodart/nemotron-speech-600m-onnx"
+HF_ONNX_BASE="https://huggingface.co/${HF_ONNX_REPO}/resolve/main"
+HF_COREML_REPO="danielbodart/nemotron-speech-600m-coreml"
+HF_COREML_BASE="https://huggingface.co/${HF_COREML_REPO}/resolve/main"
+
+IS_MACOS=false
+[ "$(uname -s)" = "Darwin" ] && IS_MACOS=true
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 RECORDINGS_DIR="$INSTALL_DIR/recordings"
@@ -55,6 +60,9 @@ is_dev_mode() {
 # ─── Permissions ──────────────────────────────────────────────────────────────
 
 check_permissions() {
+    # Linux-only: evdev/uinput permissions
+    $IS_MACOS && return
+
     # Check input group membership
     if ! id -nG | grep -qw input; then
         echo ""
@@ -84,14 +92,14 @@ check_permissions() {
 # ─── Hardware Detection ──────────────────────────────────────────────────────
 
 detect_model_variant() {
+    # macOS → CoreML (separate download path)
+    if $IS_MACOS; then
+        echo "coreml"
+        return
+    fi
     # NVIDIA GPU → int8-static (QDQ format, ~45% less VRAM than fp16)
     if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
         echo "int8-static"
-        return
-    fi
-    # Apple Silicon → fp16
-    if [ "$(uname -m)" = "arm64" ] && [ "$(uname -s)" = "Darwin" ]; then
-        echo "fp16"
         return
     fi
     # CPU-only → int8-dynamic (optimized for Intel VNNI/AMX)
@@ -102,51 +110,114 @@ detect_model_variant() {
 
 download_models() {
     local model_dir="$1"
+    local variant
+    variant=$(detect_model_variant)
+
+    if [ "$variant" = "coreml" ]; then
+        download_coreml_models "$model_dir"
+    else
+        download_onnx_models "$model_dir" "$variant"
+    fi
+}
+
+download_coreml_models() {
+    local model_dir="$1"
+    local onnx_dir="$model_dir/nemotron"
+    local coreml_dir="$model_dir/nemotron-coreml"
+    mkdir -p "$onnx_dir" "$coreml_dir"
+
+    # Check if already downloaded
+    if [ -d "$coreml_dir/encoder.mlmodelc" ] && [ -d "$coreml_dir/decoder.mlmodelc" ] \
+       && [ -f "$onnx_dir/filterbank.bin" ] && [ -f "$onnx_dir/tokens.txt" ]; then
+        echo "CoreML models already present."
+        return
+    fi
+
+    echo "Detected hardware → Apple Silicon (CoreML)"
+    echo "Model: Nemotron Speech 600M CoreML (FP16, 93% ANE)"
+
+    if ! confirm "Download now?"; then
+        echo ""
+        echo "Models directory: $coreml_dir"
+        echo "Download manually from: https://huggingface.co/$HF_COREML_REPO"
+        return
+    fi
+
+    require_cmd curl "Install curl to download models."
+
+    echo "Downloading CoreML models..."
+
+    # CoreML compiled models (.mlmodelc directories — download individual files)
+    for model in encoder decoder; do
+        local mlmodelc_dir="$coreml_dir/${model}.mlmodelc"
+        mkdir -p "$mlmodelc_dir/weights" "$mlmodelc_dir/analytics"
+        curl -L --progress-bar -o "$mlmodelc_dir/model.mil" \
+            "$HF_COREML_BASE/fp16/${model}.mlmodelc/model.mil"
+        curl -L --progress-bar -o "$mlmodelc_dir/coremldata.bin" \
+            "$HF_COREML_BASE/fp16/${model}.mlmodelc/coremldata.bin"
+        curl -L --progress-bar -o "$mlmodelc_dir/metadata.json" \
+            "$HF_COREML_BASE/fp16/${model}.mlmodelc/metadata.json"
+        curl -L --progress-bar -o "$mlmodelc_dir/weights/weight.bin" \
+            "$HF_COREML_BASE/fp16/${model}.mlmodelc/weights/weight.bin"
+        curl -L --progress-bar -o "$mlmodelc_dir/analytics/coremldata.bin" \
+            "$HF_COREML_BASE/fp16/${model}.mlmodelc/analytics/coremldata.bin"
+    done
+
+    # Shared files (filterbank + vocabulary from ONNX repo)
+    curl -L --progress-bar -o "$onnx_dir/filterbank.bin" \
+        "$HF_ONNX_BASE/shared/filterbank.bin"
+    curl -L --progress-bar -o "$onnx_dir/tokens.txt" \
+        "$HF_ONNX_BASE/shared/tokens.txt"
+
+    echo "CoreML models downloaded."
+}
+
+download_onnx_models() {
+    local model_dir="$1"
+    local variant="$2"
     local target_dir="$model_dir/nemotron"
     mkdir -p "$target_dir"
 
     # Check if already downloaded
     if [ -f "$target_dir/encoder_model.onnx" ] && [ -f "$target_dir/decoder_model.onnx" ] \
        && [ -f "$target_dir/filterbank.bin" ] && [ -f "$target_dir/tokens.txt" ]; then
-        echo "Nemotron model already present."
+        echo "ONNX models already present."
         return
     fi
 
-    local variant
-    variant=$(detect_model_variant)
     echo "Detected hardware → $variant precision"
     echo "Model: Nemotron Speech 600M ONNX ($variant)"
 
     if ! confirm "Download now?"; then
         echo ""
         echo "Models directory: $target_dir"
-        echo "Download manually from: https://huggingface.co/$HF_REPO"
+        echo "Download manually from: https://huggingface.co/$HF_ONNX_REPO"
         return
     fi
 
     require_cmd curl "Install curl to download models."
 
-    echo "Downloading Nemotron model ($variant)..."
+    echo "Downloading ONNX model ($variant)..."
 
     # Variant-specific ONNX files
     curl -L --progress-bar -o "$target_dir/encoder_model.onnx" \
-        "$HF_BASE/$variant/encoder_model.onnx"
+        "$HF_ONNX_BASE/$variant/encoder_model.onnx"
     curl -L --progress-bar -o "$target_dir/encoder_model.onnx.data" \
-        "$HF_BASE/$variant/encoder_model.onnx.data"
+        "$HF_ONNX_BASE/$variant/encoder_model.onnx.data"
     curl -L --progress-bar -o "$target_dir/decoder_model.onnx" \
-        "$HF_BASE/$variant/decoder_model.onnx"
+        "$HF_ONNX_BASE/$variant/decoder_model.onnx"
     curl -L --progress-bar -o "$target_dir/decoder_model.onnx.data" \
-        "$HF_BASE/$variant/decoder_model.onnx.data"
+        "$HF_ONNX_BASE/$variant/decoder_model.onnx.data"
 
     # Shared files (filterbank, vocabulary, config)
     curl -L --progress-bar -o "$target_dir/filterbank.bin" \
-        "$HF_BASE/shared/filterbank.bin"
+        "$HF_ONNX_BASE/shared/filterbank.bin"
     curl -L --progress-bar -o "$target_dir/tokens.txt" \
-        "$HF_BASE/shared/tokens.txt"
+        "$HF_ONNX_BASE/shared/tokens.txt"
     curl -L --progress-bar -o "$target_dir/config.json" \
-        "$HF_BASE/config.json"
+        "$HF_ONNX_BASE/config.json"
 
-    echo "Model downloaded ($variant)."
+    echo "ONNX model downloaded ($variant)."
 }
 
 # ─── PipeWire Channel Detection & Gain Calibration ───────────────────────────

@@ -6,7 +6,7 @@ import { join } from "path";
 process.env.FORCE_COLOR = "1";
 
 const IS_MACOS = process.platform === "darwin";
-const BINARY = "./dist/bin/capsper";
+const BINARY = IS_MACOS ? "./dist/bin/capsper" : "./dist/bin/capsper-cuda";
 const SCRIPT_DIR = import.meta.dir;
 const TARBALL = IS_MACOS ? "capsper-macos-arm64.tar.gz" : "capsper-linux-x86_64.tar.gz";
 const LIB_DIR = IS_MACOS ? "dist/lib-macos" : "dist/lib";
@@ -64,10 +64,18 @@ async function ensureDepsLinux() {
 }
 
 function ensureBinary() {
-    if (!existsSync(BINARY)) {
-        console.error(`Binary not found: ${BINARY}`);
-        console.error("Run: ./run.ts build");
-        process.exit(1);
+    if (IS_MACOS) {
+        if (!existsSync("./dist/bin/capsper")) {
+            console.error("Binary not found: ./dist/bin/capsper");
+            console.error("Run: ./run.ts build");
+            process.exit(1);
+        }
+    } else {
+        if (!existsSync("./dist/bin/capsper-cuda") && !existsSync("./dist/bin/capsper-cpu")) {
+            console.error("No binaries found in dist/bin/");
+            console.error("Run: ./run.ts build");
+            process.exit(1);
+        }
     }
 }
 
@@ -87,9 +95,15 @@ async function version(): Promise<string> {
 export async function build() {
     await ensureDeps();
     const ver = await version();
-    console.log(`Building v${ver}...`);
-    const cpuFlag = IS_MACOS ? [] : ["-Dcpu=x86_64_v3"];
-    await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe ${cpuFlag}`;
+    if (IS_MACOS) {
+        console.log(`Building v${ver} (coreml)...`);
+        await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe`;
+    } else {
+        console.log(`Building v${ver} (ort-cuda)...`);
+        await $`zig build --prefix dist -Dbackend=ort_cuda -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
+        console.log(`Building v${ver} (ort-cpu)...`);
+        await $`zig build --prefix dist -Dbackend=ort_cpu -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
+    }
 }
 
 export async function clean() {
@@ -173,13 +187,28 @@ async function distLinux() {
         process.exit(1);
     }
 
-    // Validate no AVX-512 instructions
-    const { stdout: objdumpOut } = await $`objdump -d dist/bin/capsper | grep -c 'zmm\\|%k[0-7],'`.quiet().nothrow();
-    const avx512Count = parseInt(objdumpOut.toString().trim()) || 0;
-    if (avx512Count > 0) {
-        console.error(`ERROR: binary contains ${avx512Count} AVX-512 instructions`);
-        process.exit(1);
+    // Validate no AVX-512 in both binaries
+    for (const bin of ["dist/bin/capsper-cuda", "dist/bin/capsper-cpu"]) {
+        if (!existsSync(bin)) continue;
+        const { stdout: objdumpOut } = await $`objdump -d ${bin} | grep -c 'zmm\\|%k[0-7],'`.quiet().nothrow();
+        const avx512Count = parseInt(objdumpOut.toString().trim()) || 0;
+        if (avx512Count > 0) {
+            console.error(`ERROR: ${bin} contains ${avx512Count} AVX-512 instructions`);
+            process.exit(1);
+        }
     }
+
+    // Create launcher script
+    const launcher = `#!/bin/sh
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    exec "$DIR/capsper-cuda" "$@"
+else
+    exec "$DIR/capsper-cpu" "$@"
+fi
+`;
+    await Bun.write("dist/bin/capsper", launcher);
+    await $`chmod +x dist/bin/capsper`;
 
     const ver = await version();
     await Bun.write("dist/VERSION", ver);
@@ -227,9 +256,7 @@ export async function ci() {
     await $`shellcheck dist/*.sh bootstrap.sh`;
     console.log("Running tests...");
     await $`zig build test`;
-    console.log(`Building v${ver}...`);
-    const cpuFlag = IS_MACOS ? [] : ["-Dcpu=x86_64_v3"];
-    await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe ${cpuFlag}`;
+    await build();
     await dist();
     if (process.env.GH_TOKEN) {
         const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
