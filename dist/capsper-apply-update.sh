@@ -80,27 +80,40 @@ migrate_service_config() {
     exec_start=$(grep '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
     [ -n "$exec_start" ] || return 0
 
-    # Nothing to migrate if already using nemotron model path
-    echo "$exec_start" | grep -q '/nemotron' && return 0
-
-    echo "Migrating service config to Nemotron..."
-
     local new_exec_start="$exec_start"
+    local needs_migrate=false
 
-    # Replace old whisper model path with nemotron
-    # shellcheck disable=SC2001
-    new_exec_start=$(sed 's|--model [^ ]*|--model '"$INSTALL_DIR"'/models/nemotron|' <<< "$new_exec_start")
+    # Migrate old whisper model path to nemotron
+    if ! echo "$exec_start" | grep -q '/nemotron'; then
+        echo "Migrating service config to Nemotron..."
+        needs_migrate=true
 
-    # Strip removed flags (with their arguments)
-    local flag
-    for flag in --domain-terms --warmup-file --asr --vad --vad-threshold --vad-threshold-off --min-silence-ms --max-tokens-per-sec; do
-        new_exec_start="${new_exec_start//$flag [^ ]* /}"
-        new_exec_start="${new_exec_start//$flag [^ ]*/}"
-    done
+        # Replace old whisper model path with nemotron
+        # shellcheck disable=SC2001
+        new_exec_start=$(sed 's|--model [^ ]*|--model '"$INSTALL_DIR"'/models/nemotron|' <<< "$new_exec_start")
 
-    # Strip flags without arguments
-    new_exec_start="${new_exec_start//--no-warmup /}"
-    new_exec_start="${new_exec_start//--no-warmup/}"
+        # Strip removed flags (with their arguments)
+        local flag
+        for flag in --domain-terms --warmup-file --asr --vad --vad-threshold --vad-threshold-off --min-silence-ms --max-tokens-per-sec; do
+            new_exec_start="${new_exec_start//$flag [^ ]* /}"
+            new_exec_start="${new_exec_start//$flag [^ ]*/}"
+        done
+
+        # Strip flags without arguments
+        new_exec_start="${new_exec_start//--no-warmup /}"
+        new_exec_start="${new_exec_start//--no-warmup/}"
+    fi
+
+    # Migrate --pw-* flags to --audio-* (cross-platform rename)
+    if echo "$new_exec_start" | grep -q -- '--pw-'; then
+        needs_migrate=true
+        new_exec_start="${new_exec_start//--pw-channel /--audio-channel }"
+        new_exec_start="${new_exec_start//--pw-target /--audio-target }"
+        new_exec_start="${new_exec_start//--pw-gain /--audio-gain }"
+        new_exec_start="${new_exec_start//--pw-detect/--audio-detect}"
+    fi
+
+    $needs_migrate || return 0
 
     # Clean up double spaces and trailing space
     while [[ "$new_exec_start" == *"  "* ]]; do

@@ -103,6 +103,8 @@ export async function build() {
         await $`zig build --prefix dist -Dbackend=ort_cuda -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
         console.log(`Building v${ver} (ort-cpu)...`);
         await $`zig build --prefix dist -Dbackend=ort_cpu -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
+        // Symlink capsper → capsper-cuda for dev (dist creates a proper launcher script)
+        await $`ln -sf capsper-cuda dist/bin/capsper`;
     }
 }
 

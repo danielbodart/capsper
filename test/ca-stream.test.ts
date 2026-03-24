@@ -149,7 +149,7 @@ describe.skipIf(!isMacOS || !hasBinary || !hasModel || !blackhole)("ca-stream", 
 
         const server = await launchService([
             "--input", "local",
-            "--pw-target", "BlackHole 2ch",
+            "--audio-target", "BlackHole 2ch",
             "--no-auto-gain",
             "--verbose",
         ]);

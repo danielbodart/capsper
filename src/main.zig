@@ -31,14 +31,14 @@ pub fn main() !void {
     var model_path_is_default = true;
     var port: u16 = 43007;
     var input_mode: InputMode = .tcp;
-    var pw_target: ?[:0]const u8 = null;
+    var audio_target: ?[:0]const u8 = null;
     var audio_channel: u32 = AudioCapture.default_channel;
     var verbose: bool = false;
     var trigger_key: ?u16 = null;
     var trigger_passthrough: bool = false;
     var type_delay_us: u64 = 12_000; // 12ms
     var dry_run: bool = false;
-    var do_pw_detect: bool = false;
+    var do_audio_detect: bool = false;
     var detect_duration: u32 = 5;
     var drop_terms_path: ?[:0]const u8 = null;
     var record_dir: ?[:0]const u8 = null;
@@ -46,7 +46,7 @@ pub fn main() !void {
     var stream_wav_file: ?[:0]const u8 = null;
     var transcribe_file: ?[:0]const u8 = null;
     var low_latency: bool = false;
-    var pw_gain: f32 = 1.0;
+    var audio_gain: f32 = 1.0;
     var no_auto_gain: bool = false;
     var warmup_file: ?[:0]const u8 = "jfk.wav";
     var warmup_file_is_default = true;
@@ -83,10 +83,10 @@ pub fn main() !void {
                     return;
                 }
             }
-        } else if (std.mem.eql(u8, arg, "--pw-target")) {
+        } else if (std.mem.eql(u8, arg, "--audio-target") or std.mem.eql(u8, arg, "--pw-target")) {
             i += 1;
-            if (i < args.len) pw_target = args[i];
-        } else if (std.mem.eql(u8, arg, "--pw-channel") or std.mem.eql(u8, arg, "--audio-channel")) {
+            if (i < args.len) audio_target = args[i];
+        } else if (std.mem.eql(u8, arg, "--audio-channel") or std.mem.eql(u8, arg, "--pw-channel")) {
             i += 1;
             if (i < args.len) {
                 audio_channel = AudioCapture.parseChannelName(args[i]) orelse {
@@ -109,8 +109,8 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--type-delay")) {
             i += 1;
             if (i < args.len) type_delay_us = std.fmt.parseInt(u64, args[i], 10) catch 12_000;
-        } else if (std.mem.eql(u8, arg, "--pw-detect")) {
-            do_pw_detect = true;
+        } else if (std.mem.eql(u8, arg, "--audio-detect") or std.mem.eql(u8, arg, "--pw-detect")) {
+            do_audio_detect = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "--detect-duration")) {
@@ -141,9 +141,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--transcribe")) {
             i += 1;
             if (i < args.len) transcribe_file = args[i];
-        } else if (std.mem.eql(u8, arg, "--pw-gain")) {
+        } else if (std.mem.eql(u8, arg, "--audio-gain") or std.mem.eql(u8, arg, "--pw-gain")) {
             i += 1;
-            if (i < args.len) pw_gain = std.fmt.parseFloat(f32, args[i]) catch 1.0;
+            if (i < args.len) audio_gain = std.fmt.parseFloat(f32, args[i]) catch 1.0;
         } else if (std.mem.eql(u8, arg, "--low-latency")) {
             low_latency = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-gain")) {
@@ -168,13 +168,13 @@ pub fn main() !void {
         return;
     }
 
-    // PipeWire utility commands (early exit, no model loading needed)
-    if (do_pw_detect) {
-        audio_detect.detectChannel(allocator, pw_target, detect_duration);
+    // Audio detect utility command (early exit, no model loading needed)
+    if (do_audio_detect) {
+        audio_detect.detectChannel(allocator, audio_target, detect_duration);
         return;
     }
 
-    // --trigger implies --input local (PipeWire capture) and starts not-live (trigger key controls recording)
+    // --trigger implies --input local (audio capture) and starts not-live (trigger key controls recording)
     if (trigger_key != null) {
         input_mode = .local;
     }
@@ -465,20 +465,20 @@ pub fn main() !void {
     }
 
     // Start server
-    var server = Server.init(allocator, pipeline_factory, port, input_mode, pw_target, audio_channel, verbose, low_latency, type_callback, drop_terms, recorder, pw_gain, no_auto_gain);
+    var server = Server.init(allocator, pipeline_factory, port, input_mode, audio_target, audio_channel, verbose, low_latency, type_callback, drop_terms, recorder, audio_gain, no_auto_gain);
     try server.run();
 }
 
 fn printUsage() void {
     std.debug.print("Usage: capsper [--model PATH] [--port PORT]\n", .{});
     std.debug.print("       [--verbose|-v]\n", .{});
-    std.debug.print("       [--input tcp|local] [--pw-target NODE] [--pw-channel CHANNEL]\n", .{});
+    std.debug.print("       [--input tcp|local] [--audio-target NODE] [--audio-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
     std.debug.print("       [--drop-terms FILE]\n", .{});
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
     std.debug.print("       [--transcribe FILE] [--stream-wav FILE]\n", .{});
-    std.debug.print("       [--pw-gain FACTOR] [--no-auto-gain] [--low-latency]\n", .{});
-    std.debug.print("       [--pw-detect [--detect-duration SECS]]\n", .{});
+    std.debug.print("       [--audio-gain FACTOR] [--no-auto-gain] [--low-latency]\n", .{});
+    std.debug.print("       [--audio-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--warmup-file FILE] [--no-warmup]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
 }

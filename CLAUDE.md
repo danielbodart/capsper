@@ -17,7 +17,10 @@ Zig and Bun are installed automatically via `bootstrap.sh` + mise.
 ./run.ts clean
 
 # Run directly (loads model, grabs keyboard, CapsLock = push-to-talk)
-./dist/bin/capsper --trigger capslock --pw-channel FL --drop-terms drop-terms.txt
+# Linux:
+./dist/bin/capsper --trigger capslock --audio-channel FL --drop-terms drop-terms.txt
+# macOS:
+./dist/bin/capsper --trigger capslock --drop-terms drop-terms.txt
 
 # First-time setup (builds, configures permissions, installs service)
 ./run.ts setup
@@ -134,7 +137,13 @@ To update the running capsper service after CI passes:
 
 ```bash
 ~/.local/share/capsper/capsper-update.sh    # downloads from GitHub Releases, stages, verifies SHA256
-systemctl --user restart capsper             # apply-update.sh runs as ExecStartPre, swaps symlink
+
+# Linux: apply-update.sh runs as ExecStartPre, swaps symlink
+systemctl --user restart capsper
+
+# macOS: restart LaunchAgent
+launchctl bootout gui/$(id -u)/com.capsper.capsper 2>/dev/null
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist
 ```
 
 Do NOT manually download CI artifacts or stage releases by hand — the update script handles everything.
@@ -161,3 +170,7 @@ Do NOT manually download CI artifacts or stage releases by hand — the update s
 - Conversion scripts: [nemotron-speech-600m-coreml](https://github.com/danielbodart/nemotron-speech-600m-coreml) (CoreML), [nemotron-speech-600m-onnx](https://github.com/danielbodart/nemotron-speech-600m-onnx) (ONNX)
 - Audio format: 16kHz mono S16_LE PCM (32000 bytes/sec)
 - Default server port: 43007
+- CLI flags: `--audio-channel`, `--audio-target`, `--audio-gain`, `--audio-detect` (cross-platform names; `--pw-*` aliases kept for backwards compatibility)
+- Service management: `systemctl --user` on Linux, `launchctl bootstrap/bootout gui/$(id -u)` on macOS
+- Service files: `~/.config/systemd/user/capsper.service` (Linux), `~/Library/LaunchAgents/com.capsper.capsper.plist` (macOS)
+- Permissions: `input` group + udev rule on Linux; Accessibility + Microphone TCC on macOS

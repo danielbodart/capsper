@@ -158,8 +158,8 @@ async function streamPcmPipeWire(
 
     const server = await startLocalServer([
         "--input", "local",
-        "--pw-target", LOOPBACK_SOURCE,
-        "--pw-channel", "MONO",
+        "--audio-target", LOOPBACK_SOURCE,
+        "--audio-channel", "MONO",
         ...serverArgs,
     ]);
 

@@ -89,7 +89,7 @@ install_service() {
             drop-terms=*)  args+=("--drop-terms" "${arg#*=}") ;;
             record-dir=*)  args+=("--record-dir" "${arg#*=}") ;;
             low-latency)   args+=("--low-latency") ;;
-            pw-gain=*)     args+=("--pw-gain" "${arg#*=}") ;;
+            audio-gain=*)  args+=("--audio-gain" "${arg#*=}") ;;
         esac
     done
 
@@ -207,7 +207,7 @@ extract_service_config() {
     SAVED_LOW_LATENCY=false
     echo "$args_str" | grep -q -- '--low-latency' && SAVED_LOW_LATENCY=true
 
-    SAVED_GAIN=$(echo "$args_str" | sed -n 's/.*--pw-gain \([^ ]*\).*/\1/p')
+    SAVED_GAIN=$(echo "$args_str" | sed -n 's/.*--\(audio\|pw\)-gain \([^ ]*\).*/\2/p')
     SAVED_GAIN="${SAVED_GAIN:-1.0}"
 }
 
@@ -322,7 +322,7 @@ cmd_install() {
             [ -n "$SAVED_DROP_TERMS" ] && service_args+=("drop-terms=$SAVED_DROP_TERMS")
             $SAVED_RECORDINGS_ENABLED && service_args+=("record-dir=$RECORDINGS_DIR")
             $SAVED_LOW_LATENCY && service_args+=("low-latency")
-            [ "$SAVED_GAIN" != "1.0" ] && [ "$SAVED_GAIN" != "1" ] && service_args+=("pw-gain=$SAVED_GAIN")
+            [ "$SAVED_GAIN" != "1.0" ] && [ "$SAVED_GAIN" != "1" ] && service_args+=("audio-gain=$SAVED_GAIN")
 
             install_service "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
 

@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # Usage:
 #   ./install.sh              Full interactive setup (download models, permissions, systemd)
-#   ./install.sh pw-detect    Detect best PipeWire microphone channel (delegates to capsper --pw-detect)
+#   ./install.sh audio-detect  Detect best microphone channel (delegates to capsper --audio-detect)
 
 # shellcheck source=dist/install-common.sh
 source "$(cd "$(dirname "$0")" >/dev/null && pwd)/install-common.sh"
@@ -45,11 +45,11 @@ check_permissions() {
     fi
 }
 
-# ─── PipeWire Channel Detection & Gain Calibration ───────────────────────────
+# ─── Audio Channel Detection & Gain Calibration ─────────────────────────────
 
-pw_detect() {
+audio_detect() {
     local binary="$1"
-    "$binary" --pw-detect
+    "$binary" --audio-detect
 }
 
 # ─── Systemd Service ─────────────────────────────────────────────────────────
@@ -69,12 +69,12 @@ install_service() {
     local service_dir="$HOME/.config/systemd/user"
     mkdir -p "$service_dir"
 
-    local exec_start="$binary --trigger capslock --pw-channel $channel"
+    local exec_start="$binary --trigger capslock --audio-channel $channel"
     if [ -n "$gain" ] && [ "$gain" != "1.0" ] && [ "$gain" != "1" ]; then
-        exec_start="$exec_start --pw-gain $gain"
+        exec_start="$exec_start --audio-gain $gain"
     fi
     exec_start="$exec_start --model $model_dir/nemotron"
-    [ -n "$target" ] && exec_start="$exec_start --pw-target $target"
+    [ -n "$target" ] && exec_start="$exec_start --audio-target $target"
     [ -n "$drop_terms" ] && exec_start="$exec_start --drop-terms $drop_terms"
     if $enable_recordings; then
         mkdir -p "$RECORDINGS_DIR"
@@ -122,10 +122,10 @@ extract_service_config() {
     local exec_start
     exec_start=$(grep '^ExecStart=' "$service_file" | sed 's/^ExecStart=//')
 
-    SAVED_CHANNEL=$(echo "$exec_start" | sed -n 's/.*--pw-channel \([^ ]*\).*/\1/p')
+    SAVED_CHANNEL=$(echo "$exec_start" | sed -n 's/.*--\(audio\|pw\)-channel \([^ ]*\).*/\2/p')
     SAVED_CHANNEL="${SAVED_CHANNEL:-FL}"
 
-    SAVED_TARGET=$(echo "$exec_start" | sed -n 's/.*--pw-target \([^ ]*\).*/\1/p')
+    SAVED_TARGET=$(echo "$exec_start" | sed -n 's/.*--\(audio\|pw\)-target \([^ ]*\).*/\2/p')
     SAVED_TARGET="${SAVED_TARGET:-}"
 
     SAVED_DROP_TERMS=$(echo "$exec_start" | sed -n 's/.*--drop-terms \([^ ]*\).*/\1/p')
@@ -137,7 +137,7 @@ extract_service_config() {
     SAVED_LOW_LATENCY=false
     echo "$exec_start" | grep -q -- '--low-latency' && SAVED_LOW_LATENCY=true
 
-    SAVED_GAIN=$(echo "$exec_start" | sed -n 's/.*--pw-gain \([^ ]*\).*/\1/p')
+    SAVED_GAIN=$(echo "$exec_start" | sed -n 's/.*--\(audio\|pw\)-gain \([^ ]*\).*/\2/p')
     SAVED_GAIN="${SAVED_GAIN:-1.0}"
 }
 
@@ -258,6 +258,7 @@ cmd_install() {
         project_dir="$(cd "$SCRIPT_DIR/.." && pwd)"
 
         check_permissions
+        ensure_cudnn
 
         if ! $is_upgrade || $update_config; then
             local channel="FL"
@@ -266,7 +267,7 @@ cmd_install() {
             echo "=== Audio Configuration ==="
             if confirm "Run microphone channel detection? (No = use default FL, no gain boost)"; then
                 local detect_output
-                detect_output=$(pw_detect "$SCRIPT_DIR/bin/capsper")
+                detect_output=$(audio_detect "$SCRIPT_DIR/bin/capsper")
                 channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
                 gain=$(echo "$detect_output" | grep '^GAIN=' | tail -1 | cut -d= -f2)
                 [ -z "$channel" ] && channel="FL"
@@ -316,6 +317,7 @@ cmd_install() {
         install_files
         download_models "$INSTALL_DIR/models"
         check_permissions
+        ensure_cudnn
 
         if ! $is_upgrade || $update_config; then
             local channel="FL"
@@ -324,7 +326,7 @@ cmd_install() {
             echo "=== Audio Configuration ==="
             if confirm "Run microphone channel detection? (No = use default FL, no gain boost)"; then
                 local detect_output
-                detect_output=$(pw_detect "$INSTALL_DIR/current/bin/capsper")
+                detect_output=$(audio_detect "$INSTALL_DIR/current/bin/capsper")
                 channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
                 gain=$(echo "$detect_output" | grep '^GAIN=' | tail -1 | cut -d= -f2)
                 [ -z "$channel" ] && channel="FL"
@@ -433,7 +435,8 @@ cmd_install() {
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-install}" in
-    install)    cmd_install ;;
-    pw-detect)  pw_detect "$SCRIPT_DIR/bin/capsper" ;;
-    *)          die "Unknown command: $1. Usage: install.sh [install|pw-detect]" ;;
+    install)        cmd_install ;;
+    audio-detect)   audio_detect "$SCRIPT_DIR/bin/capsper" ;;
+    pw-detect)      audio_detect "$SCRIPT_DIR/bin/capsper" ;;  # legacy alias
+    *)              die "Unknown command: $1. Usage: install.sh [install|audio-detect]" ;;
 esac

@@ -37,7 +37,7 @@ pub fn detectChannel(allocator: std.mem.Allocator, target: ?[:0]const u8, durati
     var chosen_target: ?[:0]const u8 = target;
 
     if (chosen_target) |t| {
-        // Use specified --pw-target, look up its channel count
+        // Use specified --audio-target, look up its channel count
         for (results[0..n]) |info| {
             const name = std.mem.sliceTo(&info.name, 0);
             if (std.mem.eql(u8, name, t)) {
@@ -185,7 +185,7 @@ pub fn detectChannel(allocator: std.mem.Allocator, target: ?[:0]const u8, durati
         std.debug.print("Level OK — no gain boost needed.\n", .{});
     }
 
-    std.debug.print("\n  --pw-channel {s} --pw-gain {d:.1}\n", .{ chosen_name, cal.gain });
+    std.debug.print("\n  --audio-channel {s} --audio-gain {d:.1}\n", .{ chosen_name, cal.gain });
 
     // Write parseable output to stdout for install.sh
     var out_buf: [64]u8 = undefined;

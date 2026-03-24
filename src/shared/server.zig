@@ -16,7 +16,7 @@ const net = std.net;
 // main.zig for no-trigger local mode, trigger key press/release.
 pub var is_live = std.atomic.Value(bool).init(false);
 
-// Global capture pointer — set by runLocal so setLive can toggle the PipeWire stream.
+// Global capture pointer — set by runLocalCapture so setLive can toggle the audio stream.
 // When non-null, setLive also activates/deactivates the stream so the desktop
 // microphone indicator only appears during active recording.
 var capture_ptr = std.atomic.Value(?*AudioCapture).init(null);
@@ -28,7 +28,7 @@ var use_cork_mode = std.atomic.Value(bool).init(false);
 // PTT latency tracking — set by input thread via setLive(), read by server loop.
 // Use i64 (not i128) for atomic compatibility — nanoTimestamp fits in i64 for ~292 years.
 var ptt_press_ns = std.atomic.Value(i64).init(0);
-var pw_connect_done_ns = std.atomic.Value(i64).init(0);
+var capture_connect_done_ns = std.atomic.Value(i64).init(0);
 
 fn nanoTimestampI64() i64 {
     return @intCast(std.time.nanoTimestamp());
@@ -43,7 +43,7 @@ pub fn setLive(live: bool) void {
         } else {
             cap.setActive(live);
         }
-        if (live) pw_connect_done_ns.store(nanoTimestampI64(), .monotonic);
+        if (live) capture_connect_done_ns.store(nanoTimestampI64(), .monotonic);
     }
 }
 
@@ -58,7 +58,7 @@ pub const TypeCallback = struct {
 };
 
 /// Chunked audio reader. Buffers raw reads and yields exactly `chunk_size`
-/// bytes at a time, ensuring every transport (TCP, PipeWire pipe, etc.)
+/// bytes at a time, ensuring every transport (TCP, local audio capture, etc.)
 /// delivers identical chunk boundaries to the server loop.
 const ChunkedReader = struct {
     fd: posix.fd_t,
@@ -87,7 +87,7 @@ const ChunkedReader = struct {
         while (true) {
             const chunk = try self.readChunk();
             if (chunk.len == 0) return chunk; // EOF
-            // Digital zero is never real audio — skip it. This strips PipeWire
+            // Digital zero is never real audio — skip it. This strips audio system
             // pipeline latency and trailing silence from loopback teardown.
             if (self.skip_digital_zero and std.mem.allEqual(u8, chunk, 0)) {
                 self.total_zero_chunks_skipped += 1;
@@ -174,8 +174,8 @@ pub const Server = struct {
     pipeline_factory: PipelineFactory,
     port: u16,
     input_mode: InputMode,
-    pw_target: ?[:0]const u8,
-    pw_channel: u32,
+    audio_target: ?[:0]const u8,
+    audio_channel: u32,
     verbose: bool,
     low_latency: bool,
     type_callback: ?TypeCallback,
@@ -189,8 +189,8 @@ pub const Server = struct {
         pipeline_factory: PipelineFactory,
         port: u16,
         input_mode: InputMode,
-        pw_target: ?[:0]const u8,
-        pw_channel: u32,
+        audio_target: ?[:0]const u8,
+        audio_channel: u32,
         verbose: bool,
         low_latency: bool,
         type_callback: ?TypeCallback,
@@ -204,8 +204,8 @@ pub const Server = struct {
             .pipeline_factory = pipeline_factory,
             .port = port,
             .input_mode = input_mode,
-            .pw_target = pw_target,
-            .pw_channel = pw_channel,
+            .audio_target = audio_target,
+            .audio_channel = audio_channel,
             .verbose = verbose,
             .low_latency = low_latency,
             .type_callback = type_callback,
@@ -219,7 +219,7 @@ pub const Server = struct {
     pub fn run(self: *Server) !void {
         switch (self.input_mode) {
             .tcp => try self.runTcp(),
-            .local => try self.runPipeWire(),
+            .local => try self.runLocalCapture(),
         }
     }
 
@@ -259,11 +259,11 @@ pub const Server = struct {
         }
     }
 
-    fn runPipeWire(self: *Server) !void {
-        std.debug.print("Starting local PipeWire capture...\n", .{});
+    fn runLocalCapture(self: *Server) !void {
+        std.debug.print("Starting local audio capture...\n", .{});
 
-        var capture = AudioCapture.init(self.pw_target, self.pw_channel) catch |err| {
-            std.debug.print("Failed to start PipeWire capture: {}\n", .{err});
+        var capture = AudioCapture.init(self.audio_target, self.audio_channel) catch |err| {
+            std.debug.print("Failed to start audio capture: {}\n", .{err});
             return err;
         };
         defer capture.deinit();
@@ -280,7 +280,7 @@ pub const Server = struct {
 
         if (self.low_latency) {
             // Low-latency mode: connect stream once at startup, use cork/uncork for PTT.
-            // Mic indicator stays visible, but avoids ~1.3s PipeWire reconnect on each press.
+            // Mic indicator stays visible, but avoids ~1.3s audio reconnect on each press.
             use_cork_mode.store(true, .monotonic);
             capture.setActive(true);
             if (!is_live.load(.monotonic)) {
@@ -399,7 +399,7 @@ pub const Server = struct {
             // Live: process chunk
             if (self.recorder) |rec| rec.recordPcm(audio);
 
-            // Auto-gain (PipeWire only)
+            // Auto-gain (local capture only)
             if (!self.no_auto_gain) {
                 if (capture_ptr.load(.monotonic)) |cap| {
                     const rms = utils.channelRms(audio, 1, 0);
@@ -468,7 +468,7 @@ pub const Server = struct {
 
 /// Format audio-position timestamp as "{s}.{tenths}" into buf.
 /// Uses total audio bytes received (at 32000 bytes/sec) instead of wall-clock,
-/// so timestamps are consistent across TCP fast, TCP realtime, and PipeWire modes.
+/// so timestamps are consistent across TCP fast, TCP realtime, and local capture modes.
 fn formatAudioTime(buf: []u8, total_audio_bytes: usize) []u8 {
     const elapsed_ms: u64 = total_audio_bytes * 1000 / 32000;
     return std.fmt.bufPrint(buf, "{d}.{d}", .{ elapsed_ms / 1000, (elapsed_ms % 1000) / 100 }) catch buf[0..3];

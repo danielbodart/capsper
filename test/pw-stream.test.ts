@@ -34,8 +34,8 @@ describe.skipIf(!isLinux)("pw-stream", () => {
 
             const server = await startLocalServer([
                 "--input", "local",
-                "--pw-target", LOOPBACK_SOURCE,
-                "--pw-channel", "MONO",
+                "--audio-target", LOOPBACK_SOURCE,
+                "--audio-channel", "MONO",
                 "--verbose",
             ]);
 

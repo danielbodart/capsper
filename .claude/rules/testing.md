@@ -9,11 +9,11 @@ globs:
 
 ## Unit Tests
 
-Add unit tests for any pure functions (functions that don't depend on onnxruntime C types). Keep testable logic in modules that don't import `ort_c.zig` so tests run fast without requiring the model. Unit tests live inline in their source files (see `src/utils.zig`, `src/nemo_mel.zig`).
+Add unit tests for any pure functions (functions that don't depend on backend-specific C types). Keep testable logic in modules that don't import `ort_c.zig` (Linux) or CoreML helpers (macOS) so tests run fast without requiring the model. Unit tests live inline in their source files (see `src/shared/utils.zig`, `src/shared/nemo_mel.zig`).
 
 ## Property Tests
 
-For functions with tricky invariants (buffer trimming, PCM conversion, WAV roundtrips, attention analysis, input event generation), add property-based tests in `src/prop_tests.zig` using [minish](https://github.com/CogitatorTech/minish). Good candidates: functions that are idempotent, symmetric, have roundtrip relationships, or where edge cases matter. Property tests catch bugs that hand-written examples miss.
+For functions with tricky invariants (buffer trimming, PCM conversion, WAV roundtrips, input event generation), add property-based tests in `src/shared/prop_tests.zig` using [minish](https://github.com/CogitatorTech/minish). Good candidates: functions that are idempotent, symmetric, have roundtrip relationships, or where edge cases matter. Property tests catch bugs that hand-written examples miss.
 
 ## Integration Tests
 

@@ -4,25 +4,42 @@
 
 Does CapsLock annoy you? Ever wished it actually did something useful instead of SHOUTING AT PEOPLE BY ACCIDENT?
 
-Ever wished you could just whisper to a friendly ghost and have your words appear on screen? Well now you can. Capsper is your friendly neighbourhood ghost writer — hold CapsLock, speak, and he types it out for you. No cloud, no subscription, no latency worth complaining about. Just a local GPU, a haunted key, and a little whisper magic.
+Ever wished you could just whisper to a friendly ghost and have your words appear on screen? Well now you can. Capsper is your friendly neighbourhood ghost writer — hold CapsLock, speak, and he types it out for you. No cloud, no subscription, no latency worth complaining about. Just a local GPU (or CPU), a haunted key, and a little whisper magic.
 
-Push-to-talk voice dictation for Linux. Uses a streaming [whisper.cpp](https://github.com/ggml-org/whisper.cpp) server written in Zig with [AlignAtt](https://aclanthology.org/2023.findings-emnlp.744/) for low-latency transcription. Works on both X11 and Wayland.
+Push-to-talk voice dictation for Linux and macOS. Uses NVIDIA's [Nemotron Speech 600M](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) model (FastConformer RNNT) for streaming speech-to-text. Single self-contained binary per platform.
 
 ## How it works
 
-1. A single Zig binary grabs your keyboard via evdev, intercepts CapsLock as push-to-talk
-2. Audio is captured directly via PipeWire while the trigger key is held
-3. Incremental transcription runs on the GPU with VAD (Silero, on CPU) and token accumulation for consistency
-4. Transcribed text is injected as keystrokes via uinput into the focused window
+1. A single binary intercepts CapsLock as push-to-talk
+2. Audio is captured directly from the system audio while the trigger key is held
+3. Incremental transcription runs locally via the Nemotron RNNT model
+4. Transcribed text is injected as keystrokes into the focused window
+
+| | Linux | macOS |
+|---|---|---|
+| **Keyboard** | evdev grab + uinput virtual keyboard | CGEventTap + CGEventPost |
+| **Audio** | PipeWire capture | CoreAudio (AUHAL) |
+| **Inference** | ONNX Runtime (CUDA or CPU) | CoreML (93% Apple Neural Engine) |
+| **Display server** | X11 and Wayland | native |
 
 ## Requirements
 
-- Linux (Debian/Ubuntu)
-- NVIDIA GPU with ~4 GB VRAM (Turing or newer: GTX 16xx, RTX 20xx/30xx/40xx/50xx)
-- NVIDIA GPU drivers (Ubuntu: `sudo ubuntu-drivers autoinstall`)
+### Linux
+
+- Debian/Ubuntu (or similar)
 - PipeWire (default audio server on modern Ubuntu/Fedora)
+- **GPU (recommended):** NVIDIA GPU with ~2 GB VRAM (Turing or newer: GTX 16xx, RTX 20xx/30xx/40xx/50xx), NVIDIA drivers, and cuDNN
+- **CPU-only:** works without a GPU (slower, but functional)
+
+### macOS
+
+- Apple Silicon Mac (M1 or later)
+- macOS 13 (Ventura) or later
+- Accessibility and Microphone permissions (the installer walks you through this)
 
 ## Install
+
+### Linux
 
 ```bash
 mkdir capsper && cd capsper
@@ -30,19 +47,37 @@ curl -fSL https://github.com/danielbodart/capsper/releases/latest/download/capsp
 ./install.sh
 ```
 
-The installer walks you through everything interactively — downloading models (~574 MB), setting up permissions for keyboard grab and text injection, detecting your microphone channel, and installing a systemd user service.
+### macOS
+
+```bash
+mkdir capsper && cd capsper
+curl -fSL https://github.com/danielbodart/capsper/releases/latest/download/capsper-macos-arm64.tar.gz | tar -xz
+./install.sh
+```
+
+The installer walks you through everything interactively — downloading models, setting up permissions, detecting your microphone, and installing a background service.
+
+On Linux, a launcher script automatically detects whether you have an NVIDIA GPU and runs the appropriate binary (`capsper-cuda` or `capsper-cpu`).
 
 ## Usage
 
+### Linux
+
 ```bash
 systemctl --user start capsper.service
+```
+
+### macOS
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist
 ```
 
 Hold CapsLock and speak. Release to stop. Text appears in the focused window. CapsLock is the default trigger — you can use any key with `--trigger` (see [Server options](#server-options)).
 
 ## Auto-updates
 
-Capsper can optionally check for updates daily via a systemd timer (the installer offers to set this up). When a new version is found, it's downloaded and staged in the background. The update is applied automatically on the next service restart — capsper is never interrupted mid-session.
+Capsper can optionally check for updates daily (the installer offers to set this up). When a new version is found, it's downloaded and staged in the background. The update is applied automatically on the next service restart — capsper is never interrupted mid-session.
 
 Check for updates manually:
 
@@ -53,13 +88,19 @@ Check for updates manually:
 Apply a staged update:
 
 ```bash
+# Linux
 systemctl --user restart capsper.service
+
+# macOS
+launchctl bootout gui/$(id -u)/com.capsper.capsper 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist
 ```
 
-If a new version crashes repeatedly (3 times within 60 seconds), capsper automatically rolls back to the previous version. You can also roll back manually:
+If a new version crashes repeatedly (3 times within 60 seconds), capsper automatically rolls back to the previous version (Linux). You can also roll back manually:
 
 ```bash
 ~/.local/share/capsper/capsper-rollback.sh --force
+
+# Linux
 systemctl --user reset-failed capsper.service
 systemctl --user start capsper.service
 ```
@@ -67,27 +108,16 @@ systemctl --user start capsper.service
 Disable auto-updates:
 
 ```bash
+# Linux
 systemctl --user disable --now capsper-update.timer
-```
 
-### Domain terms
-
-If you frequently use jargon, tool names, or domain-specific vocabulary, you can provide a text file of terms to improve transcription accuracy. The installer can set this up for you, or you can configure it manually:
-
-```bash
-capsper --trigger capslock --domain-terms ~/my-terms.txt
-```
-
-The terms file is plain text — comma-separated, one per line, or prose. These terms are tokenized and injected into the Whisper decoder as context, biasing it toward your vocabulary without overriding acoustic evidence.
-
-Example `my-terms.txt`:
-```
-Kubernetes, kubectl, Terraform, Ansible, gRPC, PostgreSQL
+# macOS
+launchctl bootout gui/$(id -u)/com.capsper.update
 ```
 
 ### Drop terms
 
-Whisper sometimes hallucinates short phrases (e.g. "Thank you.", "I love you") on segments that contain no real speech. You can suppress these by providing a drop terms file:
+Capsper's RNNT model sometimes emits short filler phrases (e.g. "Thank you.", "I love you") on segments with no real speech. You can suppress these by providing a drop terms file:
 
 ```bash
 capsper --trigger capslock --drop-terms ~/my-drop-terms.txt
@@ -101,24 +131,24 @@ Thank you.
 I love you
 ```
 
-### PipeWire setup
+### Audio setup (Linux)
 
 Run the interactive setup wizard to detect your microphone channel and calibrate gain:
 
 ```bash
-capsper --pw-detect
+capsper --audio-detect
 ```
 
-This walks you through everything in one flow: lists available audio sources, lets you pick a device, records silence and speech to detect the best channel, then calibrates software gain — all without interruption. At the end it prints the recommended flags:
+This lists available audio sources, lets you pick a device, records silence and speech to detect the best channel, then calibrates software gain. At the end it prints the recommended flags:
 
 ```
-  --pw-channel FL --pw-gain 3.2
+  --audio-channel FL --audio-gain 3.2
 ```
 
 If you already know your device, skip the selection step:
 
 ```bash
-capsper --pw-detect --pw-target alsa_input.usb-Focusrite_Vocaster...
+capsper --audio-detect --audio-target alsa_input.usb-Focusrite_Vocaster...
 ```
 
 ### Debug recording
@@ -127,7 +157,7 @@ To diagnose transcription issues (e.g. dropped words), enable per-utterance reco
 
 ```bash
 mkdir /tmp/capsper-debug
-capsper --trigger capslock --pw-channel FL --record-dir /tmp/capsper-debug
+capsper --trigger capslock --record-dir /tmp/capsper-debug
 ```
 
 Each utterance produces a pair of files (`000.wav`/`000.log`, `001.wav`/`001.log`, etc.) in a ring buffer — old files are overwritten after `--record-keep` pairs (default 10). The WAV contains the full utterance audio and the log contains emitted text plus a per-cycle diagnostic trace.
@@ -140,93 +170,17 @@ capsper --transcribe /tmp/capsper-debug/005.wav
 
 This loads the model, transcribes the entire file in one shot, prints the result, and exits.
 
-## Acknowledgements
-
-Capsper's streaming approach is inspired by [SimulStreaming](https://github.com/ufal/SimulStreaming) (ÚFAL, Charles University), which implements AlignAtt-based simultaneous speech processing and won the IWSLT 2025 Simultaneous Speech Translation Shared Task. We borrowed the core idea of using cross-attention analysis to decide when it's safe to emit partial transcriptions.
-
-Where SimulStreaming targets multilingual translation with Whisper + a 9B-parameter LLM (requiring 10+ GB VRAM and a full Python/PyTorch stack), Capsper takes a different path:
-
-- **Dictation only** — no translation layer, just fast speech-to-text in the focused window
-- **~1.7 GB VRAM** vs 5–10+ GB, thanks to a quantised model and no LLM
-- **Single Zig binary** — deterministic memory management, no garbage collector, no Python runtime
-- **Near-zero idle usage** — no CPU or GPU activity when you're not speaking
-- **Direct hardware integration** — evdev keyboard grab, PipeWire audio capture, and uinput text injection with no external tools
-
-## Development
-
-Want to hack on Capsper? You'll need the [requirements](#requirements) above. The Zig binary compiles without CUDA — pre-built whisper.cpp shared libs are committed via Git LFS.
-
-To rebuild the whisper.cpp shared libs (only needed after bumping the submodule), you'll need the CUDA 12 toolkit (`sudo apt install nvidia-cuda-toolkit`). The libs are compiled as PTX (virtual architectures) so no specific GPU hardware is required for compilation — the driver JIT-compiles to the target GPU at first launch.
-
-```bash
-git clone --recurse-submodules https://github.com/danielbodart/capsper.git
-cd capsper
-./run
-```
-
-This auto-detects and handles everything:
-- Installs toolchain (mise, Zig 0.15.2, Bun) on first run via `bootstrap.sh`
-- Installs system packages (`pv`, `ncat`)
-- Initialises the whisper.cpp submodule if needed
-- Downloads the Whisper model (~574 MB) if missing (VAD models are included in the repo)
-- Compiles the Zig binary (pre-built whisper.cpp shared libs are committed via Git LFS)
-- Runs unit and property tests, then integration smoke tests
-- Configures uinput permissions (for text injection via virtual keyboard)
-- Creates and enables a systemd user service
-
-Every step is incremental — re-running `./run` is fast if everything is already set up.
-
 ## Architecture
 
-```
-Physical Keyboard ──evdev──→ capsper ──uinput──→ Virtual Keyboard → Apps
-                              │
-                              ├─ Trigger key held → PipeWire audio capture
-                              ├─ whisper.cpp (GPU) + Silero VAD (CPU)
-                              ├─ AlignAtt streaming + token accumulation
-                              └─ All other keys → forwarded transparently
-```
+Capsper uses NVIDIA's Nemotron Speech 600M model — a FastConformer-based RNNT (Recurrent Neural Network Transducer) that's inherently incremental. Unlike the previous whisper.cpp approach which needed separate voice activity detection and cross-attention tricks for streaming, the RNNT model naturally processes audio as it arrives and emits tokens incrementally. Push-to-talk is the sole gate — no VAD needed.
 
-A single self-contained binary (`src/`):
+The model runs through different backends depending on platform:
 
-| File | Purpose |
-|---|---|
-| `main.zig` | Entry point, argument parsing, model loading, warmup |
-| `input.zig` | evdev keyboard grab, uinput virtual keyboard, trigger key + text injection |
-| `server.zig` | Streaming state machine, VAD-driven state transitions, word delta emission |
-| `pipeline.zig` | Low-level whisper.cpp integration, two-tier token context, mel/encode/decode loop |
-| `mel.zig` | Incremental mel spectrogram (FFT, Hann window, mel filterbank with frame caching) |
-| `alignatt.zig` | Cross-attention analysis for streaming stop/rewind decisions |
-| `recorder.zig` | Per-utterance debug recording (WAV + diagnostic log capture) |
-| `utils.zig` | Pure utility functions (PCM conversion, WAV parsing, buffer trimming, RMS analysis) |
-| `vad.zig` | VAD backend dispatch (`VadBackend` tagged union) and `VadFilter` state machine — see [VAD](#voice-activity-detection-vad) |
-| `vad_silero.zig` | Silero backend — wraps whisper.cpp's `whisper_vad_detect_speech` with streaming LSTM state |
-| `ten_vad_ggml.zig` | TEN-VAD GGML backend — feature extraction + GGML inference (separable convs, LSTM, dense) |
-| `vad_ten_native.zig` | TEN-VAD Native backend — dlopen wrapper for prebuilt `libten_vad.so` |
-| `conv.zig` | Separable conv layers for TEN-VAD GGML (pure Zig, no C FFI) |
-| `pitch_est.zig` | LPC-residual autocorrelation pitch estimator for TEN-VAD GGML |
-| `dsp.zig` | Pure DSP helpers for pitch estimation (biquad filters, LPC, band energy) |
-| `audio_capture.zig` | PipeWire audio capture via `pw_thread_loop` + `pw_stream`, software gain |
-| `pw_detect.zig` | Interactive PipeWire setup wizard (device selection, channel detection, gain calibration) |
-| `auto_gain.zig` | Pure-math auto-gain controller (runtime + calibration), capped at PipeWire's 10x ceiling |
-| `pw_helpers.c` | C helpers for PipeWire SPA pod building, stream gain, and source enumeration |
-| `whisper_c.zig` | C import bridge for whisper.cpp |
-| `pipewire_c.zig` | C import bridge for PipeWire |
-| `prop_tests.zig` | Property-based tests (PCM conversion, WAV roundtrips, buffer trimming, attention analysis) |
+- **Linux (NVIDIA GPU):** ONNX Runtime with CUDA execution provider — int8-static quantization
+- **Linux (CPU):** ONNX Runtime CPU — int8-dynamic quantization
+- **macOS (Apple Silicon):** CoreML — FP16, runs 93% on the Apple Neural Engine
 
-### Technical highlights
-
-**Manual decode loop with cross-attention introspection** — Instead of using whisper.cpp's high-level `whisper_full()`, Capsper manually drives the mel spectrogram → encode → decode pipeline token by token. This gives per-token access to the decoder's cross-attention weights, which is how AlignAtt decides when to stop: it watches where each attention head is "looking" in the audio, and stops when attention drifts past the end of the buffer or jumps backwards (a sign of hallucination). The attention values go through z-score normalisation, median filtering, and head averaging before the stopping decision. Cross-attention also provides per-token audio frame positions, which are used for exact token-audio alignment when the sliding window trims audio from the front — instead of estimating how many tokens to demote, the pipeline knows precisely which tokens correspond to trimmed audio. The most-attended frame persists across decode cycles, so backward attention jumps between cycles (not just within a single decode) are also caught as rewind signals.
-
-**Incremental mel spectrogram** — Rather than recomputing the full mel spectrogram from scratch each cycle, Capsper caches raw (pre-normalisation) mel frames and only computes FFT for new audio samples. The mel filterbank, Hann window, and FFT are implemented in pure Zig (`mel.zig`), giving full control over the caching boundary. Normalisation is still a full pass each cycle but takes under 1ms. The cache is reset on segment boundaries or buffer trims (clean slate).
-
-**Token accumulation with two-tier context** — Rather than re-transcribing the entire audio buffer each cycle and diffing the output, Capsper commits confirmed tokens as a forced decoder prefix. Each cycle, the model is given previously emitted tokens after `[notimestamps]` as forced output — it processes them as its own previous output, building KV cache state, then continues generating from where it left off. This eliminates the instability that comes from re-decoding: the model always sees the same prefix, so it never contradicts what was already emitted.
-
-When the 30-second sliding window trims audio from the front, the corresponding tokens are demoted from forced output to conditioning context. Instead of being deleted (which caused misalignment and hallucination), they move to the `<|startofprev|>` section before `[sot]`, where the model treats them as a hint rather than a constraint. This two-tier approach — forced tokens for audio in the buffer, conditioning tokens for trimmed audio — is inspired by SimulStreaming's token management.
-
-**CPU-only VAD** — Voice activity detection runs entirely on the CPU while whisper.cpp transcription runs on the GPU, avoiding GPU context switching overhead. Three backends are available (Silero, TEN-VAD GGML, TEN-VAD Native) — all streaming, all CPU-only. See [VAD](#voice-activity-detection-vad) for details.
-
-**Transparent keyboard forwarding** — Rather than intercepting specific keys, Capsper grabs all physical keyboards via `EVIOCGRAB` and creates a uinput virtual keyboard that forwards every event transparently. Only the trigger key (CapsLock) is consumed; all other keys pass through unchanged. This means the grab is invisible to applications while giving Capsper exclusive access to the trigger. The virtual keyboard also handles text injection — transcribed text is emitted as synthetic keystrokes with proper shift-state handling, which works on both X11 and Wayland without any external tools. A panic sequence (Enter+Backspace+Escape simultaneously) ungrab all keyboards as a safety net.
+A single Zig binary handles everything: keyboard interception, audio capture, mel spectrogram computation, model inference, SentencePiece detokenization, and text injection. No Python, no runtime dependencies beyond the platform's audio system and GPU drivers.
 
 ## Server options
 
@@ -235,139 +189,99 @@ Running `capsper` with no arguments prints usage and exits.
 ```
 capsper [OPTIONS]
 
-  --model, -m PATH        Whisper model path (default: ../models/ggml-large-v3-turbo-q5_0.bin relative to binary)
-  --port, -p PORT         TCP port (default: 43007, use 0 for OS-assigned)
-  --warmup-file PATH      WAV file for GPU warmup (default: jfk.wav next to binary)
-  --no-warmup             Skip warmup inference
-  --input tcp|local       Input mode: tcp (socket) or local (PipeWire capture)
-  --trigger KEY           Trigger key for push-to-talk (default: capslock)
-  --trigger-passthrough   Forward trigger key to OS after interception
-  --type-delay US         Delay between injected keystrokes in microseconds (default: 12000)
-  --low-latency           Keep PipeWire stream open (mic indicator always visible, ~300ms faster)
-  --pw-target NODE        PipeWire capture target node name
-  --pw-channel CHANNEL    PipeWire channel: MONO, FL, FR, AUX0-AUX63 (default: FL)
-  --pw-gain FACTOR        PipeWire software gain multiplier (default: 1.0, max: 10.0)
-  --domain-terms FILE     Text file of domain terms to bias transcription toward (one per line)
-  --drop-terms FILE       Text file of phrases to suppress (one per line, exact match)
-  --record-dir DIR        Record each utterance to DIR (WAV + diagnostic log)
-  --record-keep N         Number of recording pairs to keep (default: 10, ring buffer)
-  --transcribe FILE       Batch-transcribe a WAV file (non-streaming) and exit
-  --vad ten|silero|ten-native  VAD backend (default: silero)
-  --pw-detect             Interactive setup wizard (device selection, channel detection, gain calibration)
-  --detect-duration SECS  Duration per detection phase (default: 5)
-  --verbose               Enable verbose logging
-  --dry-run               Load models, run warmup, then exit (validates setup)
-  --version               Print version and exit
+  --model, -m PATH          Model directory path (default: ../models/nemotron relative to binary)
+  --port, -p PORT           TCP port (default: 43007, use 0 for OS-assigned)
+  --input tcp|local         Input mode: tcp (socket) or local (audio capture)
+  --trigger KEY             Trigger key for push-to-talk (default: none)
+  --trigger-passthrough     Forward trigger key to OS after interception
+  --type-delay US           Delay between injected keystrokes in microseconds (default: 12000)
+  --low-latency             Keep audio stream open (mic indicator always visible, ~300ms faster)
+  --audio-target NODE       Audio capture target device name
+  --audio-channel CHANNEL   Audio channel: MONO, FL, FR, AUX0-AUX63 (default: FL)
+  --audio-gain FACTOR       Software gain multiplier (default: 1.0, max: 10.0)
+  --audio-detect            Interactive audio setup wizard (device selection, channel detection, gain calibration)
+  --detect-duration SECS    Duration per detection phase (default: 5)
+  --drop-terms FILE         Text file of phrases to suppress (one per line, exact match)
+  --record-dir DIR          Record each utterance to DIR (WAV + diagnostic log)
+  --record-keep N           Number of recording pairs to keep (default: 10, ring buffer)
+  --transcribe FILE         Batch-transcribe a WAV file (non-streaming) and exit
+  --no-auto-gain            Disable automatic gain adjustment
+  --warmup-file FILE        WAV file for inference warmup at startup
+  --no-warmup               Skip warmup inference
+  --verbose, -v             Enable verbose logging
+  --dry-run                 Load models, run warmup, then exit (validates setup)
+  --version                 Print version and exit
 ```
 
-## Voice activity detection (VAD)
+## Development
 
-All VAD backends run on the CPU in streaming mode, processing small audio chunks as they arrive. Whisper transcription runs on the GPU, so VAD has zero impact on transcription throughput.
-
-| Backend | Flag | Model | Chunk size | Deps | Notes |
-|---|---|---|---|---|---|
-| **Silero** (default) | `--vad silero` | `ggml-silero-v5.1.2.bin` (865 KB) | 512 samples (32ms) | Via whisper.cpp | Best accuracy, slightly higher CPU. LSTM state carried across chunks for temporal context ([upstream PR](https://github.com/ggml-org/whisper.cpp/pull/3677)). |
-| **TEN-VAD GGML** | `--vad ten` | `ten-vad-ggml.bin` (296 KB) | 256 samples (16ms) | None (pure Zig + GGML) | Only GGML reimplementation of TEN-VAD in existence. Separable convs + LSTM + dense layers, all in Zig. Performance matches the native ONNX model. |
-| **TEN-VAD Native** | `--vad ten-native` | Embedded in `libten_vad.so` (306 KB) | 256 samples (16ms) | `libc++`, `libc++abi` | Reference implementation using the original ONNX model via the prebuilt shared library. |
-
-**Trade-offs**: Silero has the best speech detection accuracy (94.3% avg coverage, 8.5% avg WER on regression tests vs TEN-VAD's 92.8% / 9.9%), but the difference is single-digit percentages and only shows on medium/long recordings — short utterances are identical across all backends. TEN-VAD GGML has zero external dependencies (the model is a 296 KB GGML file, the inference is pure Zig), while TEN-VAD Native requires `libc++` / `libc++abi` shared libraries.
-
-### Testing with different backends
-
-The regression tests accept `VAD_BACKEND` to override the default:
+Want to hack on Capsper? You'll need the [requirements](#requirements) for your platform.
 
 ```bash
-VAD_BACKEND=ten ./run.ts short-test
-VAD_BACKEND=silero ./run.ts medium-test
-VAD_BACKEND=ten-native ./run.ts short-test
+git clone https://github.com/danielbodart/capsper.git
+cd capsper
+./run.ts
 ```
 
-Additional environment variables for threshold tuning: `VAD_THRESHOLD`, `VAD_THRESHOLD_OFF`, `VAD_MIN_SILENCE_MS`.
+This auto-detects your platform and handles everything:
+- Installs toolchain (mise, Zig 0.15, Bun) on first run via `bootstrap.sh`
+- Installs system packages (`libpipewire-0.3-dev`, `pv`, `ncat` on Linux; `shellcheck` on macOS)
+- Downloads models if missing (~250 MB for ONNX, ~150 MB for CoreML)
+- Compiles the Zig binary (pre-built ONNX Runtime shared libs committed via Git LFS on Linux)
+- Runs unit tests, property tests, and short integration smoke tests
 
-## Building & testing
+On Linux, `./run.ts build` produces two binaries (`capsper-cuda` + `capsper-cpu`) plus a launcher script. On macOS, it produces a single `capsper` binary using CoreML.
 
-All commands go through the Bun-based task runner (`run.ts`), which bootstraps its own toolchain via `bootstrap.sh` + mise. See [Development](#development) for first-time setup.
+Every step is incremental — re-running `./run.ts` is fast if everything is already set up.
+
+### Building & testing
+
+All commands go through the Bun-based task runner (`run.ts`):
 
 ```bash
 # Build (default command)
 ./run.ts build
 
-# Rebuild whisper.cpp shared libs (only needed after bumping submodule)
-./run.ts rebuild-whisper
-
 # Unit + property tests (no GPU required)
 ./run.ts test
 
-# Regression test groups (requires GPU + built binary)
+# Regression test groups (requires built binary + model)
 ./run.ts short-test               # Short files (<15s) via fast-forward TCP
 ./run.ts medium-test              # Medium files (15-40s) via fast-forward TCP
 ./run.ts long-test                # Long files (>60s) via fast-forward TCP
 
-# All integration tests (all groups + PipeWire plumbing)
+# All integration tests (all groups + platform plumbing)
 ./run.ts slow-test
 ```
 
-## Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `VAD_BACKEND` | *(unset)* | Override VAD backend in regression tests (`ten`, `silero`, `ten-native`) |
-| `VAD_THRESHOLD` | *(unset)* | Override VAD onset threshold in regression tests |
-| `VAD_THRESHOLD_OFF` | *(unset)* | Override VAD offset threshold in regression tests |
-| `VAD_MIN_SILENCE_MS` | *(unset)* | Override minimum silence duration (ms) in regression tests |
-
-## Performance
-
-On an RTX 5070 Ti with the `large-v3-turbo-q5_0` model:
-
-### First-emit latency (PTT press → first text appears): ~2.6s
-
-| Step | Time | Notes |
-|---|---|---|
-| Key press → PipeWire connect | ~2ms | `pw_stream_connect` request |
-| PipeWire stream setup | ~330ms | Format negotiation, source starts delivering buffers |
-| Audio accumulation | ~1,000ms | Waiting for 1s of audio (`transcribe_interval_bytes`) |
-| VAD speech detection | ~15ms | Silero on last 0.5s window |
-| Mel spectrogram | ~15ms | Incremental, only computes new frames |
-| Encoder (self-attention) | ~100ms | Full self-attention, not incrementalisable |
-| Decoder | ~5ms | Autoregressive token generation |
-| **Total** | **~2,600ms** | |
-
-The table steps add up to ~1.5s, not 2.6s. The gap is because the first transcription cycle (after 1s of audio) almost always produces nothing — AlignAtt's cross-attention analysis isn't confident enough to emit tokens from just one second of speech. So the system waits for a second round of audio accumulation (~1s more), runs a second transcription cycle, and *that* one emits the first words. The ~2.6s floor is fundamental: Whisper needs roughly 2s of audio context before AlignAtt will commit to emitting.
-
-PipeWire stream setup and audio accumulation are the dominant costs. The stream is connected on each PTT press and disconnected on release so the desktop microphone indicator only appears while recording.
-
-### `--low-latency` mode
-
-Pass `--low-latency` to keep the PipeWire stream connected at all times, using cork/uncork instead of connect/disconnect. The microphone indicator stays visible permanently, but eliminates PipeWire stream setup on each press (~300ms saving, ~2.3s total). Subsequent presses in the same session are faster (~2.0s) since the stream is already warmed up.
-
-### Subsequent emissions: ~1s apart
-
-Once audio is flowing, new words appear every ~1s (the transcription interval). Each cycle takes ~130ms on the GPU — the rest is waiting for audio to accumulate.
-
 ## Troubleshooting
 
-**"No CUDA GPU detected"** — capsper requires a CUDA-capable NVIDIA GPU and won't fall back to CPU. Ensure NVIDIA drivers are installed (`sudo ubuntu-drivers autoinstall`) and that `nvidia-smi` shows your GPU.
+### Linux
 
-**Server fails to start** — check `/tmp/capsper.log`. Ensure CUDA is installed and GPU has sufficient VRAM.
-
-**"Failed to load model"** — model file not found. Download it:
-```bash
-curl -L -o dist/models/ggml-large-v3-turbo-q5_0.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
-```
+**"No CUDA GPU detected"** — the CUDA binary requires an NVIDIA GPU with cuDNN. Ensure NVIDIA drivers are installed (`sudo ubuntu-drivers autoinstall`), that `nvidia-smi` shows your GPU, and that cuDNN is installed. Alternatively, the CPU binary works without a GPU (the launcher script auto-detects this).
 
 **Cannot open /dev/input** — ensure your user is in the `input` group (`groups` to check, `sudo usermod -aG input $USER` then log out/in).
 
-**Text not being typed** — ensure `/dev/uinput` is accessible. The udev rule should be set up by `./run setup`, or manually: `echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uinput.rules && sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput`.
+**Text not being typed** — ensure `/dev/uinput` is accessible. The udev rule should be set up by `./install.sh`, or manually: `echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uinput.rules && sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput`.
+
+**Audio capture fails** — ensure PipeWire is running (`pw-cli info`). Run `capsper --audio-detect` to list available sources, select your device, and detect the correct channel.
+
+**Quiet or degraded transcription** — if using a multi-channel audio interface, make sure you're capturing the correct channel. Run `capsper --audio-detect` to detect the best channel and calibrate gain.
+
+### macOS
+
+**"Failed to init input handler"** — Accessibility permission not granted. Open System Settings > Privacy & Security > Accessibility and add capsper (or Terminal).
+
+**No audio captured** — Microphone permission not granted. Open System Settings > Privacy & Security > Microphone and add capsper (or Terminal).
+
+**Service not starting** — check logs with `tail -f ~/.local/share/capsper/capsper.log`. Ensure both Accessibility and Microphone permissions are granted.
+
+### Both platforms
 
 **Keyboard locked up** — press Enter+Backspace+Escape simultaneously to trigger the panic sequence and ungrab all keyboards.
 
-**Build fails** — ensure the whisper.cpp submodule is initialised and Git LFS files are pulled:
-```bash
-git submodule update --init --recursive
-git lfs pull
-```
+**"Failed to load model"** — model files not found. Re-run `./install.sh` to download models, or download manually from HuggingFace.
 
-**PipeWire capture fails** — ensure PipeWire is running (`pw-cli info`). Run `capsper --pw-detect` to list available sources, select your device, and detect the correct channel.
+## Acknowledgements
 
-**Quiet or degraded transcription** — if using a multi-channel audio interface (e.g. Focusrite Vocaster), make sure you're capturing the correct channel (not a MONO downmix). Run `capsper --pw-detect` to detect the best channel and calibrate gain. Use the recommended `--pw-channel` and `--pw-gain` flags.
+Capsper uses NVIDIA's [Nemotron Speech 600M](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) (FastConformer RNNT) model for speech recognition. The model is converted to ONNX and CoreML formats for cross-platform deployment.

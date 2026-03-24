@@ -59,6 +59,78 @@ detect_model_variant() {
     echo "int8-dynamic"
 }
 
+# ─── cuDNN Detection & Install (Linux NVIDIA only) ──────────────────────────
+
+# Check if cuDNN is installed. Returns 0 if found, 1 if missing.
+has_cudnn() {
+    # Check ldconfig cache first (fastest)
+    if ldconfig -p 2>/dev/null | grep -q libcudnn; then
+        return 0
+    fi
+    # Check common paths
+    for path in /usr/lib/x86_64-linux-gnu/libcudnn*.so* /usr/local/cuda/lib64/libcudnn*.so*; do
+        [ -e "$path" ] && return 0
+    done
+    return 1
+}
+
+# Try to install cuDNN via apt. Tries multiple package names across distros.
+install_cudnn() {
+    echo ""
+    echo "=== cuDNN Required ==="
+    echo "The NVIDIA CUDA binary requires cuDNN for inference."
+    echo "Attempting to install via apt..."
+
+    # Try package names in order of preference:
+    # 1. libcudnn9-cuda-12 — NVIDIA's official repo (Ubuntu 22.04+)
+    # 2. libcudnn8        — older NVIDIA repo / Ubuntu 20.04
+    # 3. nvidia-cudnn      — some Ubuntu 24.04+ configurations
+    local pkg=""
+    for candidate in libcudnn9-cuda-12 libcudnn8 nvidia-cudnn; do
+        if apt-cache show "$candidate" >/dev/null 2>&1; then
+            pkg="$candidate"
+            break
+        fi
+    done
+
+    if [ -n "$pkg" ]; then
+        echo "Found package: $pkg"
+        if confirm "Install $pkg? (requires sudo)"; then
+            if sudo apt install -y "$pkg"; then
+                echo "cuDNN installed successfully."
+                return 0
+            else
+                echo "WARNING: apt install failed."
+            fi
+        fi
+    else
+        echo "No cuDNN package found in apt repositories."
+        echo ""
+        echo "To add NVIDIA's apt repository, follow:"
+        echo "  https://developer.nvidia.com/cudnn-downloads"
+        echo ""
+        echo "Or install manually:"
+        echo "  sudo apt install libcudnn9-cuda-12"
+    fi
+
+    echo ""
+    echo "WARNING: cuDNN not installed. The CUDA binary may fail at runtime."
+    echo "Capsper will fall back to the CPU binary if CUDA initialization fails."
+    return 1
+}
+
+# Check cuDNN and offer to install if missing. Only runs on Linux with NVIDIA GPU.
+ensure_cudnn() {
+    [ "$(uname -s)" = "Linux" ] || return 0
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1 || return 0
+
+    if has_cudnn; then
+        return 0
+    fi
+
+    install_cudnn
+}
+
 # ─── Model Download ──────────────────────────────────────────────────────────
 
 download_models() {
