@@ -117,18 +117,19 @@ launchctl bootout gui/$(id -u)/com.capsper.update
 
 ### Drop terms
 
-Capsper's RNNT model sometimes emits short filler phrases (e.g. "Thank you.", "I love you") on segments with no real speech. You can suppress these by providing a drop terms file:
+Unlike Whisper, the Nemotron RNNT model doesn't automatically suppress filler words like "um" and "uh". You can suppress these (and other unwanted phrases) by providing a drop terms file:
 
 ```bash
 capsper --trigger capslock --drop-terms ~/my-drop-terms.txt
 ```
 
-The file is one phrase per line. If the entire output of a single decode cycle exactly matches a drop term, it's silently suppressed. Matching is case-sensitive and includes punctuation.
+The file is one phrase per line. If the entire output of a single decode cycle exactly matches a drop term, it's silently suppressed. Matching is case-sensitive.
 
 Example `my-drop-terms.txt`:
 ```
-Thank you.
-I love you
+uh
+um
+you know
 ```
 
 ### Audio setup (Linux)
