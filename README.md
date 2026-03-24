@@ -123,7 +123,7 @@ Unlike Whisper, the Nemotron RNNT model doesn't automatically suppress filler wo
 capsper --trigger capslock --drop-terms ~/my-drop-terms.txt
 ```
 
-The file is one phrase per line. If the entire output of a single decode cycle exactly matches a drop term, it's silently suppressed. Matching is case-sensitive.
+The file is one phrase per line. If the entire output of a single decode cycle exactly matches a drop term, it's silently suppressed. Write terms in lowercase (the model always outputs lowercase text).
 
 Example `my-drop-terms.txt`:
 ```
