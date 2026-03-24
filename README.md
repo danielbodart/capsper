@@ -28,8 +28,8 @@ Push-to-talk voice dictation for Linux and macOS. Uses NVIDIA's [Nemotron Speech
 
 - Debian/Ubuntu (or similar)
 - PipeWire (default audio server on modern Ubuntu/Fedora)
-- **GPU (recommended):** NVIDIA GPU with ~2 GB VRAM (Turing or newer: GTX 16xx, RTX 20xx/30xx/40xx/50xx), NVIDIA drivers, and cuDNN
-- **CPU-only:** works without a GPU (slower, but functional)
+- **GPU (recommended):** NVIDIA GPU with ~4 GB VRAM (Turing or newer: GTX 16xx, RTX 20xx/30xx/40xx/50xx), NVIDIA drivers, and cuDNN — near-zero CPU impact during inference
+- **CPU-only:** works without a GPU at similar speed, but uses significant CPU while speaking
 
 ### macOS
 
