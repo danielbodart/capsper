@@ -8,6 +8,7 @@ set -euo pipefail
 
 REPO="danielbodart/capsper"
 ASSET="capsper-linux-x86_64.tar.gz"
+DEPS_ASSET="capsper-linux-x86_64-deps.tar.gz"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 HF_ONNX_REPO="danielbodart/nemotron-speech-600m-onnx"
 HF_ONNX_BASE="https://huggingface.co/${HF_ONNX_REPO}/resolve/main"
@@ -54,6 +55,63 @@ download_nemotron_model() {
     curl -fsSL -o "$target_dir/config.json" "$HF_ONNX_BASE/config.json" || return 1
 
     echo "Nemotron model downloaded ($variant)."
+}
+
+ensure_ort_libs() {
+    local release_dir="$1"
+    local release_tag="$2"
+    local shared_lib="$INSTALL_DIR/lib"
+    local needed_version=""
+
+    # Read required deps version from staged release
+    if [ -f "$release_dir/lib/DEPS_VERSION" ]; then
+        needed_version=$(cat "$release_dir/lib/DEPS_VERSION")
+    fi
+
+    # If the release has real .so files (old-style tarball), move them to shared
+    if [ -f "$release_dir/lib/libonnxruntime.so" ]; then
+        echo "Migrating bundled ORT libs to shared directory..."
+        mkdir -p "$shared_lib"
+        cp -a "$release_dir/lib/"*.so "$release_dir/lib/"*.so.* "$shared_lib/" 2>/dev/null || true
+        [ -n "$needed_version" ] && cp "$release_dir/lib/DEPS_VERSION" "$shared_lib/"
+        return 0
+    fi
+
+    # Check if shared libs already match the needed version
+    if [ -n "$needed_version" ] && [ -f "$shared_lib/DEPS_VERSION" ]; then
+        local current_version
+        current_version=$(cat "$shared_lib/DEPS_VERSION")
+        if [ "$current_version" = "$needed_version" ]; then
+            return 0
+        fi
+    fi
+
+    # Shared libs exist but no version tracking yet (transition from old-style).
+    # Accept them — the next ORT upgrade will set DEPS_VERSION properly.
+    if [ -f "$shared_lib/libonnxruntime.so" ] && [ ! -f "$shared_lib/DEPS_VERSION" ]; then
+        return 0
+    fi
+
+    # Download deps tarball from the same GitHub release
+    echo "Downloading ORT runtime libraries..."
+    local deps_url="https://github.com/$REPO/releases/download/$release_tag/$DEPS_ASSET"
+    curl -fSL -o "$TMP_DIR/$DEPS_ASSET" "$deps_url" || {
+        echo "WARNING: Failed to download deps tarball from $deps_url"
+        echo "ORT libs may need to be installed manually."
+        return 1
+    }
+
+    # Verify SHA256 if available
+    if curl -fSL -o "$TMP_DIR/$DEPS_ASSET.sha256" \
+        "https://github.com/$REPO/releases/download/$release_tag/$DEPS_ASSET.sha256" 2>/dev/null; then
+        (cd "$TMP_DIR" && sha256sum -c "$DEPS_ASSET.sha256") || die "Deps SHA256 verification failed"
+        echo "Deps SHA256 verified."
+    fi
+
+    mkdir -p "$shared_lib" "$TMP_DIR/deps"
+    tar -xzf "$TMP_DIR/$DEPS_ASSET" -C "$TMP_DIR/deps"
+    cp -a "$TMP_DIR/deps/lib/"* "$shared_lib/"
+    echo "ORT runtime libraries installed."
 }
 
 main() {
@@ -113,7 +171,6 @@ main() {
 
     # Validate critical files exist (bin/capsper is the launcher script on Linux)
     [ -f "$release_dir/bin/capsper" ] || die "Extracted release is missing capsper launcher"
-    [ -d "$release_dir/lib" ] || die "Extracted release is missing lib/ directory"
 
     # Update top-level scripts from staged release
     for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh; do
@@ -122,6 +179,9 @@ main() {
             chmod +x "$INSTALL_DIR/$script"
         fi
     done
+
+    # Ensure ORT shared libs are present (downloads deps tarball if needed)
+    ensure_ort_libs "$release_dir" "$latest_tag"
 
     # Download Nemotron model if not present or incomplete
     ensure_nemotron_model

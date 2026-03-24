@@ -34,6 +34,34 @@ main() {
         rm -f "$recordings_dir"/*.wav "$recordings_dir"/*.log 2>/dev/null || true
     fi
 
+    # Symlink shared ORT libs into the new release so the binary can find them
+    # via RPATH ($ORIGIN/../lib). If the release has real .so files (old-style),
+    # migrate them to the shared directory first.
+    local shared_lib_dir="$INSTALL_DIR/lib"
+    local release_lib_dir="$release_dir/lib"
+    if [ -d "$release_lib_dir" ] && [ -f "$release_lib_dir/libonnxruntime.so" ]; then
+        # Old-style release with bundled libs — migrate to shared
+        mkdir -p "$shared_lib_dir"
+        cp -a "$release_lib_dir/"*.so "$release_lib_dir/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
+        [ -f "$release_lib_dir/DEPS_VERSION" ] && cp "$release_lib_dir/DEPS_VERSION" "$shared_lib_dir/"
+    fi
+    # Transition: if shared libs don't exist yet, check the previous release for libs
+    # (handles first update from old-style to new-style when old update script ran)
+    if [ ! -f "$shared_lib_dir/libonnxruntime.so" ] && [ -n "$current_target" ]; then
+        local prev_lib="$INSTALL_DIR/$current_target/lib"
+        if [ -d "$prev_lib" ] && [ -f "$prev_lib/libonnxruntime.so" ]; then
+            echo "Migrating ORT libs from previous release to shared directory..."
+            mkdir -p "$shared_lib_dir"
+            cp -a "$prev_lib/"*.so "$prev_lib/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
+            [ -f "$prev_lib/DEPS_VERSION" ] && cp "$prev_lib/DEPS_VERSION" "$shared_lib_dir/"
+        fi
+    fi
+    if [ -d "$shared_lib_dir" ] && [ -f "$shared_lib_dir/libonnxruntime.so" ]; then
+        # Replace release lib/ with symlink to shared (remove dir contents first)
+        rm -rf "$release_lib_dir"
+        ln -sfn "$shared_lib_dir" "$release_lib_dir"
+    fi
+
     # Symlink shared models into the new release so the binary can find them
     # via its default relative path (bin/../models/).
     local shared_models_dir="$INSTALL_DIR/models"

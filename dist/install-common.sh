@@ -236,6 +236,45 @@ download_onnx_models() {
     echo "ONNX model downloaded ($variant)."
 }
 
+# ─── ORT Runtime Libraries ────────────────────────────────────────────────
+
+download_ort_libs() {
+    local target_dir="$1"
+    local release_tag="$2"
+    local repo="danielbodart/capsper"
+    local asset="capsper-linux-x86_64-deps.tar.gz"
+    local url="https://github.com/$repo/releases/download/$release_tag/$asset"
+
+    echo "Downloading ORT runtime libraries..."
+    require_cmd curl "Install curl to download dependencies."
+
+    local tmp
+    tmp=$(mktemp -d)
+
+    curl -fSL -o "$tmp/$asset" "$url" || {
+        echo "WARNING: Failed to download deps from $url"
+        echo "ORT libs may need to be installed manually."
+        rm -rf "$tmp"
+        return 1
+    }
+
+    # Verify SHA256 if available
+    if curl -fSL -o "$tmp/$asset.sha256" "${url}.sha256" 2>/dev/null; then
+        (cd "$tmp" && sha256sum -c "$asset.sha256") || {
+            echo "ERROR: Deps SHA256 verification failed" >&2
+            rm -rf "$tmp"
+            return 1
+        }
+        echo "Deps SHA256 verified."
+    fi
+
+    mkdir -p "$target_dir" "$tmp/deps"
+    tar -xzf "$tmp/$asset" -C "$tmp/deps"
+    cp -a "$tmp/deps/lib/"* "$target_dir/"
+    rm -rf "$tmp"
+    echo "ORT runtime libraries installed."
+}
+
 # ─── Install Files ────────────────────────────────────────────────────────────
 
 install_files() {
@@ -251,9 +290,29 @@ install_files() {
     mkdir -p "$release_dir"
 
     cp -a "$SCRIPT_DIR/bin" "$release_dir/"
-    [ -d "$SCRIPT_DIR/lib" ] && cp -a "$SCRIPT_DIR/lib" "$release_dir/"
     cp "$SCRIPT_DIR/VERSION" "$release_dir/"
     mkdir -p "$release_dir/models"
+
+    # Set up shared ORT libs
+    local shared_lib="$INSTALL_DIR/lib"
+    if [ -d "$SCRIPT_DIR/lib" ] && [ -f "$SCRIPT_DIR/lib/libonnxruntime.so" ]; then
+        # Old-style tarball with bundled libs — copy to shared
+        mkdir -p "$shared_lib"
+        cp -a "$SCRIPT_DIR/lib/"* "$shared_lib/"
+    elif [ -d "$SCRIPT_DIR/lib" ] && [ -f "$SCRIPT_DIR/lib/DEPS_VERSION" ]; then
+        # New-style tarball — download deps if shared libs missing or outdated
+        local needed_version
+        needed_version=$(cat "$SCRIPT_DIR/lib/DEPS_VERSION")
+        local have_version=""
+        [ -f "$shared_lib/DEPS_VERSION" ] && have_version=$(cat "$shared_lib/DEPS_VERSION")
+        if [ ! -f "$shared_lib/libonnxruntime.so" ] || [ "$have_version" != "$needed_version" ]; then
+            download_ort_libs "$shared_lib" "v$ver"
+        fi
+    fi
+    # Symlink shared libs into release
+    if [ -d "$shared_lib" ] && [ -f "$shared_lib/libonnxruntime.so" ]; then
+        ln -sfn "$shared_lib" "$release_dir/lib"
+    fi
 
     # Save current version for rollback (if upgrading)
     local current_target
@@ -281,8 +340,9 @@ install_files() {
     done
 
     # Clean up old flat layout (migration from pre-versioned installs)
+    # Only remove $INSTALL_DIR/bin — $INSTALL_DIR/lib is now the shared ORT lib location
     if [ -d "$INSTALL_DIR/bin" ] && [ ! -L "$INSTALL_DIR/bin" ]; then
-        rm -rf "${INSTALL_DIR:?}/bin" "${INSTALL_DIR:?}/lib"
+        rm -rf "${INSTALL_DIR:?}/bin"
         echo "Migrated from flat layout to versioned directories."
     fi
 

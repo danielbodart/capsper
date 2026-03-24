@@ -9,6 +9,7 @@ const IS_MACOS = process.platform === "darwin";
 const BINARY = IS_MACOS ? "./dist/bin/capsper" : "./dist/bin/capsper-cuda";
 const SCRIPT_DIR = import.meta.dir;
 const TARBALL = IS_MACOS ? "capsper-macos-arm64.tar.gz" : "capsper-linux-x86_64.tar.gz";
+const DEPS_TARBALL = "capsper-linux-x86_64-deps.tar.gz";
 const LIB_DIR = IS_MACOS ? "dist/lib-macos" : "dist/lib";
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -214,9 +215,35 @@ fi
 
     const ver = await version();
     await Bun.write("dist/VERSION", ver);
-    await $`tar -czf ${TARBALL} -C dist bin/ lib/ install.sh install-common.sh capsper-update.sh capsper-apply-update.sh capsper-rollback.sh VERSION`;
+
+    // Generate DEPS_VERSION from sha256 of real ORT libs (skip symlinks)
+    const { stdout: depsHash } = await $`find dist/lib -name '*.so' -not -type l | sort | xargs sha256sum | sha256sum | cut -d' ' -f1`.quiet();
+    const depsVersion = depsHash.toString().trim();
+
+    // Binary tarball: binaries + scripts + lib/DEPS_VERSION marker
+    // lib/ dir with just DEPS_VERSION satisfies old update scripts that check [ -d lib ]
+    await $`rm -rf /tmp/capsper-dist-linux`;
+    await $`mkdir -p /tmp/capsper-dist-linux`;
+    await $`cp -a dist/bin /tmp/capsper-dist-linux/`;
+    await $`mkdir -p /tmp/capsper-dist-linux/lib`;
+    await Bun.write("/tmp/capsper-dist-linux/lib/DEPS_VERSION", depsVersion);
+    for (const script of ["install.sh", "install-common.sh", "capsper-update.sh", "capsper-apply-update.sh", "capsper-rollback.sh"]) {
+        await $`cp dist/${script} /tmp/capsper-dist-linux/`;
+    }
+    await $`cp dist/VERSION /tmp/capsper-dist-linux/`;
+    await $`tar -czf ${TARBALL} -C /tmp/capsper-dist-linux .`;
     await $`sha256sum ${TARBALL} > ${TARBALL}.sha256`;
+    await $`rm -rf /tmp/capsper-dist-linux`;
     console.log(`Tarball: ${TARBALL} (v${ver})`);
+
+    // Deps tarball: ORT shared libs + DEPS_VERSION
+    await $`mkdir -p /tmp/capsper-dist-deps/lib`;
+    await $`cp -a dist/lib/libonnxruntime* /tmp/capsper-dist-deps/lib/`;
+    await Bun.write("/tmp/capsper-dist-deps/lib/DEPS_VERSION", depsVersion);
+    await $`tar -czf ${DEPS_TARBALL} -C /tmp/capsper-dist-deps .`;
+    await $`sha256sum ${DEPS_TARBALL} > ${DEPS_TARBALL}.sha256`;
+    await $`rm -rf /tmp/capsper-dist-deps`;
+    console.log(`Deps tarball: ${DEPS_TARBALL} (${depsVersion.slice(0, 12)})`);
 }
 
 async function distMacOS() {
@@ -254,10 +281,15 @@ export async function ci() {
     await dist();
     if (process.env.GH_TOKEN) {
         const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
+        // Collect all release assets (deps tarball only exists for Linux)
+        const assets = [TARBALL, `${TARBALL}.sha256`];
+        if (!IS_MACOS && existsSync(DEPS_TARBALL)) {
+            assets.push(DEPS_TARBALL, `${DEPS_TARBALL}.sha256`);
+        }
         if (noCreateRelease) {
             console.log(`Uploading assets to release v${ver}...`);
             for (let attempt = 1; attempt <= 10; attempt++) {
-                const { exitCode } = await $`gh release upload v${ver} ${TARBALL} ${TARBALL}.sha256 --clobber`.nothrow();
+                const { exitCode } = await $`gh release upload v${ver} ${assets} --clobber`.nothrow();
                 if (exitCode === 0) break;
                 if (attempt === 10) {
                     console.error(`Failed to upload after ${attempt} attempts`);
@@ -269,7 +301,7 @@ export async function ci() {
         } else {
             const commitMsg = (await $`git log -1 --format=%B`.quiet()).text().trim();
             console.log(`Creating release v${ver}...`);
-            await $`gh release create v${ver} ${TARBALL} ${TARBALL}.sha256 --title v${ver} --notes ${commitMsg}`;
+            await $`gh release create v${ver} ${assets} --title v${ver} --notes ${commitMsg}`;
         }
     }
 }
