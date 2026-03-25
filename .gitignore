@@ -1,5 +1,5 @@
 dist/bin/
-dist/models/nemotron/
+dist/models/*
 zig-out/
 dist/VERSION
 .zig-cache/
