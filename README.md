@@ -4,7 +4,7 @@
 
 Does CapsLock annoy you? Ever wished it actually did something useful instead of SHOUTING AT PEOPLE BY ACCIDENT?
 
-Ever wished you could just whisper to a friendly ghost and have your words appear on screen? Well now you can. Capsper is your friendly neighbourhood ghost writer — hold CapsLock, speak, and he types it out for you. No cloud, no subscription, no latency worth complaining about. Just a local GPU (or CPU), a haunted key, and a little whisper magic.
+Ever wished you could just whisper to a friendly ghost and have your words appear on screen? Well now you can. Capsper is your friendly neighbourhood ghost writer — hold CapsLock, speak, and he types it out for you. No cloud, no subscription, no latency worth complaining about. Just a local GPU (or CPU), a haunted key, and a little ~~whisper~~ nemo magic.
 
 Push-to-talk voice dictation for Linux and macOS. Uses NVIDIA's [Nemotron Speech 600M](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) model (FastConformer RNNT) for streaming speech-to-text. Single self-contained binary per platform.
 
