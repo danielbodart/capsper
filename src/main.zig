@@ -100,7 +100,11 @@ pub fn main() !void {
             if (i < args.len) {
                 trigger_key = input_mod.parseTriggerKey(args[i]) orelse {
                     std.debug.print("Unknown trigger key '{s}'\n", .{args[i]});
-                    std.debug.print("Supported: capslock, f24, scrolllock, numlock, pause, f13-f20\n", .{});
+                    std.debug.print("Supported: capslock, scrolllock, numlock, " ++
+                        (if (builtin.os.tag == .linux) "pause, " else "") ++
+                        "f13-f20" ++
+                        (if (builtin.os.tag == .linux) ", f21-f24" else "") ++
+                        "\n", .{});
                     return;
                 };
             }

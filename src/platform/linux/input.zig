@@ -836,7 +836,6 @@ fn waitNeutral(fd: posix.fd_t) !void {
 /// Parse a trigger key name to a Linux keycode
 pub fn parseTriggerKey(name: []const u8) ?u16 {
     if (std.ascii.eqlIgnoreCase(name, "capslock")) return ev.KEY_CAPSLOCK;
-    if (std.ascii.eqlIgnoreCase(name, "f24")) return ev.KEY_F24;
     if (std.ascii.eqlIgnoreCase(name, "scrolllock")) return ev.KEY_SCROLLLOCK;
     if (std.ascii.eqlIgnoreCase(name, "numlock")) return ev.KEY_NUMLOCK;
     if (std.ascii.eqlIgnoreCase(name, "pause")) return ev.KEY_PAUSE;
@@ -848,6 +847,10 @@ pub fn parseTriggerKey(name: []const u8) ?u16 {
     if (std.ascii.eqlIgnoreCase(name, "f18")) return ev.KEY_F18;
     if (std.ascii.eqlIgnoreCase(name, "f19")) return ev.KEY_F19;
     if (std.ascii.eqlIgnoreCase(name, "f20")) return ev.KEY_F20;
+    if (std.ascii.eqlIgnoreCase(name, "f21")) return ev.KEY_F21;
+    if (std.ascii.eqlIgnoreCase(name, "f22")) return ev.KEY_F22;
+    if (std.ascii.eqlIgnoreCase(name, "f23")) return ev.KEY_F23;
+    if (std.ascii.eqlIgnoreCase(name, "f24")) return ev.KEY_F24;
     return null;
 }
 
@@ -943,7 +946,12 @@ test "parseTriggerKey" {
     try std.testing.expectEqual(ev.KEY_CAPSLOCK, parseTriggerKey("capslock").?);
     try std.testing.expectEqual(ev.KEY_CAPSLOCK, parseTriggerKey("CapsLock").?);
     try std.testing.expectEqual(ev.KEY_F24, parseTriggerKey("f24").?);
+    try std.testing.expectEqual(ev.KEY_F21, parseTriggerKey("f21").?);
+    try std.testing.expectEqual(ev.KEY_F22, parseTriggerKey("f22").?);
+    try std.testing.expectEqual(ev.KEY_F23, parseTriggerKey("f23").?);
     try std.testing.expectEqual(ev.KEY_SCROLLLOCK, parseTriggerKey("ScrollLock").?);
+    try std.testing.expectEqual(ev.KEY_NUMLOCK, parseTriggerKey("NumLock").?);
+    try std.testing.expectEqual(ev.KEY_PAUSE, parseTriggerKey("Pause").?);
     try std.testing.expect(parseTriggerKey("nonexistent") == null);
 }
 

@@ -137,6 +137,8 @@ pub const InputHandler = struct {
 /// Parse trigger key name to macOS virtual keycode.
 pub fn parseTriggerKey(name: []const u8) ?u16 {
     if (std.ascii.eqlIgnoreCase(name, "capslock")) return 57; // kVK_CapsLock
+    if (std.ascii.eqlIgnoreCase(name, "scrolllock")) return 107; // Same as F14 on macOS
+    if (std.ascii.eqlIgnoreCase(name, "numlock")) return 71; // kVK_ANSI_KeypadClear
     if (std.ascii.eqlIgnoreCase(name, "f13")) return 105;
     if (std.ascii.eqlIgnoreCase(name, "f14")) return 107;
     if (std.ascii.eqlIgnoreCase(name, "f15")) return 113;

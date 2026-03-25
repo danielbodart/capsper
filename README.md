@@ -73,7 +73,7 @@ systemctl --user start capsper.service
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist
 ```
 
-Hold CapsLock and speak. Release to stop. Text appears in the focused window. CapsLock is the default trigger — you can use any key with `--trigger` (see [Server options](#server-options)).
+Hold CapsLock and speak. Release to stop. Text appears in the focused window. CapsLock is the default trigger — you can change it with `--trigger` (see [Trigger keys](#trigger-keys)).
 
 ## Auto-updates
 
@@ -193,7 +193,7 @@ capsper [OPTIONS]
   --model, -m PATH          Model directory path (default: ../models/nemotron relative to binary)
   --port, -p PORT           TCP port (default: 43007, use 0 for OS-assigned)
   --input tcp|local         Input mode: tcp (socket) or local (audio capture)
-  --trigger KEY             Trigger key for push-to-talk (default: none)
+  --trigger KEY             Trigger key for push-to-talk (see Trigger keys below)
   --trigger-passthrough     Forward trigger key to OS after interception
   --type-delay US           Delay between injected keystrokes in microseconds (default: 12000)
   --low-latency             Keep audio stream open (mic indicator always visible, ~300ms faster)
@@ -213,6 +213,21 @@ capsper [OPTIONS]
   --dry-run                 Load models, run warmup, then exit (validates setup)
   --version                 Print version and exit
 ```
+
+### Trigger keys
+
+The `--trigger` flag selects which key activates push-to-talk. CapsLock is the default.
+
+| Key | Linux | macOS | Notes |
+|-----|:-----:|:-----:|-------|
+| `capslock` | yes | yes | Default. On macOS, remapped to F19 via hidutil to suppress LED/modifier |
+| `scrolllock` | yes | yes | On macOS, shares keycode with F14 |
+| `numlock` | yes | yes | On macOS, maps to Clear (kVK_ANSI_KeypadClear) |
+| `pause` | yes | — | |
+| `f13`–`f20` | yes | yes | |
+| `f21`–`f24` | yes | — | |
+
+Function keys F13–F20 are the safest choice for a non-default trigger — they exist on both platforms and are rarely used by applications.
 
 ## Development
 
