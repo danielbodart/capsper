@@ -204,9 +204,11 @@ async function distLinux() {
         }
     }
 
-    // Remove dev symlink — tarball ships only the real binaries.
-    // The installer creates bin/capsper → capsper-cuda or capsper-cpu at install time.
-    await $`rm -f dist/bin/capsper`;
+    // Replace dev symlink with a default capsper → capsper-cpu for the tarball.
+    // The installer/apply-update overrides this with the correct variant (cuda or cpu)
+    // based on GPU detection. The default ensures compatibility with older update
+    // scripts that validate bin/capsper exists.
+    await $`ln -sf capsper-cpu dist/bin/capsper`;
 
     const ver = await version();
     await Bun.write("dist/VERSION", ver);
