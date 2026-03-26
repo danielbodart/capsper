@@ -7,6 +7,10 @@ set -euo pipefail
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 
+# Source shared functions (has_nvidia_gpu, create_capsper_symlink, etc.)
+# shellcheck source=dist/install-common.sh
+source "$INSTALL_DIR/install-common.sh"
+
 main() {
     local pending_file="$INSTALL_DIR/.update-pending"
 
@@ -89,6 +93,9 @@ main() {
 
     # Migrate systemd service file: update model path, strip removed flags
     migrate_service_config
+
+    # On Linux, create bin/capsper symlink to the right variant for this machine
+    create_capsper_symlink "$release_dir/bin"
 
     # Atomic symlink swap
     ln -sfn "releases/$pending" "$INSTALL_DIR/current.tmp"

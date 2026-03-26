@@ -169,8 +169,10 @@ main() {
     mkdir -p "$release_dir"
     tar -xzf "$TMP_DIR/$ASSET" -C "$release_dir"
 
-    # Validate critical files exist (bin/capsper is the launcher script on Linux)
-    [ -f "$release_dir/bin/capsper" ] || die "Extracted release is missing capsper launcher"
+    # Validate critical files exist
+    [ -f "$release_dir/bin/capsper-cuda" ] || [ -f "$release_dir/bin/capsper-cpu" ] \
+        || [ -f "$release_dir/bin/capsper" ] \
+        || die "Extracted release is missing capsper binaries"
 
     # Update top-level scripts from staged release
     for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh; do

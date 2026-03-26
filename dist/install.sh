@@ -226,7 +226,9 @@ run_dry_run_linux() {
 # ─── Main Install ─────────────────────────────────────────────────────────────
 
 cmd_install() {
-    [ -f "$SCRIPT_DIR/bin/capsper" ] || die "capsper binary not found in $SCRIPT_DIR/bin"
+    [ -f "$SCRIPT_DIR/bin/capsper-cuda" ] || [ -f "$SCRIPT_DIR/bin/capsper-cpu" ] \
+        || [ -f "$SCRIPT_DIR/bin/capsper" ] \
+        || die "capsper binaries not found in $SCRIPT_DIR/bin"
 
     local service_file="$HOME/.config/systemd/user/capsper.service"
     local is_upgrade=false

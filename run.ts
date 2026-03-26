@@ -204,18 +204,9 @@ async function distLinux() {
         }
     }
 
-    // Create launcher script (remove dev symlink first — Bun.write follows symlinks)
+    // Remove dev symlink — tarball ships only the real binaries.
+    // The installer creates bin/capsper → capsper-cuda or capsper-cpu at install time.
     await $`rm -f dist/bin/capsper`;
-    const launcher = `#!/bin/sh
-DIR="$(cd "$(dirname "$0")" && pwd)"
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    exec "$DIR/capsper-cuda" "$@"
-else
-    exec "$DIR/capsper-cpu" "$@"
-fi
-`;
-    await Bun.write("dist/bin/capsper", launcher);
-    await $`chmod +x dist/bin/capsper`;
 
     const ver = await version();
     await Bun.write("dist/VERSION", ver);

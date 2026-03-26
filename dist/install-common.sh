@@ -47,16 +47,38 @@ is_dev_mode() {
 
 # ─── Hardware Detection ──────────────────────────────────────────────────────
 
+has_nvidia_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
+}
+
 detect_model_variant() {
     if [ "$(uname -s)" = "Darwin" ]; then
         echo "coreml"
         return
     fi
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    if has_nvidia_gpu; then
         echo "int8-static"
         return
     fi
     echo "int8-dynamic"
+}
+
+# Create bin/capsper symlink pointing to the right binary for this machine.
+# On macOS, capsper is already the real binary — no symlink needed.
+# On Linux, symlinks to capsper-cuda (NVIDIA GPU) or capsper-cpu (no GPU).
+create_capsper_symlink() {
+    local bin_dir="$1"
+    [ "$(uname -s)" = "Darwin" ] && return 0
+
+    local target
+    if has_nvidia_gpu; then
+        target="capsper-cuda"
+    else
+        target="capsper-cpu"
+    fi
+
+    ln -sf "$target" "$bin_dir/capsper"
+    echo "Selected binary: $target (symlinked as capsper)"
 }
 
 # ─── cuDNN Detection & Install (Linux NVIDIA only) ──────────────────────────
@@ -115,7 +137,7 @@ install_cudnn() {
 
     echo ""
     echo "WARNING: cuDNN not installed. The CUDA binary may fail at runtime."
-    echo "Capsper will fall back to the CPU binary if CUDA initialization fails."
+    echo "If CUDA fails, re-run the installer to switch to the CPU binary."
     return 1
 }
 
@@ -293,6 +315,9 @@ install_files() {
     cp "$SCRIPT_DIR/VERSION" "$release_dir/"
     mkdir -p "$release_dir/models"
 
+    # On Linux, create bin/capsper symlink to the right variant for this machine
+    create_capsper_symlink "$release_dir/bin"
+
     # Set up shared ORT libs
     local shared_lib="$INSTALL_DIR/lib"
     if [ -d "$SCRIPT_DIR/lib" ] && [ -f "$SCRIPT_DIR/lib/libonnxruntime.so" ]; then
@@ -359,12 +384,13 @@ install_files() {
         rm -rf "$dir"
     done
 
-    # Symlink into ~/.local/bin so capsper is on PATH
+    # Symlink into ~/.local/bin so capsper and capsper-update are on PATH
     mkdir -p "$HOME/.local/bin"
     ln -sf "$INSTALL_DIR/current/bin/capsper" "$HOME/.local/bin/capsper"
+    ln -sf "$INSTALL_DIR/capsper-update.sh" "$HOME/.local/bin/capsper-update"
 
     echo "Installed v$ver. Binary: $INSTALL_DIR/current/bin/capsper"
-    echo "Symlink:  ~/.local/bin/capsper"
+    echo "Commands: ~/.local/bin/capsper, ~/.local/bin/capsper-update"
 
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
         echo ""
