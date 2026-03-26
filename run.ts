@@ -190,9 +190,12 @@ async function distLinux() {
         process.exit(1);
     }
 
-    // Validate no AVX-512 in both binaries
+    // Validate both binaries exist and contain no AVX-512
     for (const bin of ["dist/bin/capsper-cuda", "dist/bin/capsper-cpu"]) {
-        if (!existsSync(bin)) continue;
+        if (!existsSync(bin)) {
+            console.error(`ERROR: ${bin} not found — did build() run?`);
+            process.exit(1);
+        }
         const { stdout: objdumpOut } = await $`objdump -d ${bin} | grep -c 'zmm\\|%k[0-7],'`.quiet().nothrow();
         const avx512Count = parseInt(objdumpOut.toString().trim()) || 0;
         if (avx512Count > 0) {
@@ -201,7 +204,8 @@ async function distLinux() {
         }
     }
 
-    // Create launcher script
+    // Create launcher script (remove dev symlink first — Bun.write follows symlinks)
+    await $`rm -f dist/bin/capsper`;
     const launcher = `#!/bin/sh
 DIR="$(cd "$(dirname "$0")" && pwd)"
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
