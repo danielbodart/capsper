@@ -269,9 +269,6 @@ else
 fi
 
 RCODESIGN="${RCODESIGN:-rcodesign}"
-if ! command -v "$RCODESIGN" &>/dev/null; then
-    RCODESIGN="$HOME/.cargo/bin/rcodesign"
-fi
 
 # Compile the designated requirement to binary format (required by rcodesign)
 # csreq outputs a RequirementSet blob (fade0c01), but rcodesign expects

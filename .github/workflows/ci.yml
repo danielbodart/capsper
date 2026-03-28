@@ -27,7 +27,6 @@ jobs:
           path: tools
           key: mise-tools-linux-${{ hashFiles('.mise.toml') }}
           restore-keys: mise-tools-linux-
-      - uses: sigstore/cosign-installer@v3
       - name: CI
         run: ./run ci
         env:
@@ -55,13 +54,6 @@ jobs:
           path: tools
           key: mise-tools-macos-${{ hashFiles('.mise.toml') }}
           restore-keys: mise-tools-macos-
-      - uses: sigstore/cosign-installer@v3
-      - name: Install rcodesign
-        run: |
-          curl -fsSL -o /tmp/apple-codesign.tar.gz \
-            https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz
-          tar -xzf /tmp/apple-codesign.tar.gz -C /tmp
-          sudo cp /tmp/apple-codesign-0.29.0-macos-universal/rcodesign /usr/local/bin/
       - name: CI
         run: ./run ci
         env:
