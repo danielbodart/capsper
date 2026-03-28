@@ -131,7 +131,7 @@ export async function setup() {
 export async function dev() {
     await build();
     console.log("Running lint...");
-    await $`shellcheck dist/*.sh bootstrap.sh`;
+    await $`shellcheck dist/*.sh scripts/*.sh bootstrap.sh`;
     console.log("Running unit + property tests...");
     await $`zig build test`;
     console.log("Running integration smoke tests...");
@@ -263,25 +263,62 @@ async function distMacOS() {
     console.log(`Tarball: ${TARBALL} (v${ver})`);
 }
 
+export async function sign() {
+    ensureBinary();
+    if (!existsSync(TARBALL)) {
+        console.error(`Tarball not found: ${TARBALL} — run dist first`);
+        process.exit(1);
+    }
+
+    const hasOidc = !!process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+
+    // macOS: sign the Mach-O binary with Fulcio cert via rcodesign
+    if (IS_MACOS) {
+        console.log("Signing macOS binary with Fulcio...");
+        await $`./scripts/fulcio-codesign.sh dist/bin/capsper`;
+        // Re-create tarball with signed binary
+        await distMacOS();
+    }
+
+    // Both platforms: sign the tarball with cosign for provenance
+    if (hasOidc) {
+        console.log(`Signing ${TARBALL} with cosign...`);
+        await $`cosign sign-blob ${TARBALL} --bundle ${TARBALL}.sigstore.json --yes`;
+        if (!IS_MACOS && existsSync(DEPS_TARBALL)) {
+            console.log(`Signing ${DEPS_TARBALL} with cosign...`);
+            await $`cosign sign-blob ${DEPS_TARBALL} --bundle ${DEPS_TARBALL}.sigstore.json --yes`;
+        }
+    } else {
+        console.log("Skipping cosign blob signing (no OIDC token — not in CI)");
+    }
+}
+
 export async function lint() {
-    await $`shellcheck dist/*.sh bootstrap.sh`;
+    await $`shellcheck dist/*.sh bootstrap.sh scripts/*.sh`;
 }
 
 export async function ci() {
     await ensureDeps();
     const ver = await version();
     console.log("Running lint...");
-    await $`shellcheck dist/*.sh bootstrap.sh`;
+    await $`shellcheck dist/*.sh scripts/*.sh bootstrap.sh`;
     console.log("Running tests...");
     await $`zig build test`;
     await build();
     await dist();
+    await sign();
     if (process.env.GH_TOKEN) {
         const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
         // Collect all release assets (deps tarball only exists for Linux)
         const assets = [TARBALL, `${TARBALL}.sha256`];
+        if (existsSync(`${TARBALL}.sigstore.json`)) {
+            assets.push(`${TARBALL}.sigstore.json`);
+        }
         if (!IS_MACOS && existsSync(DEPS_TARBALL)) {
             assets.push(DEPS_TARBALL, `${DEPS_TARBALL}.sha256`);
+            if (existsSync(`${DEPS_TARBALL}.sigstore.json`)) {
+                assets.push(`${DEPS_TARBALL}.sigstore.json`);
+            }
         }
         if (noCreateRelease) {
             console.log(`Uploading assets to release v${ver}...`);
@@ -310,7 +347,7 @@ async function printVersion() {
 }
 
 const commands: Record<string, Function> = {
-    dev, build, clean, setup, test, lint, dist, ci, version: printVersion,
+    dev, build, clean, setup, test, lint, dist, sign, ci, version: printVersion,
     "short-test": shortTest,
     "medium-test": mediumTest,
     "long-test": longTest,
