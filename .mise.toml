@@ -2,5 +2,5 @@
 zig = "0.15.2"
 bun = "latest"
 shellcheck = "latest"
-cosign = "latest"
-"github:indygreg/apple-platform-rs" = { version = "latest", exe = "rcodesign", matching = "apple-codesign" }
+cosign = "3.0.5"
+"github:indygreg/apple-platform-rs" = { version = "apple-codesign/0.29.0", exe = "rcodesign", matching = "apple-codesign" }
