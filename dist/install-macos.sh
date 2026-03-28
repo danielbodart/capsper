@@ -86,9 +86,10 @@ $prog_args    </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
-    <key>ThrottleInterval</key>
-    <integer>5</integer>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>$INSTALL_DIR/capsper.log</string>
     <key>StandardErrorPath</key>
@@ -244,7 +245,10 @@ cmd_install() {
         echo ""
 
         install_files
-        clear_quarantine "$INSTALL_DIR/current/bin/capsper"
+        # Copy binary to stable path (TCC tracks by absolute path for non-bundled binaries)
+        mkdir -p "$INSTALL_DIR/bin"
+        cp "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/bin/capsper"
+        clear_quarantine "$INSTALL_DIR/bin/capsper"
         download_models "$INSTALL_DIR/models"
 
         if ! $is_upgrade || $update_config; then
@@ -271,7 +275,7 @@ cmd_install() {
                 service_args+=("record-dir=$RECORDINGS_DIR")
             fi
 
-            install_service "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
+            install_service "$INSTALL_DIR/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
             install_update_timer
         else
             # Upgrade without config change: preserve settings
@@ -283,7 +287,7 @@ cmd_install() {
             $SAVED_LOW_LATENCY && service_args+=("low-latency")
             [ "$SAVED_GAIN" != "1.0" ] && [ "$SAVED_GAIN" != "1" ] && service_args+=("audio-gain=$SAVED_GAIN")
 
-            install_service "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
+            install_service "$INSTALL_DIR/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
             install_update_timer
         fi
     fi

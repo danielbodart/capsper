@@ -43,6 +43,12 @@ main() {
     rm -f "$INSTALL_DIR/current"
     mv "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
 
+    # Update stable binary path
+    if [ -d "$INSTALL_DIR/bin" ]; then
+        cp "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/bin/capsper.tmp"
+        mv "$INSTALL_DIR/bin/capsper.tmp" "$INSTALL_DIR/bin/capsper"
+    fi
+
     # Clean up markers
     rm -f "$prev_file" "$timestamp_file" "$INSTALL_DIR/.update-pending"
 

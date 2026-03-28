@@ -118,10 +118,25 @@ main() {
         echo "Selected binary: $target"
     fi
 
-    # Atomic symlink swap
+    # Atomic symlink swap (for models, scripts, VERSION, etc.)
     ln -sfn "releases/$pending" "$INSTALL_DIR/current.tmp"
     rm -f "$INSTALL_DIR/current"
     mv "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
+
+    # Copy the binary to a stable path so TCC (macOS) and service configs
+    # reference a fixed location that doesn't change across updates.
+    # Uses cp + mv for atomic replacement (mv is atomic on same filesystem).
+    mkdir -p "$INSTALL_DIR/bin"
+    if $IS_MACOS; then
+        cp "$release_dir/bin/capsper" "$INSTALL_DIR/bin/capsper.tmp"
+        mv "$INSTALL_DIR/bin/capsper.tmp" "$INSTALL_DIR/bin/capsper"
+    else
+        # Linux: copy the selected variant (capsper-cuda or capsper-cpu) as capsper
+        local selected
+        selected=$(readlink "$release_dir/bin/capsper" 2>/dev/null || echo "capsper")
+        cp "$release_dir/bin/$selected" "$INSTALL_DIR/bin/capsper.tmp"
+        mv "$INSTALL_DIR/bin/capsper.tmp" "$INSTALL_DIR/bin/capsper"
+    fi
 
     rm -f "$pending_file"
 
