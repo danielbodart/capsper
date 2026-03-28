@@ -237,7 +237,7 @@ main() {
     fi
 
     # Update top-level scripts from staged release
-    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh; do
+    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh capsper-launcher.sh; do
         if [ -f "$release_dir/$script" ]; then
             cp "$release_dir/$script" "$INSTALL_DIR/"
             chmod +x "$INSTALL_DIR/$script"
