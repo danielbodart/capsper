@@ -255,7 +255,7 @@ cmd_install() {
             fi
 
             install_service "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
-            # TODO: install_update_timer — needs capsper-update.sh macOS support first
+            install_update_timer
         else
             # Upgrade without config change: preserve settings
             extract_service_config
@@ -267,7 +267,7 @@ cmd_install() {
             [ "$SAVED_GAIN" != "1.0" ] && [ "$SAVED_GAIN" != "1" ] && service_args+=("audio-gain=$SAVED_GAIN")
 
             install_service "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
-            # TODO: install_update_timer — needs capsper-update.sh macOS support first
+            install_update_timer
         fi
     fi
 
