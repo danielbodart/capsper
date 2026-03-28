@@ -20,73 +20,13 @@ PLIST_PATH="$PLIST_DIR/$PLIST_LABEL.plist"
 UPDATE_PLIST_LABEL="com.capsper.update"
 UPDATE_PLIST_PATH="$PLIST_DIR/$UPDATE_PLIST_LABEL.plist"
 
-# ─── Permissions ──────────────────────────────────────────────────────────────
+# ─── Quarantine ──────────────────────────────────────────────────────────────
 
-check_accessibility() {
-    local result
-    result=$(swift -e 'import ApplicationServices; print(AXIsProcessTrusted())' 2>/dev/null || echo "false")
-    [ "$result" = "true" ]
-}
-
-check_microphone() {
-    # 0=notDetermined, 1=restricted, 2=denied, 3=authorized
-    local status
-    status=$(swift -e 'import AVFoundation; print(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)' 2>/dev/null || echo "0")
-    [ "$status" = "3" ]
-}
-
-check_permissions() {
-    local binary_path
-    if is_dev_mode; then
-        binary_path="$SCRIPT_DIR/bin/capsper"
-    else
-        binary_path="$INSTALL_DIR/current/bin/capsper"
-    fi
-
-    local needs_action=false
-
-    if ! check_accessibility; then
-        echo ""
-        echo "=== Accessibility Permission Required ==="
-        echo "Capsper needs Accessibility access for keyboard interception and text injection."
-        echo ""
-        echo "1. Opening System Settings > Privacy & Security > Accessibility..."
-        open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-        echo "2. Click '+' and add this binary:"
-        echo "   $binary_path"
-        echo ""
-        echo "   Tip: In the file dialog, press Cmd+Shift+G and paste the path above."
-        needs_action=true
-    fi
-
-    if ! check_microphone; then
-        echo ""
-        echo "=== Microphone Permission Required ==="
-        echo "Capsper needs Microphone access for audio capture."
-        echo ""
-        echo "1. Opening System Settings > Privacy & Security > Microphone..."
-        open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-        echo "2. Add capsper to the list."
-        needs_action=true
-    fi
-
-    if $needs_action; then
-        echo ""
-        echo "Press Enter when done..."
-        read -r
-
-        if ! check_accessibility; then
-            echo "WARNING: Accessibility permission not detected."
-            echo "The capsper binary must be added to Accessibility:"
-            echo "  $binary_path"
-            echo "See Troubleshooting in the README if the service fails to start."
-        fi
-        if ! check_microphone; then
-            echo "WARNING: Microphone permission not detected. Capsper may not work."
-        fi
-    else
-        echo "Permissions: Accessibility and Microphone already granted."
-    fi
+# Remove macOS quarantine flag so Gatekeeper doesn't block the binary.
+# Permissions (Accessibility, Microphone) are handled by the binary at runtime.
+clear_quarantine() {
+    local binary="$1"
+    xattr -d com.apple.quarantine "$binary" 2>/dev/null || true
 }
 
 # ─── LaunchAgent Service ─────────────────────────────────────────────────────
@@ -179,24 +119,6 @@ EOF
     echo "Update timer installed (daily at noon)."
 }
 
-has_auto_update() {
-    [ -f "$UPDATE_PLIST_PATH" ]
-}
-
-# Auto-updates are disabled on macOS: updates change the binary hash, which
-# invalidates Accessibility permission (TCC keys on cdhash for ad-hoc signed
-# binaries). This will be re-enabled once we have proper code signing.
-disable_auto_update_if_present() {
-    if has_auto_update; then
-        echo ""
-        echo "Disabling auto-updates (updates would break Accessibility permission)."
-        echo "To update manually: re-download and run install.sh, then re-approve"
-        echo "capsper in System Settings > Privacy & Security > Accessibility."
-        launchctl bootout "gui/$(id -u)/$UPDATE_PLIST_LABEL" 2>/dev/null || true
-        rm -f "$UPDATE_PLIST_PATH"
-    fi
-}
-
 # ─── Service Control ──────────────────────────────────────────────────────────
 
 stop_service() {
@@ -271,7 +193,7 @@ cmd_install() {
         echo "(detected git checkout)"
         echo ""
 
-        check_permissions
+        clear_quarantine "$SCRIPT_DIR/bin/capsper"
 
         if ! $is_upgrade || $update_config; then
             # Build service args
@@ -305,8 +227,8 @@ cmd_install() {
         echo ""
 
         install_files
+        clear_quarantine "$INSTALL_DIR/current/bin/capsper"
         download_models "$INSTALL_DIR/models"
-        check_permissions
 
         if ! $is_upgrade || $update_config; then
             local service_args=()
@@ -333,11 +255,7 @@ cmd_install() {
             fi
 
             install_service "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
-
-            # Disable auto-updates on macOS: updates change the binary hash,
-            # which invalidates Accessibility permission (TCC keys on cdhash
-            # for ad-hoc signed binaries). Requires code signing to fix.
-            disable_auto_update_if_present
+            # TODO: install_update_timer — needs capsper-update.sh macOS support first
         else
             # Upgrade without config change: preserve settings
             extract_service_config
@@ -349,8 +267,7 @@ cmd_install() {
             [ "$SAVED_GAIN" != "1.0" ] && [ "$SAVED_GAIN" != "1" ] && service_args+=("audio-gain=$SAVED_GAIN")
 
             install_service "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
-
-            disable_auto_update_if_present
+            # TODO: install_update_timer — needs capsper-update.sh macOS support first
         fi
     fi
 
