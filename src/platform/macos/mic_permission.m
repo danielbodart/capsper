@@ -5,6 +5,7 @@
 // check and request permission before starting capture.
 
 #import <AVFoundation/AVFoundation.h>
+#import <AppKit/AppKit.h>
 
 // Returns: 0 = not determined, 1 = restricted, 2 = denied, 3 = authorized
 int capsper_mic_permission_status(void) {
@@ -27,4 +28,10 @@ int capsper_mic_request_permission(void) {
     }];
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
     return granted;
+}
+
+// Open the Microphone pane in System Settings.
+void capsper_mic_open_settings(void) {
+    NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"];
+    [[NSWorkspace sharedWorkspace] openURL:url];
 }

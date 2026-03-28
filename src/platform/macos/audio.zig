@@ -22,6 +22,7 @@ const ca = @cImport({
 // Objective-C helper for microphone permission (mic_permission_macos.m)
 extern fn capsper_mic_permission_status() c_int;
 extern fn capsper_mic_request_permission() c_int;
+extern fn capsper_mic_open_settings() void;
 
 /// Shared state between main thread and CoreAudio callback thread.
 /// Heap-allocated so the pointer remains stable for the unit's lifetime.
@@ -62,21 +63,41 @@ pub const AudioCapture = struct {
         // Skip when a specific target device is given (e.g. BlackHole loopback) —
         // virtual devices deliver real audio without mic permission, and the user
         // explicitly chose the device.
-        const mic_status = if (target != null) @as(c_int, 3) else capsper_mic_permission_status();
+        var mic_status = if (target != null) @as(c_int, 3) else capsper_mic_permission_status();
         if (mic_status == 0) {
+            // Not determined — try the system prompt first
             log.info("Requesting microphone permission...", .{});
-            if (capsper_mic_request_permission() == 0) {
-                log.err("Microphone permission denied.", .{});
-                log.err("Grant access in: System Settings → Privacy & Security → Microphone", .{});
+            if (capsper_mic_request_permission() == 1) {
+                mic_status = 3; // granted
+            } else {
+                // System prompt may not have shown (CLI/background process).
+                // Open Settings and poll for up to 60s.
+                mic_status = capsper_mic_permission_status();
+            }
+        }
+        if (mic_status != 3) {
+            if (mic_status == 1) {
+                log.err("Microphone access is restricted by system policy.", .{});
                 return error.AudioInitFailed;
             }
-        } else if (mic_status == 2) {
-            log.err("Microphone permission denied.", .{});
-            log.err("Grant access in: System Settings → Privacy & Security → Microphone", .{});
-            return error.AudioInitFailed;
-        } else if (mic_status == 1) {
-            log.err("Microphone access is restricted by system policy.", .{});
-            return error.AudioInitFailed;
+            // Denied or still not determined — open Settings and wait
+            log.info("Opening Microphone settings...", .{});
+            capsper_mic_open_settings();
+
+            const max_wait_s = 60;
+            const poll_interval_ns: u64 = 2 * std.time.ns_per_s;
+            var waited: u32 = 0;
+            while (waited < max_wait_s) {
+                std.Thread.sleep(poll_interval_ns);
+                waited += 2;
+                if (capsper_mic_permission_status() == 3) break;
+                log.info("Waiting for Microphone permission... ({d}s)", .{waited});
+            }
+            if (capsper_mic_permission_status() != 3) {
+                log.err("Microphone permission not granted after {d}s", .{max_wait_s});
+                return error.AudioInitFailed;
+            }
+            log.info("Microphone permission granted", .{});
         }
 
         // Create pipe for passing PCM from CoreAudio thread to main thread
