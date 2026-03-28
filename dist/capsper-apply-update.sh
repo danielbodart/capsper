@@ -6,6 +6,8 @@ set -euo pipefail
 # Only acts if .update-pending exists.
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
+IS_MACOS=false
+[ "$(uname -s)" = "Darwin" ] && IS_MACOS=true
 
 main() {
     local pending_file="$INSTALL_DIR/.update-pending"
@@ -34,32 +36,29 @@ main() {
         rm -f "$recordings_dir"/*.wav "$recordings_dir"/*.log 2>/dev/null || true
     fi
 
-    # Symlink shared ORT libs into the new release so the binary can find them
-    # via RPATH ($ORIGIN/../lib). If the release has real .so files (old-style),
-    # migrate them to the shared directory first.
-    local shared_lib_dir="$INSTALL_DIR/lib"
-    local release_lib_dir="$release_dir/lib"
-    if [ -d "$release_lib_dir" ] && [ -f "$release_lib_dir/libonnxruntime.so" ]; then
-        # Old-style release with bundled libs — migrate to shared
-        mkdir -p "$shared_lib_dir"
-        cp -a "$release_lib_dir/"*.so "$release_lib_dir/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
-        [ -f "$release_lib_dir/DEPS_VERSION" ] && cp "$release_lib_dir/DEPS_VERSION" "$shared_lib_dir/"
-    fi
-    # Transition: if shared libs don't exist yet, check the previous release for libs
-    # (handles first update from old-style to new-style when old update script ran)
-    if [ ! -f "$shared_lib_dir/libonnxruntime.so" ] && [ -n "$current_target" ]; then
-        local prev_lib="$INSTALL_DIR/$current_target/lib"
-        if [ -d "$prev_lib" ] && [ -f "$prev_lib/libonnxruntime.so" ]; then
-            echo "Migrating ORT libs from previous release to shared directory..."
+    # Linux: Symlink shared ORT libs into the new release so the binary can find
+    # them via RPATH ($ORIGIN/../lib). macOS uses system CoreML — no bundled libs.
+    if ! $IS_MACOS; then
+        local shared_lib_dir="$INSTALL_DIR/lib"
+        local release_lib_dir="$release_dir/lib"
+        if [ -d "$release_lib_dir" ] && [ -f "$release_lib_dir/libonnxruntime.so" ]; then
             mkdir -p "$shared_lib_dir"
-            cp -a "$prev_lib/"*.so "$prev_lib/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
-            [ -f "$prev_lib/DEPS_VERSION" ] && cp "$prev_lib/DEPS_VERSION" "$shared_lib_dir/"
+            cp -a "$release_lib_dir/"*.so "$release_lib_dir/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
+            [ -f "$release_lib_dir/DEPS_VERSION" ] && cp "$release_lib_dir/DEPS_VERSION" "$shared_lib_dir/"
         fi
-    fi
-    if [ -d "$shared_lib_dir" ] && [ -f "$shared_lib_dir/libonnxruntime.so" ]; then
-        # Replace release lib/ with symlink to shared (remove dir contents first)
-        rm -rf "$release_lib_dir"
-        ln -sfn "$shared_lib_dir" "$release_lib_dir"
+        if [ ! -f "$shared_lib_dir/libonnxruntime.so" ] && [ -n "$current_target" ]; then
+            local prev_lib="$INSTALL_DIR/$current_target/lib"
+            if [ -d "$prev_lib" ] && [ -f "$prev_lib/libonnxruntime.so" ]; then
+                echo "Migrating ORT libs from previous release to shared directory..."
+                mkdir -p "$shared_lib_dir"
+                cp -a "$prev_lib/"*.so "$prev_lib/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
+                [ -f "$prev_lib/DEPS_VERSION" ] && cp "$prev_lib/DEPS_VERSION" "$shared_lib_dir/"
+            fi
+        fi
+        if [ -d "$shared_lib_dir" ] && [ -f "$shared_lib_dir/libonnxruntime.so" ]; then
+            rm -rf "$release_lib_dir"
+            ln -sfn "$shared_lib_dir" "$release_lib_dir"
+        fi
     fi
 
     # Symlink shared models into the new release so the binary can find them
@@ -77,18 +76,28 @@ main() {
         done
     fi
 
-    # Abort if Nemotron model is missing — the update script should have downloaded it.
-    # Don't attempt download here: ExecStartPre has a 90s timeout, model is ~500MB.
-    local model_dir="$INSTALL_DIR/models/nemotron"
-    if [ ! -f "$model_dir/encoder_model.onnx" ] || [ ! -f "$model_dir/decoder_model.onnx" ] \
-       || [ ! -f "$model_dir/filterbank.bin" ] || [ ! -f "$model_dir/tokens.txt" ]; then
-        echo "ERROR: Nemotron model not found in $model_dir" >&2
-        echo "Run: ~/.local/share/capsper/capsper-update.sh" >&2
-        exit 1
+    # Abort if models are missing — the update script should have downloaded them.
+    local nemotron_dir="$INSTALL_DIR/models/nemotron"
+    if $IS_MACOS; then
+        local coreml_dir="$INSTALL_DIR/models/nemotron-coreml"
+        if [ ! -d "$coreml_dir/encoder.mlmodelc" ] || [ ! -d "$coreml_dir/decoder.mlmodelc" ] \
+           || [ ! -f "$nemotron_dir/filterbank.bin" ] || [ ! -f "$nemotron_dir/tokens.txt" ]; then
+            echo "ERROR: CoreML models not found" >&2
+            echo "Run: ~/.local/share/capsper/capsper-update.sh" >&2
+            exit 1
+        fi
+        # Remove quarantine so Gatekeeper doesn't block the signed binary
+        xattr -d com.apple.quarantine "$release_dir/bin/capsper" 2>/dev/null || true
+    else
+        if [ ! -f "$nemotron_dir/encoder_model.onnx" ] || [ ! -f "$nemotron_dir/decoder_model.onnx" ] \
+           || [ ! -f "$nemotron_dir/filterbank.bin" ] || [ ! -f "$nemotron_dir/tokens.txt" ]; then
+            echo "ERROR: Nemotron model not found in $nemotron_dir" >&2
+            echo "Run: ~/.local/share/capsper/capsper-update.sh" >&2
+            exit 1
+        fi
+        # Migrate systemd service file: update model path, strip removed flags
+        migrate_service_config
     fi
-
-    # Migrate systemd service file: update model path, strip removed flags
-    migrate_service_config
 
     # On Linux, create bin/capsper symlink to the right variant for this machine.
     # Inline detection — this script must be self-contained (no install-common.sh dependency).

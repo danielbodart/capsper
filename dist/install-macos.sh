@@ -36,8 +36,8 @@ install_service() {
     local model_dir="$2"
     shift 2
 
-    # Build command args
-    local args=("$binary" "--trigger" "capslock" "--model" "$model_dir/nemotron")
+    # Build command args — launcher applies pending updates then exec's capsper
+    local args=("$INSTALL_DIR/capsper-launcher.sh" "$binary" "--trigger" "capslock" "--model" "$model_dir/nemotron")
 
     # Optional args passed as key=value pairs
     for arg in "$@"; do

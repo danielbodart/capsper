@@ -357,7 +357,7 @@ install_files() {
     mv "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
 
     # Install update scripts
-    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh install-common.sh; do
+    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh capsper-launcher.sh install-common.sh; do
         if [ -f "$SCRIPT_DIR/$script" ]; then
             cp "$SCRIPT_DIR/$script" "$INSTALL_DIR/"
             chmod +x "$INSTALL_DIR/$script"

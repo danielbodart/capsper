@@ -47,7 +47,11 @@ main() {
     rm -f "$prev_file" "$timestamp_file" "$INSTALL_DIR/.update-pending"
 
     echo "Rolled back to $prev."
-    echo "Run: systemctl --user reset-failed capsper.service && systemctl --user start capsper.service"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "Run: launchctl bootout gui/\$(id -u)/com.capsper.capsper; launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist"
+    else
+        echo "Run: systemctl --user reset-failed capsper.service && systemctl --user start capsper.service"
+    fi
 }
 
 main "$@"

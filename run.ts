@@ -256,6 +256,7 @@ async function distMacOS() {
     await $`cp dist/capsper-update.sh /tmp/capsper-dist-macos/`;
     await $`cp dist/capsper-apply-update.sh /tmp/capsper-dist-macos/`;
     await $`cp dist/capsper-rollback.sh /tmp/capsper-dist-macos/`;
+    await $`cp dist/capsper-launcher.sh /tmp/capsper-dist-macos/`;
     await $`cp dist/VERSION /tmp/capsper-dist-macos/`;
     await $`tar -czf ${TARBALL} -C /tmp/capsper-dist-macos .`;
     await $`shasum -a 256 ${TARBALL} > ${TARBALL}.sha256`;
