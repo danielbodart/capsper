@@ -86,10 +86,9 @@ $prog_args    </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
     <key>StandardOutPath</key>
     <string>$INSTALL_DIR/capsper.log</string>
     <key>StandardErrorPath</key>

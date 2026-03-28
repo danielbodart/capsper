@@ -428,7 +428,7 @@ pub fn main() !void {
                 if (builtin.os.tag == .linux) {
                     std.debug.print("Check: is user in 'input' group? Is /dev/uinput accessible?\n", .{});
                 }
-                return;
+                std.process.exit(1);
             };
             type_callback = .{
                 .context = @ptrCast(&input_handler.?),
