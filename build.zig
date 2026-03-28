@@ -146,10 +146,7 @@ pub fn build(b: *std.Build) void {
 const Exe = std.Build.Step.Compile;
 
 fn addLibPath(b: *std.Build, exe: *Exe, is_macos: bool) void {
-    if (is_macos) {
-        exe.root_module.addLibraryPath(b.path("dist/lib-macos"));
-        exe.root_module.addRPathSpecial("@loader_path/../lib");
-    } else {
+    if (!is_macos) {
         exe.root_module.addLibraryPath(b.path("dist/lib"));
         exe.root_module.addRPathSpecial("$ORIGIN/../lib");
     }

@@ -10,7 +10,7 @@ const BINARY = IS_MACOS ? "./dist/bin/capsper" : "./dist/bin/capsper-cuda";
 const SCRIPT_DIR = import.meta.dir;
 const TARBALL = IS_MACOS ? "capsper-macos-arm64.tar.gz" : "capsper-linux-x86_64.tar.gz";
 const DEPS_TARBALL = "capsper-linux-x86_64-deps.tar.gz";
-const LIB_DIR = IS_MACOS ? "dist/lib-macos" : "dist/lib";
+const LIB_DIR = "dist/lib"; // Linux only — macOS uses system CoreML frameworks
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 

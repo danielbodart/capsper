@@ -46,12 +46,6 @@ jobs:
           fetch-depth: 0
       - uses: actions/cache@v4
         with:
-          path: .git/lfs
-          key: lfs-macos-${{ hashFiles('dist/lib-macos/*.dylib') }}
-          restore-keys: lfs-macos-
-      - run: git lfs pull
-      - uses: actions/cache@v4
-        with:
           path: tools
           key: mise-tools-macos-${{ hashFiles('.mise.toml') }}
           restore-keys: mise-tools-macos-

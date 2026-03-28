@@ -65,11 +65,7 @@ ${progArgs.map(a => `        <string>${a}</string>`).join("\n")}
     <string>${logFile}</string>
     <key>RunAtLoad</key>
     <true/>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>DYLD_LIBRARY_PATH</key>
-        <string>${cwd}/dist/lib-macos</string>
-    </dict>
+
 </dict>
 </plist>`;
     writeFileSync(PLIST_PATH, plist);
