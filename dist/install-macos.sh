@@ -13,12 +13,27 @@ set -euo pipefail
 # shellcheck source=dist/install-common.sh
 source "$(cd "$(dirname "$0")" >/dev/null && pwd)/install-common.sh"
 
-PLIST_LABEL="com.capsper.capsper"
+PLIST_LABEL="io.github.danielbodart.capsper"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$PLIST_DIR/$PLIST_LABEL.plist"
 
-UPDATE_PLIST_LABEL="com.capsper.update"
+UPDATE_PLIST_LABEL="io.github.danielbodart.capsper.update"
 UPDATE_PLIST_PATH="$PLIST_DIR/$UPDATE_PLIST_LABEL.plist"
+
+# ─── Migration ───────────────────────────────────────────────────────────────
+
+# Remove old com.capsper.* LaunchAgents (renamed to io.github.danielbodart.capsper.*)
+cleanup_old_launchagents() {
+    local old_label old_plist
+    for old_label in com.capsper.capsper com.capsper.update; do
+        launchctl bootout "gui/$(id -u)/$old_label" 2>/dev/null || true
+        old_plist="$PLIST_DIR/$old_label.plist"
+        if [ -f "$old_plist" ]; then
+            echo "Removing old LaunchAgent: $old_label"
+            rm -f "$old_plist"
+        fi
+    done
+}
 
 # ─── Quarantine ──────────────────────────────────────────────────────────────
 
@@ -167,6 +182,8 @@ extract_service_config() {
 
 cmd_install() {
     [ -f "$SCRIPT_DIR/bin/capsper" ] || die "capsper binary not found in $SCRIPT_DIR/bin"
+
+    cleanup_old_launchagents
 
     local is_upgrade=false
     local update_config=false

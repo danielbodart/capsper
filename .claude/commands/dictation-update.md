@@ -14,12 +14,12 @@ Monitor CI, trigger the auto-update, and restart the capsper service.
 
 5. **Restart service**:
    - **Linux**: Run `systemctl --user restart capsper.service` and wait 2 seconds.
-   - **macOS**: Run `launchctl bootout gui/$(id -u)/com.capsper.capsper 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist` and wait 2 seconds.
+   - **macOS**: Run `launchctl bootout gui/$(id -u)/io.github.danielbodart.capsper 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.danielbodart.capsper.plist` and wait 2 seconds.
 
 6. **Verify**:
    - Check service is running:
      - **Linux**: `systemctl --user status capsper.service` (should be "active (running)")
-     - **macOS**: `launchctl print gui/$(id -u)/com.capsper.capsper 2>&1 | head -5` (should show the service)
+     - **macOS**: `launchctl print gui/$(id -u)/io.github.danielbodart.capsper 2>&1 | head -5` (should show the service)
    - Confirm new version: `~/.local/share/capsper/current/bin/capsper --version 2>&1`
 
 7. **Restart failed?**

@@ -8,7 +8,7 @@ Analyze captured debug recordings to find transcription issues and create regres
 
 2. **Find model path**: Check the service config for the `--model` path:
    - **Linux**: parse `~/.config/systemd/user/capsper.service` for the `ExecStart=` line
-   - **macOS**: parse `~/Library/LaunchAgents/com.capsper.capsper.plist` with `plutil -convert json -o - | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('ProgramArguments',[])))"`
+   - **macOS**: parse `~/Library/LaunchAgents/io.github.danielbodart.capsper.plist` with `plutil -convert json -o - | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('ProgramArguments',[])))"`
    - Fall back to `dist/models/nemotron`
 
 3. **For each recording**:

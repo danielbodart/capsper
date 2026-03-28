@@ -6,7 +6,7 @@ import { ensureBinary, ensureFile, wavDuration, trackProc, saveLog } from "./hel
 const HELPERS = "test/macos-audio-helpers";
 const BINARY = "./dist/bin/capsper";
 const MODEL_DIR = "dist/models/nemotron";
-const PLIST_NAME = "com.capsper.test";
+const PLIST_NAME = "io.github.danielbodart.capsper.test";
 const PLIST_PATH = `/tmp/${PLIST_NAME}.plist`;
 
 const isMacOS = process.platform === "darwin";

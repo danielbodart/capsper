@@ -70,7 +70,7 @@ systemctl --user start capsper.service
 ### macOS
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.danielbodart.capsper.plist
 ```
 
 Hold CapsLock and speak. Release to stop. Text appears in the focused window. CapsLock is the default trigger — you can change it with `--trigger` (see [Trigger keys](#trigger-keys)).

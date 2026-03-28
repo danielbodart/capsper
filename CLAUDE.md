@@ -142,8 +142,8 @@ To update the running capsper service after CI passes:
 systemctl --user restart capsper
 
 # macOS: restart LaunchAgent
-launchctl bootout gui/$(id -u)/com.capsper.capsper 2>/dev/null
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist
+launchctl bootout gui/$(id -u)/io.github.danielbodart.capsper 2>/dev/null
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.danielbodart.capsper.plist
 ```
 
 Do NOT manually download CI artifacts or stage releases by hand — the update script handles everything.
@@ -172,5 +172,5 @@ Do NOT manually download CI artifacts or stage releases by hand — the update s
 - Default server port: 43007
 - CLI flags: `--audio-channel`, `--audio-target`, `--audio-gain`, `--audio-detect` (cross-platform names; `--pw-*` aliases kept for backwards compatibility)
 - Service management: `systemctl --user` on Linux, `launchctl bootstrap/bootout gui/$(id -u)` on macOS
-- Service files: `~/.config/systemd/user/capsper.service` (Linux), `~/Library/LaunchAgents/com.capsper.capsper.plist` (macOS)
+- Service files: `~/.config/systemd/user/capsper.service` (Linux), `~/Library/LaunchAgents/io.github.danielbodart.capsper.plist` (macOS)
 - Permissions: `input` group + udev rule on Linux; Accessibility + Microphone TCC on macOS

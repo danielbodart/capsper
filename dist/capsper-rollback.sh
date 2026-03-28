@@ -48,7 +48,7 @@ main() {
 
     echo "Rolled back to $prev."
     if [ "$(uname -s)" = "Darwin" ]; then
-        echo "Run: launchctl bootout gui/\$(id -u)/com.capsper.capsper; launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist"
+        echo "Run: launchctl bootout gui/\$(id -u)/io.github.danielbodart.capsper; launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/io.github.danielbodart.capsper.plist"
     else
         echo "Run: systemctl --user reset-failed capsper.service && systemctl --user start capsper.service"
     fi

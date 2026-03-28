@@ -21,6 +21,14 @@ main() {
     local release_dir="$INSTALL_DIR/releases/$pending"
     [ -d "$release_dir/bin" ] || { echo "ERROR: Staged release $pending not found" >&2; exit 1; }
 
+    # Clean up old com.capsper.* LaunchAgents (renamed to io.github.danielbodart.capsper.*)
+    if $IS_MACOS; then
+        for old_label in com.capsper.capsper com.capsper.update; do
+            launchctl bootout "gui/$(id -u)/$old_label" 2>/dev/null || true
+            rm -f "$HOME/Library/LaunchAgents/$old_label.plist" 2>/dev/null || true
+        done
+    fi
+
     # Save current version for rollback
     local current_target
     current_target=$(readlink "$INSTALL_DIR/current" 2>/dev/null || true)
