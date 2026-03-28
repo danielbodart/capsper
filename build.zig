@@ -179,7 +179,6 @@ fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
         exe.linkFramework("CoreFoundation");
         exe.linkFramework("ApplicationServices");
         exe.linkFramework("AVFoundation");
-        exe.linkFramework("AppKit");
         exe.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos/mic_permission.m"),
             .flags = &.{"-fobjc-arc"},
