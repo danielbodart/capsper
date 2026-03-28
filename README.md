@@ -77,42 +77,34 @@ Hold CapsLock and speak. Release to stop. Text appears in the focused window. Ca
 
 ## Auto-updates
 
-Capsper can optionally check for updates daily (the installer offers to set this up). When a new version is found, it's downloaded and staged in the background. The update is applied automatically on the next service restart — capsper is never interrupted mid-session.
+On Linux, capsper can optionally check for updates daily (the installer offers to set this up). When a new version is found, it's downloaded and staged in the background. The update is applied automatically on the next service restart — capsper is never interrupted mid-session.
 
-Check for updates manually:
+On macOS, auto-updates are not yet available — updating the binary invalidates Accessibility permission because macOS identifies ad-hoc signed binaries by hash. To update manually, re-download and run `install.sh`, then re-approve capsper in System Settings > Accessibility.
+
+Check for updates manually (Linux):
 
 ```bash
 ~/.local/share/capsper/capsper-update.sh
 ```
 
-Apply a staged update:
+Apply a staged update (Linux):
 
 ```bash
-# Linux
 systemctl --user restart capsper.service
-
-# macOS
-launchctl bootout gui/$(id -u)/com.capsper.capsper 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.capsper.capsper.plist
 ```
 
 If a new version crashes repeatedly (3 times within 60 seconds), capsper automatically rolls back to the previous version (Linux). You can also roll back manually:
 
 ```bash
 ~/.local/share/capsper/capsper-rollback.sh --force
-
-# Linux
 systemctl --user reset-failed capsper.service
 systemctl --user start capsper.service
 ```
 
-Disable auto-updates:
+Disable auto-updates (Linux):
 
 ```bash
-# Linux
 systemctl --user disable --now capsper-update.timer
-
-# macOS
-launchctl bootout gui/$(id -u)/com.capsper.update
 ```
 
 ### Drop terms
@@ -286,11 +278,15 @@ All commands go through the Bun-based task runner (`run.ts`):
 
 ### macOS
 
-**"Failed to init input handler"** — Accessibility permission not granted. Open System Settings > Privacy & Security > Accessibility and add capsper (or Terminal).
+**"Failed to init input handler"** — Accessibility permission not granted. The capsper *binary itself* must be in the Accessibility list (not just Terminal). Open System Settings > Privacy & Security > Accessibility, click '+', press Cmd+Shift+G, and paste:
+```
+~/.local/share/capsper/current/bin/capsper
+```
+If capsper is already in the list, remove it and re-add — macOS caches the permission against the binary hash, so it may need refreshing after an update.
 
 **No audio captured** — Microphone permission not granted. Open System Settings > Privacy & Security > Microphone and add capsper (or Terminal).
 
-**Service not starting** — check logs with `tail -f ~/.local/share/capsper/capsper.log`. Ensure both Accessibility and Microphone permissions are granted.
+**Service not starting** — check logs with `tail -f ~/.local/share/capsper/capsper.log`. Ensure both Accessibility and Microphone permissions are granted for the capsper binary.
 
 ### Both platforms
 

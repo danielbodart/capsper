@@ -36,14 +36,26 @@ check_microphone() {
 }
 
 check_permissions() {
+    local binary_path
+    if is_dev_mode; then
+        binary_path="$SCRIPT_DIR/bin/capsper"
+    else
+        binary_path="$INSTALL_DIR/current/bin/capsper"
+    fi
+
     local needs_action=false
 
     if ! check_accessibility; then
         echo ""
         echo "=== Accessibility Permission Required ==="
         echo "Capsper needs Accessibility access for keyboard interception and text injection."
-        echo "Opening System Settings > Privacy & Security > Accessibility..."
+        echo ""
+        echo "1. Opening System Settings > Privacy & Security > Accessibility..."
         open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        echo "2. Click '+' and add this binary:"
+        echo "   $binary_path"
+        echo ""
+        echo "   Tip: In the file dialog, press Cmd+Shift+G and paste the path above."
         needs_action=true
     fi
 
@@ -51,19 +63,23 @@ check_permissions() {
         echo ""
         echo "=== Microphone Permission Required ==="
         echo "Capsper needs Microphone access for audio capture."
-        echo "Opening System Settings > Privacy & Security > Microphone..."
+        echo ""
+        echo "1. Opening System Settings > Privacy & Security > Microphone..."
         open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        echo "2. Add capsper to the list."
         needs_action=true
     fi
 
     if $needs_action; then
         echo ""
-        echo "Add capsper (or Terminal) in the System Settings panes that opened."
         echo "Press Enter when done..."
         read -r
 
         if ! check_accessibility; then
-            echo "WARNING: Accessibility permission not detected. Capsper may not work."
+            echo "WARNING: Accessibility permission not detected."
+            echo "The capsper binary must be added to Accessibility:"
+            echo "  $binary_path"
+            echo "See Troubleshooting in the README if the service fails to start."
         fi
         if ! check_microphone; then
             echo "WARNING: Microphone permission not detected. Capsper may not work."
@@ -165,6 +181,20 @@ EOF
 
 has_auto_update() {
     [ -f "$UPDATE_PLIST_PATH" ]
+}
+
+# Auto-updates are disabled on macOS: updates change the binary hash, which
+# invalidates Accessibility permission (TCC keys on cdhash for ad-hoc signed
+# binaries). This will be re-enabled once we have proper code signing.
+disable_auto_update_if_present() {
+    if has_auto_update; then
+        echo ""
+        echo "Disabling auto-updates (updates would break Accessibility permission)."
+        echo "To update manually: re-download and run install.sh, then re-approve"
+        echo "capsper in System Settings > Privacy & Security > Accessibility."
+        launchctl bootout "gui/$(id -u)/$UPDATE_PLIST_LABEL" 2>/dev/null || true
+        rm -f "$UPDATE_PLIST_PATH"
+    fi
 }
 
 # ─── Service Control ──────────────────────────────────────────────────────────
@@ -302,18 +332,12 @@ cmd_install() {
                 service_args+=("record-dir=$RECORDINGS_DIR")
             fi
 
-            # Auto-updates
-            local enable_updates=true
-            echo ""
-            if ! confirm "Enable automatic updates?"; then
-                enable_updates=false
-            fi
-
             install_service "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
 
-            if $enable_updates; then
-                install_update_timer
-            fi
+            # Disable auto-updates on macOS: updates change the binary hash,
+            # which invalidates Accessibility permission (TCC keys on cdhash
+            # for ad-hoc signed binaries). Requires code signing to fix.
+            disable_auto_update_if_present
         else
             # Upgrade without config change: preserve settings
             extract_service_config
@@ -326,12 +350,7 @@ cmd_install() {
 
             install_service "$INSTALL_DIR/current/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
 
-            if ! has_auto_update; then
-                echo ""
-                if confirm "Enable automatic updates?"; then
-                    install_update_timer
-                fi
-            fi
+            disable_auto_update_if_present
         fi
     fi
 

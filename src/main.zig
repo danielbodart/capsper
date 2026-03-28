@@ -261,6 +261,10 @@ pub fn main() !void {
 
     // Build context graph for drop terms (filler suppression via negative bias)
     var nemo_context_graph: ?*ContextGraph = null;
+    defer if (nemo_context_graph) |cg| {
+        cg.deinit();
+        allocator.destroy(cg);
+    };
     if (drop_terms.len > 0) {
         var bias_scores = std.ArrayListUnmanaged(f32){};
         defer bias_scores.deinit(allocator);
