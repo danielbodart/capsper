@@ -53,6 +53,27 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
     return NULL;  // Swallow the event
 }
 
+// ──── Accessibility permission ──────────────────────────────────────────────
+
+// Check if the process has Accessibility permission.
+// Returns 1 if trusted, 0 if not.
+int capsper_input_check_accessibility(void) {
+    return AXIsProcessTrusted() ? 1 : 0;
+}
+
+// Request Accessibility permission. Shows the system dialog pointing the user
+// to System Settings > Privacy & Security > Accessibility.
+// Returns 1 if already trusted, 0 if not (user needs to grant).
+int capsper_input_request_accessibility(void) {
+    const void *keys[] = { kAXTrustedCheckOptionPrompt };
+    const void *values[] = { kCFBooleanTrue };
+    CFDictionaryRef options = CFDictionaryCreate(NULL, keys, values, 1,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    Boolean trusted = AXIsProcessTrustedWithOptions(options);
+    CFRelease(options);
+    return trusted ? 1 : 0;
+}
+
 // ──── Public API ────────────────────────────────────────────────────────────
 
 // Create and install a CGEventTap for the trigger key.
@@ -68,13 +89,6 @@ int capsper_input_create_tap(int trigger_keycode,
     g_ctx->trigger_keycode = (CGKeyCode)trigger_keycode;
     g_ctx->on_press = on_press;
     g_ctx->on_release = on_release;
-
-    // Check accessibility permission
-    if (!AXIsProcessTrusted()) {
-        fprintf(stderr, "error(input): Accessibility permission required.\n");
-        fprintf(stderr, "error(input): Grant in: System Settings → Privacy & Security → Accessibility\n");
-        // Don't fail — the tap will silently not work, but we'll detect it
-    }
 
     CGEventMask mask = (1 << kCGEventKeyDown) | (1 << kCGEventKeyUp);
     g_ctx->tap = CGEventTapCreate(

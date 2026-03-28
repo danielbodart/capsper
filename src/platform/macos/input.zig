@@ -13,6 +13,8 @@ const std = @import("std");
 const log = std.log.scoped(.input);
 
 // C helpers from input_helpers_macos.c
+extern fn capsper_input_check_accessibility() c_int;
+extern fn capsper_input_request_accessibility() c_int;
 extern fn capsper_input_create_tap(trigger_keycode: c_int, on_press: *const fn () callconv(.c) void, on_release: *const fn () callconv(.c) void) c_int;
 extern fn capsper_input_run_tap() void;
 extern fn capsper_input_stop_tap() void;
@@ -55,6 +57,28 @@ pub const InputHandler = struct {
 
     pub fn init(config: Config) !InputHandler {
         g_live_fn = config.live_fn;
+
+        // Ensure Accessibility permission before creating the event tap.
+        // If not granted, show the system prompt and poll until the user grants it.
+        if (capsper_input_check_accessibility() == 0) {
+            log.info("Requesting Accessibility permission...", .{});
+            _ = capsper_input_request_accessibility();
+
+            const max_wait_s = 60;
+            const poll_interval_ns: u64 = 2 * std.time.ns_per_s;
+            var waited: u32 = 0;
+            while (waited < max_wait_s) {
+                std.Thread.sleep(poll_interval_ns);
+                waited += 2;
+                if (capsper_input_check_accessibility() != 0) break;
+                log.info("Waiting for Accessibility permission... ({d}s)", .{waited});
+            }
+            if (capsper_input_check_accessibility() == 0) {
+                log.err("Accessibility permission not granted after {d}s", .{max_wait_s});
+                return error.AccessibilityPermissionDenied;
+            }
+            log.info("Accessibility permission granted", .{});
+        }
 
         // Remap CapsLock → F19 via hidutil (if trigger is CapsLock)
         var did_remap = false;

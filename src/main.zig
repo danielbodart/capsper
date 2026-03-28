@@ -425,9 +425,7 @@ pub fn main() !void {
                 .live_fn = &server_mod.setLive,
             }) catch |err| {
                 std.debug.print("Failed to init input handler: {}\n", .{err});
-                if (builtin.os.tag == .macos) {
-                    std.debug.print("Check: is Accessibility permission granted in System Settings?\n", .{});
-                } else {
+                if (builtin.os.tag == .linux) {
                     std.debug.print("Check: is user in 'input' group? Is /dev/uinput accessible?\n", .{});
                 }
                 return;
