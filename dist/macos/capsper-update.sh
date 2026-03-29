@@ -146,11 +146,7 @@ main() {
     mv "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
 
     # Copy binary to stable path (TCC tracks by absolute path).
-    # Reset mic permission — TCC stores the cdhash at grant time, so a new
-    # binary at the same path gets silently denied. Resetting clears the stale
-    # entry so the next launch triggers a fresh mic permission dialog.
     mkdir -p "$INSTALL_DIR/bin"
-    tccutil reset Microphone 2>/dev/null || true
     cp "$release_dir/bin/capsper" "$INSTALL_DIR/bin/capsper.tmp"
     mv "$INSTALL_DIR/bin/capsper.tmp" "$INSTALL_DIR/bin/capsper"
 
