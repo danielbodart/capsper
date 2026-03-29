@@ -47,11 +47,17 @@ trap cleanup EXIT
 
 TMPDIR_WORK=$(mktemp -d)
 
-# ─── Step 1: Generate ephemeral EC key pair ──────────────────────────────────
+# ─── Step 1: Generate ephemeral EC key pair + CSR ────────────────────────────
 
 echo "Generating ephemeral key pair..."
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$TMPDIR_WORK/key.pem" 2>/dev/null
 openssl pkey -in "$TMPDIR_WORK/key.pem" -pubout -out "$TMPDIR_WORK/pub.pem" 2>/dev/null
+
+# Create a CSR with a non-empty subject. Fulcio documents that "the CSR's
+# subject name is not verified" but will include it in the issued cert.
+# A non-empty subject is required for macOS keychain identity creation.
+openssl req -new -key "$TMPDIR_WORK/key.pem" -out "$TMPDIR_WORK/csr.pem" \
+    -subj "/CN=$IDENTIFIER/O=danielbodart" 2>/dev/null
 
 # ─── Step 2: Get OIDC token ──────────────────────────────────────────────────
 
@@ -150,51 +156,29 @@ jwt_payload() {
 # Decode and display token claims (for debugging)
 echo "OIDC token issuer: $(jwt_payload "$OIDC_TOKEN" | jq -r '.iss' 2>/dev/null || echo 'unknown')"
 
-# ─── Step 3: Create proof of possession ──────────────────────────────────────
-# Sign the OIDC identity (email if present, otherwise sub) with our ephemeral key.
-# This must match Fulcio's SubjectFromUnverifiedToken logic:
-#   if email is present and email_verified: use email
-#   otherwise: use sub
-
-PAYLOAD_JSON=$(jwt_payload "$OIDC_TOKEN")
-EMAIL=$(echo "$PAYLOAD_JSON" | jq -r '.email // empty')
-EMAIL_VERIFIED=$(echo "$PAYLOAD_JSON" | jq -r '.email_verified // false')
-SUB_CLAIM=$(echo "$PAYLOAD_JSON" | jq -r '.sub')
-
-if [ -n "$EMAIL" ] && [ "$EMAIL_VERIFIED" = "true" ]; then
-    CHALLENGE="$EMAIL"
-    echo "OIDC identity (email): $EMAIL"
-else
-    CHALLENGE="$SUB_CLAIM"
-    echo "OIDC identity (sub): $SUB_CLAIM"
-fi
-
-# Sign the challenge as proof of possession
-echo -n "$CHALLENGE" | openssl dgst -sha256 -sign "$TMPDIR_WORK/key.pem" -out "$TMPDIR_WORK/proof.sig"
-PROOF_B64=$(base64 < "$TMPDIR_WORK/proof.sig")
-
-# Read public key content
-PUB_KEY_CONTENT=$(cat "$TMPDIR_WORK/pub.pem")
-
-# ─── Step 4: Request certificate from Fulcio ─────────────────────────────────
+# ─── Step 3: Request certificate from Fulcio (via CSR) ──────────────────────
+# The CSR carries both the public key and a non-empty subject (CN + O).
+# The self-signed CSR also serves as proof of possession of the private key,
+# so no separate proof-of-possession signature is needed.
+#
+# Fulcio docs: "the CSR's subject name is not verified, or tested for
+# compatibility with its specified X.509 name type". The subject we set
+# in the CSR is included in the issued cert, giving us a non-empty subject
+# that macOS keychain needs to create a signing identity.
 
 echo "Requesting certificate from Fulcio..."
 
+# Fulcio expects "PKCS#10 PEM-encoded" CSR, base64-encoded for JSON transport
+CSR_PEM_B64=$(base64 < "$TMPDIR_WORK/csr.pem" | tr -d '\n')
+
 REQUEST_BODY=$(jq -n \
     --arg token "$OIDC_TOKEN" \
-    --arg pubkey "$PUB_KEY_CONTENT" \
-    --arg proof "$PROOF_B64" \
+    --arg csr "$CSR_PEM_B64" \
     '{
         credentials: {
             oidcIdentityToken: $token
         },
-        publicKeyRequest: {
-            publicKey: {
-                algorithm: "ECDSA",
-                content: $pubkey
-            },
-            proofOfPossession: $proof
-        }
+        certificateSigningRequest: $csr
     }')
 
 RESPONSE=$(curl -sS -w "\n%{http_code}" \
@@ -263,14 +247,22 @@ echo ""
 echo "Signing $BINARY with codesign (Fulcio cert)..."
 
 # Create PKCS#12 with ephemeral key + leaf cert + full chain.
-# The -legacy flag is required for macOS keychain compatibility.
-openssl pkcs12 -export \
+# Try -legacy first (needed for newer openssl + macOS keychain compatibility),
+# fall back to without it (older openssl doesn't support -legacy).
+if ! openssl pkcs12 -export \
     -inkey "$TMPDIR_WORK/key.pem" \
     -in "$TMPDIR_WORK/leaf.pem" \
     -certfile "$TMPDIR_WORK/chain.pem" \
     -out "$TMPDIR_WORK/signing.p12" \
     -passout pass:fulcio-ephemeral \
-    -legacy 2>/dev/null
+    -legacy 2>/dev/null; then
+    openssl pkcs12 -export \
+        -inkey "$TMPDIR_WORK/key.pem" \
+        -in "$TMPDIR_WORK/leaf.pem" \
+        -certfile "$TMPDIR_WORK/chain.pem" \
+        -out "$TMPDIR_WORK/signing.p12" \
+        -passout pass:fulcio-ephemeral
+fi
 
 # Create a temporary keychain for this signing operation.
 # Using a dedicated keychain avoids polluting the login keychain
