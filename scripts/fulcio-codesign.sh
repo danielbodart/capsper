@@ -18,7 +18,7 @@ set -euo pipefail
 #   Locally (opens browser for OIDC login):
 #     ./scripts/fulcio-codesign.sh dist/macos/bin/capsper
 #
-# Requirements: openssl, curl, jq, rcodesign, csreq (macOS)
+# Requirements: openssl, curl, jq, csreq (macOS)
 
 IDENTIFIER="io.github.danielbodart.capsper"
 FULCIO_URL="https://fulcio.sigstore.dev"
@@ -30,11 +30,16 @@ BINARY="${1:?Usage: fulcio-codesign.sh <binary>}"
 [ -f "$BINARY" ] || { echo "error: binary not found: $BINARY" >&2; exit 1; }
 
 TMPDIR_WORK=""
+SIGNING_KEYCHAIN=""
 cleanup() {
+    # Delete the temporary signing keychain
+    if [ -n "$SIGNING_KEYCHAIN" ] && [ -f "$SIGNING_KEYCHAIN" ]; then
+        security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+    fi
     if [ -n "$TMPDIR_WORK" ]; then
         # Shred private key material
         [ -f "$TMPDIR_WORK/key.pem" ] && rm -P "$TMPDIR_WORK/key.pem" 2>/dev/null || true
-        [ -f "$TMPDIR_WORK/signing.pem" ] && rm -P "$TMPDIR_WORK/signing.pem" 2>/dev/null || true
+        [ -f "$TMPDIR_WORK/signing.p12" ] && rm -P "$TMPDIR_WORK/signing.p12" 2>/dev/null || true
         rm -rf "$TMPDIR_WORK"
     fi
 }
@@ -45,7 +50,6 @@ TMPDIR_WORK=$(mktemp -d)
 # ─── Step 1: Generate ephemeral EC key pair ──────────────────────────────────
 
 echo "Generating ephemeral key pair..."
-# Generate in PKCS#8 format (required by rcodesign)
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$TMPDIR_WORK/key.pem" 2>/dev/null
 openssl pkey -in "$TMPDIR_WORK/key.pem" -pubout -out "$TMPDIR_WORK/pub.pem" 2>/dev/null
 
@@ -244,22 +248,72 @@ CERT_REPO_URI=$(openssl x509 -in "$TMPDIR_WORK/leaf.pem" -noout -text 2>/dev/nul
     | grep -F -A1 "$REPO_OID:" | tail -1 | sed 's/^[[:space:]]*//;s/^.*\(https\{0,1\}:\/\/\)/\1/' || echo "")
 echo "Source Repository URI in cert: ${CERT_REPO_URI:-not found}"
 
-# ─── Step 5: Sign with rcodesign ─────────────────────────────────────────────
-# rcodesign signs Mach-O binaries directly from PEM key+cert files,
-# bypassing the macOS keychain entirely. This avoids issues with Fulcio's
-# empty-subject certs not forming valid keychain identities.
+# ─── Step 5: Sign with Apple's codesign via temporary keychain ───────────────
+# We use Apple's native codesign instead of rcodesign because rcodesign
+# re-encodes certificate DER bytes when embedding them in the CMS signature,
+# which invalidates the certificate chain signatures. Apple's codesign
+# preserves the original cert encoding, so macOS can resolve the full
+# Authority chain (leaf → intermediate → root) from the signed binary.
+#
+# This matters for TCC: macOS needs to read the signing identity from the
+# CMS blob to track permission grants. With rcodesign's broken certs,
+# Authority=(unavailable) and TCC silently denies mic/camera access.
 
 echo ""
-echo "Signing $BINARY with rcodesign..."
+echo "Signing $BINARY with codesign (Fulcio cert)..."
 
-# Combine key and cert chain into a single PEM for rcodesign
-cat "$TMPDIR_WORK/key.pem" "$TMPDIR_WORK/leaf.pem" "$TMPDIR_WORK/chain.pem" \
-    > "$TMPDIR_WORK/signing.pem"
+# Create PKCS#12 with ephemeral key + leaf cert + full chain.
+# The -legacy flag is required for macOS keychain compatibility.
+openssl pkcs12 -export \
+    -inkey "$TMPDIR_WORK/key.pem" \
+    -in "$TMPDIR_WORK/leaf.pem" \
+    -certfile "$TMPDIR_WORK/chain.pem" \
+    -out "$TMPDIR_WORK/signing.p12" \
+    -passout pass:fulcio-ephemeral \
+    -legacy 2>/dev/null
+
+# Create a temporary keychain for this signing operation.
+# Using a dedicated keychain avoids polluting the login keychain
+# and ensures cleanup even if the script is interrupted.
+SIGNING_KEYCHAIN="$TMPDIR_WORK/signing.keychain-db"
+KEYCHAIN_PASS="signing-$(openssl rand -hex 8)"
+security create-keychain -p "$KEYCHAIN_PASS" "$SIGNING_KEYCHAIN"
+security set-keychain-settings "$SIGNING_KEYCHAIN"
+security unlock-keychain -p "$KEYCHAIN_PASS" "$SIGNING_KEYCHAIN"
+
+# Import the P12 into the temporary keychain
+security import "$TMPDIR_WORK/signing.p12" \
+    -k "$SIGNING_KEYCHAIN" \
+    -P fulcio-ephemeral \
+    -T /usr/bin/codesign
+
+# Allow codesign to use the key without a keychain password prompt
+security set-key-partition-list \
+    -S apple-tool:,apple:,codesign: \
+    -s -k "$KEYCHAIN_PASS" \
+    "$SIGNING_KEYCHAIN" >/dev/null
+
+# Add the temporary keychain to the search list so codesign can find it.
+# Preserve the existing search list and restore it in cleanup.
+ORIGINAL_KEYCHAINS=$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
+# shellcheck disable=SC2086
+security list-keychains -d user -s "$SIGNING_KEYCHAIN" $ORIGINAL_KEYCHAINS
+
+# Find the signing identity hash from the temporary keychain
+IDENTITY_HASH=$(security find-identity -p codesigning "$SIGNING_KEYCHAIN" \
+    | grep -oE '[A-F0-9]{40}' | head -1)
+
+if [ -z "$IDENTITY_HASH" ]; then
+    echo "error: no signing identity found in temporary keychain" >&2
+    echo "Identities:" >&2
+    security find-identity "$SIGNING_KEYCHAIN" >&2
+    exit 1
+fi
+echo "Signing identity: $IDENTITY_HASH"
 
 # Build the designated requirement
-# Always pins on identifier + the Fulcio Source Repository URI OID.
+# Pins on identifier + the Fulcio Source Repository URI OID.
 # In CI this is the actual repo URL; locally it's the Dex OAuth redirect.
-# This lets us test the full DR pipeline locally with the same structure.
 if [ -n "$CERT_REPO_URI" ]; then
     DR="designated => identifier \"$IDENTIFIER\" and certificate leaf[field.$REPO_OID] = \"$CERT_REPO_URI\""
     echo "DR: identifier + repo OID = $CERT_REPO_URI"
@@ -267,14 +321,6 @@ else
     DR="designated => identifier \"$IDENTIFIER\""
     echo "DR: identifier only (no repo OID in cert)"
 fi
-
-RCODESIGN="${RCODESIGN:-rcodesign}"
-
-# Compile the designated requirement to binary format (required by rcodesign)
-# csreq outputs a RequirementSet blob (fade0c01), but rcodesign expects
-# just the inner Requirement blob (fade0c00), so we strip the 20-byte header.
-csreq -r="$DR" -b "$TMPDIR_WORK/requirements-set.bin"
-dd if="$TMPDIR_WORK/requirements-set.bin" of="$TMPDIR_WORK/requirements.bin" bs=1 skip=20 2>/dev/null
 
 # Entitlements: hardened runtime requires explicit entitlements for mic access.
 # Without com.apple.security.device.audio-input, TCC silently denies the mic
@@ -290,21 +336,28 @@ cat > "$TMPDIR_WORK/entitlements.plist" <<ENTITLEMENTS
 </plist>
 ENTITLEMENTS
 
-"$RCODESIGN" sign \
-    --pem-source "$TMPDIR_WORK/signing.pem" \
-    --binary-identifier "$IDENTIFIER" \
-    --code-signature-flags runtime \
-    --code-requirements-file "$TMPDIR_WORK/requirements.bin" \
-    --entitlements-xml-file "$TMPDIR_WORK/entitlements.plist" \
+codesign --force --options runtime \
+    --identifier "$IDENTIFIER" \
+    --entitlements "$TMPDIR_WORK/entitlements.plist" \
+    -r="$DR" \
+    -s "$IDENTITY_HASH" \
+    --keychain "$SIGNING_KEYCHAIN" \
     "$BINARY"
 
 echo "Binary signed successfully."
 
-# ─── Step 7: Verify ──────────────────────────────────────────────────────────
+# Restore the original keychain search list
+# shellcheck disable=SC2086
+security list-keychains -d user -s $ORIGINAL_KEYCHAINS
+
+# ─── Step 6: Verify ─────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Verification ==="
 codesign -dvvv "$BINARY" 2>&1 | head -20
+echo ""
+echo "Entitlements:"
+codesign -d --entitlements - "$BINARY" 2>&1
 echo ""
 echo "Designated requirement:"
 codesign -dr- "$BINARY" 2>&1
