@@ -276,11 +276,26 @@ RCODESIGN="${RCODESIGN:-rcodesign}"
 csreq -r="$DR" -b "$TMPDIR_WORK/requirements-set.bin"
 dd if="$TMPDIR_WORK/requirements-set.bin" of="$TMPDIR_WORK/requirements.bin" bs=1 skip=20 2>/dev/null
 
+# Entitlements: hardened runtime requires explicit entitlements for mic access.
+# Without com.apple.security.device.audio-input, TCC silently denies the mic
+# permission prompt for hardened-runtime binaries.
+cat > "$TMPDIR_WORK/entitlements.plist" <<ENTITLEMENTS
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+
 "$RCODESIGN" sign \
     --pem-source "$TMPDIR_WORK/signing.pem" \
     --binary-identifier "$IDENTIFIER" \
     --code-signature-flags runtime \
     --code-requirements-file "$TMPDIR_WORK/requirements.bin" \
+    --entitlements-xml-file "$TMPDIR_WORK/entitlements.plist" \
     "$BINARY"
 
 echo "Binary signed successfully."
