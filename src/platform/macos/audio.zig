@@ -63,20 +63,22 @@ pub const AudioCapture = struct {
         // virtual devices deliver real audio without mic permission, and the user
         // explicitly chose the device.
         const mic_status = if (target != null) @as(c_int, 3) else capsper_mic_permission_status();
-        if (mic_status == 0) {
+        if (mic_status != 3) {
+            // Not yet authorized: request permission (or poll if denied).
+            // For notDetermined (0): shows the system permission dialog and blocks.
+            // For denied (2): polls for 30s in case a dialog from a previous
+            //   launch is still visible (launchd restarts race with user clicking Allow).
+            // For restricted (1): polls briefly then fails.
+            if (mic_status == 1) {
+                log.err("Microphone access is restricted by system policy.", .{});
+                return error.AudioInitFailed;
+            }
             log.info("Requesting microphone permission...", .{});
             if (capsper_mic_request_permission() == 0) {
                 log.err("Microphone permission denied.", .{});
                 log.err("Grant access in: System Settings → Privacy & Security → Microphone", .{});
                 return error.AudioInitFailed;
             }
-        } else if (mic_status == 2) {
-            log.err("Microphone permission denied.", .{});
-            log.err("Grant access in: System Settings → Privacy & Security → Microphone", .{});
-            return error.AudioInitFailed;
-        } else if (mic_status == 1) {
-            log.err("Microphone access is restricted by system policy.", .{});
-            return error.AudioInitFailed;
         }
 
         // Create pipe for passing PCM from CoreAudio thread to main thread
