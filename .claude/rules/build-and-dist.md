@@ -3,7 +3,7 @@ description: Build system, RPATH, dist packaging, and CI conventions
 globs:
   - build.zig
   - run.ts
-  - dist/*
+  - dist/**/*
   - .github/*
 ---
 
@@ -11,13 +11,13 @@ globs:
 
 ## RPATH (Linux)
 
-- Binary RPATH is `$ORIGIN/../lib` so `dist/bin/capsper` finds `dist/lib/*.so` at runtime.
+- Binary RPATH is `$ORIGIN/../lib` so `dist/linux/bin/capsper` finds `dist/linux/lib/*.so` at runtime.
 - **Never use `patchelf`** — fix RPATH at build time.
 - macOS uses `@loader_path/../lib` (set by Zig build) and links system CoreML/CoreAudio frameworks.
 
 ## Shared Libraries
 
-Pre-built onnxruntime shared libraries are committed in `dist/lib/` via Git LFS (Linux only). The Zig build links against these directly. macOS uses the system CoreML framework — no bundled shared libs.
+Pre-built onnxruntime shared libraries are committed in `dist/linux/lib/` via Git LFS (Linux only). The Zig build links against these directly. macOS uses the system CoreML framework — no bundled shared libs.
 
 ## CPU Target
 

@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
     exe.linkLibC();
     b.installArtifact(exe);
 
-    // Install warmup file next to the binary (dist/bin/jfk.wav)
+    // Install warmup file next to the binary (e.g. dist/macos/bin/jfk.wav)
     b.installFile("test/jfk.wav", "bin/jfk.wav");
 
     // --- Run step ---
@@ -147,7 +147,7 @@ const Exe = std.Build.Step.Compile;
 
 fn addLibPath(b: *std.Build, exe: *Exe, is_macos: bool) void {
     if (!is_macos) {
-        exe.root_module.addLibraryPath(b.path("dist/lib"));
+        exe.root_module.addLibraryPath(b.path("dist/linux/lib"));
         exe.root_module.addRPathSpecial("$ORIGIN/../lib");
     }
 }
@@ -163,7 +163,7 @@ fn addBackendDeps(b: *std.Build, exe: *Exe, backend: Backend) void {
             });
         },
         .ort_cuda, .ort_cpu => {
-            exe.root_module.addIncludePath(b.path("dist/include/onnxruntime"));
+            exe.root_module.addIncludePath(b.path("dist/linux/include/onnxruntime"));
             exe.linkSystemLibrary("onnxruntime");
         },
     }

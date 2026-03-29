@@ -11,8 +11,17 @@ set -euo pipefail
 #   ./install.sh              Full interactive setup (download models, permissions, systemd)
 #   ./install.sh audio-detect  Detect best microphone channel (delegates to capsper --audio-detect)
 
-# shellcheck source=dist/install-common.sh
-source "$(cd "$(dirname "$0")" >/dev/null && pwd)/install-common.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
+
+# In a tarball, install-common.sh is alongside install.sh.
+# In the repo, it's in the sibling shared/ directory.
+if [ -f "$SCRIPT_DIR/install-common.sh" ]; then
+    # shellcheck source=dist/shared/install-common.sh
+    source "$SCRIPT_DIR/install-common.sh"
+else
+    # shellcheck source=dist/shared/install-common.sh
+    source "$SCRIPT_DIR/../shared/install-common.sh"
+fi
 
 NEEDS_REBOOT=false
 

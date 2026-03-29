@@ -13,10 +13,10 @@ set -euo pipefail
 #
 # Usage:
 #   In GitHub Actions (keyless, automatic):
-#     ./scripts/fulcio-codesign.sh dist/bin/capsper
+#     ./scripts/fulcio-codesign.sh dist/macos/bin/capsper
 #
 #   Locally (opens browser for OIDC login):
-#     ./scripts/fulcio-codesign.sh dist/bin/capsper
+#     ./scripts/fulcio-codesign.sh dist/macos/bin/capsper
 #
 # Requirements: openssl, curl, jq, rcodesign, csreq (macOS)
 

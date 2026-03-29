@@ -192,7 +192,7 @@ test "incremental mel matches batch mel" {
     }
 
     // Load filterbank (free the underlying u8 allocation via ptrCast)
-    const fb = nemo_mel.loadFilterbank(allocator, "dist/models/nemotron/filterbank.bin") catch return;
+    const fb = nemo_mel.loadFilterbank(allocator, if (@import("builtin").os.tag == .macos) "dist/macos/models/nemotron/filterbank.bin" else "dist/linux/models/nemotron/filterbank.bin") catch return;
     defer allocator.free(@as([*]u8, @ptrCast(fb.ptr))[0 .. fb.len * @sizeOf(f32)]);
 
     // Batch computation (reference)
@@ -241,7 +241,7 @@ test "incremental mel — single sample at a time" {
         samples[i] = @floatCast(@sin(2.0 * math.pi * 1000.0 * t) * 0.3);
     }
 
-    const fb = nemo_mel.loadFilterbank(allocator, "dist/models/nemotron/filterbank.bin") catch return;
+    const fb = nemo_mel.loadFilterbank(allocator, if (@import("builtin").os.tag == .macos) "dist/macos/models/nemotron/filterbank.bin" else "dist/linux/models/nemotron/filterbank.bin") catch return;
     defer allocator.free(@as([*]u8, @ptrCast(fb.ptr))[0 .. fb.len * @sizeOf(f32)]);
 
     // Feed one sample at a time

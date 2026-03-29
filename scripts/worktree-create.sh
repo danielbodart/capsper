@@ -15,10 +15,17 @@ WORKTREE_DIR="$CWD/.claude/worktrees/$NAME"
 # Create the git worktree with a new branch based on HEAD
 git -C "$CWD" worktree add -b "$NAME" "$WORKTREE_DIR" HEAD >&2
 
+# Determine platform model directory
+if [ "$(uname -s)" = "Darwin" ]; then
+    PLATFORM_DIR="dist/macos"
+else
+    PLATFORM_DIR="dist/linux"
+fi
+
 # Symlink model directories (not in git, downloaded at install time)
 for model_name in nemotron nemotron-coreml; do
-    MAIN_MODEL_DIR="$CWD/dist/models/$model_name"
-    WT_MODEL_DIR="$WORKTREE_DIR/dist/models/$model_name"
+    MAIN_MODEL_DIR="$CWD/$PLATFORM_DIR/models/$model_name"
+    WT_MODEL_DIR="$WORKTREE_DIR/$PLATFORM_DIR/models/$model_name"
     if [ -d "$MAIN_MODEL_DIR" ] && [ ! -e "$WT_MODEL_DIR" ]; then
         mkdir -p "$(dirname "$WT_MODEL_DIR")"
         ln -s "$MAIN_MODEL_DIR" "$WT_MODEL_DIR" >&2 && echo "Symlinked $model_name model" >&2

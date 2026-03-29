@@ -2,12 +2,10 @@
 set -euo pipefail
 
 # Apply a staged capsper update (atomic symlink swap + service migration).
-# Called as ExecStartPre= before capsper starts.
+# Called as ExecStartPre= before capsper starts (Linux only).
 # Only acts if .update-pending exists.
 
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
-IS_MACOS=false
-[ "$(uname -s)" = "Darwin" ] && IS_MACOS=true
 
 main() {
     local pending_file="$INSTALL_DIR/.update-pending"
@@ -20,14 +18,6 @@ main() {
 
     local release_dir="$INSTALL_DIR/releases/$pending"
     [ -d "$release_dir/bin" ] || { echo "ERROR: Staged release $pending not found" >&2; exit 1; }
-
-    # Clean up old com.capsper.* LaunchAgents (renamed to io.github.danielbodart.capsper.*)
-    if $IS_MACOS; then
-        for old_label in com.capsper.capsper com.capsper.update; do
-            launchctl bootout "gui/$(id -u)/$old_label" 2>/dev/null || true
-            rm -f "$HOME/Library/LaunchAgents/$old_label.plist" 2>/dev/null || true
-        done
-    fi
 
     # Save current version for rollback
     local current_target
@@ -44,29 +34,27 @@ main() {
         rm -f "$recordings_dir"/*.wav "$recordings_dir"/*.log 2>/dev/null || true
     fi
 
-    # Linux: Symlink shared ORT libs into the new release so the binary can find
-    # them via RPATH ($ORIGIN/../lib). macOS uses system CoreML — no bundled libs.
-    if ! $IS_MACOS; then
-        local shared_lib_dir="$INSTALL_DIR/lib"
-        local release_lib_dir="$release_dir/lib"
-        if [ -d "$release_lib_dir" ] && [ -f "$release_lib_dir/libonnxruntime.so" ]; then
+    # Symlink shared ORT libs into the new release so the binary can find
+    # them via RPATH ($ORIGIN/../lib).
+    local shared_lib_dir="$INSTALL_DIR/lib"
+    local release_lib_dir="$release_dir/lib"
+    if [ -d "$release_lib_dir" ] && [ -f "$release_lib_dir/libonnxruntime.so" ]; then
+        mkdir -p "$shared_lib_dir"
+        cp -a "$release_lib_dir/"*.so "$release_lib_dir/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
+        [ -f "$release_lib_dir/DEPS_VERSION" ] && cp "$release_lib_dir/DEPS_VERSION" "$shared_lib_dir/"
+    fi
+    if [ ! -f "$shared_lib_dir/libonnxruntime.so" ] && [ -n "$current_target" ]; then
+        local prev_lib="$INSTALL_DIR/$current_target/lib"
+        if [ -d "$prev_lib" ] && [ -f "$prev_lib/libonnxruntime.so" ]; then
+            echo "Migrating ORT libs from previous release to shared directory..."
             mkdir -p "$shared_lib_dir"
-            cp -a "$release_lib_dir/"*.so "$release_lib_dir/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
-            [ -f "$release_lib_dir/DEPS_VERSION" ] && cp "$release_lib_dir/DEPS_VERSION" "$shared_lib_dir/"
+            cp -a "$prev_lib/"*.so "$prev_lib/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
+            [ -f "$prev_lib/DEPS_VERSION" ] && cp "$prev_lib/DEPS_VERSION" "$shared_lib_dir/"
         fi
-        if [ ! -f "$shared_lib_dir/libonnxruntime.so" ] && [ -n "$current_target" ]; then
-            local prev_lib="$INSTALL_DIR/$current_target/lib"
-            if [ -d "$prev_lib" ] && [ -f "$prev_lib/libonnxruntime.so" ]; then
-                echo "Migrating ORT libs from previous release to shared directory..."
-                mkdir -p "$shared_lib_dir"
-                cp -a "$prev_lib/"*.so "$prev_lib/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
-                [ -f "$prev_lib/DEPS_VERSION" ] && cp "$prev_lib/DEPS_VERSION" "$shared_lib_dir/"
-            fi
-        fi
-        if [ -d "$shared_lib_dir" ] && [ -f "$shared_lib_dir/libonnxruntime.so" ]; then
-            rm -rf "$release_lib_dir"
-            ln -sfn "$shared_lib_dir" "$release_lib_dir"
-        fi
+    fi
+    if [ -d "$shared_lib_dir" ] && [ -f "$shared_lib_dir/libonnxruntime.so" ]; then
+        rm -rf "$release_lib_dir"
+        ln -sfn "$shared_lib_dir" "$release_lib_dir"
     fi
 
     # Symlink shared models into the new release so the binary can find them
@@ -86,57 +74,36 @@ main() {
 
     # Abort if models are missing — the update script should have downloaded them.
     local nemotron_dir="$INSTALL_DIR/models/nemotron"
-    if $IS_MACOS; then
-        local coreml_dir="$INSTALL_DIR/models/nemotron-coreml"
-        if [ ! -d "$coreml_dir/encoder.mlmodelc" ] || [ ! -d "$coreml_dir/decoder.mlmodelc" ] \
-           || [ ! -f "$nemotron_dir/filterbank.bin" ] || [ ! -f "$nemotron_dir/tokens.txt" ]; then
-            echo "ERROR: CoreML models not found" >&2
-            echo "Run: ~/.local/share/capsper/capsper-update.sh" >&2
-            exit 1
-        fi
-        # Remove quarantine so Gatekeeper doesn't block the signed binary
-        xattr -d com.apple.quarantine "$release_dir/bin/capsper" 2>/dev/null || true
-    else
-        if [ ! -f "$nemotron_dir/encoder_model.onnx" ] || [ ! -f "$nemotron_dir/decoder_model.onnx" ] \
-           || [ ! -f "$nemotron_dir/filterbank.bin" ] || [ ! -f "$nemotron_dir/tokens.txt" ]; then
-            echo "ERROR: Nemotron model not found in $nemotron_dir" >&2
-            echo "Run: ~/.local/share/capsper/capsper-update.sh" >&2
-            exit 1
-        fi
-        # Migrate systemd service file: update model path, strip removed flags
-        migrate_service_config
+    if [ ! -f "$nemotron_dir/encoder_model.onnx" ] || [ ! -f "$nemotron_dir/decoder_model.onnx" ] \
+       || [ ! -f "$nemotron_dir/filterbank.bin" ] || [ ! -f "$nemotron_dir/tokens.txt" ]; then
+        echo "ERROR: Nemotron model not found in $nemotron_dir" >&2
+        echo "Run: ~/.local/share/capsper/capsper-update.sh" >&2
+        exit 1
     fi
 
-    # On Linux, create bin/capsper symlink to the right variant for this machine.
-    # Inline detection — this script must be self-contained (no install-common.sh dependency).
-    if [ "$(uname -s)" = "Linux" ]; then
-        local target="capsper-cpu"
-        if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-            target="capsper-cuda"
-        fi
-        ln -sf "$target" "$release_dir/bin/capsper"
-        echo "Selected binary: $target"
+    # Migrate systemd service file: update model path, strip removed flags
+    migrate_service_config
+
+    # Create bin/capsper symlink to the right variant for this machine.
+    local target="capsper-cpu"
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+        target="capsper-cuda"
     fi
+    ln -sf "$target" "$release_dir/bin/capsper"
+    echo "Selected binary: $target"
 
     # Atomic symlink swap (for models, scripts, VERSION, etc.)
     ln -sfn "releases/$pending" "$INSTALL_DIR/current.tmp"
     rm -f "$INSTALL_DIR/current"
     mv "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
 
-    # Copy the binary to a stable path so TCC (macOS) and service configs
-    # reference a fixed location that doesn't change across updates.
+    # Copy the selected variant to a stable path for service configs.
     # Uses cp + mv for atomic replacement (mv is atomic on same filesystem).
     mkdir -p "$INSTALL_DIR/bin"
-    if $IS_MACOS; then
-        cp "$release_dir/bin/capsper" "$INSTALL_DIR/bin/capsper.tmp"
-        mv "$INSTALL_DIR/bin/capsper.tmp" "$INSTALL_DIR/bin/capsper"
-    else
-        # Linux: copy the selected variant (capsper-cuda or capsper-cpu) as capsper
-        local selected
-        selected=$(readlink "$release_dir/bin/capsper" 2>/dev/null || echo "capsper")
-        cp "$release_dir/bin/$selected" "$INSTALL_DIR/bin/capsper.tmp"
-        mv "$INSTALL_DIR/bin/capsper.tmp" "$INSTALL_DIR/bin/capsper"
-    fi
+    local selected
+    selected=$(readlink "$release_dir/bin/capsper" 2>/dev/null || echo "capsper")
+    cp "$release_dir/bin/$selected" "$INSTALL_DIR/bin/capsper.tmp"
+    mv "$INSTALL_DIR/bin/capsper.tmp" "$INSTALL_DIR/bin/capsper"
 
     rm -f "$pending_file"
 

@@ -18,9 +18,9 @@ Zig and Bun are installed automatically via `bootstrap.sh` + mise.
 
 # Run directly (loads model, grabs keyboard, CapsLock = push-to-talk)
 # Linux:
-./dist/bin/capsper --trigger capslock --audio-channel FL --drop-terms drop-terms.txt
+./dist/linux/bin/capsper --trigger capslock --audio-channel FL --drop-terms drop-terms.txt
 # macOS:
-./dist/bin/capsper --trigger capslock --drop-terms drop-terms.txt
+./dist/macos/bin/capsper --trigger capslock --drop-terms drop-terms.txt
 
 # First-time setup (builds, configures permissions, installs service)
 ./run.ts setup
@@ -114,21 +114,24 @@ src/
 
 ### Build System & `dist/` Layout
 
-Pre-built onnxruntime shared libraries are committed in `dist/lib/` via Git LFS (Linux only). macOS uses system CoreML framework.
+Platform-specific files are separated into `dist/linux/` and `dist/macos/`, mirroring the `src/platform/` pattern. Shared scripts live in `dist/shared/`. Pre-built onnxruntime shared libraries are committed in `dist/linux/lib/` via Git LFS. macOS uses system CoreML framework.
 
 ```
 dist/
-├── bin/
-│   ├── capsper              (macOS: real binary. Linux: launcher script)
-│   ├── capsper-cuda         (Linux only — ORT + CUDA binary)
-│   └── capsper-cpu          (Linux only — ORT CPU binary)
-├── lib/                     (Linux: pre-built ORT .so files via LFS)
-├── lib-macos/               (macOS: ORT dylib — legacy, not used by CoreML)
-├── include/onnxruntime/     (ORT C API headers — Linux builds only)
-├── models/
-│   ├── nemotron/            (downloaded: filterbank.bin, tokens.txt, ONNX models)
-│   └── nemotron-coreml/     (downloaded: encoder.mlmodelc, decoder.mlmodelc)
-└── install.sh               (committed)
+├── linux/
+│   ├── bin/                     (build output: capsper-cuda, capsper-cpu, capsper symlink)
+│   ├── lib/                     (pre-built ORT .so files via LFS)
+│   ├── include/onnxruntime/     (ORT C API headers — build-time only)
+│   ├── install.sh               (Linux installer)
+│   ├── capsper-update.sh        (two-phase: stage only, applied on restart)
+│   ├── capsper-apply-update.sh  (ExecStartPre: applies staged update)
+│   └── capsper-rollback.sh      (OnFailure: auto-rollback)
+├── macos/
+│   ├── bin/                     (build output: capsper)
+│   ├── install.sh               (macOS installer — no auto-update)
+│   └── capsper-update.sh        (manual: download + immediate swap)
+└── shared/
+    └── install-common.sh        (shared helpers, model download, install_files)
 ```
 
 ## Deployment
@@ -136,14 +139,13 @@ dist/
 To update the running capsper service after CI passes:
 
 ```bash
-~/.local/share/capsper/capsper-update.sh    # downloads from GitHub Releases, stages, verifies SHA256
+# Both platforms: run the update script
+~/.local/share/capsper/capsper-update.sh    # downloads from GitHub Releases, verifies SHA256
 
-# Linux: apply-update.sh runs as ExecStartPre, swaps symlink
+# Linux: stages update, applied on next restart via ExecStartPre
 systemctl --user restart capsper
 
-# macOS: restart LaunchAgent
-launchctl bootout gui/$(id -u)/io.github.danielbodart.capsper 2>/dev/null
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.danielbodart.capsper.plist
+# macOS: downloads, swaps, and restarts in one step (no auto-update timer)
 ```
 
 Do NOT manually download CI artifacts or stage releases by hand — the update script handles everything.

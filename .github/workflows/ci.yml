@@ -19,7 +19,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .git/lfs
-          key: lfs-${{ hashFiles('dist/lib/*.so') }}
+          key: lfs-${{ hashFiles('dist/linux/lib/*.so') }}
           restore-keys: lfs-
       - run: git lfs pull
       - uses: actions/cache@v4
@@ -36,7 +36,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: capsper-linux-x86_64
-          path: dist/
+          path: dist/linux/
 
   macos:
     runs-on: macos-15
@@ -59,4 +59,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: capsper-macos-arm64
-          path: dist/
+          path: dist/macos/

@@ -5,7 +5,8 @@ import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, copyFileS
 import { tmpdir } from "os";
 import { join } from "path";
 
-export const BINARY = "./dist/bin/capsper";
+const IS_MACOS = process.platform === "darwin";
+export const BINARY = IS_MACOS ? "./dist/macos/bin/capsper" : "./dist/linux/bin/capsper";
 
 // Track all spawned child processes so we can kill them on exit/signal.
 // Prevents orphaned capsper processes holding GPU memory after Ctrl+C.

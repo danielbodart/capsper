@@ -6,11 +6,12 @@ import { join } from "path";
 process.env.FORCE_COLOR = "1";
 
 const IS_MACOS = process.platform === "darwin";
-const BINARY = IS_MACOS ? "./dist/bin/capsper" : "./dist/bin/capsper-cuda";
+const PLATFORM_DIR = IS_MACOS ? "dist/macos" : "dist/linux";
+const BINARY = IS_MACOS ? `./${PLATFORM_DIR}/bin/capsper` : `./${PLATFORM_DIR}/bin/capsper-cuda`;
 const SCRIPT_DIR = import.meta.dir;
 const TARBALL = IS_MACOS ? "capsper-macos-arm64.tar.gz" : "capsper-linux-x86_64.tar.gz";
 const DEPS_TARBALL = "capsper-linux-x86_64-deps.tar.gz";
-const LIB_DIR = "dist/lib"; // Linux only — macOS uses system CoreML frameworks
+const LIB_DIR = "dist/linux/lib"; // Linux only — macOS uses system CoreML frameworks
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -66,14 +67,14 @@ async function ensureDepsLinux() {
 
 function ensureBinary() {
     if (IS_MACOS) {
-        if (!existsSync("./dist/bin/capsper")) {
-            console.error("Binary not found: ./dist/bin/capsper");
+        if (!existsSync(`./${PLATFORM_DIR}/bin/capsper`)) {
+            console.error(`Binary not found: ./${PLATFORM_DIR}/bin/capsper`);
             console.error("Run: ./run.ts build");
             process.exit(1);
         }
     } else {
-        if (!existsSync("./dist/bin/capsper-cuda") && !existsSync("./dist/bin/capsper-cpu")) {
-            console.error("No binaries found in dist/bin/");
+        if (!existsSync(`./${PLATFORM_DIR}/bin/capsper-cuda`) && !existsSync(`./${PLATFORM_DIR}/bin/capsper-cpu`)) {
+            console.error(`No binaries found in ${PLATFORM_DIR}/bin/`);
             console.error("Run: ./run.ts build");
             process.exit(1);
         }
@@ -98,19 +99,19 @@ export async function build() {
     const ver = await version();
     if (IS_MACOS) {
         console.log(`Building v${ver} (coreml)...`);
-        await $`zig build --prefix dist -Dversion=${ver} -Doptimize=ReleaseSafe`;
+        await $`zig build --prefix ${PLATFORM_DIR} -Dversion=${ver} -Doptimize=ReleaseSafe`;
     } else {
         console.log(`Building v${ver} (ort-cuda)...`);
-        await $`zig build --prefix dist -Dbackend=ort_cuda -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
+        await $`zig build --prefix ${PLATFORM_DIR} -Dbackend=ort_cuda -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
         console.log(`Building v${ver} (ort-cpu)...`);
-        await $`zig build --prefix dist -Dbackend=ort_cpu -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
+        await $`zig build --prefix ${PLATFORM_DIR} -Dbackend=ort_cpu -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
         // Symlink capsper → capsper-cuda for dev (dist creates a proper launcher script)
-        await $`ln -sf capsper-cuda dist/bin/capsper`;
+        await $`ln -sf capsper-cuda ${PLATFORM_DIR}/bin/capsper`;
     }
 }
 
 export async function clean() {
-    await $`rm -rf dist/bin .zig-cache`;
+    await $`rm -rf ${PLATFORM_DIR}/bin .zig-cache`;
     console.log("Cleaned.");
 }
 
@@ -118,8 +119,7 @@ export async function setup() {
     await build();
 
     // Delegate permissions, audio detection, and service setup to install script
-    const installScript = IS_MACOS ? "install-macos.sh" : "install.sh";
-    const installSh = join(SCRIPT_DIR, "dist", installScript);
+    const installSh = join(SCRIPT_DIR, PLATFORM_DIR, "install.sh");
     if (existsSync(installSh)) {
         await $`bash ${installSh}`;
     } else {
@@ -131,7 +131,7 @@ export async function setup() {
 export async function dev() {
     await build();
     console.log("Running lint...");
-    await $`shellcheck dist/*.sh scripts/*.sh bootstrap.sh`;
+    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh bootstrap.sh`;
     console.log("Running unit + property tests...");
     await $`zig build test`;
     console.log("Running integration smoke tests...");
@@ -181,17 +181,17 @@ export async function dist() {
 
 async function distLinux() {
     // Validate that ORT libs are real ELF binaries
-    const { stdout } = await $`file dist/lib/*.so`.quiet();
+    const { stdout } = await $`file ${LIB_DIR}/*.so`.quiet();
     const lines = stdout.toString().trim().split("\n");
     const bad = lines.filter(l => !l.includes("ELF") && !l.includes("symbolic link"));
     if (bad.length > 0) {
-        console.error("ERROR: dist/lib/ contains non-ELF files:");
+        console.error("ERROR: dist/linux/lib/ contains non-ELF files:");
         bad.forEach(l => console.error(`  ${l}`));
         process.exit(1);
     }
 
     // Validate both binaries exist and contain no AVX-512
-    for (const bin of ["dist/bin/capsper-cuda", "dist/bin/capsper-cpu"]) {
+    for (const bin of [`${PLATFORM_DIR}/bin/capsper-cuda`, `${PLATFORM_DIR}/bin/capsper-cpu`]) {
         if (!existsSync(bin)) {
             console.error(`ERROR: ${bin} not found — did build() run?`);
             process.exit(1);
@@ -208,59 +208,59 @@ async function distLinux() {
     // The installer/apply-update overrides this with the correct variant (cuda or cpu)
     // based on GPU detection. The default ensures compatibility with older update
     // scripts that validate bin/capsper exists.
-    await $`ln -sf capsper-cpu dist/bin/capsper`;
+    await $`ln -sf capsper-cpu ${PLATFORM_DIR}/bin/capsper`;
 
     const ver = await version();
-    await Bun.write("dist/VERSION", ver);
+    await Bun.write(`${PLATFORM_DIR}/VERSION`, ver);
 
     // Generate DEPS_VERSION from sha256 of real ORT libs (skip symlinks)
-    const { stdout: depsHash } = await $`find dist/lib -name '*.so' -not -type l | sort | xargs sha256sum | sha256sum | cut -d' ' -f1`.quiet();
+    const { stdout: depsHash } = await $`find ${LIB_DIR} -name '*.so' -not -type l | sort | xargs sha256sum | sha256sum | cut -d' ' -f1`.quiet();
     const depsVersion = depsHash.toString().trim();
 
     // Binary tarball: binaries + scripts + lib/DEPS_VERSION marker
     // lib/ dir with just DEPS_VERSION satisfies old update scripts that check [ -d lib ]
-    await $`rm -rf /tmp/capsper-dist-linux`;
-    await $`mkdir -p /tmp/capsper-dist-linux`;
-    await $`cp -a dist/bin /tmp/capsper-dist-linux/`;
-    await $`mkdir -p /tmp/capsper-dist-linux/lib`;
-    await Bun.write("/tmp/capsper-dist-linux/lib/DEPS_VERSION", depsVersion);
-    for (const script of ["install.sh", "install-common.sh", "capsper-update.sh", "capsper-apply-update.sh", "capsper-rollback.sh"]) {
-        await $`cp dist/${script} /tmp/capsper-dist-linux/`;
+    const staging = "/tmp/capsper-dist-linux";
+    await $`rm -rf ${staging}`;
+    await $`mkdir -p ${staging}`;
+    await $`cp -a ${PLATFORM_DIR}/bin ${staging}/`;
+    await $`mkdir -p ${staging}/lib`;
+    await Bun.write(`${staging}/lib/DEPS_VERSION`, depsVersion);
+    for (const script of ["install.sh", "capsper-update.sh", "capsper-apply-update.sh", "capsper-rollback.sh"]) {
+        await $`cp ${PLATFORM_DIR}/${script} ${staging}/`;
     }
-    await $`cp dist/VERSION /tmp/capsper-dist-linux/`;
-    await $`tar -czf ${TARBALL} -C /tmp/capsper-dist-linux .`;
+    await $`cp dist/shared/install-common.sh ${staging}/`;
+    await $`cp ${PLATFORM_DIR}/VERSION ${staging}/`;
+    await $`tar -czf ${TARBALL} -C ${staging} .`;
     await $`sha256sum ${TARBALL} > ${TARBALL}.sha256`;
-    await $`rm -rf /tmp/capsper-dist-linux`;
+    await $`rm -rf ${staging}`;
     console.log(`Tarball: ${TARBALL} (v${ver})`);
 
     // Deps tarball: ORT shared libs + DEPS_VERSION
-    await $`mkdir -p /tmp/capsper-dist-deps/lib`;
-    await $`cp -a dist/lib/libonnxruntime* /tmp/capsper-dist-deps/lib/`;
-    await Bun.write("/tmp/capsper-dist-deps/lib/DEPS_VERSION", depsVersion);
-    await $`tar -czf ${DEPS_TARBALL} -C /tmp/capsper-dist-deps .`;
+    const depsStaging = "/tmp/capsper-dist-deps";
+    await $`mkdir -p ${depsStaging}/lib`;
+    await $`cp -a ${LIB_DIR}/libonnxruntime* ${depsStaging}/lib/`;
+    await Bun.write(`${depsStaging}/lib/DEPS_VERSION`, depsVersion);
+    await $`tar -czf ${DEPS_TARBALL} -C ${depsStaging} .`;
     await $`sha256sum ${DEPS_TARBALL} > ${DEPS_TARBALL}.sha256`;
-    await $`rm -rf /tmp/capsper-dist-deps`;
+    await $`rm -rf ${depsStaging}`;
     console.log(`Deps tarball: ${DEPS_TARBALL} (${depsVersion.slice(0, 12)})`);
 }
 
 async function distMacOS() {
     const ver = await version();
-    await Bun.write("dist/VERSION", ver);
+    await Bun.write(`${PLATFORM_DIR}/VERSION`, ver);
 
-    await $`rm -rf /tmp/capsper-dist-macos`;
-    await $`mkdir -p /tmp/capsper-dist-macos`;
-    await $`cp -r dist/bin /tmp/capsper-dist-macos/`;
-    // Rename install-macos.sh → install.sh so same instructions work on both platforms
-    await $`cp dist/install-macos.sh /tmp/capsper-dist-macos/install.sh`;
-    await $`cp dist/install-common.sh /tmp/capsper-dist-macos/`;
-    await $`cp dist/capsper-update.sh /tmp/capsper-dist-macos/`;
-    await $`cp dist/capsper-apply-update.sh /tmp/capsper-dist-macos/`;
-    await $`cp dist/capsper-rollback.sh /tmp/capsper-dist-macos/`;
-    await $`cp dist/capsper-launcher.sh /tmp/capsper-dist-macos/`;
-    await $`cp dist/VERSION /tmp/capsper-dist-macos/`;
-    await $`tar -czf ${TARBALL} -C /tmp/capsper-dist-macos .`;
+    const staging = "/tmp/capsper-dist-macos";
+    await $`rm -rf ${staging}`;
+    await $`mkdir -p ${staging}`;
+    await $`cp -r ${PLATFORM_DIR}/bin ${staging}/`;
+    await $`cp ${PLATFORM_DIR}/install.sh ${staging}/`;
+    await $`cp ${PLATFORM_DIR}/capsper-update.sh ${staging}/`;
+    await $`cp dist/shared/install-common.sh ${staging}/`;
+    await $`cp ${PLATFORM_DIR}/VERSION ${staging}/`;
+    await $`tar -czf ${TARBALL} -C ${staging} .`;
     await $`shasum -a 256 ${TARBALL} > ${TARBALL}.sha256`;
-    await $`rm -rf /tmp/capsper-dist-macos`;
+    await $`rm -rf ${staging}`;
     console.log(`Tarball: ${TARBALL} (v${ver})`);
 }
 
@@ -276,7 +276,7 @@ export async function sign() {
     // macOS: sign the Mach-O binary with Fulcio cert via rcodesign
     if (IS_MACOS) {
         console.log("Signing macOS binary with Fulcio...");
-        await $`./scripts/fulcio-codesign.sh dist/bin/capsper`;
+        await $`./scripts/fulcio-codesign.sh ${PLATFORM_DIR}/bin/capsper`;
         // Re-create tarball with signed binary
         await distMacOS();
     }
@@ -295,14 +295,14 @@ export async function sign() {
 }
 
 export async function lint() {
-    await $`shellcheck dist/*.sh bootstrap.sh scripts/*.sh`;
+    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh bootstrap.sh scripts/*.sh`;
 }
 
 export async function ci() {
     await ensureDeps();
     const ver = await version();
     console.log("Running lint...");
-    await $`shellcheck dist/*.sh scripts/*.sh bootstrap.sh`;
+    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh bootstrap.sh`;
     console.log("Running tests...");
     await $`zig build test`;
     await build();

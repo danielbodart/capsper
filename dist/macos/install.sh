@@ -10,15 +10,21 @@ set -euo pipefail
 # Usage:
 #   ./install.sh              Full interactive setup (download models, permissions, LaunchAgent)
 
-# shellcheck source=dist/install-common.sh
-source "$(cd "$(dirname "$0")" >/dev/null && pwd)/install-common.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
+
+# In a tarball, install-common.sh is alongside install.sh.
+# In the repo, it's in the sibling shared/ directory.
+if [ -f "$SCRIPT_DIR/install-common.sh" ]; then
+    # shellcheck source=dist/shared/install-common.sh
+    source "$SCRIPT_DIR/install-common.sh"
+else
+    # shellcheck source=dist/shared/install-common.sh
+    source "$SCRIPT_DIR/../shared/install-common.sh"
+fi
 
 PLIST_LABEL="io.github.danielbodart.capsper"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$PLIST_DIR/$PLIST_LABEL.plist"
-
-UPDATE_PLIST_LABEL="io.github.danielbodart.capsper.update"
-UPDATE_PLIST_PATH="$PLIST_DIR/$UPDATE_PLIST_LABEL.plist"
 
 # ─── Migration ───────────────────────────────────────────────────────────────
 
@@ -33,6 +39,11 @@ cleanup_old_launchagents() {
             rm -f "$old_plist"
         fi
     done
+
+    # Remove old auto-update timer (no longer used on macOS)
+    local update_label="io.github.danielbodart.capsper.update"
+    launchctl bootout "gui/$(id -u)/$update_label" 2>/dev/null || true
+    rm -f "$PLIST_DIR/$update_label.plist"
 }
 
 # ─── Quarantine ──────────────────────────────────────────────────────────────
@@ -51,8 +62,8 @@ install_service() {
     local model_dir="$2"
     shift 2
 
-    # Build command args — launcher applies pending updates then exec's capsper
-    local args=("$INSTALL_DIR/capsper-launcher.sh" "$binary" "--trigger" "capslock" "--model" "$model_dir/nemotron")
+    # Build command args — binary runs directly (no launcher wrapper)
+    local args=("$binary" "--trigger" "capslock" "--model" "$model_dir/nemotron")
 
     # Optional args passed as key=value pairs
     for arg in "$@"; do
@@ -98,40 +109,6 @@ $prog_args    </array>
 EOF
 
     echo "LaunchAgent installed: $PLIST_PATH"
-}
-
-# ─── Auto-Update Timer ────────────────────────────────────────────────────────
-
-install_update_timer() {
-    cat > "$UPDATE_PLIST_PATH" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>$UPDATE_PLIST_LABEL</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$INSTALL_DIR/capsper-update.sh</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>0</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>$INSTALL_DIR/update.log</string>
-    <key>StandardErrorPath</key>
-    <string>$INSTALL_DIR/update.log</string>
-</dict>
-</plist>
-EOF
-
-    launchctl bootout "gui/$(id -u)/$UPDATE_PLIST_LABEL" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$UPDATE_PLIST_PATH"
-    echo "Update timer installed (daily at noon)."
 }
 
 # ─── Service Control ──────────────────────────────────────────────────────────
@@ -275,7 +252,6 @@ cmd_install() {
             fi
 
             install_service "$INSTALL_DIR/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
-            install_update_timer
         else
             # Upgrade without config change: preserve settings
             extract_service_config
@@ -287,10 +263,11 @@ cmd_install() {
             [ "$SAVED_GAIN" != "1.0" ] && [ "$SAVED_GAIN" != "1" ] && service_args+=("audio-gain=$SAVED_GAIN")
 
             install_service "$INSTALL_DIR/bin/capsper" "$INSTALL_DIR/models" "${service_args[@]+"${service_args[@]}"}"
-            install_update_timer
         fi
     fi
 
+    echo ""
+    echo "To update capsper manually, run: capsper-update"
     echo ""
     if $is_upgrade && $was_running; then
         echo "Restarting service..."

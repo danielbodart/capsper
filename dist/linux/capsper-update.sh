@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Check for capsper updates from GitHub Releases.
+# Check for capsper updates from GitHub Releases (Linux).
 # Called by capsper-update.timer (daily).
 # Downloads and stages new versions; does NOT apply them.
 # The update is applied on next service restart via capsper-apply-update.sh.
@@ -10,26 +10,9 @@ REPO="danielbodart/capsper"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 HF_ONNX_REPO="danielbodart/nemotron-speech-600m-onnx"
 HF_ONNX_BASE="https://huggingface.co/${HF_ONNX_REPO}/resolve/main"
-HF_COREML_REPO="danielbodart/nemotron-speech-600m-coreml"
-HF_COREML_BASE="https://huggingface.co/${HF_COREML_REPO}/resolve/main"
+ASSET="capsper-linux-x86_64.tar.gz"
+DEPS_ASSET="capsper-linux-x86_64-deps.tar.gz"
 TMP_DIR=""
-
-IS_MACOS=false
-if [ "$(uname -s)" = "Darwin" ]; then
-    IS_MACOS=true
-    ASSET="capsper-macos-arm64.tar.gz"
-else
-    ASSET="capsper-linux-x86_64.tar.gz"
-    DEPS_ASSET="capsper-linux-x86_64-deps.tar.gz"
-fi
-
-sha256_check() {
-    if $IS_MACOS; then
-        shasum -a 256 -c "$1"
-    else
-        sha256sum -c "$1"
-    fi
-}
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
@@ -45,47 +28,6 @@ detect_model_variant() {
     else
         echo "int8-dynamic"
     fi
-}
-
-ensure_models() {
-    if $IS_MACOS; then
-        ensure_coreml_models
-    else
-        ensure_nemotron_model
-    fi
-}
-
-ensure_coreml_models() {
-    local coreml_dir="$INSTALL_DIR/models/nemotron-coreml"
-    local onnx_dir="$INSTALL_DIR/models/nemotron"
-    if [ -d "$coreml_dir/encoder.mlmodelc" ] && [ -d "$coreml_dir/decoder.mlmodelc" ] \
-       && [ -f "$onnx_dir/filterbank.bin" ] && [ -f "$onnx_dir/tokens.txt" ]; then
-        return 0
-    fi
-    download_coreml_models
-}
-
-download_coreml_models() {
-    local coreml_dir="$INSTALL_DIR/models/nemotron-coreml"
-    local onnx_dir="$INSTALL_DIR/models/nemotron"
-    mkdir -p "$coreml_dir" "$onnx_dir"
-
-    echo "Downloading CoreML models..."
-    for model in encoder decoder; do
-        local mlmodelc_dir="$coreml_dir/${model}.mlmodelc"
-        mkdir -p "$mlmodelc_dir/analytics"
-        curl -fsSL -o "$mlmodelc_dir/model.mlmodel" \
-            "$HF_COREML_BASE/fp16/${model}.mlmodelc/model.mlmodel"
-        curl -fsSL -o "$mlmodelc_dir/coremldata.bin" \
-            "$HF_COREML_BASE/fp16/${model}.mlmodelc/coremldata.bin"
-        curl -fsSL -o "$mlmodelc_dir/analytics/coremldata.bin" \
-            "$HF_COREML_BASE/fp16/${model}.mlmodelc/analytics/coremldata.bin"
-    done
-
-    # Shared files (filterbank + tokenizer)
-    curl -fsSL -o "$onnx_dir/filterbank.bin" "$HF_ONNX_BASE/shared/filterbank.bin"
-    curl -fsSL -o "$onnx_dir/tokens.txt" "$HF_ONNX_BASE/shared/tokens.txt"
-    echo "CoreML models downloaded."
 }
 
 ensure_nemotron_model() {
@@ -162,7 +104,7 @@ ensure_ort_libs() {
     # Verify SHA256 if available
     if curl -fSL -o "$TMP_DIR/$DEPS_ASSET.sha256" \
         "https://github.com/$REPO/releases/download/$release_tag/$DEPS_ASSET.sha256" 2>/dev/null; then
-        (cd "$TMP_DIR" && sha256_check "$DEPS_ASSET.sha256") || die "Deps SHA256 verification failed"
+        (cd "$TMP_DIR" && sha256sum -c "$DEPS_ASSET.sha256") || die "Deps SHA256 verification failed"
         echo "Deps SHA256 verified."
     fi
 
@@ -199,8 +141,6 @@ main() {
         local pending
         pending=$(cat "$INSTALL_DIR/.update-pending")
         if [ "$pending" = "$latest_tag" ]; then
-            # Ensure model is downloaded even if a previous run staged the
-            # release but was missing the download logic (whisper → nemotron transition)
             ensure_nemotron_model
             echo "Update $latest_tag already staged, pending restart."
             exit 0
@@ -217,7 +157,7 @@ main() {
     # Verify SHA256 checksum
     if curl -fSL -o "$TMP_DIR/$ASSET.sha256" \
         "https://github.com/$REPO/releases/download/$latest_tag/$ASSET.sha256" 2>/dev/null; then
-        (cd "$TMP_DIR" && sha256_check "$ASSET.sha256") || die "SHA256 verification failed"
+        (cd "$TMP_DIR" && sha256sum -c "$ASSET.sha256") || die "SHA256 verification failed"
         echo "SHA256 verified."
     fi
 
@@ -228,33 +168,23 @@ main() {
     tar -xzf "$TMP_DIR/$ASSET" -C "$release_dir"
 
     # Validate critical files exist
-    if $IS_MACOS; then
-        [ -f "$release_dir/bin/capsper" ] || die "Extracted release is missing capsper binary"
-    else
-        [ -f "$release_dir/bin/capsper-cuda" ] || [ -f "$release_dir/bin/capsper-cpu" ] \
-            || [ -f "$release_dir/bin/capsper" ] \
-            || die "Extracted release is missing capsper binaries"
-    fi
+    [ -f "$release_dir/bin/capsper-cuda" ] || [ -f "$release_dir/bin/capsper-cpu" ] \
+        || [ -f "$release_dir/bin/capsper" ] \
+        || die "Extracted release is missing capsper binaries"
 
     # Update top-level scripts from staged release
-    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh capsper-launcher.sh; do
+    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh; do
         if [ -f "$release_dir/$script" ]; then
             cp "$release_dir/$script" "$INSTALL_DIR/"
             chmod +x "$INSTALL_DIR/$script"
         fi
     done
 
-    # Platform-specific post-extraction
-    if $IS_MACOS; then
-        # Remove quarantine so Gatekeeper doesn't block the signed binary
-        xattr -d com.apple.quarantine "$release_dir/bin/capsper" 2>/dev/null || true
-    else
-        # Ensure ORT shared libs are present (downloads deps tarball if needed)
-        ensure_ort_libs "$release_dir" "$latest_tag"
-    fi
+    # Ensure ORT shared libs are present (downloads deps tarball if needed)
+    ensure_ort_libs "$release_dir" "$latest_tag"
 
     # Download models if not present or incomplete
-    ensure_models
+    ensure_nemotron_model
 
     # Clean up old releases (keep current + previous + newly staged)
     local keep_current keep_previous

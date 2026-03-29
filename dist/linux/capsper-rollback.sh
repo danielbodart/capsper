@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Roll back to the previous capsper version.
+# Roll back to the previous capsper version (Linux only).
 # Triggered by OnFailure= when capsper.service crashes repeatedly after an update.
 # Only rolls back if the update was applied less than 5 minutes ago.
 
@@ -53,11 +53,7 @@ main() {
     rm -f "$prev_file" "$timestamp_file" "$INSTALL_DIR/.update-pending"
 
     echo "Rolled back to $prev."
-    if [ "$(uname -s)" = "Darwin" ]; then
-        echo "Run: launchctl bootout gui/\$(id -u)/io.github.danielbodart.capsper; launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/io.github.danielbodart.capsper.plist"
-    else
-        echo "Run: systemctl --user reset-failed capsper.service && systemctl --user start capsper.service"
-    fi
+    echo "Run: systemctl --user reset-failed capsper.service && systemctl --user start capsper.service"
 }
 
 main "$@"

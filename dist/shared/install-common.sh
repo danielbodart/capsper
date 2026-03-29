@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Shared functions for capsper installers (sourced by install.sh and install-macos.sh).
+# Shared functions for capsper installers (sourced by linux/install.sh and macos/install.sh).
 # Not executable on its own.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
+# SCRIPT_DIR points to the platform installer's directory (the sourcing script),
+# not this file's directory. The sourcing script sets it before sourcing us.
+# In a tarball, install-common.sh is alongside install.sh so this works as-is.
+# In the repo, the platform installer overrides SCRIPT_DIR before sourcing.
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)}"
 
 HF_ONNX_REPO="danielbodart/nemotron-speech-600m-onnx"
 HF_ONNX_BASE="https://huggingface.co/${HF_ONNX_REPO}/resolve/main"
@@ -42,7 +46,9 @@ require_cmd() {
 }
 
 is_dev_mode() {
-    [ -d "$SCRIPT_DIR/../.git" ]
+    # In the repo: SCRIPT_DIR is dist/linux/ or dist/macos/, so .git is at ../../.git
+    # In a tarball: no .git directory exists at all
+    [ -d "$SCRIPT_DIR/../.git" ] || [ -d "$SCRIPT_DIR/../../.git" ]
 }
 
 # ─── Hardware Detection ──────────────────────────────────────────────────────
@@ -356,10 +362,15 @@ install_files() {
     rm -f "$INSTALL_DIR/current"
     mv "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
 
-    # Install update scripts
-    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh capsper-launcher.sh install-common.sh; do
+    # Install scripts (capsper-update.sh is always present; others are platform-specific).
+    # In a tarball, all scripts are in SCRIPT_DIR. In the repo, install-common.sh
+    # is in the sibling shared/ directory.
+    for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh install-common.sh; do
         if [ -f "$SCRIPT_DIR/$script" ]; then
             cp "$SCRIPT_DIR/$script" "$INSTALL_DIR/"
+            chmod +x "$INSTALL_DIR/$script"
+        elif [ -f "$SCRIPT_DIR/../shared/$script" ]; then
+            cp "$SCRIPT_DIR/../shared/$script" "$INSTALL_DIR/"
             chmod +x "$INSTALL_DIR/$script"
         fi
     done

@@ -1,11 +1,11 @@
 import { describe, test, expect, beforeAll } from "bun:test";
 import { $, spawn, file } from "bun";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { ensureBinary, ensureFile, wavDuration, trackProc, saveLog } from "./helpers";
 
 const HELPERS = "test/macos-audio-helpers";
-const BINARY = "./dist/bin/capsper";
-const MODEL_DIR = "dist/models/nemotron";
+const BINARY = "./dist/macos/bin/capsper";
+const MODEL_DIR = "dist/macos/models/nemotron";
 const PLIST_NAME = "io.github.danielbodart.capsper.test";
 const PLIST_PATH = `/tmp/${PLIST_NAME}.plist`;
 

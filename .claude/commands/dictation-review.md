@@ -9,11 +9,11 @@ Analyze captured debug recordings to find transcription issues and create regres
 2. **Find model path**: Check the service config for the `--model` path:
    - **Linux**: parse `~/.config/systemd/user/capsper.service` for the `ExecStart=` line
    - **macOS**: parse `~/Library/LaunchAgents/io.github.danielbodart.capsper.plist` with `plutil -convert json -o - | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('ProgramArguments',[])))"`
-   - Fall back to `dist/models/nemotron`
+   - Fall back to `dist/macos/models/nemotron` (macOS) or `dist/linux/models/nemotron` (Linux)
 
 3. **For each recording**:
    - Read the `.log` file and extract the "Emitted Text" section (what streaming mode produced)
-   - Batch-transcribe the `.wav` file using: `./dist/bin/capsper --transcribe <file> --model <model> 2>/dev/null`
+   - Batch-transcribe the `.wav` file using the platform binary (e.g. `./dist/macos/bin/capsper --transcribe <file> --model <model> 2>/dev/null`)
    - Compare streaming vs batch output, normalizing both (lowercase, strip punctuation except apostrophes)
    - Calculate the WAV duration: `(file_size - 44) / 32000` seconds
 
