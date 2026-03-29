@@ -346,7 +346,11 @@ security list-keychains -d user -s $ORIGINAL_KEYCHAINS
 
 echo ""
 echo "=== Verification ==="
-codesign -dvvv "$BINARY" 2>&1 | head -20
+# codesign -dvvv may return a non-zero exit for Fulcio-signed binaries
+# because the Sigstore CA is not in Apple's trust store. This is expected
+# and does not affect functionality — TCC reads the signing identity from
+# the CMS blob regardless of chain trust.
+codesign -dvvv "$BINARY" 2>&1 | head -20 || true
 echo ""
 echo "Entitlements:"
 codesign -d --entitlements - "$BINARY" 2>&1
