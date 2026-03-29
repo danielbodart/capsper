@@ -10,15 +10,17 @@ int capsper_mic_permission_status(void) {
     return (int)[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
 }
 
-// Blocks until the user responds to the permission dialog.
-// Returns 1 if granted, 0 if denied.
+// Blocks until microphone permission is granted.
 // If status is notDetermined, shows the permission dialog and blocks.
-// If status is denied, polls for up to 30 seconds in case a permission
-// dialog from a previous launch is still visible (launchd restarts can
-// race with the user clicking "Allow").
+// If status is denied, blocks and polls indefinitely — the user may be
+// responding to a dialog from a previous launch, or may grant access
+// via System Settings. Either way, we wait rather than crash and restart
+// (which would spawn duplicate permission dialogs via launchd KeepAlive).
+// Returns 1 if granted, 0 only for restricted (system policy, no recovery).
 int capsper_mic_request_permission(void) {
     AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
     if (status == AVAuthorizationStatusAuthorized) return 1;
+    if (status == AVAuthorizationStatusRestricted) return 0;
 
     if (status == AVAuthorizationStatusNotDetermined) {
         __block int granted = 0;
@@ -28,19 +30,17 @@ int capsper_mic_request_permission(void) {
             dispatch_semaphore_signal(sem);
         }];
         dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        return granted;
+        if (granted) return 1;
+        // User denied — fall through to polling below
     }
 
-    // Status is denied or restricted. Poll briefly in case the user is
-    // responding to a mic dialog from a previous launch attempt — launchd's
-    // KeepAlive restarts can overlap with a pending permission prompt.
-    for (int i = 0; i < 15; i++) {
-        [NSThread sleepForTimeInterval:2.0];
+    // Denied: poll every 5s until granted. The user can grant access via
+    // System Settings → Privacy & Security → Microphone at any time.
+    while (1) {
+        [NSThread sleepForTimeInterval:5.0];
         if ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]
                 == AVAuthorizationStatusAuthorized) {
             return 1;
         }
     }
-    return 0;
 }
-
