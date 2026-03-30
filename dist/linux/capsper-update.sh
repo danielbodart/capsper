@@ -18,6 +18,20 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
+# Atomically copy .so files from src_dir to dst_dir.
+# Uses cp-to-temp + mv (rename) so the running process keeps
+# reading from the old inode — prevents mmap corruption.
+atomic_copy_libs() {
+    local src_dir="$1" dst_dir="$2"
+    for f in "$src_dir"/*.so "$src_dir"/*.so.*; do
+        [ -e "$f" ] || continue
+        local name
+        name=$(basename "$f")
+        cp -a "$f" "$dst_dir/$name.tmp"
+        mv -f "$dst_dir/$name.tmp" "$dst_dir/$name"
+    done
+}
+
 current_version() {
     cat "$INSTALL_DIR/current/VERSION" 2>/dev/null || echo "unknown"
 }
@@ -72,7 +86,7 @@ ensure_ort_libs() {
     if [ -f "$release_dir/lib/libonnxruntime.so" ]; then
         echo "Migrating bundled ORT libs to shared directory..."
         mkdir -p "$shared_lib"
-        cp -a "$release_dir/lib/"*.so "$release_dir/lib/"*.so.* "$shared_lib/" 2>/dev/null || true
+        atomic_copy_libs "$release_dir/lib" "$shared_lib"
         [ -n "$needed_version" ] && cp "$release_dir/lib/DEPS_VERSION" "$shared_lib/"
         return 0
     fi
@@ -110,7 +124,13 @@ ensure_ort_libs() {
 
     mkdir -p "$shared_lib" "$TMP_DIR/deps"
     tar -xzf "$TMP_DIR/$DEPS_ASSET" -C "$TMP_DIR/deps"
-    cp -a "$TMP_DIR/deps/lib/"* "$shared_lib/"
+    atomic_copy_libs "$TMP_DIR/deps/lib" "$shared_lib"
+    # Copy non-.so files (DEPS_VERSION, etc.) normally
+    for f in "$TMP_DIR/deps/lib/"*; do
+        case "$f" in *.so|*.so.*) continue ;; esac
+        [ -e "$f" ] || continue
+        cp -a "$f" "$shared_lib/"
+    done
     echo "ORT runtime libraries installed."
 }
 
