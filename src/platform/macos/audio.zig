@@ -20,7 +20,6 @@ const ca = @cImport({
 });
 
 // Objective-C helper for microphone permission (mic_permission_macos.m)
-extern fn capsper_mic_permission_status() c_int;
 extern fn capsper_mic_request_permission() c_int;
 
 /// Shared state between main thread and CoreAudio callback thread.
@@ -62,12 +61,11 @@ pub const AudioCapture = struct {
         // Skip when a specific target device is given (e.g. BlackHole loopback) —
         // virtual devices deliver real audio without mic permission, and the user
         // explicitly chose the device.
-        const mic_status = if (target != null) @as(c_int, 3) else capsper_mic_permission_status();
-        if (mic_status != 3) {
-            // Not yet authorized — blocks until the user grants permission.
-            // For notDetermined: shows the system dialog and waits.
-            // For denied: polls until granted via System Settings.
-            // Never returns failure except for restricted (system policy).
+        if (target == null) {
+            // Request microphone permission — single call to avoid duplicate
+            // TCC dialogs. Blocks until granted (shows dialog if needed, then
+            // polls if denied). Skipped for explicit target devices (e.g.
+            // BlackHole loopback) which work without mic permission.
             log.info("Waiting for microphone permission...", .{});
             if (capsper_mic_request_permission() == 0) {
                 log.err("Microphone access is restricted by system policy.", .{});

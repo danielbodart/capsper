@@ -2,40 +2,33 @@
 //
 // CoreAudio silently delivers zero samples when microphone permission
 // hasn't been granted. This helper uses AVFoundation (Objective-C) to
-// check and request permission before starting capture.
+// request permission before starting capture.
 
 #import <AVFoundation/AVFoundation.h>
-// Returns: 0 = not determined, 1 = restricted, 2 = denied, 3 = authorized
-int capsper_mic_permission_status(void) {
-    return (int)[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
-}
 
 // Blocks until microphone permission is granted.
-// If status is notDetermined, shows the permission dialog and blocks.
-// If status is denied, blocks and polls indefinitely — the user may be
-// responding to a dialog from a previous launch, or may grant access
-// via System Settings. Either way, we wait rather than crash and restart
-// (which would spawn duplicate permission dialogs via launchd KeepAlive).
-// Returns 1 if granted, 0 only for restricted (system policy, no recovery).
+// Makes exactly ONE permission request to avoid duplicate TCC dialogs,
+// then polls if denied. Never returns — the process stays alive waiting
+// for the user to grant access (via dialog or System Settings), so
+// launchd doesn't restart and spawn duplicate prompts.
+// Returns 1 when granted. Only returns 0 for restricted (system policy).
 int capsper_mic_request_permission(void) {
-    AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
-    if (status == AVAuthorizationStatusAuthorized) return 1;
-    if (status == AVAuthorizationStatusRestricted) return 0;
+    // Single requestAccess call — handles all states:
+    //   authorized:     completion fires immediately with YES
+    //   notDetermined:  shows dialog, blocks until user responds
+    //   denied:         completion fires immediately with NO
+    //   restricted:     completion fires immediately with NO
+    __block int granted = 0;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL g) {
+        granted = g ? 1 : 0;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    if (granted) return 1;
 
-    if (status == AVAuthorizationStatusNotDetermined) {
-        __block int granted = 0;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL g) {
-            granted = g ? 1 : 0;
-            dispatch_semaphore_signal(sem);
-        }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        if (granted) return 1;
-        // User denied — fall through to polling below
-    }
-
-    // Denied: poll every 5s until granted. The user can grant access via
-    // System Settings → Privacy & Security → Microphone at any time.
+    // Denied or restricted. Poll until granted — the user may grant
+    // access via System Settings at any time.
     while (1) {
         [NSThread sleepForTimeInterval:5.0];
         if ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]
