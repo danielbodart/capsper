@@ -169,6 +169,16 @@ main() {
         local plist_path="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
         if [ -f "$plist_path" ]; then
             echo "Restarting service..."
+            # bootout is async — wait for the old service to fully tear down
+            local attempts=0
+            while launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; do
+                sleep 1
+                attempts=$((attempts + 1))
+                if [ "$attempts" -ge 10 ]; then
+                    echo "Warning: old service still registered after ${attempts}s"
+                    break
+                fi
+            done
             launchctl bootstrap "gui/$(id -u)" "$plist_path"
             echo "Service restarted. Check logs with:"
             echo "  tail -f $INSTALL_DIR/capsper.log"
