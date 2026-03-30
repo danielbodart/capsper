@@ -100,6 +100,12 @@ export async function build() {
     if (IS_MACOS) {
         console.log(`Building v${ver} (coreml)...`);
         await $`zig build --prefix ${PLATFORM_DIR} -Dversion=${ver} -Doptimize=ReleaseSafe`;
+        // Symlink installed models so the binary finds them at ../models/ relative to bin/
+        const modelsLink = `${PLATFORM_DIR}/models`;
+        const modelsTarget = join(process.env.HOME!, ".local/share/capsper/models");
+        if (!existsSync(modelsLink) && existsSync(modelsTarget)) {
+            await $`ln -s ${modelsTarget} ${modelsLink}`;
+        }
     } else {
         console.log(`Building v${ver} (ort-cuda)...`);
         await $`zig build --prefix ${PLATFORM_DIR} -Dbackend=ort_cuda -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
@@ -107,6 +113,12 @@ export async function build() {
         await $`zig build --prefix ${PLATFORM_DIR} -Dbackend=ort_cpu -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
         // Symlink capsper → capsper-cuda for dev (dist creates a proper launcher script)
         await $`ln -sf capsper-cuda ${PLATFORM_DIR}/bin/capsper`;
+        // Symlink installed models so the binary finds them at ../models/ relative to bin/
+        const modelsLink = `${PLATFORM_DIR}/models`;
+        const modelsTarget = join(process.env.HOME!, ".local/share/capsper/models");
+        if (!existsSync(modelsLink) && existsSync(modelsTarget)) {
+            await $`ln -s ${modelsTarget} ${modelsLink}`;
+        }
     }
 }
 

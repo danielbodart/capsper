@@ -19,9 +19,6 @@ const ca = @cImport({
     @cInclude("CoreAudio/CoreAudio.h");
 });
 
-// Objective-C helper for microphone permission (mic_permission_macos.m)
-extern fn capsper_mic_request_permission() c_int;
-
 /// Shared state between main thread and CoreAudio callback thread.
 /// Heap-allocated so the pointer remains stable for the unit's lifetime.
 const CallbackData = struct {
@@ -56,22 +53,10 @@ pub const AudioCapture = struct {
     pub fn init(target: ?[:0]const u8, _channel_position: u32) !AudioCapture {
         _ = _channel_position; // Channel selection deferred — mono only for now
 
-        // Check and request microphone permission before anything else.
-        // CoreAudio silently delivers zero samples without permission.
-        // Skip when a specific target device is given (e.g. BlackHole loopback) —
-        // virtual devices deliver real audio without mic permission, and the user
-        // explicitly chose the device.
-        if (target == null) {
-            // Request microphone permission — single call to avoid duplicate
-            // TCC dialogs. Blocks until granted (shows dialog if needed, then
-            // polls if denied). Skipped for explicit target devices (e.g.
-            // BlackHole loopback) which work without mic permission.
-            log.info("Waiting for microphone permission...", .{});
-            if (capsper_mic_request_permission() == 0) {
-                log.err("Microphone access is restricted by system policy.", .{});
-                return error.AudioInitFailed;
-            }
-        }
+        // Microphone permission is handled automatically by macOS:
+        // hardened runtime + com.apple.security.device.audio-input entitlement
+        // causes TCC to prompt when CoreAudio accesses the input device.
+        // No explicit requestAccessForMediaType: call needed.
 
         // Create pipe for passing PCM from CoreAudio thread to main thread
         const pipe_fds = try posix.pipe();

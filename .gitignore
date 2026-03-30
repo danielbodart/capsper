@@ -1,5 +1,7 @@
 dist/bin/
 dist/models/*
+dist/macos/models
+dist/linux/models
 zig-out/
 dist/VERSION
 .zig-cache/
