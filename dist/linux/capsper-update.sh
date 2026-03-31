@@ -192,11 +192,14 @@ main() {
         || [ -f "$release_dir/bin/capsper" ] \
         || die "Extracted release is missing capsper binaries"
 
-    # Update top-level scripts from staged release
+    # Update top-level scripts from staged release.
+    # Use cp-to-temp + mv (rename) so the running script keeps its old inode —
+    # a plain `cp` overwrites in-place, which corrupts bash's read position.
     for script in capsper-update.sh capsper-apply-update.sh capsper-rollback.sh; do
         if [ -f "$release_dir/$script" ]; then
-            cp "$release_dir/$script" "$INSTALL_DIR/"
-            chmod +x "$INSTALL_DIR/$script"
+            cp "$release_dir/$script" "$INSTALL_DIR/$script.tmp"
+            chmod +x "$INSTALL_DIR/$script.tmp"
+            mv -f "$INSTALL_DIR/$script.tmp" "$INSTALL_DIR/$script"
         fi
     done
 
