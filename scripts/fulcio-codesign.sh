@@ -306,13 +306,13 @@ echo "Signing identity: $IDENTITY_HASH"
 # Build the designated requirement
 # Pins on identifier + the Fulcio Source Repository URI OID.
 # In CI this is the actual repo URL; locally it's the Dex OAuth redirect.
-if [ -n "$CERT_REPO_URI" ]; then
-    DR="designated => identifier \"$IDENTIFIER\" and certificate leaf[field.$REPO_OID] = \"$CERT_REPO_URI\""
-    echo "DR: identifier + repo OID = $CERT_REPO_URI"
-else
-    DR="designated => identifier \"$IDENTIFIER\""
-    echo "DR: identifier only (no repo OID in cert)"
-fi
+# Use identifier-only DR. The Fulcio cert provides supply-chain verification
+# (via cosign/sigstore), but can't be used in the DR because macOS evaluates
+# certificate leaf fields via SecTrustEvaluate which treats the short-lived
+# Fulcio cert as expired — even with a secure timestamp. An identifier-only
+# DR lets TCC persist grants across builds without cert chain validation.
+DR="designated => identifier \"$IDENTIFIER\""
+echo "DR: identifier only"
 
 # Entitlements: hardened runtime requires explicit entitlements for mic access.
 # Without com.apple.security.device.audio-input, TCC silently denies the mic
