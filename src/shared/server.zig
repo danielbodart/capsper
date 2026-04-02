@@ -294,7 +294,7 @@ pub const Server = struct {
 
         const stdout_fd: posix.fd_t = 1; // STDOUT_FILENO
         if (self.type_callback != null) {
-            std.debug.print("Capturing audio, injecting text via uinput\n", .{});
+            std.debug.print("Capturing audio, injecting text via uinput.\n", .{});
         } else {
             std.debug.print("Capturing audio, transcribing to stdout\n", .{});
         }
