@@ -72,13 +72,13 @@ echo ""
 # ─── Step 3: Sign the bundle ───────────────────────────────────────────────
 
 echo "=== Step 3: Sign bundle with Fulcio ==="
-# fulcio-codesign.sh signs a Mach-O binary. We need to sign the binary
+# fulcio-codesign signs a Mach-O binary. We need to sign the binary
 # inside the bundle, then sign the bundle itself.
 # For now, sign just the inner binary with our existing script, then
 # codesign the bundle with an ad-hoc signature that preserves the inner sig.
 
 # Sign the binary inside the bundle with Fulcio (same DR as production)
-./scripts/fulcio-codesign.sh "$BUNDLE_DIR/Contents/MacOS/capsper"
+fulcio-codesign --identifier io.github.danielbodart.capsper --subject io.github.danielbodart.capsper --entitlements dist/macos/entitlements.plist "$BUNDLE_DIR/Contents/MacOS/capsper"
 
 # Record the cdhash for comparison later
 CDHASH_V1=$(codesign -dvvv "$BUNDLE_DIR/Contents/MacOS/capsper" 2>&1 | grep CDHash | head -1)
@@ -154,7 +154,7 @@ git checkout -- "$MARKER_FILE"
 cp dist/macos/bin/capsper "$BUNDLE_DIR/Contents/MacOS/capsper"
 
 # Re-sign with Fulcio (new ephemeral cert, new cdhash, same DR)
-./scripts/fulcio-codesign.sh "$BUNDLE_DIR/Contents/MacOS/capsper"
+fulcio-codesign --identifier io.github.danielbodart.capsper --subject io.github.danielbodart.capsper --entitlements dist/macos/entitlements.plist "$BUNDLE_DIR/Contents/MacOS/capsper"
 
 CDHASH_V2=$(codesign -dvvv "$BUNDLE_DIR/Contents/MacOS/capsper" 2>&1 | grep CDHash | head -1)
 echo ""

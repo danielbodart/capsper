@@ -285,10 +285,10 @@ export async function sign() {
 
     const hasOidc = !!process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
 
-    // macOS: sign the Mach-O binary with Fulcio cert via rcodesign
+    // macOS: sign the Mach-O binary with Fulcio cert
     if (IS_MACOS) {
         console.log("Signing macOS binary with Fulcio...");
-        await $`./scripts/fulcio-codesign.sh ${PLATFORM_DIR}/bin/capsper`;
+        await $`fulcio-codesign --identifier io.github.danielbodart.capsper --subject io.github.danielbodart.capsper --entitlements dist/macos/entitlements.plist ${PLATFORM_DIR}/bin/capsper`;
         // Re-create tarball with signed binary
         await distMacOS();
     }
