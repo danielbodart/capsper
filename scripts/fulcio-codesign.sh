@@ -328,7 +328,7 @@ cat > "$TMPDIR_WORK/entitlements.plist" <<ENTITLEMENTS
 </plist>
 ENTITLEMENTS
 
-codesign --force --options runtime \
+codesign --force --options runtime --timestamp \
     --identifier "$IDENTIFIER" \
     --entitlements "$TMPDIR_WORK/entitlements.plist" \
     -r="$DR" \
@@ -346,10 +346,10 @@ security list-keychains -d user -s $ORIGINAL_KEYCHAINS
 
 echo ""
 echo "=== Verification ==="
-# codesign -dvvv may return a non-zero exit for Fulcio-signed binaries
-# because the Sigstore CA is not in Apple's trust store. This is expected
-# and does not affect functionality — TCC reads the signing identity from
-# the CMS blob regardless of chain trust.
+# The --timestamp flag embeds an Apple-signed secure timestamp, proving
+# the signature was created while the Fulcio cert was valid. This allows
+# macOS to validate the cert chain (and thus the designated requirement's
+# certificate leaf OID check) even after the short-lived Fulcio cert expires.
 codesign -dvvv "$BINARY" 2>&1 | head -20 || true
 echo ""
 echo "Entitlements:"
