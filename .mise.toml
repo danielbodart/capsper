@@ -2,5 +2,11 @@
 zig = "0.15.2"
 bun = "1.3.10"
 shellcheck = "0.11.0"
-cosign = "3.0.5"
-"github:danielbodart/fulcio-codesign" = "latest"
+
+[tools.cosign]
+version = "3.0.5"
+os = ["macos", "linux"]
+
+[tools."github:danielbodart/fulcio-codesign"]
+version = "latest"
+os = ["macos"]
