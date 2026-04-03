@@ -11,9 +11,9 @@ const Recorder = recorder_mod.Recorder;
 const posix = std.posix;
 const net = std.net;
 
-// Global live state (module-level so input handler can access it via setLive).
-// Default not-live. Callers set it explicitly: runTcp on accept/disconnect,
-// main.zig for no-trigger local mode, trigger key press/release.
+// Global live state for local PTT mode (module-level so input handler can access it via setLive).
+// Default not-live. Callers set it explicitly: main.zig for no-trigger local mode, trigger key press/release.
+// TCP connections use their own per-connection atomic (always true).
 pub var is_live = std.atomic.Value(bool).init(false);
 
 // Global capture pointer — set by runLocalCapture so setLive can toggle the audio stream.
@@ -160,6 +160,12 @@ const ChunkedReader = struct {
 
 pub const InputMode = enum { tcp, local };
 
+/// Per-connection argument struct for TCP handler threads.
+const TcpConnection = struct {
+    server: *Server,
+    conn_fd: posix.fd_t,
+};
+
 /// Creates a fresh Pipeline for each connection.
 pub const PipelineFactory = struct {
     backend: *backend_init.BackendState,
@@ -217,10 +223,17 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server) !void {
-        switch (self.input_mode) {
-            .tcp => try self.runTcp(),
-            .local => try self.runLocalCapture(),
+        if (self.input_mode == .local) {
+            // Spawn local capture in a background thread, then run TCP in the calling thread.
+            const t = std.Thread.spawn(.{}, runLocalCaptureThread, .{self});
+            if (t) |thread| {
+                thread.detach();
+            } else |err| {
+                std.debug.print("Failed to spawn local capture thread: {}\n", .{err});
+                return err;
+            }
         }
+        try self.runTcp();
     }
 
     fn runTcp(self: *Server) !void {
@@ -231,7 +244,7 @@ pub const Server = struct {
         try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
         try posix.bind(listener, &address.any, address.getOsSockLen());
-        try posix.listen(listener, 1);
+        try posix.listen(listener, 8);
 
         // Query actual port (needed when self.port == 0 for OS-assigned port)
         var bound: net.Address = undefined;
@@ -243,20 +256,41 @@ pub const Server = struct {
 
         while (true) {
             const conn = try posix.accept(listener, null, null, posix.SOCK.CLOEXEC);
-            defer posix.close(conn);
 
-            std.debug.print("Client connected\n", .{});
-            setLive(true);
-            if (self.recorder) |rec| rec.startRecording();
-            self.handleConnection(conn, conn, self.type_callback) catch |err| {
-                std.debug.print("Connection error: {}\n", .{err});
+            const args = self.allocator.create(TcpConnection) catch {
+                std.debug.print("Failed to allocate TCP connection\n", .{});
+                posix.close(conn);
+                continue;
             };
-            if (self.recorder) |rec| rec.endRecording() catch |err| {
-                std.debug.print("[rec] write error: {}\n", .{err});
-            };
-            setLive(false);
-            std.debug.print("Client disconnected\n", .{});
+            args.* = .{ .server = self, .conn_fd = conn };
+            const t = std.Thread.spawn(.{}, tcpConnectionThread, .{args});
+            if (t) |thread| {
+                thread.detach();
+            } else |err| {
+                std.debug.print("Failed to spawn connection thread: {}\n", .{err});
+                posix.close(conn);
+                self.allocator.destroy(args);
+            }
         }
+    }
+
+    fn tcpConnectionThread(args: *TcpConnection) void {
+        defer {
+            posix.close(args.conn_fd);
+            args.server.allocator.destroy(args);
+        }
+        std.debug.print("Client connected\n", .{});
+        var live = std.atomic.Value(bool).init(true);
+        args.server.handleConnection(args.conn_fd, args.conn_fd, &live, null, null) catch |err| {
+            std.debug.print("Connection error: {}\n", .{err});
+        };
+        std.debug.print("Client disconnected\n", .{});
+    }
+
+    fn runLocalCaptureThread(self: *Server) void {
+        self.runLocalCapture() catch |err| {
+            std.debug.print("Local capture error: {}\n", .{err});
+        };
     }
 
     fn runLocalCapture(self: *Server) !void {
@@ -299,7 +333,7 @@ pub const Server = struct {
             std.debug.print("Capturing audio, transcribing to stdout\n", .{});
         }
 
-        self.handleConnection(capture.getFd(), stdout_fd, self.type_callback) catch |err| {
+        self.handleConnection(capture.getFd(), stdout_fd, &is_live, self.type_callback, &capture) catch |err| {
             std.debug.print("Local capture error: {}\n", .{err});
             return err;
         };
@@ -307,7 +341,9 @@ pub const Server = struct {
 
     /// PTT-gated streaming loop. Audio chunks go directly to the pipeline
     /// for incremental processing. No VAD — PTT press/release drives segmentation.
-    pub fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, type_cb: ?TypeCallback) !void {
+    /// For TCP connections, `live` is always true and `capture` is null.
+    /// For local connections, `live` points to the global is_live atomic and `capture` to the AudioCapture.
+    pub fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, live: *std.atomic.Value(bool), type_cb: ?TypeCallback, capture: ?*AudioCapture) !void {
         const asr = try self.pipeline_factory.create(self.allocator);
         defer {
             asr.deinit();
@@ -319,7 +355,7 @@ pub const Server = struct {
         // 560ms chunks = 56 mel frames × 160 hop × 2 bytes/sample = 17920 bytes
         const streaming_chunk_bytes: usize = 17920;
         var reader = ChunkedReader.init(audio_fd, streaming_chunk_bytes, true);
-        var was_live: bool = is_live.load(.monotonic);
+        var was_live: bool = live.load(.monotonic);
         var total_audio_bytes: usize = 0;
 
         while (true) {
@@ -349,10 +385,10 @@ pub const Server = struct {
             }
 
             total_audio_bytes += n;
-            const live = is_live.load(.monotonic);
+            const is_live_now = live.load(.monotonic);
 
             // PTT release edge: flush + reset
-            if (was_live and !live) {
+            if (was_live and !is_live_now) {
                 // Flush pipeline
                 const samples = try utils.pcmToFloat(self.allocator, audio);
                 defer self.allocator.free(samples);
@@ -380,13 +416,13 @@ pub const Server = struct {
             }
 
             // Not live: discard audio
-            if (!live) {
+            if (!is_live_now) {
                 was_live = false;
                 continue;
             }
 
             // PTT press edge: start fresh
-            if (!was_live and live) {
+            if (!was_live and is_live_now) {
                 asr.resetSegment();
                 was_live = true;
                 if (self.recorder) |rec| rec.startRecording();
@@ -399,9 +435,9 @@ pub const Server = struct {
             // Live: process chunk
             if (self.recorder) |rec| rec.recordPcm(audio);
 
-            // Auto-gain (local capture only)
+            // Auto-gain (local capture only — TCP connections pass null)
             if (!self.no_auto_gain) {
-                if (capture_ptr.load(.monotonic)) |cap| {
+                if (capture) |cap| {
                     const rms = utils.channelRms(audio, 1, 0);
                     if (auto_gain.update(rms)) |new_gain| {
                         cap.setGain(new_gain);
@@ -446,22 +482,17 @@ pub const Server = struct {
         return false;
     }
 
-    /// Write a timestamped delta to the output fd (or type callback) and log it.
+    /// Write transcription delta to the output fd (or type callback) and log it.
     fn emitDelta(self: *Server, output_fd: posix.fd_t, total_audio_bytes: usize, delta: []const u8, type_cb: ?TypeCallback) error{BrokenPipe}!void {
-        var ts_buf: [32]u8 = undefined;
-        const ts = formatAudioTime(&ts_buf, total_audio_bytes);
-
         if (type_cb) |cb| {
             // Inject text as keystrokes (evdev mode)
             cb.call(delta);
         } else {
-            // Write wire protocol to fd
-            _ = posix.write(output_fd, ts) catch return error.BrokenPipe;
-            _ = posix.write(output_fd, "\t") catch return error.BrokenPipe;
+            // Raw text stream — write exactly what the model produced
             _ = posix.write(output_fd, delta) catch return error.BrokenPipe;
-            _ = posix.write(output_fd, "\n") catch return error.BrokenPipe;
         }
-        std.debug.print("  [{s}s] >> {s}\n", .{ ts, delta });
+        var ts_buf: [32]u8 = undefined;
+        std.debug.print("  [{s}s] >> {s}\n", .{ formatAudioTime(&ts_buf, total_audio_bytes), delta });
         if (self.recorder) |rec| rec.logEmit(delta);
     }
 };

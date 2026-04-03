@@ -177,9 +177,7 @@ describe.skipIf(!isMacOS || !hasBinary || !hasModel || !blackhole)("ca-stream", 
             console.error("=== Streaming Output ===");
             console.error(output);
 
-            const wordCount = output.split("\n").filter(Boolean)
-                .map(line => line.split("\t").slice(1).join("\t"))
-                .join(" ").split(/\s+/).filter(Boolean).length;
+            const wordCount = output.split(/\s+/).filter(Boolean).length;
             console.error(`Total words emitted: ${wordCount}`);
 
             expect(wordCount).toBeGreaterThan(0);

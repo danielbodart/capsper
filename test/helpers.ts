@@ -370,12 +370,11 @@ export interface Emission {
     text: string;
 }
 
-/** Parse "timestamp\ttext\n" lines from server output. */
+/** Parse emissions from server output.
+ *  Raw text stream (no delimiters) — treat entire output as one emission. */
 export function parseEmissions(rawOutput: string): Emission[] {
-    return rawOutput.split("\n").filter(Boolean).map(line => {
-        const [ts, ...rest] = line.split("\t");
-        return { time: parseFloat(ts), text: rest.join("\t") };
-    });
+    if (rawOutput.trim().length === 0) return [];
+    return [{ time: 0, text: rawOutput }];
 }
 
 /** Find the maximum gap between consecutive emissions. */

@@ -18,10 +18,15 @@
 typedef struct {
     void *encoder;       // MLModel* (retained)
     void *decoder;       // MLModel* (retained)
+} CapsperCoreMLModels;
+
+// Per-pipeline encoder cache state. Each pipeline gets its own caches
+// so multiple transcriptions can run concurrently on the shared model.
+typedef struct {
     void *cache_channel; // MLMultiArray* (retained)
     void *cache_time;    // MLMultiArray* (retained)
     void *cache_len;     // MLMultiArray* (retained)
-} CapsperCoreMLModels;
+} CapsperCoreMLCaches;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -230,39 +235,53 @@ CapsperCoreMLModels *capsper_coreml_load(const char *model_dir) {
         models->encoder = (void *)CFBridgingRetain(encoder);
         models->decoder = (void *)CFBridgingRetain(decoder);
 
-        // Initialize cache state (batch-first: [1, 24, 70, 1024], [1, 24, 1024, 8], [1])
-        models->cache_channel = (void *)CFBridgingRetain(
-            make_zeros(@[@1, @24, @70, @1024], MLMultiArrayDataTypeFloat32));
-        models->cache_time = (void *)CFBridgingRetain(
-            make_zeros(@[@1, @24, @1024, @8], MLMultiArrayDataTypeFloat32));
-        models->cache_len = (void *)CFBridgingRetain(
-            make_zeros(@[@1], MLMultiArrayDataTypeInt32));
-
         NSLog(@"capsper_coreml: models loaded from %@", dir);
         return models;
     }
 }
 
-/// Release all CoreML models and cache state.
+/// Release all CoreML models.
 void capsper_coreml_release(CapsperCoreMLModels *models) {
     if (!models) return;
     @autoreleasepool {
         if (models->encoder) CFBridgingRelease(models->encoder);
         if (models->decoder) CFBridgingRelease(models->decoder);
-        if (models->cache_channel) CFBridgingRelease(models->cache_channel);
-        if (models->cache_time) CFBridgingRelease(models->cache_time);
-        if (models->cache_len) CFBridgingRelease(models->cache_len);
         free(models);
     }
 }
 
-/// Reset encoder cache state to zeros (call between utterances).
-void capsper_coreml_reset_state(CapsperCoreMLModels *models) {
-    if (!models) return;
+/// Create per-pipeline encoder cache state.
+CapsperCoreMLCaches *capsper_coreml_create_caches(void) {
     @autoreleasepool {
-        MLMultiArray *ch = (__bridge MLMultiArray *)(models->cache_channel);
-        MLMultiArray *t = (__bridge MLMultiArray *)(models->cache_time);
-        MLMultiArray *l = (__bridge MLMultiArray *)(models->cache_len);
+        CapsperCoreMLCaches *caches = (CapsperCoreMLCaches *)calloc(1, sizeof(CapsperCoreMLCaches));
+        caches->cache_channel = (void *)CFBridgingRetain(
+            make_zeros(@[@1, @24, @70, @1024], MLMultiArrayDataTypeFloat32));
+        caches->cache_time = (void *)CFBridgingRetain(
+            make_zeros(@[@1, @24, @1024, @8], MLMultiArrayDataTypeFloat32));
+        caches->cache_len = (void *)CFBridgingRetain(
+            make_zeros(@[@1], MLMultiArrayDataTypeInt32));
+        return caches;
+    }
+}
+
+/// Release per-pipeline encoder cache state.
+void capsper_coreml_release_caches(CapsperCoreMLCaches *caches) {
+    if (!caches) return;
+    @autoreleasepool {
+        if (caches->cache_channel) CFBridgingRelease(caches->cache_channel);
+        if (caches->cache_time) CFBridgingRelease(caches->cache_time);
+        if (caches->cache_len) CFBridgingRelease(caches->cache_len);
+        free(caches);
+    }
+}
+
+/// Reset encoder cache state to zeros (call between utterances).
+void capsper_coreml_reset_state(CapsperCoreMLCaches *caches) {
+    if (!caches) return;
+    @autoreleasepool {
+        MLMultiArray *ch = (__bridge MLMultiArray *)(caches->cache_channel);
+        MLMultiArray *t = (__bridge MLMultiArray *)(caches->cache_time);
+        MLMultiArray *l = (__bridge MLMultiArray *)(caches->cache_len);
         memset(ch.dataPointer, 0, ch.count * sizeof(float));
         memset(t.dataPointer, 0, t.count * sizeof(float));
         memset(l.dataPointer, 0, l.count * sizeof(int32_t));
@@ -282,15 +301,16 @@ void capsper_coreml_reset_state(CapsperCoreMLModels *models) {
 /// Returns 0 on success, -1 on error.
 int capsper_coreml_run_encoder(
     CapsperCoreMLModels *models,
+    CapsperCoreMLCaches *caches,
     const float *mel_data,
     float *out_encoded,
     int32_t *out_encoded_len
 ) {
     @autoreleasepool {
         MLModel *encoder = (__bridge MLModel *)(models->encoder);
-        MLMultiArray *cache_ch = (__bridge MLMultiArray *)(models->cache_channel);
-        MLMultiArray *cache_time = (__bridge MLMultiArray *)(models->cache_time);
-        MLMultiArray *cache_len = (__bridge MLMultiArray *)(models->cache_len);
+        MLMultiArray *cache_ch = (__bridge MLMultiArray *)(caches->cache_channel);
+        MLMultiArray *cache_time = (__bridge MLMultiArray *)(caches->cache_time);
+        MLMultiArray *cache_len = (__bridge MLMultiArray *)(caches->cache_len);
 
         // Wrap mel input (zero-copy)
         MLMultiArray *mel = wrap_f32((float *)mel_data, @[@1, @128, @65], 1 * 128 * 65);

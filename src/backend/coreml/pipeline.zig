@@ -31,8 +31,10 @@ const N_MELS = mel_state_mod.N_MELS;
 
 // CoreML C API (from coreml_helpers.m)
 pub const CapsperCoreMLModels = opaque {};
+pub const CapsperCoreMLCaches = opaque {};
 extern fn capsper_coreml_run_encoder(
     models: *CapsperCoreMLModels,
+    caches: *CapsperCoreMLCaches,
     mel_data: [*]const f32,
     out_encoded: [*]f32,
     out_encoded_len: *i32,
@@ -47,7 +49,9 @@ extern fn capsper_coreml_run_decoder(
     out_state_h: [*]f32,
     out_state_c: [*]f32,
 ) c_int;
-extern fn capsper_coreml_reset_state(models: *CapsperCoreMLModels) void;
+extern fn capsper_coreml_create_caches() ?*CapsperCoreMLCaches;
+extern fn capsper_coreml_release_caches(caches: *CapsperCoreMLCaches) void;
+extern fn capsper_coreml_reset_state(caches: *CapsperCoreMLCaches) void;
 
 /// Process-lifetime config. CoreML models are shared across connections.
 pub const CoreMLConfig = struct {
@@ -69,6 +73,9 @@ pub const CoreMLPipeline = struct {
     // Pre-encode cache: last PRE_ENCODE_CACHE mel frames from previous chunk
     pre_cache: [N_MELS * PRE_ENCODE_CACHE]f32 = [_]f32{0} ** (N_MELS * PRE_ENCODE_CACHE),
 
+    // Per-pipeline encoder cache state (CoreML MLMultiArrays)
+    caches: *CapsperCoreMLCaches,
+
     // RNNT decoder state
     dec_state1: []f32,
     dec_state2: []f32,
@@ -84,6 +91,8 @@ pub const CoreMLPipeline = struct {
     pub fn init(allocator: std.mem.Allocator, config: CoreMLConfig, verbose: bool) !CoreMLPipeline {
         const dec_state_size = PRED_LAYERS * 1 * PRED_HIDDEN;
 
+        const caches = capsper_coreml_create_caches() orelse return error.CoreMLCacheInitFailed;
+
         const dec_state1 = try allocator.alloc(f32, dec_state_size);
         errdefer allocator.free(dec_state1);
         @memset(dec_state1, 0);
@@ -97,6 +106,7 @@ pub const CoreMLPipeline = struct {
             .config = config,
             .verbose = verbose,
             .mel = NemoMelState.init(allocator, config.filterbank),
+            .caches = caches,
             .dec_state1 = dec_state1,
             .dec_state2 = dec_state2,
         };
@@ -107,6 +117,7 @@ pub const CoreMLPipeline = struct {
     }
 
     pub fn deinit(self: *CoreMLPipeline) void {
+        capsper_coreml_release_caches(self.caches);
         self.allocator.free(self.dec_state1);
         self.allocator.free(self.dec_state2);
         self.emitted_text.deinit(self.allocator);
@@ -154,7 +165,7 @@ pub const CoreMLPipeline = struct {
         self.mel.reset();
         self.mel_frame_cursor = 0;
         @memset(&self.pre_cache, 0);
-        capsper_coreml_reset_state(self.config.models);
+        capsper_coreml_reset_state(self.caches);
         @memset(self.dec_state1, 0);
         @memset(self.dec_state2, 0);
         self.last_token = tokenizer.BLANK_ID;
@@ -241,6 +252,7 @@ pub const CoreMLPipeline = struct {
 
         const status = capsper_coreml_run_encoder(
             self.config.models,
+            self.caches,
             &mel_input,
             &enc_output,
             &enc_len,

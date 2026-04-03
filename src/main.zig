@@ -22,7 +22,8 @@ const Recorder = @import("shared/recorder.zig").Recorder;
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var ts_allocator = std.heap.ThreadSafeAllocator{ .child_allocator = gpa.allocator() };
+    const allocator = ts_allocator.allocator();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -72,17 +73,9 @@ pub fn main() !void {
                 break :blk 43007;
             };
         } else if (std.mem.eql(u8, arg, "--input")) {
+            // Deprecated: local mode is now enabled by --trigger. Accept and skip for backwards compatibility.
             i += 1;
-            if (i < args.len) {
-                if (std.mem.eql(u8, args[i], "tcp")) {
-                    input_mode = .tcp;
-                } else if (std.mem.eql(u8, args[i], "local")) {
-                    input_mode = .local;
-                } else {
-                    std.debug.print("Invalid --input value '{s}', expected 'tcp' or 'local'\n", .{args[i]});
-                    return;
-                }
-            }
+            std.debug.print("Warning: --input is deprecated. Use --trigger to enable local mode alongside TCP.\n", .{});
         } else if (std.mem.eql(u8, arg, "--audio-target") or std.mem.eql(u8, arg, "--pw-target")) {
             i += 1;
             if (i < args.len) audio_target = args[i];
@@ -178,7 +171,7 @@ pub fn main() !void {
         return;
     }
 
-    // --trigger implies --input local (audio capture) and starts not-live (trigger key controls recording)
+    // --trigger enables local audio capture alongside TCP (trigger key controls PTT recording)
     if (trigger_key != null) {
         input_mode = .local;
     }
@@ -356,8 +349,8 @@ pub fn main() !void {
         };
 
         var server2 = Server.init(allocator, pipeline_factory, 0, .tcp, null, 0, verbose, false, null, drop_terms, null, 1.0, true);
-        server_mod.is_live.store(true, .monotonic);
-        server2.handleConnection(file.handle, 1, null) catch |err| {
+        var always_live = std.atomic.Value(bool).init(true);
+        server2.handleConnection(file.handle, 1, &always_live, null, null) catch |err| {
             std.debug.print("Stream error: {}\n", .{err});
         };
         file.close();
@@ -478,7 +471,7 @@ pub fn main() !void {
 fn printUsage() void {
     std.debug.print("Usage: capsper [--model PATH] [--port PORT]\n", .{});
     std.debug.print("       [--verbose|-v]\n", .{});
-    std.debug.print("       [--input tcp|local] [--audio-target NODE] [--audio-channel CHANNEL]\n", .{});
+    std.debug.print("       [--audio-target NODE] [--audio-channel CHANNEL]\n", .{});
     std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
     std.debug.print("       [--drop-terms FILE]\n", .{});
     std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
@@ -487,4 +480,8 @@ fn printUsage() void {
     std.debug.print("       [--audio-detect [--detect-duration SECS]]\n", .{});
     std.debug.print("       [--warmup-file FILE] [--no-warmup]\n", .{});
     std.debug.print("       [--dry-run] [--version]\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("TCP server is always active (default port 43007). Multiple clients can connect\n", .{});
+    std.debug.print("simultaneously, each getting an independent transcription pipeline.\n", .{});
+    std.debug.print("Use --trigger to also enable local audio capture with push-to-talk.\n", .{});
 }

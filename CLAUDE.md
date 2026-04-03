@@ -16,11 +16,14 @@ Zig and Bun are installed automatically via `bootstrap.sh` + mise.
 # Clean build artifacts
 ./run.ts clean
 
-# Run directly (loads model, grabs keyboard, CapsLock = push-to-talk)
+# Run directly (TCP server + local push-to-talk via CapsLock)
 # Linux:
 ./dist/linux/bin/capsper --trigger capslock --audio-channel FL --drop-terms drop-terms.txt
 # macOS:
 ./dist/macos/bin/capsper --trigger capslock --drop-terms drop-terms.txt
+
+# TCP-only mode (no local capture, for testing or remote transcription)
+./dist/linux/bin/capsper --drop-terms drop-terms.txt
 
 # First-time setup (builds, configures permissions, installs service)
 ./run.ts setup
@@ -55,7 +58,7 @@ On macOS, `./run.ts build` produces one binary. On Linux, it builds both `capspe
 
 ## Architecture
 
-Push-to-talk voice dictation for Linux and macOS. Self-contained binary per platform. On Linux: grabs keyboards via evdev, intercepts CapsLock, captures audio via PipeWire, transcribes with Nemotron RNNT (via onnxruntime), injects text via uinput. On macOS: CGEventTap input, CoreAudio capture, CoreML inference (93% ANE), CGEventPost injection.
+Push-to-talk voice dictation for Linux and macOS. Self-contained binary per platform. Supports multiple concurrent transcriptions — TCP server accepts multiple clients simultaneously, each getting an independent pipeline while sharing the single loaded model. Use `--trigger` to also enable local audio capture with push-to-talk alongside TCP. On Linux: grabs keyboards via evdev, intercepts CapsLock, captures audio via PipeWire, transcribes with Nemotron RNNT (via onnxruntime), injects text via uinput. On macOS: CGEventTap input, CoreAudio capture, CoreML inference (93% ANE), CGEventPost injection.
 
 > **History:** Capsper originally used whisper.cpp for ASR with Silero/TEN-VAD for voice activity detection. It now uses NVIDIA's Nemotron Speech 600M model (FastConformer RNNT) which is incremental and doesn't need a separate VAD — PTT (push-to-talk) is the sole gate. The name "Capsper" is a nod to Casper the friendly ghost — ghostwriting via CapsLock.
 
@@ -172,7 +175,7 @@ Do NOT manually download CI artifacts or stage releases by hand — the update s
 - Conversion scripts: [nemotron-speech-600m-coreml](https://github.com/danielbodart/nemotron-speech-600m-coreml) (CoreML), [nemotron-speech-600m-onnx](https://github.com/danielbodart/nemotron-speech-600m-onnx) (ONNX)
 - Audio format: 16kHz mono S16_LE PCM (32000 bytes/sec)
 - Default server port: 43007
-- CLI flags: `--audio-channel`, `--audio-target`, `--audio-gain`, `--audio-detect` (cross-platform names; `--pw-*` aliases kept for backwards compatibility)
+- CLI flags: `--audio-channel`, `--audio-target`, `--audio-gain`, `--audio-detect` (cross-platform names; `--pw-*` aliases kept for backwards compatibility). `--trigger` enables local audio capture + PTT alongside TCP. `--input` is deprecated.
 - Service management: `systemctl --user` on Linux, `launchctl bootstrap/bootout gui/$(id -u)` on macOS
 - Service files: `~/.config/systemd/user/capsper.service` (Linux), `~/Library/LaunchAgents/io.github.danielbodart.capsper.plist` (macOS)
 - Permissions: `input` group + udev rule on Linux; Accessibility + Microphone TCC on macOS
