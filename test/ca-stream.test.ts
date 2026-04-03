@@ -144,7 +144,6 @@ describe.skipIf(!isMacOS || !hasBinary || !hasModel || !blackhole)("ca-stream", 
         console.error(`BlackHole device ID: ${blackholeId}`);
 
         const server = await launchService([
-            "--input", "local",
             "--audio-target", "BlackHole 2ch",
             "--no-auto-gain",
             "--verbose",

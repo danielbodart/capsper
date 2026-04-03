@@ -33,9 +33,9 @@ describe.skipIf(!isLinux)("pw-stream", () => {
             expect(linkCheck).toBe(0); // PipeWire loopback must be available
 
             const server = await startLocalServer([
-                "--input", "local",
                 "--audio-target", LOOPBACK_SOURCE,
                 "--audio-channel", "MONO",
+                "--on-device-lost", "exit",
                 "--verbose",
             ]);
 
@@ -54,12 +54,12 @@ describe.skipIf(!isLinux)("pw-stream", () => {
                 await pwcat.exited;
 
                 // Kill the loopback → PipeWire destroys the source node →
-                // server's PW stream gets ERROR state → onStateChanged closes pipe →
-                // server's read() returns EOF → flush → idle
+                // hotplug monitor detects target removal → closes audio pipe →
+                // server's ChunkedReader gets EOF → clean exit.
                 try { loopback.kill(); } catch {}
-                await Bun.sleep(200); // let PipeWire propagate node destruction
+                await Bun.sleep(500); // let PipeWire propagate node destruction
 
-                await waitForLog(server.logFile, /flush → idle/, server.proc, 30);
+                await waitForLog(server.logFile, /handleConnection returning/, server.proc, 10);
 
                 const output = await file(server.outputFile).text();
                 console.error("");

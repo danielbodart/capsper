@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdatomic.h>
 
 /* Build a SPA pod for S16_LE mono capture at the given channel position.
@@ -284,6 +285,8 @@ struct pw_device_monitor {
     _Atomic uint32_t target_node_id;  /* PW id when present, 0 = absent */
     int        initial_enum_done;     /* set after first pw_core_sync */
     int        pending_sync;
+    _Atomic int exit_on_lost;         /* if set, close pipe_write_fd on target removal */
+    _Atomic int pipe_write_fd;        /* fd to close on target removal (-1 = none) */
 };
 
 static void
@@ -319,6 +322,13 @@ on_monitor_global_remove(void *data, uint32_t id)
     if (atomic_load(&m->target_node_id) == id) {
         atomic_store(&m->target_node_id, 0);
         fprintf(stderr, "[hotplug] Target device removed\n");
+        if (atomic_load(&m->exit_on_lost)) {
+            int fd = atomic_exchange(&m->pipe_write_fd, -1);
+            if (fd >= 0) {
+                fprintf(stderr, "[hotplug] Closing audio pipe (--on-device-lost exit)\n");
+                close(fd);
+            }
+        }
     }
 }
 
@@ -337,6 +347,8 @@ pw_device_monitor_create(const char *target)
     if (!m) return NULL;
 
     snprintf(m->target, sizeof(m->target), "%s", target);
+    atomic_store(&m->pipe_write_fd, -1);
+    atomic_store(&m->exit_on_lost, 0);
 
     m->thread_loop = pw_thread_loop_new("capsper-hotplug", NULL);
     if (!m->thread_loop) { free(m); return NULL; }
@@ -423,4 +435,12 @@ int
 pw_device_monitor_target_available(struct pw_device_monitor *m)
 {
     return atomic_load(&m->target_node_id) != 0;
+}
+
+void
+pw_device_monitor_set_exit_on_lost(struct pw_device_monitor *m, int pipe_write_fd)
+{
+    if (!m) return;
+    atomic_store(&m->pipe_write_fd, pipe_write_fd);
+    atomic_store(&m->exit_on_lost, 1);
 }

@@ -210,6 +210,14 @@ pub const AudioCapture = struct {
         _ = pw.pw_stream_set_active(self.stream, !corked);
     }
 
+    /// Enable exit-on-device-lost: when the target device is removed, close the
+    /// audio pipe so the server's ChunkedReader gets EOF and exits cleanly.
+    pub fn setExitOnDeviceLost(self: *AudioCapture) void {
+        if (self.monitor) |mon| {
+            pw.pw_device_monitor_set_exit_on_lost(mon, self.pipe_write_fd);
+        }
+    }
+
     pub fn getFd(self: *const AudioCapture) posix.fd_t {
         return self.pipe_read_fd;
     }

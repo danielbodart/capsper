@@ -132,7 +132,7 @@ migrate_service_config() {
 
         # Strip removed flags (with their arguments)
         local flag
-        for flag in --domain-terms --warmup-file --asr --vad --vad-threshold --vad-threshold-off --min-silence-ms --max-tokens-per-sec; do
+        for flag in --domain-terms --warmup-file --asr --vad --vad-threshold --vad-threshold-off --min-silence-ms --max-tokens-per-sec --input; do
             new_exec_start="${new_exec_start//$flag [^ ]* /}"
             new_exec_start="${new_exec_start//$flag [^ ]*/}"
         done

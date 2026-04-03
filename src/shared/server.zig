@@ -158,8 +158,6 @@ const ChunkedReader = struct {
     }
 };
 
-pub const InputMode = enum { tcp, local };
-
 /// Per-connection argument struct for TCP handler threads.
 const TcpConnection = struct {
     server: *Server,
@@ -178,8 +176,8 @@ pub const PipelineFactory = struct {
 pub const Server = struct {
     allocator: std.mem.Allocator,
     pipeline_factory: PipelineFactory,
-    port: u16,
-    input_mode: InputMode,
+    port: ?u16,
+    want_local: bool,
     audio_target: ?[:0]const u8,
     audio_channel: u32,
     verbose: bool,
@@ -189,12 +187,13 @@ pub const Server = struct {
     recorder: ?*Recorder,
     initial_gain: f32,
     no_auto_gain: bool,
+    exit_on_device_lost: bool,
 
     pub fn init(
         allocator: std.mem.Allocator,
         pipeline_factory: PipelineFactory,
-        port: u16,
-        input_mode: InputMode,
+        port: ?u16,
+        want_local: bool,
         audio_target: ?[:0]const u8,
         audio_channel: u32,
         verbose: bool,
@@ -204,12 +203,13 @@ pub const Server = struct {
         recorder: ?*Recorder,
         initial_gain: f32,
         no_auto_gain: bool,
+        exit_on_device_lost: bool,
     ) Server {
         return .{
             .allocator = allocator,
             .pipeline_factory = pipeline_factory,
             .port = port,
-            .input_mode = input_mode,
+            .want_local = want_local,
             .audio_target = audio_target,
             .audio_channel = audio_channel,
             .verbose = verbose,
@@ -219,12 +219,13 @@ pub const Server = struct {
             .recorder = recorder,
             .initial_gain = initial_gain,
             .no_auto_gain = no_auto_gain,
+            .exit_on_device_lost = exit_on_device_lost,
         };
     }
 
     pub fn run(self: *Server) !void {
-        if (self.input_mode == .local) {
-            // Spawn local capture in a background thread, then run TCP in the calling thread.
+        if (self.want_local and self.port != null) {
+            // Both modes: spawn local capture in background, run TCP in calling thread.
             const t = std.Thread.spawn(.{}, runLocalCaptureThread, .{self});
             if (t) |thread| {
                 thread.detach();
@@ -232,12 +233,16 @@ pub const Server = struct {
                 std.debug.print("Failed to spawn local capture thread: {}\n", .{err});
                 return err;
             }
+            try self.runTcp();
+        } else if (self.port != null) {
+            try self.runTcp();
+        } else if (self.want_local) {
+            try self.runLocalCapture();
         }
-        try self.runTcp();
     }
 
     fn runTcp(self: *Server) !void {
-        const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.port);
+        const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.port.?);
         const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
         defer posix.close(listener);
 
@@ -305,6 +310,10 @@ pub const Server = struct {
         // Register capture so setLive can toggle stream active state.
         capture_ptr.store(&capture, .monotonic);
         defer capture_ptr.store(null, .monotonic);
+
+        if (self.exit_on_device_lost) {
+            capture.setExitOnDeviceLost();
+        }
 
         // Apply calibrated initial gain (from --pw-gain) before first audio arrives
         if (self.initial_gain > 1.01) {

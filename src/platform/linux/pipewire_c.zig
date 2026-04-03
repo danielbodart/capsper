@@ -111,6 +111,7 @@ pub const pw_device_monitor = opaque {};
 pub extern fn pw_device_monitor_create(target: [*:0]const u8) ?*pw_device_monitor;
 pub extern fn pw_device_monitor_destroy(m: *pw_device_monitor) void;
 pub extern fn pw_device_monitor_target_available(m: *pw_device_monitor) c_int;
+pub extern fn pw_device_monitor_set_exit_on_lost(m: *pw_device_monitor, pipe_write_fd: c_int) void;
 
 // PipeWire property keys
 pub const PW_KEY_MEDIA_TYPE = pw.PW_KEY_MEDIA_TYPE;

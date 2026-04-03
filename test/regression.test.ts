@@ -157,9 +157,9 @@ async function streamPcmPipeWire(
     await Bun.sleep(500); // let PipeWire register the nodes
 
     const server = await startLocalServer([
-        "--input", "local",
         "--audio-target", LOOPBACK_SOURCE,
         "--audio-channel", "MONO",
+        "--on-device-lost", "exit",
         ...serverArgs,
     ]);
 
@@ -174,13 +174,11 @@ async function streamPcmPipeWire(
 
         await pwcat.exited;
 
-        // Kill the loopback → PipeWire destroys the source node →
-        // server's PW stream gets ERROR state → onStateChanged closes pipe →
-        // server's read() returns EOF → flush → idle
+        // Kill loopback → hotplug monitor closes audio pipe → clean EOF exit.
         try { loopback.kill(); } catch {}
-        await Bun.sleep(200); // let PipeWire propagate node destruction
+        await Bun.sleep(500);
 
-        await waitForLog(server.logFile, /flush → idle/, server.proc, 10);
+        await waitForLog(server.logFile, /handleConnection returning/, server.proc, 10);
 
         const output = await file(server.outputFile).text();
         return { output, logFile: server.logFile };

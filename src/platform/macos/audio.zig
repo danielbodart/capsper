@@ -309,6 +309,9 @@ pub const AudioCapture = struct {
         }
     }
 
+    /// No-op on macOS — device monitoring not yet implemented.
+    pub fn setExitOnDeviceLost(_: *AudioCapture) void {}
+
     pub fn getFd(self: *const AudioCapture) posix.fd_t {
         return self.pipe_read_fd;
     }

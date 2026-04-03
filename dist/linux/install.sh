@@ -74,6 +74,7 @@ install_service() {
     local enable_recordings="${8:-false}"
     local low_latency="${9:-false}"
     local gain="${10:-1.0}"
+    local tcp_port="${11:-}"
 
     local service_dir="$HOME/.config/systemd/user"
     mkdir -p "$service_dir"
@@ -91,6 +92,9 @@ install_service() {
     fi
     if $low_latency; then
         exec_start="$exec_start --low-latency"
+    fi
+    if [ -n "$tcp_port" ]; then
+        exec_start="$exec_start --port $tcp_port"
     fi
 
     {
@@ -148,6 +152,9 @@ extract_service_config() {
 
     SAVED_GAIN=$(echo "$exec_start" | sed -n 's/.*--\(audio\|pw\)-gain \([^ ]*\).*/\2/p')
     SAVED_GAIN="${SAVED_GAIN:-1.0}"
+
+    SAVED_TCP_PORT=$(echo "$exec_start" | sed -n 's/.*--port \([^ ]*\).*/\1/p')
+    SAVED_TCP_PORT="${SAVED_TCP_PORT:-}"
 }
 
 # ─── Auto-Update Infrastructure ──────────────────────────────────────────────
@@ -376,13 +383,25 @@ cmd_install() {
                 low_latency=true
             fi
 
+            local tcp_port=""
+            echo ""
+            echo "=== TCP Server (optional) ==="
+            echo "Enable a TCP server for remote transcription (e.g. from other tools)."
+            echo "Multiple clients can connect simultaneously."
+            if confirm_default_no "Enable TCP server?"; then
+                tcp_port="43007"
+                printf 'TCP port [43007]: '
+                read -r user_port
+                [ -n "$user_port" ] && tcp_port="$user_port"
+            fi
+
             local enable_updates=true
             echo ""
             if ! confirm "Enable automatic updates?"; then
                 enable_updates=false
             fi
 
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "" $enable_updates "$drop_terms" $enable_recordings $low_latency "$gain"
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "" $enable_updates "$drop_terms" $enable_recordings $low_latency "$gain" "$tcp_port"
 
             if $enable_updates; then
                 install_update_timer
@@ -392,7 +411,7 @@ cmd_install() {
             extract_service_config
 
             if has_auto_update; then
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" true "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN" "$SAVED_TCP_PORT"
             else
                 local enable_updates=true
                 echo ""
@@ -400,7 +419,7 @@ cmd_install() {
                     enable_updates=false
                 fi
 
-                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN"
+                install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$SAVED_CHANNEL" "$INSTALL_DIR/models" "$SAVED_TARGET" $enable_updates "$SAVED_DROP_TERMS" "$SAVED_RECORDINGS_ENABLED" "$SAVED_LOW_LATENCY" "$SAVED_GAIN" "$SAVED_TCP_PORT"
 
                 if $enable_updates; then
                     install_update_timer

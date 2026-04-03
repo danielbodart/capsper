@@ -10,7 +10,6 @@ const Pipeline = pipeline_mod.Pipeline;
 const server_mod = @import("shared/server.zig");
 const Server = server_mod.Server;
 const PipelineFactory = server_mod.PipelineFactory;
-const InputMode = server_mod.InputMode;
 const TypeCallback = server_mod.TypeCallback;
 const AudioCapture = @import("platform/audio.zig").AudioCapture;
 const input_mod = @import("platform/input.zig");
@@ -30,8 +29,7 @@ pub fn main() !void {
 
     var model_path: [:0]const u8 = "../models/nemotron";
     var model_path_is_default = true;
-    var port: u16 = 43007;
-    var input_mode: InputMode = .tcp;
+    var port: ?u16 = null;
     var audio_target: ?[:0]const u8 = null;
     var audio_channel: u32 = AudioCapture.default_channel;
     var verbose: bool = false;
@@ -49,8 +47,9 @@ pub fn main() !void {
     var low_latency: bool = false;
     var audio_gain: f32 = 1.0;
     var no_auto_gain: bool = false;
-    var warmup_file: ?[:0]const u8 = "jfk.wav";
-    var warmup_file_is_default = true;
+    var exit_on_device_lost: bool = false;
+    const warmup_file: ?[:0]const u8 = "jfk.wav";
+    const warmup_file_is_default = true;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -69,13 +68,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
             i += 1;
             if (i < args.len) port = std.fmt.parseInt(u16, args[i], 10) catch |err| blk: {
-                std.log.warn("invalid --port value '{s}': {}, using default {d}", .{ args[i], err, 43007 });
-                break :blk 43007;
+                std.log.warn("invalid --port value '{s}': {}", .{ args[i], err });
+                break :blk 0;
             };
-        } else if (std.mem.eql(u8, arg, "--input")) {
-            // Deprecated: local mode is now enabled by --trigger. Accept and skip for backwards compatibility.
-            i += 1;
-            std.debug.print("Warning: --input is deprecated. Use --trigger to enable local mode alongside TCP.\n", .{});
         } else if (std.mem.eql(u8, arg, "--audio-target") or std.mem.eql(u8, arg, "--pw-target")) {
             i += 1;
             if (i < args.len) audio_target = args[i];
@@ -132,7 +127,7 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--record-keep")) {
             i += 1;
             if (i < args.len) record_keep = std.fmt.parseInt(usize, args[i], 10) catch 10;
-        } else if (std.mem.eql(u8, arg, "--stream-wav")) {
+        } else if (std.mem.eql(u8, arg, "--stream") or std.mem.eql(u8, arg, "--stream-wav")) {
             i += 1;
             if (i < args.len) stream_wav_file = args[i];
         } else if (std.mem.eql(u8, arg, "--transcribe")) {
@@ -145,17 +140,24 @@ pub fn main() !void {
             low_latency = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-gain")) {
             no_auto_gain = true;
-        } else if (std.mem.eql(u8, arg, "--warmup-file")) {
+        } else if (std.mem.eql(u8, arg, "--on-device-lost")) {
             i += 1;
             if (i < args.len) {
-                warmup_file = args[i];
-                warmup_file_is_default = false;
+                if (std.mem.eql(u8, args[i], "exit")) {
+                    exit_on_device_lost = true;
+                } else if (std.mem.eql(u8, args[i], "wait")) {
+                    exit_on_device_lost = false;
+                } else {
+                    std.debug.print("Invalid --on-device-lost value '{s}', expected 'exit' or 'wait'\n", .{args[i]});
+                    return;
+                }
             }
-        } else if (std.mem.eql(u8, arg, "--no-warmup")) {
-            warmup_file = null;
         } else {
-            printUsage();
-            return;
+            // Unknown flag: warn and skip (with argument if it looks like it takes one)
+            std.debug.print("Warning: unknown option '{s}' will be ignored\n", .{arg});
+            if (i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-') {
+                i += 1; // skip argument value
+            }
         }
     }
 
@@ -171,9 +173,16 @@ pub fn main() !void {
         return;
     }
 
-    // --trigger enables local audio capture alongside TCP (trigger key controls PTT recording)
-    if (trigger_key != null) {
-        input_mode = .local;
+    // Determine run mode from flags:
+    // --audio-target (or --trigger which requires audio) → local capture
+    // --port → TCP server
+    // Both can be active simultaneously.
+    const want_local = audio_target != null or trigger_key != null;
+    const want_tcp = port != null;
+
+    if (!want_local and !want_tcp and stream_wav_file == null and transcribe_file == null and !do_audio_detect and !dry_run) {
+        printUsage();
+        return;
     }
 
     // Resolve exe-relative paths (default paths are relative to the binary location)
@@ -348,7 +357,7 @@ pub fn main() !void {
             return;
         };
 
-        var server2 = Server.init(allocator, pipeline_factory, 0, .tcp, null, 0, verbose, false, null, drop_terms, null, 1.0, true);
+        var server2 = Server.init(allocator, pipeline_factory, null, false, null, 0, verbose, false, null, drop_terms, null, 1.0, true, false);
         var always_live = std.atomic.Value(bool).init(true);
         server2.handleConnection(file.handle, 1, &always_live, null, null) catch |err| {
             std.debug.print("Stream error: {}\n", .{err});
@@ -430,10 +439,10 @@ pub fn main() !void {
         }
 
         // With trigger key: start not-live (trigger press goes live)
-        // Without trigger key in local mode: start live (always on)
+        // Without trigger key but with audio target: start live (always on)
         if (trigger_key != null) {
             server_mod.setLive(false);
-        } else if (input_mode == .local) {
+        } else if (want_local) {
             server_mod.setLive(true);
         }
     }
@@ -464,24 +473,44 @@ pub fn main() !void {
     }
 
     // Start server
-    var server = Server.init(allocator, pipeline_factory, port, input_mode, audio_target, audio_channel, verbose, low_latency, type_callback, drop_terms, recorder, audio_gain, no_auto_gain);
+    var server = Server.init(allocator, pipeline_factory, port, want_local, audio_target, audio_channel, verbose, low_latency, type_callback, drop_terms, recorder, audio_gain, no_auto_gain, exit_on_device_lost);
     try server.run();
 }
 
 fn printUsage() void {
-    std.debug.print("Usage: capsper [--model PATH] [--port PORT]\n", .{});
-    std.debug.print("       [--verbose|-v]\n", .{});
-    std.debug.print("       [--audio-target NODE] [--audio-channel CHANNEL]\n", .{});
-    std.debug.print("       [--trigger KEY] [--trigger-passthrough] [--type-delay MICROSECONDS]\n", .{});
-    std.debug.print("       [--drop-terms FILE]\n", .{});
-    std.debug.print("       [--record-dir DIR [--record-keep N]]\n", .{});
-    std.debug.print("       [--transcribe FILE] [--stream-wav FILE]\n", .{});
-    std.debug.print("       [--audio-gain FACTOR] [--no-auto-gain] [--low-latency]\n", .{});
-    std.debug.print("       [--audio-detect [--detect-duration SECS]]\n", .{});
-    std.debug.print("       [--warmup-file FILE] [--no-warmup]\n", .{});
-    std.debug.print("       [--dry-run] [--version]\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("TCP server is always active (default port 43007). Multiple clients can connect\n", .{});
-    std.debug.print("simultaneously, each getting an independent transcription pipeline.\n", .{});
-    std.debug.print("Use --trigger to also enable local audio capture with push-to-talk.\n", .{});
+    std.debug.print(
+        \\Usage: capsper <mode> [options]
+        \\
+        \\Modes (at least one required):
+        \\  --audio-target NODE      Local audio capture (always-live without --trigger)
+        \\  --trigger KEY             Enable push-to-talk (implies local capture)
+        \\  --port PORT              Start TCP server (multiple concurrent clients)
+        \\  --stream FILE            Stream WAV file through pipeline, output to stdout
+        \\  --transcribe FILE        Transcribe WAV file in one shot, output to stdout
+        \\  --audio-detect           Detect audio devices and channels, then exit
+        \\
+        \\Options:
+        \\  --model PATH             Model directory (default: ../models/nemotron)
+        \\  --audio-channel CHANNEL  Audio channel: MONO, FL, FR, AUX0-AUX63
+        \\  --audio-gain FACTOR      Initial gain multiplier
+        \\  --no-auto-gain           Disable automatic gain adjustment
+        \\  --on-device-lost MODE    exit or wait (default: wait)
+        \\  --low-latency            Use cork/uncork instead of connect/disconnect
+        \\  --trigger-passthrough    Pass trigger key through to applications
+        \\  --type-delay MICROSECONDS Delay between injected keystrokes (default: 12000)
+        \\  --drop-terms FILE        Filler words to suppress (one per line)
+        \\  --record-dir DIR         Save audio recordings to directory
+        \\  --record-keep N          Keep last N recordings (default: 10)
+        \\  --detect-duration SECS   Audio detection duration (default: 5)
+        \\  --verbose, -v            Verbose logging
+        \\  --dry-run                Load model and exit (verify setup)
+        \\  --version                Show version
+        \\
+        \\Examples:
+        \\  capsper --trigger capslock --audio-target my-mic
+        \\  capsper --trigger capslock --audio-target my-mic --port 43007
+        \\  capsper --port 0
+        \\  capsper --stream recording.wav
+        \\
+    , .{});
 }

@@ -72,6 +72,7 @@ install_service() {
             record-dir=*)  args+=("--record-dir" "${arg#*=}") ;;
             low-latency)   args+=("--low-latency") ;;
             audio-gain=*)  args+=("--audio-gain" "${arg#*=}") ;;
+            tcp-port=*)    args+=("--port" "${arg#*=}") ;;
         esac
     done
 
