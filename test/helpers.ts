@@ -47,13 +47,18 @@ export function tmpFile(prefix: string, ext: string): string {
 export async function waitForLog(logFile: string, pattern: RegExp, proc: ReturnType<typeof spawn>, timeoutSec = 60): Promise<string> {
     const deadline = Date.now() + timeoutSec * 1000;
     while (Date.now() < deadline) {
-        if (proc.exitCode !== null) {
-            const log = await file(logFile).text().catch(() => "(empty)");
-            throw new Error(`Server died during startup. Log:\n${log}`);
-        }
+        // Check the log FIRST — the process may cleanly self-exit (e.g.
+        // --on-device-lost exit) right after emitting the awaited line.
         const text = await file(logFile).text().catch(() => "");
         const match = text.match(pattern);
         if (match) return match[0];
+        if (proc.exitCode !== null) {
+            // Process gone; do a final read in case the line landed as it exited.
+            const finalText = await file(logFile).text().catch(() => "(empty)");
+            const finalMatch = finalText.match(pattern);
+            if (finalMatch) return finalMatch[0];
+            throw new Error(`Server exited (code ${proc.exitCode}) before matching ${pattern}. Log:\n${finalText.slice(-2000)}`);
+        }
         await Bun.sleep(500);
     }
     const log = await file(logFile).text().catch(() => "(empty)");

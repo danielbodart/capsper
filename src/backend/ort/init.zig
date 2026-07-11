@@ -44,6 +44,7 @@ pub const BackendState = struct {
         api.ReleaseSession.?(self.ort_enc_session);
         api.ReleaseMemoryInfo.?(self.ort_mem_info);
         api.ReleaseEnv.?(self.ort_env);
+        self.allocator.destroy(self);
     }
 };
 

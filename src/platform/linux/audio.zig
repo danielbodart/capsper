@@ -20,6 +20,9 @@ pub const AudioCapture = struct {
     pipe_write_fd: posix.fd_t,
     monitor: ?*pw.pw_device_monitor,
     connected_to_target: bool,
+    /// When true, the hotplug monitor owns pipe_write_fd (it closes it on
+    /// device removal), so deinit must not also close it.
+    exit_on_lost_armed: bool = false,
 
     /// Default channel: PipeWire SPA_AUDIO_CHANNEL_FL.
     pub const default_channel: u32 = pw.SPA_AUDIO_CHANNEL_FL;
@@ -215,6 +218,7 @@ pub const AudioCapture = struct {
     pub fn setExitOnDeviceLost(self: *AudioCapture) void {
         if (self.monitor) |mon| {
             pw.pw_device_monitor_set_exit_on_lost(mon, self.pipe_write_fd);
+            self.exit_on_lost_armed = true;
         }
     }
 
@@ -228,8 +232,12 @@ pub const AudioCapture = struct {
         pw.pw_stream_destroy(self.stream);
         pw.pw_thread_loop_destroy(self.thread_loop);
         posix.close(self.pipe_read_fd);
-        // pipe_write_fd may already be closed by onStateChanged
-        if (self.stream_data.pipe_write_fd != -1) {
+        // pipe_write_fd may be closed out-of-band: onStateChanged (stream error)
+        // nulls stream_data.pipe_write_fd; the hotplug monitor (when exit-on-lost
+        // is armed) closes it on device removal WITHOUT nulling the field. In the
+        // armed case the monitor owns the fd, so we must not close it here — a
+        // double-close panics (EBADF); a leaked fd at process exit is harmless.
+        if (!self.exit_on_lost_armed and self.stream_data.pipe_write_fd != -1) {
             posix.close(self.pipe_write_fd);
         }
         std.heap.page_allocator.destroy(self.stream_data);
