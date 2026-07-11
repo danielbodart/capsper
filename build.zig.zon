@@ -3,7 +3,11 @@
     .version = "0.0.1",
     .dependencies = .{
         .minish = .{
-            .url = "https://github.com/CogitatorTech/minish/archive/main.tar.gz",
+            // Pin to the immutable v0.1.0 tag — NOT main.tar.gz, which is a
+            // moving branch: upstream advancing main (0.1.0 → 0.3.0) broke the
+            // hash and failed CI on every push. Tag tarball is byte-identical
+            // to the pinned hash.
+            .url = "https://github.com/CogitatorTech/minish/archive/refs/tags/v0.1.0.tar.gz",
             .hash = "minish-0.1.0-SQtSTWHkAQACfz3xGuWHU8zbx320vK_47r2yto3Pq0Rf",
         },
     },
