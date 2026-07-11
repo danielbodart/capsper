@@ -178,7 +178,7 @@ async function streamPcmPipeWire(
         try { loopback.kill(); } catch {}
         await Bun.sleep(500);
 
-        await waitForLog(server.logFile, /handleConnection returning/, server.proc, 10);
+        await waitForLog(server.logFile, /session ended/, server.proc, 10);
 
         const output = await file(server.outputFile).text();
         return { output, logFile: server.logFile };

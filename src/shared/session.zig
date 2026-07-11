@@ -13,6 +13,7 @@
 // no keyboard, no clock, no sockets, no GPU.
 
 const std = @import("std");
+const posix = std.posix;
 const Recorder = @import("recorder.zig").Recorder;
 
 /// Input to the session driver. The *source* of these events is pluggable
@@ -140,6 +141,88 @@ pub const ScriptedEventSource = struct {
     }
 };
 
+/// EventSource for local push-to-talk capture. Multiplexes two fds with a
+/// blocking `poll` (no timeout — wakes only when something happens, so no
+/// wall-clock is baked into the hot path):
+///   - `audio_fd`: the PCM pipe from the capture thread → `audio` events.
+///   - `ptt_fd`: a pipe the input thread writes on each PTT transition
+///     (byte 1 = press, 0 = release) → `press`/`release` events.
+///
+/// PTT is checked before audio so a release is delivered promptly even mid
+/// audio — crucially, it is NOT starved when the capture stream corks on
+/// release (the bug that stopped recordings and let one segment run forever).
+/// Partial sub-chunk audio tails are held until they fill (same as the old
+/// ChunkedReader), so no full chunk is ever split.
+pub const LocalPttEventSource = struct {
+    audio_fd: posix.fd_t,
+    ptt_fd: posix.fd_t,
+    chunk_size: usize,
+    skip_digital_zero: bool,
+    buf: [32768]u8 = undefined,
+    buffered: usize = 0,
+    offset: usize = 0,
+    saw_eof: bool = false,
+
+    pub fn init(audio_fd: posix.fd_t, ptt_fd: posix.fd_t, chunk_size: usize, skip_digital_zero: bool) LocalPttEventSource {
+        return .{ .audio_fd = audio_fd, .ptt_fd = ptt_fd, .chunk_size = chunk_size, .skip_digital_zero = skip_digital_zero };
+    }
+
+    pub fn source(self: *LocalPttEventSource) EventSource {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = EventSource.VTable{ .next = nextImpl };
+
+    fn nextImpl(ptr: *anyopaque) anyerror!Event {
+        const self: *LocalPttEventSource = @ptrCast(@alignCast(ptr));
+        while (true) {
+            // Yield any buffered full chunk first (skipping all-zero chunks).
+            while (self.buffered - self.offset >= self.chunk_size) {
+                const start = self.offset;
+                self.offset += self.chunk_size;
+                const chunk = self.buf[start .. start + self.chunk_size];
+                if (self.skip_digital_zero and std.mem.allEqual(u8, chunk, 0)) continue;
+                return .{ .audio = chunk };
+            }
+            // Compact consumed bytes to the front so the next read has room.
+            if (self.offset > 0) {
+                const rem = self.buffered - self.offset;
+                if (rem > 0) std.mem.copyForwards(u8, self.buf[0..rem], self.buf[self.offset..self.buffered]);
+                self.buffered = rem;
+                self.offset = 0;
+            }
+            if (self.saw_eof) return .eof;
+
+            var fds = [_]posix.pollfd{
+                .{ .fd = self.ptt_fd, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = self.audio_fd, .events = posix.POLL.IN, .revents = 0 },
+            };
+            _ = try posix.poll(&fds, -1);
+
+            // PTT first — a release must not wait behind buffered audio.
+            if (fds[0].revents & posix.POLL.IN != 0) {
+                var b: [1]u8 = undefined;
+                const n = posix.read(self.ptt_fd, &b) catch 0;
+                if (n == 1) return if (b[0] != 0) Event.press else Event.release;
+                // n == 0: ptt pipe closed — ignore, fall through to audio.
+            }
+
+            // Audio — accumulate; the top of the loop yields once a chunk fills.
+            if (fds[1].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+                const n = posix.read(self.audio_fd, self.buf[self.buffered..]) catch |err| switch (err) {
+                    error.WouldBlock => continue,
+                    else => return err,
+                };
+                if (n == 0) {
+                    self.saw_eof = true;
+                    continue;
+                }
+                self.buffered += n;
+            }
+        }
+    }
+};
+
 // ──────────────────────────── tests ────────────────────────────
 
 const testing = std.testing;
@@ -224,6 +307,45 @@ test "driver: eof while idle just stops" {
 // actions against a REAL Recorder in a temp dir. Proves recording actually
 // writes a .wav — the thing that has been silently broken — with no keyboard,
 // clock, socket, or GPU. `transcribe` actions are no-ops here (no pipeline).
+fn expectTag(e: Event, tag: std.meta.Tag(Event)) !void {
+    try testing.expectEqual(tag, std.meta.activeTag(e));
+}
+
+// LocalPttEventSource multiplexes a PTT pipe and an audio pipe with real fds
+// (no hardware). Proves a release is delivered even though audio is present,
+// full chunks are yielded, and audio-pipe EOF surfaces as `.eof`.
+test "LocalPttEventSource: multiplexes PTT and audio over real pipes" {
+    const audio = try posix.pipe();
+    defer posix.close(audio[0]);
+    const ptt = try posix.pipe();
+    defer posix.close(ptt[0]);
+    defer posix.close(ptt[1]);
+
+    var impl = LocalPttEventSource.init(audio[0], ptt[0], 320, true);
+    const src = impl.source();
+
+    // press
+    _ = try posix.write(ptt[1], &[_]u8{1});
+    try expectTag(try src.next(), .press);
+
+    // one full audio chunk
+    const chunk = [_]u8{0x22} ** 320;
+    _ = try posix.write(audio[1], &chunk);
+    const a = try src.next();
+    try expectTag(a, .audio);
+    try testing.expectEqual(@as(usize, 320), a.audio.len);
+
+    // an all-zero chunk is skipped, and a release behind it still arrives
+    const zeros = [_]u8{0} ** 320;
+    _ = try posix.write(audio[1], &zeros);
+    _ = try posix.write(ptt[1], &[_]u8{0});
+    try expectTag(try src.next(), .release); // zeros skipped, release delivered
+
+    // audio pipe EOF → .eof
+    posix.close(audio[1]);
+    try expectTag(try src.next(), .eof);
+}
+
 test "scripted PTT session writes a recording" {
     const allocator = testing.allocator;
 

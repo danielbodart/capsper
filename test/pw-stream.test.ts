@@ -59,7 +59,7 @@ describe.skipIf(!isLinux)("pw-stream", () => {
                 try { loopback.kill(); } catch {}
                 await Bun.sleep(500); // let PipeWire propagate node destruction
 
-                await waitForLog(server.logFile, /handleConnection returning/, server.proc, 10);
+                await waitForLog(server.logFile, /session ended/, server.proc, 10);
 
                 const output = await file(server.outputFile).text();
                 console.error("");

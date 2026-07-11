@@ -36,6 +36,11 @@ var use_cork_mode = std.atomic.Value(bool).init(false);
 var ptt_press_ns = std.atomic.Value(i64).init(0);
 var capture_connect_done_ns = std.atomic.Value(i64).init(0);
 
+// PTT transition pipe: setLive() (input thread) writes 1=press / 0=release;
+// LocalPttEventSource reads it, so releases reach the session loop even when the
+// audio stream is corked. -1 until runLocalCapture creates the pipe.
+var ptt_event_write_fd = std.atomic.Value(i32).init(-1);
+
 fn nanoTimestampI64() i64 {
     return @intCast(std.time.nanoTimestamp());
 }
@@ -43,6 +48,12 @@ fn nanoTimestampI64() i64 {
 pub fn setLive(live: bool) void {
     if (live) ptt_press_ns.store(nanoTimestampI64(), .monotonic);
     is_live.store(live, .monotonic);
+    // Deliver the transition to the local session loop (survives cork).
+    const pfd = ptt_event_write_fd.load(.monotonic);
+    if (pfd >= 0) {
+        const byte = [_]u8{@intFromBool(live)};
+        _ = posix.write(pfd, &byte) catch {};
+    }
     if (capture_ptr.load(.monotonic)) |cap| {
         if (use_cork_mode.load(.monotonic)) {
             cap.setCork(!live);
@@ -374,10 +385,27 @@ pub const Server = struct {
             std.debug.print("Capturing audio, transcribing to stdout\n", .{});
         }
 
-        self.handleConnection(capture.getFd(), stdout_fd, &is_live, self.type_callback, &capture) catch |err| {
+        // PTT transition pipe: input thread writes press/release via setLive.
+        const ptt_pipe = try posix.pipe();
+        ptt_event_write_fd.store(ptt_pipe[1], .monotonic);
+        defer {
+            ptt_event_write_fd.store(-1, .monotonic);
+            posix.close(ptt_pipe[1]);
+            posix.close(ptt_pipe[0]);
+        }
+
+        var evsrc = session.LocalPttEventSource.init(capture.getFd(), ptt_pipe[0], STREAMING_CHUNK_BYTES, true);
+        self.handleSession(evsrc.source(), stdout_fd, self.type_callback, &capture, is_live.load(.monotonic)) catch |err| {
             std.debug.print("Local capture error: {}\n", .{err});
             return err;
         };
+    }
+
+    /// Run a data-driven stream (a file fd or socket) through the session
+    /// executor: always-live, audio/eof only, no PTT. Used by `--stream FILE`.
+    pub fn handleDataStream(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t) !void {
+        var evsrc = TcpEventSource.init(audio_fd, STREAMING_CHUNK_BYTES);
+        return self.handleSession(evsrc.source(), output_fd, null, null, true);
     }
 
     /// Event-driven session executor. Consumes an EventSource and executes the
@@ -438,7 +466,10 @@ pub const Server = struct {
                 .end_recording => {
                     if (self.recorder) |rec| rec.endRecording() catch {};
                 },
-                .stop => return,
+                .stop => {
+                    std.debug.print("session ended (eof)\n", .{});
+                    return;
+                },
             };
         }
     }
@@ -472,141 +503,6 @@ pub const Server = struct {
                             utils.textPreview(result.text),
                             result.timing.total_ms,
                         });
-                    }
-                }
-            }
-        }
-    }
-
-    /// PTT-gated streaming loop. Audio chunks go directly to the pipeline
-    /// for incremental processing. No VAD — PTT press/release drives segmentation.
-    /// For TCP connections, `live` is always true and `capture` is null.
-    /// For local connections, `live` points to the global is_live atomic and `capture` to the AudioCapture.
-    /// NOTE: local capture still uses this path; TCP now uses handleSession.
-    /// Phase 2b replaces this with a LocalPttEventSource + handleSession.
-    pub fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, live: *std.atomic.Value(bool), type_cb: ?TypeCallback, capture: ?*AudioCapture) !void {
-        const asr = try self.pipeline_factory.create(self.allocator);
-        defer {
-            asr.deinit();
-            self.allocator.destroy(asr);
-        }
-
-        var auto_gain = AutoGain{ .current_gain = self.initial_gain };
-
-        // 560ms chunks = 56 mel frames × 160 hop × 2 bytes/sample = 17920 bytes
-        const streaming_chunk_bytes: usize = 17920;
-        var reader = ChunkedReader.init(audio_fd, streaming_chunk_bytes, true);
-        var was_live: bool = live.load(.monotonic);
-        var total_audio_bytes: usize = 0;
-
-        while (true) {
-            const audio = try reader.read();
-            const n = audio.len;
-
-            // EOF
-            if (n == 0) {
-                if (was_live) {
-                    // Flush any remaining audio
-                    const samples = try utils.pcmToFloat(self.allocator, &.{});
-                    defer self.allocator.free(samples);
-                    if (try asr.transcribe(samples, true, null)) |result| {
-                        defer self.allocator.free(result.text);
-                        defer self.allocator.free(result.words);
-                        defer self.allocator.free(result.tokens);
-                        defer self.allocator.free(result.token_frames);
-                        if (result.text.len > 0 and !result.was_rewind) {
-                            self.emitDelta(output_fd, total_audio_bytes, result.text, type_cb) catch {};
-                        }
-                    }
-                    asr.resetSegment();
-                }
-                std.debug.print("handleConnection returning (EOF path)\n", .{});
-                reader.logSummary();
-                return;
-            }
-
-            total_audio_bytes += n;
-            const is_live_now = live.load(.monotonic);
-
-            // PTT release edge: flush + reset
-            if (was_live and !is_live_now) {
-                // Flush pipeline
-                const samples = try utils.pcmToFloat(self.allocator, audio);
-                defer self.allocator.free(samples);
-                if (try asr.transcribe(samples, true, null)) |result| {
-                    defer self.allocator.free(result.text);
-                    defer self.allocator.free(result.words);
-                    defer self.allocator.free(result.tokens);
-                    defer self.allocator.free(result.token_frames);
-                    if (result.text.len > 0 and !result.was_rewind) {
-                        self.emitDelta(output_fd, total_audio_bytes, result.text, type_cb) catch return error.BrokenPipe;
-                    }
-                    if (self.verbose) {
-                        var ts_buf: [32]u8 = undefined;
-                        std.debug.print("[{s}s] PTT release — flush: \"{s}\" ({d:.0}ms)\n", .{
-                            formatAudioTime(&ts_buf, total_audio_bytes),
-                            utils.textPreview(result.text),
-                            result.timing.total_ms,
-                        });
-                    }
-                }
-                asr.resetSegment();
-                if (self.recorder) |rec| rec.endRecording() catch {};
-                was_live = false;
-                continue;
-            }
-
-            // Not live: discard audio
-            if (!is_live_now) {
-                was_live = false;
-                continue;
-            }
-
-            // PTT press edge: start fresh
-            if (!was_live and is_live_now) {
-                asr.resetSegment();
-                was_live = true;
-                if (self.recorder) |rec| rec.startRecording();
-                if (self.verbose) {
-                    var ts_buf: [32]u8 = undefined;
-                    std.debug.print("[{s}s] PTT press — streaming start\n", .{formatAudioTime(&ts_buf, total_audio_bytes)});
-                }
-            }
-
-            // Live: process chunk
-            if (self.recorder) |rec| rec.recordPcm(audio);
-
-            // Auto-gain (local capture only — TCP connections pass null)
-            if (!self.no_auto_gain) {
-                if (capture) |cap| {
-                    const rms = utils.channelRms(audio, 1, 0);
-                    if (auto_gain.update(rms)) |new_gain| {
-                        cap.setGain(new_gain);
-                        if (self.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
-                    }
-                }
-            }
-
-            const samples = try utils.pcmToFloat(self.allocator, audio);
-            defer self.allocator.free(samples);
-
-            if (try asr.transcribe(samples, false, null)) |result| {
-                defer self.allocator.free(result.text);
-                defer self.allocator.free(result.words);
-                defer self.allocator.free(result.tokens);
-                defer self.allocator.free(result.token_frames);
-                if (result.text.len > 0 and !result.was_rewind) {
-                    // Drop terms: check if full result text matches any drop term
-                    if (!self.isDropTerm(result.text)) {
-                        self.emitDelta(output_fd, total_audio_bytes, result.text, type_cb) catch return error.BrokenPipe;
-                        if (self.verbose) {
-                            var ts_buf: [32]u8 = undefined;
-                            std.debug.print("    [{s}s] emit: \"{s}\" ({d:.0}ms)\n", .{
-                                formatAudioTime(&ts_buf, total_audio_bytes),
-                                utils.textPreview(result.text),
-                                result.timing.total_ms,
-                            });
-                        }
                     }
                 }
             }

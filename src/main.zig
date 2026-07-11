@@ -358,8 +358,7 @@ pub fn main() !void {
         };
 
         var server2 = Server.init(allocator, pipeline_factory, null, false, null, 0, verbose, false, null, drop_terms, null, 1.0, true, false);
-        var always_live = std.atomic.Value(bool).init(true);
-        server2.handleConnection(file.handle, 1, &always_live, null, null) catch |err| {
+        server2.handleDataStream(file.handle, 1) catch |err| {
             std.debug.print("Stream error: {}\n", .{err});
         };
         file.close();
