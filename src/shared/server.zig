@@ -7,9 +7,15 @@ const AutoGain = @import("auto_gain.zig").AutoGain;
 const utils = @import("utils.zig");
 const recorder_mod = @import("recorder.zig");
 const Recorder = recorder_mod.Recorder;
+const session = @import("session.zig");
+const EventSource = session.EventSource;
+const Event = session.Event;
 
 const posix = std.posix;
 const net = std.net;
+
+// 560ms chunks = 56 mel frames × 160 hop × 2 bytes/sample = 17920 bytes
+const STREAMING_CHUNK_BYTES: usize = 17920;
 
 // Global live state for local PTT mode (module-level so input handler can access it via setLive).
 // Default not-live. Callers set it explicitly: main.zig for no-trigger local mode, trigger key press/release.
@@ -158,6 +164,31 @@ const ChunkedReader = struct {
     }
 };
 
+/// EventSource for TCP connections and file streams. Emits only `audio`/`eof`
+/// — never press/release/timeout — so PTT/recording/timeout logic is
+/// structurally unable to touch the data-driven path that keeps tests fast.
+/// Blocking read, no poll, no timer: throughput is driven purely by data.
+const TcpEventSource = struct {
+    reader: ChunkedReader,
+
+    fn init(fd: posix.fd_t, chunk_bytes: usize) TcpEventSource {
+        return .{ .reader = ChunkedReader.init(fd, chunk_bytes, true) };
+    }
+
+    fn source(self: *TcpEventSource) EventSource {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = EventSource.VTable{ .next = nextImpl };
+
+    fn nextImpl(ptr: *anyopaque) anyerror!Event {
+        const self: *TcpEventSource = @ptrCast(@alignCast(ptr));
+        const chunk = try self.reader.read();
+        if (chunk.len == 0) return .eof;
+        return .{ .audio = chunk };
+    }
+};
+
 /// Per-connection argument struct for TCP handler threads.
 const TcpConnection = struct {
     server: *Server,
@@ -285,8 +316,9 @@ pub const Server = struct {
             args.server.allocator.destroy(args);
         }
         std.debug.print("Client connected\n", .{});
-        var live = std.atomic.Value(bool).init(true);
-        args.server.handleConnection(args.conn_fd, args.conn_fd, &live, null, null) catch |err| {
+        // TCP is always-live and data-driven: audio/eof only, no PTT events.
+        var evsrc = TcpEventSource.init(args.conn_fd, STREAMING_CHUNK_BYTES);
+        args.server.handleSession(evsrc.source(), args.conn_fd, null, null, true) catch |err| {
             std.debug.print("Connection error: {}\n", .{err});
         };
         std.debug.print("Client disconnected\n", .{});
@@ -348,10 +380,110 @@ pub const Server = struct {
         };
     }
 
+    /// Event-driven session executor. Consumes an EventSource and executes the
+    /// pure SessionDriver's Actions against the real Pipeline/Recorder/output.
+    /// The EventSource decides which events exist, so this one loop serves TCP
+    /// (audio/eof only) and local PTT (adds press/release/timeout) identically —
+    /// and PTT/recording logic can never touch a source that doesn't emit it.
+    fn handleSession(
+        self: *Server,
+        src: EventSource,
+        output_fd: posix.fd_t,
+        type_cb: ?TypeCallback,
+        capture: ?*AudioCapture,
+        live_at_start: bool,
+    ) !void {
+        const asr = try self.pipeline_factory.create(self.allocator);
+        defer {
+            asr.deinit();
+            self.allocator.destroy(asr);
+        }
+
+        var auto_gain = AutoGain{ .current_gain = self.initial_gain };
+        var driver = session.SessionDriver.init(live_at_start);
+        var total_audio_bytes: usize = 0;
+
+        while (true) {
+            const ev = try src.next();
+
+            // Audio bookkeeping + auto-gain live at the event level; the
+            // pipeline/recording decisions are the driver's job (via Actions).
+            if (ev == .audio) {
+                total_audio_bytes += ev.audio.len;
+                if (driver.live and !self.no_auto_gain) {
+                    if (capture) |cap| {
+                        const rms = utils.channelRms(ev.audio, 1, 0);
+                        if (auto_gain.update(rms)) |new_gain| {
+                            cap.setGain(new_gain);
+                            if (self.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
+                        }
+                    }
+                }
+            }
+
+            const acts = driver.step(ev);
+            for (acts.slice()) |a| switch (a) {
+                .reset_segment => asr.resetSegment(),
+                .start_recording => {
+                    if (self.recorder) |rec| rec.startRecording();
+                    if (self.verbose) {
+                        var ts_buf: [32]u8 = undefined;
+                        std.debug.print("[{s}s] PTT press — streaming start\n", .{formatAudioTime(&ts_buf, total_audio_bytes)});
+                    }
+                },
+                .record => |bytes| {
+                    if (self.recorder) |rec| rec.recordPcm(bytes);
+                },
+                .transcribe => |t| try self.runTranscribe(asr, t.audio, t.flush, output_fd, type_cb, total_audio_bytes),
+                .end_recording => {
+                    if (self.recorder) |rec| rec.endRecording() catch {};
+                },
+                .stop => return,
+            };
+        }
+    }
+
+    /// Transcribe one audio slice and emit any resulting text. `flush` forces
+    /// the pipeline to finalize the segment (used on release/timeout/eof, where
+    /// `audio` is empty — the trailing chunks already went in as `.audio`).
+    fn runTranscribe(
+        self: *Server,
+        asr: *Pipeline,
+        audio: []const u8,
+        flush: bool,
+        output_fd: posix.fd_t,
+        type_cb: ?TypeCallback,
+        total_audio_bytes: usize,
+    ) !void {
+        const samples = try utils.pcmToFloat(self.allocator, audio);
+        defer self.allocator.free(samples);
+        if (try asr.transcribe(samples, flush, null)) |result| {
+            defer self.allocator.free(result.text);
+            defer self.allocator.free(result.words);
+            defer self.allocator.free(result.tokens);
+            defer self.allocator.free(result.token_frames);
+            if (result.text.len > 0 and !result.was_rewind) {
+                if (!self.isDropTerm(result.text)) {
+                    self.emitDelta(output_fd, total_audio_bytes, result.text, type_cb) catch return error.BrokenPipe;
+                    if (self.verbose) {
+                        var ts_buf: [32]u8 = undefined;
+                        std.debug.print("    [{s}s] emit: \"{s}\" ({d:.0}ms)\n", .{
+                            formatAudioTime(&ts_buf, total_audio_bytes),
+                            utils.textPreview(result.text),
+                            result.timing.total_ms,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// PTT-gated streaming loop. Audio chunks go directly to the pipeline
     /// for incremental processing. No VAD — PTT press/release drives segmentation.
     /// For TCP connections, `live` is always true and `capture` is null.
     /// For local connections, `live` points to the global is_live atomic and `capture` to the AudioCapture.
+    /// NOTE: local capture still uses this path; TCP now uses handleSession.
+    /// Phase 2b replaces this with a LocalPttEventSource + handleSession.
     pub fn handleConnection(self: *Server, audio_fd: posix.fd_t, output_fd: posix.fd_t, live: *std.atomic.Value(bool), type_cb: ?TypeCallback, capture: ?*AudioCapture) !void {
         const asr = try self.pipeline_factory.create(self.allocator);
         defer {
