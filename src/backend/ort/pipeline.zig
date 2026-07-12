@@ -30,6 +30,21 @@ const ENC_DIM: usize = 1024;
 const PRED_HIDDEN: usize = 640;
 const PRED_LAYERS: usize = 2;
 const MAX_SYMBOLS_PER_FRAME: usize = 10;
+// The encoder cache is bounded (~5s window, cache_ch_len saturates at CACHE_CH_DIM),
+// but the RNNT prednet LSTM state is unbounded — over a long continuous press the
+// two desync and the joint net drifts into emitting only BLANK for real speech (the
+// "stall"). The unmistakable signature: consecutive 560ms chunks that are LOUD (speech
+// still arriving) yet emit NOTHING. Normal speech never does this — a loud chunk
+// produces words; a real pause is quiet, not loud. So when this many consecutive
+// loud-but-silent chunks occur, reset the prednet state to re-bound decoder memory to
+// the encoder's horizon (encoder cache left intact). Loudness is judged RELATIVE to
+// the recent speech level (EMA), so the trigger is gain/mic-independent.
+const STALL_LOUD_CHUNKS: usize = 2; // ~1.1s of loud-but-silent audio
+// A chunk counts as loud when its RMS is at least this fraction of the speech-level
+// EMA. Measured: silence chunks ≤0.5× the speech level, stall chunks ≥1×.
+const SPEECH_RMS_FRACTION: f32 = 0.5;
+// EMA weight for tracking the recent speech level from emitting (non-silent) chunks.
+const SPEECH_RMS_EMA_ALPHA: f32 = 0.1;
 const N_MELS = mel_state_mod.N_MELS;
 
 /// Process-lifetime config. ORT sessions are shared across connections.
@@ -64,6 +79,13 @@ pub const NemotronPipeline = struct {
     dec_state1: []f32,
     dec_state2: []f32,
     last_token: i32 = tokenizer.BLANK_ID,
+    // Stall detection (see STALL_LOUD_CHUNKS). chunk_rms is the RMS of the most recent
+    // audio chunk fed to transcribe(); speech_rms_ema tracks the level of chunks that
+    // produced emissions (the observed speech level); stall_chunks counts consecutive
+    // loud-but-silent chunks.
+    chunk_rms: f32 = 0,
+    speech_rms_ema: f32 = 0,
+    stall_chunks: usize = 0,
 
     // Accumulated text this segment
     emitted_text: std.ArrayListUnmanaged(u8) = .{},
@@ -125,15 +147,46 @@ pub const NemotronPipeline = struct {
     pub fn transcribe(self: *NemotronPipeline, samples: []const f32, flush: bool, _: ?usize) !?TranscribeResult {
         const t_start = std.time.nanoTimestamp();
 
+        // Measure this chunk's audio level (for stall detection below). Absolute scale
+        // is irrelevant — it is compared to a running speech EMA.
+        if (samples.len > 0) {
+            var sum_sq: f64 = 0;
+            for (samples) |s| sum_sq += @as(f64, s) * @as(f64, s);
+            self.chunk_rms = @floatCast(@sqrt(sum_sq / @as(f64, @floatFromInt(samples.len))));
+        }
+
         // Feed samples into incremental mel
         try self.mel.feed(samples);
 
-        // Process complete MEL_SHIFT-sized chunks
+        // Process complete MEL_SHIFT-sized chunks, tracking whether any token emitted.
+        const emitted_before = self.emitted_text.items.len;
         try self.processEncoderChunks();
 
         // On flush: process any remaining partial mel frames
         if (flush and self.mel.n_frames > self.mel_frame_cursor) {
             try self.processPartialChunk();
+        }
+
+        // Stall detection: a loud chunk that emitted nothing is a prednet stall in
+        // progress (encoder still sees speech, decoder drifted to all-blank). Several
+        // in a row → reset the prednet to re-bound decoder memory to the encoder's
+        // horizon; the encoder cache is left intact so audio context carries over.
+        if (self.emitted_text.items.len > emitted_before) {
+            self.stall_chunks = 0;
+            self.speech_rms_ema = if (self.speech_rms_ema == 0)
+                self.chunk_rms
+            else
+                SPEECH_RMS_EMA_ALPHA * self.chunk_rms + (1 - SPEECH_RMS_EMA_ALPHA) * self.speech_rms_ema;
+        } else if (self.speech_rms_ema > 0 and self.chunk_rms >= SPEECH_RMS_FRACTION * self.speech_rms_ema) {
+            self.stall_chunks += 1;
+            if (self.stall_chunks >= STALL_LOUD_CHUNKS) {
+                @memset(self.dec_state1, 0);
+                @memset(self.dec_state2, 0);
+                self.last_token = tokenizer.BLANK_ID;
+                self.stall_chunks = 0;
+            }
+        } else {
+            self.stall_chunks = 0;
         }
 
         const elapsed_ns = std.time.nanoTimestamp() - t_start;
@@ -180,6 +233,9 @@ pub const NemotronPipeline = struct {
         @memset(self.dec_state1, 0);
         @memset(self.dec_state2, 0);
         self.last_token = tokenizer.BLANK_ID;
+        self.chunk_rms = 0;
+        self.speech_rms_ema = 0;
+        self.stall_chunks = 0;
         self.emitted_text.clearRetainingCapacity();
         self.emit_cursor = 0;
         if (self.config.context_graph) |cg| {
