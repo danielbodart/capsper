@@ -27,6 +27,13 @@ const ENC_DIM: usize = 1024;
 const PRED_HIDDEN: usize = 640;
 const PRED_LAYERS: usize = 2;
 const MAX_SYMBOLS_PER_FRAME: usize = 10;
+// Runaway-loop guard: max identical tokens the joint net may emit in a row for a single
+// encoder frame before we cut it off and reset the prednet (see the guard in rnntDecode).
+// MAX_SYMBOLS_PER_FRAME caps the token *rate* per frame (any tokens); this catches the
+// pathological case of that budget being spent re-emitting ONE token. Measured across the
+// regression corpus: clean speech never repeats a token >2x within a frame, so 4 (cut on
+// the 4th) is a 2x margin; a stutter loop hits the full budget of 10.
+const MAX_FRAME_REPEAT: usize = 4;
 const N_MELS = mel_state_mod.N_MELS;
 
 // CoreML C API (from coreml_helpers.m)
@@ -277,6 +284,9 @@ pub const CoreMLPipeline = struct {
             }
 
             var symbols: usize = 0;
+            var frame_repeat: usize = 0; // consecutive identical tokens within this frame
+            var prev_in_frame: i32 = tokenizer.BLANK_ID; // sentinel — `best` is never BLANK here
+            var run_start_len: usize = self.emitted_text.items.len; // output length where the current identical run began
             while (symbols < MAX_SYMBOLS_PER_FRAME) {
                 var logits: [tokenizer.VOCAB_SIZE + 1]f32 = undefined;
                 var new_h: [PRED_LAYERS * PRED_HIDDEN]f32 = undefined;
@@ -320,6 +330,32 @@ pub const CoreMLPipeline = struct {
                 }
 
                 if (best == tokenizer.BLANK_ID) break;
+
+                // Runaway-loop guard. The joint net has emitted the same non-blank token
+                // MAX_FRAME_REPEAT times in a row for a SINGLE ~80ms encoder frame — a token
+                // rate no human speech reaches. (Measured across the regression corpus: clean
+                // speech never repeats a token >2x within a frame; a stutter loop instead fills
+                // the whole per-frame symbol budget with one token, e.g. "te"x10.) The run's
+                // tokens have only been appended to emitted_text, not yet returned to the caller
+                // (emit_cursor advances at the end of transcribe), so we RETRACT the whole run —
+                // leaving no "te te te" residue — then reset the prednet to re-bound decoder
+                // memory to the encoder's horizon (the mirror image of the all-blank stall guard
+                // above). Scoped per-frame so legitimately repeated *words* (which spread across
+                // frames, e.g. "no no no") never trip it.
+                if (best == prev_in_frame) {
+                    frame_repeat += 1;
+                } else {
+                    frame_repeat = 1;
+                    run_start_len = self.emitted_text.items.len; // new token — mark where its run begins
+                }
+                prev_in_frame = best;
+                if (frame_repeat >= MAX_FRAME_REPEAT) {
+                    self.emitted_text.shrinkRetainingCapacity(run_start_len);
+                    @memset(self.dec_state1, 0);
+                    @memset(self.dec_state2, 0);
+                    self.last_token = tokenizer.BLANK_ID;
+                    break;
+                }
 
                 // Advance trie state
                 if (self.config.context_graph) |cg| {

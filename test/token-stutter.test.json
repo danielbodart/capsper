@@ -1,0 +1,4 @@
+{
+  "group": "long",
+  "thresholds": { "minCoverage": 80, "maxWer": 30 }
+}
