@@ -5,7 +5,10 @@ TOOLS_ROOT=$(git -C "$SCRIPT_DIR" worktree list 2>/dev/null | head -1 | awk '{pr
 export MISE_DATA_DIR="${TOOLS_ROOT:-$SCRIPT_DIR}/tools"
 export MISE_INSTALL_PATH="$MISE_DATA_DIR/mise"
 export MISE_INSTALL_HELP=0
-export MISE_GLOBAL_CONFIG_FILE=/dev/null
+# Keep the build hermetic by overriding the user's personal global mise config
+# with the project's own .mise.toml (rather than /dev/null — mise >= 2026.8.x
+# parses this path by file type and errors on /dev/null, breaking install).
+export MISE_GLOBAL_CONFIG_FILE="$SCRIPT_DIR/.mise.toml"
 export ZIG_GLOBAL_CACHE_DIR="$MISE_DATA_DIR/zig-cache"
 export PATH="$MISE_DATA_DIR:$PATH"
 
