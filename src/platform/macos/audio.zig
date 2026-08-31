@@ -265,11 +265,11 @@ pub const AudioCapture = struct {
         }
     }
 
-    /// Cork/uncork — on macOS, start/stop is already fast, so this is
-    /// identical to setActive. The --low-latency flag is a no-op on macOS.
-    pub fn setCork(self: *AudioCapture, corked: bool) void {
-        self.setActive(!corked);
-    }
+    /// Arm monitor-driven reconnect on target (re)appearance. No-op on macOS:
+    /// CoreAudio's AUHAL follows the selected input device, so there is no
+    /// PipeWire-style re-route to trigger. Kept for cross-platform parity with
+    /// the Linux AudioCapture (called from the shared low-latency init path).
+    pub fn armTargetReconnect(_: *AudioCapture) void {}
 
     /// Set input gain. Prefers hardware gain via CoreAudio device volume
     /// (kAudioDevicePropertyVolumeScalar on input scope). Falls back to

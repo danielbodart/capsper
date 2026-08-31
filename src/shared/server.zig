@@ -27,9 +27,14 @@ pub var is_live = std.atomic.Value(bool).init(false);
 // microphone indicator only appears during active recording.
 var capture_ptr = std.atomic.Value(?*AudioCapture).init(null);
 
-// Low-latency mode: cork/uncork stream instead of connect/disconnect.
-// Set once during init, read from input thread via setLive().
-var use_cork_mode = std.atomic.Value(bool).init(false);
+// Low-latency mode: the capture stream is connected once and stays continuously
+// active; PTT gating happens in software (SessionDriver.live) rather than by
+// corking or disconnecting the stream. Set once during init, read from the input
+// thread via setLive(). Corking let the PipeWire node go to `suspended`, and
+// uncork from suspend (pw_stream_set_active(true)) did not reliably restart data
+// flow — dropping the first seconds of audio on rapid re-press and cold starts —
+// so low-latency never corks.
+var stream_always_active = std.atomic.Value(bool).init(false);
 
 // PTT latency tracking — set by input thread via setLive(), read by server loop.
 // Use i64 (not i128) for atomic compatibility — nanoTimestamp fits in i64 for ~292 years.
@@ -55,9 +60,10 @@ pub fn setLive(live: bool) void {
         _ = posix.write(pfd, &byte) catch {};
     }
     if (capture_ptr.load(.monotonic)) |cap| {
-        if (use_cork_mode.load(.monotonic)) {
-            cap.setCork(!live);
-        } else {
+        // Low-latency keeps the stream continuously active; the SessionDriver
+        // gates on `live` in software, so we must NOT toggle the stream here.
+        // Only non-low-latency mode connects/disconnects per press.
+        if (!stream_always_active.load(.monotonic)) {
             cap.setActive(live);
         }
         if (live) capture_connect_done_ns.store(nanoTimestampI64(), .monotonic);
@@ -365,14 +371,19 @@ pub const Server = struct {
         }
 
         if (self.low_latency) {
-            // Low-latency mode: connect stream once at startup, use cork/uncork for PTT.
-            // Mic indicator stays visible, but avoids ~1.3s audio reconnect on each press.
-            use_cork_mode.store(true, .monotonic);
+            // Low-latency mode: connect the stream once and leave it active for
+            // the process lifetime. PTT gating is done in software by the
+            // SessionDriver (non-live audio is discarded), so the stream is never
+            // corked or disconnected. This avoids both the ~1.3s reconnect of
+            // normal mode and the uncork-from-suspend audio loss that corking
+            // caused. Mic indicator stays visible (accepted low-latency trade-off).
+            stream_always_active.store(true, .monotonic);
             capture.setActive(true);
-            if (!is_live.load(.monotonic)) {
-                capture.setCork(true);
-            }
-            std.debug.print("Low-latency mode: stream stays connected, using cork/uncork\n", .{});
+            // Stream is never corked/reconnected per press, so re-route to the
+            // target device via the hotplug monitor instead (e.g. the mic is
+            // powered on after login). No-op on macOS.
+            capture.armTargetReconnect();
+            std.debug.print("Low-latency mode: stream stays active, PTT gated in software\n", .{});
         } else if (is_live.load(.monotonic)) {
             // Normal mode: connect now (no --trigger, always live).
             capture.setActive(true);

@@ -189,28 +189,35 @@ pub const AudioCapture = struct {
         _ = pw.pw_set_stream_gain(self.stream, gain, 1);
     }
 
-    /// Cork or uncork the stream. The stream stays connected (mic indicator
-    /// remains visible) but audio delivery is paused/resumed. Much faster
-    /// than connect/disconnect (~2ms vs ~1300ms).
-    /// On uncork: if the target device appeared since last connect, disconnect
-    /// and reconnect so PipeWire routes to it.
-    pub fn setCork(self: *AudioCapture, corked: bool) void {
+    /// Reconnect the capture stream to the target device. Called by the device
+    /// monitor when the target (re)appears after startup — e.g. the user powers
+    /// on the mic after login. In low-latency always-active mode the stream is
+    /// never corked/reconnected by PTT, so the monitor drives the re-route here.
+    /// Runs on the monitor's thread loop, so it locks the stream's own loop.
+    fn reconnectToTarget(self: *AudioCapture) void {
         pw.pw_thread_loop_lock(self.thread_loop);
         defer pw.pw_thread_loop_unlock(self.thread_loop);
-        if (!corked) {
-            if (self.monitor) |mon| {
-                const target_here = pw.pw_device_monitor_target_available(mon) != 0;
-                if (!self.connected_to_target and target_here) {
-                    log.info("Target device now available, reconnecting", .{});
-                    _ = pw.pw_stream_disconnect(self.stream);
-                    _ = pw.pw_connect_capture(self.stream, 16000, self.channel_position);
-                    self.connected_to_target = true;
-                    log.info("PipeWire capture connected (target device)", .{});
-                    return;
-                }
-            }
+        log.info("Target device appeared — reconnecting capture to it", .{});
+        _ = pw.pw_stream_disconnect(self.stream);
+        _ = pw.pw_connect_capture(self.stream, 16000, self.channel_position);
+        self.connected_to_target = true;
+        log.info("PipeWire capture connected (target device)", .{});
+    }
+
+    fn onTargetAppeared(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *AudioCapture = @ptrCast(@alignCast(ctx.?));
+        self.reconnectToTarget();
+    }
+
+    /// Arm monitor-driven reconnect: when the target device appears after
+    /// startup, re-route the stream to it without waiting for a PTT press.
+    /// Used in low-latency (always-active) mode, where the stream is never
+    /// corked/reconnected per press. Must be called after the AudioCapture has
+    /// its final address (the monitor holds `self` as callback context).
+    pub fn armTargetReconnect(self: *AudioCapture) void {
+        if (self.monitor) |mon| {
+            pw.pw_device_monitor_set_on_appeared(mon, onTargetAppeared, self);
         }
-        _ = pw.pw_stream_set_active(self.stream, !corked);
     }
 
     /// Enable exit-on-device-lost: when the target device is removed, close the

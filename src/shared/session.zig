@@ -262,6 +262,29 @@ test "driver: audio while not live is discarded" {
     try testing.expectEqual(@as(usize, 0), acts.len);
 }
 
+// Regression for the never-cork low-latency change: the capture stream now stays
+// continuously active, so `audio` events arrive even between presses and across a
+// rapid release→re-press (previously cork paused the stream, and uncork-from-
+// suspend dropped the first seconds of audio). The software gate must discard
+// non-live audio and give each press a fresh segment.
+test "driver: rapid re-press gates interleaved audio and resets each segment" {
+    var d = SessionDriver.init(false);
+
+    // First utterance.
+    try expectTags(d.step(.press).slice(), &.{ .reset_segment, .start_recording });
+    try expectTags(d.step(.{ .audio = "aaaa" }).slice(), &.{ .record, .transcribe });
+    try expectTags(d.step(.release).slice(), &.{ .transcribe, .end_recording });
+
+    // Audio keeps flowing while not live (stream stays active) — must be discarded.
+    try testing.expectEqual(@as(usize, 0), d.step(.{ .audio = "----" }).len);
+    try testing.expect(!d.live);
+
+    // Rapid re-press: fresh segment + recording, then live audio again.
+    try expectTags(d.step(.press).slice(), &.{ .reset_segment, .start_recording });
+    try expectTags(d.step(.{ .audio = "bbbb" }).slice(), &.{ .record, .transcribe });
+    try expectTags(d.step(.release).slice(), &.{ .transcribe, .end_recording });
+}
+
 // The core regression: release, timeout AND eof must each flush the pipeline
 // and end the recording. The old bug was that NONE of these reached the
 // endRecording call (cork starved the loop; the EOF path omitted it).

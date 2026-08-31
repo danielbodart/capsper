@@ -44,7 +44,6 @@ pub const PW_STREAM_STATE_ERROR = pw.PW_STREAM_STATE_ERROR;
 
 // Stream control
 pub const pw_stream_disconnect = pw.pw_stream_disconnect;
-pub const pw_stream_set_active = pw.pw_stream_set_active;
 pub const pw_thread_loop_lock = pw.pw_thread_loop_lock;
 pub const pw_thread_loop_unlock = pw.pw_thread_loop_unlock;
 
@@ -112,6 +111,7 @@ pub extern fn pw_device_monitor_create(target: [*:0]const u8) ?*pw_device_monito
 pub extern fn pw_device_monitor_destroy(m: *pw_device_monitor) void;
 pub extern fn pw_device_monitor_target_available(m: *pw_device_monitor) c_int;
 pub extern fn pw_device_monitor_set_exit_on_lost(m: *pw_device_monitor, pipe_write_fd: c_int) void;
+pub extern fn pw_device_monitor_set_on_appeared(m: *pw_device_monitor, cb: ?*const fn (?*anyopaque) callconv(.c) void, data: ?*anyopaque) void;
 
 // PipeWire property keys
 pub const PW_KEY_MEDIA_TYPE = pw.PW_KEY_MEDIA_TYPE;

@@ -287,6 +287,12 @@ struct pw_device_monitor {
     int        pending_sync;
     _Atomic int exit_on_lost;         /* if set, close pipe_write_fd on target removal */
     _Atomic int pipe_write_fd;        /* fd to close on target removal (-1 = none) */
+    /* Called when the target (re)appears after the initial enumeration — e.g.
+       the user powers on the mic after login. Lets the capture stream re-route
+       to the target without a PTT press (needed in low-latency always-active
+       mode, where nothing else triggers a reconnect). */
+    void (*on_appeared)(void *);
+    void  *on_appeared_data;
 };
 
 static void
@@ -311,8 +317,11 @@ on_monitor_global(void *data, uint32_t id, uint32_t permissions,
         return;
 
     atomic_store(&m->target_node_id, id);
-    if (m->initial_enum_done)
+    if (m->initial_enum_done) {
         fprintf(stderr, "[hotplug] Target device appeared: %s\n", name);
+        if (m->on_appeared)
+            m->on_appeared(m->on_appeared_data);
+    }
 }
 
 static void
@@ -443,4 +452,16 @@ pw_device_monitor_set_exit_on_lost(struct pw_device_monitor *m, int pipe_write_f
     if (!m) return;
     atomic_store(&m->pipe_write_fd, pipe_write_fd);
     atomic_store(&m->exit_on_lost, 1);
+}
+
+/* Register a callback invoked (on the monitor's thread loop) when the target
+   device (re)appears after startup. The callback must do its own locking of any
+   other PipeWire loop it touches (e.g. the capture stream's thread loop). */
+void
+pw_device_monitor_set_on_appeared(struct pw_device_monitor *m,
+                                  void (*cb)(void *), void *data)
+{
+    if (!m) return;
+    m->on_appeared = cb;
+    m->on_appeared_data = data;
 }
