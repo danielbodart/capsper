@@ -14,6 +14,8 @@ const Event = session.Event;
 const posix = std.posix;
 const net = std.net;
 
+const log = std.log.scoped(.input_level);
+
 // 560ms chunks = 56 mel frames × 160 hop × 2 bytes/sample = 17920 bytes
 const STREAMING_CHUNK_BYTES: usize = 17920;
 
@@ -440,6 +442,7 @@ pub const Server = struct {
 
         var auto_gain = AutoGain{ .current_gain = self.initial_gain };
         var driver = session.SessionDriver.init(live_at_start);
+        var level_mon = session.InputLevelMonitor{};
         var total_audio_bytes: usize = 0;
 
         while (true) {
@@ -449,12 +452,20 @@ pub const Server = struct {
             // pipeline/recording decisions are the driver's job (via Actions).
             if (ev == .audio) {
                 total_audio_bytes += ev.audio.len;
-                if (driver.live and !self.no_auto_gain) {
-                    if (capture) |cap| {
-                        const rms = utils.channelRms(ev.audio, 1, 0);
-                        if (auto_gain.update(rms)) |new_gain| {
-                            cap.setGain(new_gain);
-                            if (self.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
+                if (driver.live) {
+                    const rms = utils.channelRms(ev.audio, 1, 0);
+                    // Input-level telemetry: log only on a rolling-average
+                    // audio↔silence transition (never per chunk).
+                    if (level_mon.update(utils.rmsToDb(rms))) |t| switch (t) {
+                        .audio => log.info("audio detected ({d:.0} dBFS)", .{level_mon.levelDb()}),
+                        .silence => log.info("silence detected ({d:.0} dBFS)", .{level_mon.levelDb()}),
+                    };
+                    if (!self.no_auto_gain) {
+                        if (capture) |cap| {
+                            if (auto_gain.update(rms)) |new_gain| {
+                                cap.setGain(new_gain);
+                                if (self.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
+                            }
                         }
                     }
                 }
@@ -464,6 +475,7 @@ pub const Server = struct {
             for (acts.slice()) |a| switch (a) {
                 .reset_segment => asr.resetSegment(),
                 .start_recording => {
+                    level_mon.reset();
                     if (self.recorder) |rec| rec.startRecording();
                     if (self.verbose) {
                         var ts_buf: [32]u8 = undefined;

@@ -54,6 +54,58 @@ pub const ActionList = struct {
     }
 };
 
+/// Pure input-level monitor: fed one chunk's RMS (in dBFS) at a time while a
+/// PTT utterance is live, it emits a transition ONLY when a rolling average
+/// crosses a hysteresis threshold — so it reports "audio" vs "silence" without
+/// spamming on every chunk or flapping around the boundary. Kept pure (no I/O,
+/// no clock) so it is unit-testable; the caller logs the returned transition.
+///
+/// Rolling average is an EMA; with ~560ms chunks, alpha=0.3 gives a ~2s time
+/// constant. The 10 dB gap between enter/exit thresholds plus that smoothing
+/// means normal pauses between words never trip it. Reset on each PTT press.
+pub const InputLevelMonitor = struct {
+    ema_db: f64 = 0,
+    warmup: u8 = 0,
+    silent: bool = false,
+
+    const alpha: f64 = 0.3;
+    const warmup_chunks: u8 = 3; // ~1.7s before the first evaluation
+    const silence_enter_db: f64 = -60.0;
+    const audio_enter_db: f64 = -50.0;
+
+    pub const Transition = enum { audio, silence };
+
+    /// Start a fresh evaluation window (call on PTT press).
+    pub fn reset(self: *InputLevelMonitor) void {
+        self.* = .{};
+    }
+
+    /// Feed one chunk's RMS level in dBFS. Returns a transition if the smoothed
+    /// level newly crossed a threshold, else null. Values are seeded during a
+    /// short warmup so a genuinely-silent start fires once (not on chunk 1).
+    pub fn update(self: *InputLevelMonitor, db: f64) ?Transition {
+        if (self.warmup < warmup_chunks) {
+            self.ema_db = if (self.warmup == 0) db else self.ema_db * (1 - alpha) + db * alpha;
+            self.warmup += 1;
+            return null;
+        }
+        self.ema_db = self.ema_db * (1 - alpha) + db * alpha;
+        if (!self.silent and self.ema_db < silence_enter_db) {
+            self.silent = true;
+            return .silence;
+        }
+        if (self.silent and self.ema_db > audio_enter_db) {
+            self.silent = false;
+            return .audio;
+        }
+        return null;
+    }
+
+    pub fn levelDb(self: *const InputLevelMonitor) f64 {
+        return self.ema_db;
+    }
+};
+
 /// Pure PTT/segmentation/recording state machine. `live` tracks whether an
 /// utterance is in progress. Every transition that ends an utterance
 /// (release/timeout/eof) flushes the pipeline AND ends the recording — the two
@@ -324,6 +376,78 @@ test "driver: eof while idle just stops" {
     _ = d.step(.release);
     const acts = d.step(.eof);
     try expectTags(acts.slice(), &.{.stop});
+}
+
+test "level monitor: warmup swallows the first few chunks (no transition)" {
+    var m = InputLevelMonitor{};
+    // Even dead-silent input must not fire during warmup.
+    for (0..InputLevelMonitor.warmup_chunks) |_| {
+        try testing.expectEqual(@as(?InputLevelMonitor.Transition, null), m.update(-90));
+    }
+}
+
+test "level monitor: steady audio never reports silence" {
+    var m = InputLevelMonitor{};
+    var fired: usize = 0;
+    for (0..50) |_| {
+        if (m.update(-35) != null) fired += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), fired);
+}
+
+test "level monitor: sustained quiet fires silence exactly once" {
+    var m = InputLevelMonitor{};
+    var silences: usize = 0;
+    for (0..50) |_| {
+        if (m.update(-85)) |t| {
+            try testing.expectEqual(InputLevelMonitor.Transition.silence, t);
+            silences += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), silences); // once, not per chunk
+    try testing.expect(m.silent);
+}
+
+test "level monitor: silence then audio yields one of each, in order" {
+    var m = InputLevelMonitor{};
+    var seq: [2]InputLevelMonitor.Transition = undefined;
+    var n: usize = 0;
+    for (0..30) |_| if (m.update(-85)) |t| {
+        seq[n] = t;
+        n += 1;
+    };
+    for (0..30) |_| if (m.update(-30)) |t| {
+        seq[n] = t;
+        n += 1;
+    };
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(InputLevelMonitor.Transition.silence, seq[0]);
+    try testing.expectEqual(InputLevelMonitor.Transition.audio, seq[1]);
+}
+
+test "level monitor: hysteresis — dithering in the dead band does not flap" {
+    var m = InputLevelMonitor{};
+    // Settle into audio well above the audio-enter threshold.
+    for (0..10) |_| _ = m.update(-30);
+    // Now dither between the two thresholds (-60..-50): must stay quiet.
+    var fired: usize = 0;
+    for (0..40) |i| {
+        const db: f64 = if (i % 2 == 0) -52 else -58; // both inside the dead band
+        if (m.update(db) != null) fired += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), fired);
+    try testing.expect(!m.silent);
+}
+
+test "level monitor: reset re-arms warmup" {
+    var m = InputLevelMonitor{};
+    for (0..20) |_| _ = m.update(-85); // becomes silent
+    try testing.expect(m.silent);
+    m.reset();
+    try testing.expectEqual(@as(u8, 0), m.warmup);
+    try testing.expect(!m.silent);
+    // Post-reset warmup swallows again.
+    try testing.expectEqual(@as(?InputLevelMonitor.Transition, null), m.update(-85));
 }
 
 // End-to-end: drive a scripted PTT session and execute the recorder-relevant
