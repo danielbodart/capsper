@@ -8,6 +8,10 @@
             // hash and failed CI on every push. Tag tarball is byte-identical
             // to the pinned hash.
             .url = "https://github.com/CogitatorTech/minish/archive/refs/tags/v0.1.0.tar.gz",
+            // Only the property tests use minish, so keep it out of the way of
+            // a plain `zig build` -- that makes the binary buildable with no
+            // network access, which sandboxed packaging (Nix) requires.
+            .lazy = true,
             .hash = "minish-0.1.0-SQtSTWHkAQACfz3xGuWHU8zbx320vK_47r2yto3Pq0Rf",
         },
     },

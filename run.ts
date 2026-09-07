@@ -359,8 +359,27 @@ async function printVersion() {
     console.log(await version());
 }
 
+
+/** Verify the Nix flake: both packages build from source, and the NixOS module
+ *  actually grants the permissions it claims (checked in a real NixOS VM).
+ *  Skipped where nix is unavailable, which includes the macOS CI runner. */
+export async function nix() {
+    if (IS_MACOS) {
+        console.log("nix: skipped (macOS — the flake packages Linux only)");
+        return;
+    }
+    if (!await which("nix")) {
+        console.log("nix: skipped (nix not installed)");
+        return;
+    }
+    // Evaluates every output and builds the checks, including the NixOS VM
+    // test. Both packages are cheap: capsper itself is a zig build, and the
+    // CUDA execution provider is fetched rather than compiled.
+    await $`nix flake check --print-build-logs`;
+    await $`nix build --no-link .#capsper-cpu .#capsper-cuda`;
+}
 const commands: Record<string, Function> = {
-    dev, build, clean, setup, test, lint, dist, sign, ci, version: printVersion,
+    dev, build, clean, setup, test, lint, dist, sign, ci, nix, version: printVersion,
     "short-test": shortTest,
     "medium-test": mediumTest,
     "long-test": longTest,

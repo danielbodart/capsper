@@ -47,6 +47,16 @@ curl -fSL https://github.com/danielbodart/capsper/releases/latest/download/capsp
 ./install.sh
 ```
 
+### NixOS
+
+NixOS has its own flake, since the tarball installer's assumptions (a writable install prefix, `usermod`, hand-written udev rules, self-updating binaries) do not hold there:
+
+```nix
+inputs.capsper.url = "github:danielbodart/capsper";
+```
+
+See [docs/nixos.md](docs/nixos.md) for the NixOS and home-manager modules, and for how to fetch the models.
+
 ### macOS
 
 ```bash

@@ -140,6 +140,19 @@ dist/
     └── install-common.sh        (shared helpers, model download, install_files)
 ```
 
+### Nix / NixOS
+
+`nix/` plus the root `flake.nix` package capsper for NixOS. Both variants are **built from source** — nothing is patchelf'd, because Zig links the executable and sets its own interpreter and RPATH. Things to know:
+
+- The flake tracks the repository, not releases. There are no binary hashes to bump.
+- `capsper-cpu` links nixpkgs' `onnxruntime` (1.24.4, cached). `capsper-cuda` links the ORT that capsper's CI publishes, because `onnxruntime` with `cudaSupport` is in **no** binary cache and would be a multi-hour compile per nixpkgs bump. That one URL + hash in `nix/package.nix` is the only pinned artefact.
+- ORT 1.24.4 vs the tarball's 1.23.2 is verified equivalent — the long regression group produces identical coverage and WER on both.
+- `./run.ts nix` runs `nix flake check` (including a NixOS VM test of the module) and builds both packages. Wired into CI as its own job; it is a no-op where `nix` is absent, including macOS.
+- The Nix build relies on three `build.zig` options — `-Dort-include`/`-Dort-lib` (external onnxruntime), `-Drpath` (RPATH entries for absolute store paths), and `-Dprop-tests=false` (drops the only external Zig dependency, so the sandboxed build needs no network). All default to the previous behaviour, so the tarball build is unchanged.
+- `dist/linux/lib/*.so` are Git LFS objects and arrive as pointer files when the flake is fetched from GitHub. The source filter excludes that directory; nothing in the Nix build reads it.
+
+See `docs/nixos.md`.
+
 ## Deployment
 
 To update the running capsper service after CI passes:

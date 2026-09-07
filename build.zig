@@ -16,6 +16,19 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", version_str);
     options.addOption(Backend, "backend", backend);
 
+    // Where to find onnxruntime. Defaults to the copies vendored under dist/,
+    // which is what the tarball build uses. A package manager that supplies its
+    // own onnxruntime (Nix) points these at it instead -- the vendored copies
+    // are Git LFS objects and are not present in a source tarball anyway.
+    const ort_include = b.option([]const u8, "ort-include", "onnxruntime include directory");
+    const ort_lib = b.option([]const u8, "ort-lib", "onnxruntime library directory");
+
+    // Extra RPATH entries, repeatable. `each_lib_rpath` is deliberately off so
+    // that a dist build does not bake the build machine's /usr/lib paths into
+    // the released binary; a package manager that installs libraries at
+    // absolute store paths passes them here instead of relying on that.
+    const extra_rpaths = b.option([]const []const u8, "rpath", "Additional RPATH entry (repeatable)") orelse &.{};
+
     // --- Binary name ---
     const exe_name: []const u8 = switch (backend) {
         .coreml => "capsper",
@@ -33,8 +46,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", options);
-    addBackendDeps(b, exe, backend);
-    addPlatformDeps(b, exe, is_macos);
+    addBackendDeps(b, exe, backend, ort_include);
+    addPlatformDeps(b, exe, is_macos, ort_lib);
+    for (extra_rpaths) |dir| exe.root_module.addRPathSpecial(dir);
     exe.linkLibC();
     b.installArtifact(exe);
 
@@ -90,70 +104,85 @@ pub fn build(b: *std.Build) void {
     // --- Property tests (minish-based, runs as executable) ---
     const prop_step = b.step("prop-test", "Run property-based tests (minish)");
 
-    const minish_dep = b.dependency("minish", .{
+    // minish is the only external dependency and only the property tests use
+    // it. `-Dprop-tests=false` drops it entirely, which is what lets a
+    // sandboxed package build (Nix) produce the binary with no network access
+    // at all -- marking it `.lazy` in build.zig.zon is not enough on its own,
+    // because merely asking for the dependency here is what triggers a fetch.
+    const prop_tests = b.option(bool, "prop-tests", "Build the minish property tests") orelse true;
+
+    if (prop_tests) if (b.lazyDependency("minish", .{
         .target = target,
         .optimize = optimize,
-    });
+    })) |minish_dep| {
+        const prop_imports: []const std.Build.Module.Import = if (is_macos)
+            &.{
+                .{ .name = "minish", .module = minish_dep.module("minish") },
+                .{ .name = "utils.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/shared/utils.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+                .{ .name = "input.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/platform/macos/input.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+            }
+        else
+            &.{
+                .{ .name = "minish", .module = minish_dep.module("minish") },
+                .{ .name = "utils.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/shared/utils.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+                .{ .name = "input.zig", .module = b.createModule(.{
+                    .root_source_file = b.path("src/platform/linux/input.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }) },
+            };
 
-    const prop_imports: []const std.Build.Module.Import = if (is_macos)
-        &.{
-            .{ .name = "minish", .module = minish_dep.module("minish") },
-            .{ .name = "utils.zig", .module = b.createModule(.{
-                .root_source_file = b.path("src/shared/utils.zig"),
+        const prop_exe = b.addExecutable(.{
+            .name = "prop-tests",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/shared/prop_tests.zig"),
                 .target = target,
                 .optimize = optimize,
-            }) },
-            .{ .name = "input.zig", .module = b.createModule(.{
-                .root_source_file = b.path("src/platform/macos/input.zig"),
-                .target = target,
-                .optimize = optimize,
-            }) },
-        }
-    else
-        &.{
-            .{ .name = "minish", .module = minish_dep.module("minish") },
-            .{ .name = "utils.zig", .module = b.createModule(.{
-                .root_source_file = b.path("src/shared/utils.zig"),
-                .target = target,
-                .optimize = optimize,
-            }) },
-            .{ .name = "input.zig", .module = b.createModule(.{
-                .root_source_file = b.path("src/platform/linux/input.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }) },
-        };
+                .imports = prop_imports,
+            }),
+        });
 
-    const prop_exe = b.addExecutable(.{
-        .name = "prop-tests",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/shared/prop_tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = prop_imports,
-        }),
-    });
+        const run_prop = b.addRunArtifact(prop_exe);
+        prop_step.dependOn(&run_prop.step);
 
-    const run_prop = b.addRunArtifact(prop_exe);
-    prop_step.dependOn(&run_prop.step);
-
-    // Also include prop tests in the main test step
-    test_step.dependOn(&run_prop.step);
+        // Also include prop tests in the main test step
+        test_step.dependOn(&run_prop.step);
+    };
 }
 
 // ─── Helper functions ────────────────────────────────────────────────────────
 
 const Exe = std.Build.Step.Compile;
 
-fn addLibPath(b: *std.Build, exe: *Exe, is_macos: bool) void {
-    if (!is_macos) {
+fn addLibPath(b: *std.Build, exe: *Exe, is_macos: bool, ort_lib: ?[]const u8) void {
+    if (is_macos) return;
+
+    if (ort_lib) |dir| {
+        // An external onnxruntime (Nix) lives at an absolute path, so link
+        // against it there and record it in the RPATH -- there is no
+        // ../lib beside the binary to fall back on.
+        exe.root_module.addLibraryPath(.{ .cwd_relative = dir });
+        exe.root_module.addRPathSpecial(dir);
+    } else {
         exe.root_module.addLibraryPath(b.path("dist/linux/lib"));
         exe.root_module.addRPathSpecial("$ORIGIN/../lib");
     }
 }
 
-fn addBackendDeps(b: *std.Build, exe: *Exe, backend: Backend) void {
+fn addBackendDeps(b: *std.Build, exe: *Exe, backend: Backend, ort_include: ?[]const u8) void {
     switch (backend) {
         .coreml => {
             exe.linkFramework("CoreML");
@@ -164,14 +193,21 @@ fn addBackendDeps(b: *std.Build, exe: *Exe, backend: Backend) void {
             });
         },
         .ort_cuda, .ort_cpu => {
-            exe.root_module.addIncludePath(b.path("dist/linux/include/onnxruntime"));
-            exe.linkSystemLibrary("onnxruntime");
+            if (ort_include) |dir| {
+                exe.root_module.addIncludePath(.{ .cwd_relative = dir });
+            } else {
+                exe.root_module.addIncludePath(b.path("dist/linux/include/onnxruntime"));
+            }
+            // Not via pkg-config: onnxruntime's .pc file is named
+            // `libonnxruntime`, so a pkg-config lookup for `onnxruntime`
+            // misses it. The library directory is already on the search path.
+            exe.linkSystemLibrary2("onnxruntime", .{ .use_pkg_config = .no });
         },
     }
 }
 
-fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
-    addLibPath(b, exe, is_macos);
+fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool, ort_lib: ?[]const u8) void {
+    addLibPath(b, exe, is_macos, ort_lib);
     exe.each_lib_rpath = false;
 
     if (is_macos) {
@@ -189,13 +225,14 @@ fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool) void {
             .flags = &.{},
         });
     } else {
+        // pkg-config supplies both the link flags and the pipewire/spa include
+        // directories, so pw_helpers.c needs no hardcoded -I of its own. (It
+        // used to carry /usr/include paths, which are simply absent on distros
+        // that do not use the FHS.)
         exe.linkSystemLibrary("libpipewire-0.3");
         exe.root_module.addCSourceFile(.{
             .file = b.path("src/platform/linux/pw_helpers.c"),
-            .flags = &.{
-                "-I/usr/include/pipewire-0.3",
-                "-I/usr/include/spa-0.2",
-            },
+            .flags = &.{},
         });
     }
 }

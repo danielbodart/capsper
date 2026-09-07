@@ -60,3 +60,21 @@ jobs:
         with:
           name: capsper-macos-arm64
           path: dist/macos/
+
+  # NixOS support. There is no NixOS runner image, but a Nix derivation builds
+  # identically on any host, so Nix on ubuntu is a real verification of the
+  # packages. The NixOS module needs an actual NixOS system, which the flake's
+  # check boots in a VM — KVM is available on Linux runners and the Determinate
+  # installer enables it.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: tools
+          key: mise-tools-linux-${{ hashFiles('.mise.toml') }}
+          restore-keys: mise-tools-linux-
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Nix
+        run: ./run nix
