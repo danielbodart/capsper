@@ -77,6 +77,18 @@ pub fn load(
         return null;
     };
 
+    // ORT's intra-op thread pool spin-waits for new work after each Run before
+    // parking its threads. Batch transcription never exposes this because the
+    // Runs are back to back, but streaming dictation feeds a chunk every
+    // ~100ms -- shorter than the spin timeout -- so the workers never park and
+    // burn every core for the whole utterance. Measured on a 32-core machine:
+    // 86s of audio costs 759s of CPU transcribed flat out, but 2505s fed at
+    // real time. Turning spinning off trades a little per-chunk wake-up
+    // latency for not melting the machine while the user is talking.
+    ort_c.check(api, api.AddSessionConfigEntry.?(opts.?, "session.intra_op.allow_spinning", "0")) catch {
+        std.debug.print("Warning: could not disable ORT intra-op spinning\n", .{});
+    };
+
     // CUDA configuration based on build variant
     const backend = build_options.backend;
     if (backend == .ort_cuda) {
