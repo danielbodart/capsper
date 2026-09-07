@@ -281,6 +281,7 @@ cmd_install() {
         if ! $is_upgrade || $update_config; then
             local channel="FL"
             local gain="1.0"
+            local target=""
             echo ""
             echo "=== Audio Configuration ==="
             if confirm "Run microphone channel detection? (No = use default FL, no gain boost)"; then
@@ -288,10 +289,11 @@ cmd_install() {
                 detect_output=$(audio_detect "$SCRIPT_DIR/bin/capsper")
                 channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
                 gain=$(echo "$detect_output" | grep '^GAIN=' | tail -1 | cut -d= -f2)
+                target=$(echo "$detect_output" | grep '^TARGET=' | tail -1 | cut -d= -f2-)
                 [ -z "$channel" ] && channel="FL"
                 [ -z "$gain" ] && gain="1.0"
             else
-                echo "Using default channel: FL, gain: 1.0"
+                echo "Using default device, channel: FL, gain: 1.0"
             fi
 
             local drop_terms=""
@@ -324,7 +326,7 @@ cmd_install() {
                 low_latency=true
             fi
 
-            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$SCRIPT_DIR/models" "" false "$drop_terms" $enable_recordings $low_latency "$gain"
+            install_service "$project_dir" "$SCRIPT_DIR/bin/capsper" "$channel" "$SCRIPT_DIR/models" "$target" false "$drop_terms" $enable_recordings $low_latency "$gain"
         fi
     else
         echo "=== Capsper Installer ==="
@@ -340,6 +342,7 @@ cmd_install() {
         if ! $is_upgrade || $update_config; then
             local channel="FL"
             local gain="1.0"
+            local target=""
             echo ""
             echo "=== Audio Configuration ==="
             if confirm "Run microphone channel detection? (No = use default FL, no gain boost)"; then
@@ -347,10 +350,11 @@ cmd_install() {
                 detect_output=$(audio_detect "$INSTALL_DIR/current/bin/capsper")
                 channel=$(echo "$detect_output" | grep '^CHANNEL=' | tail -1 | cut -d= -f2)
                 gain=$(echo "$detect_output" | grep '^GAIN=' | tail -1 | cut -d= -f2)
+                target=$(echo "$detect_output" | grep '^TARGET=' | tail -1 | cut -d= -f2-)
                 [ -z "$channel" ] && channel="FL"
                 [ -z "$gain" ] && gain="1.0"
             else
-                echo "Using default channel: FL, gain: 1.0"
+                echo "Using default device, channel: FL, gain: 1.0"
             fi
 
             local drop_terms=""
@@ -401,7 +405,7 @@ cmd_install() {
                 enable_updates=false
             fi
 
-            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "" $enable_updates "$drop_terms" $enable_recordings $low_latency "$gain" "$tcp_port"
+            install_service "$INSTALL_DIR" "$INSTALL_DIR/current/bin/capsper" "$channel" "$INSTALL_DIR/models" "$target" $enable_updates "$drop_terms" $enable_recordings $low_latency "$gain" "$tcp_port"
 
             if $enable_updates; then
                 install_update_timer

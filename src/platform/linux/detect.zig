@@ -14,7 +14,7 @@ const StreamData = struct {
 /// Full setup wizard: enumerate devices, let user pick, record silence,
 /// record speech, detect channel, calibrate gain — all in one interactive flow.
 /// If target is provided, skip device selection.
-/// Writes CHANNEL=... and GAIN=... to stdout for install.sh to parse.
+/// Writes TARGET=..., CHANNEL=... and GAIN=... to stdout for install.sh to parse.
 pub fn detectChannel(allocator: std.mem.Allocator, target: ?[:0]const u8, duration: u32) void {
     std.debug.print("=== PipeWire Setup ===\n\n", .{});
 
@@ -112,8 +112,8 @@ pub fn detectChannel(allocator: std.mem.Allocator, target: ?[:0]const u8, durati
     defer allocator.free(silence_pcm);
     std.debug.print("Done.\n\n", .{});
 
-    // Phase 2: Record speech (flows directly into gain calibration)
-    std.debug.print("Press ENTER to record SPEECH and calibrate gain (talk normally, keep talking)...", .{});
+    // Phase 2: Record speech
+    std.debug.print("Press ENTER to record SPEECH (talk normally, keep talking)...", .{});
     waitForEnter();
     std.debug.print("Recording {d}s of speech...\n", .{duration});
     const speech_pcm = captureMultiChannel(allocator, chosen_target, num_channels, duration) catch |err| {
@@ -121,8 +121,9 @@ pub fn detectChannel(allocator: std.mem.Allocator, target: ?[:0]const u8, durati
         return;
     };
     defer allocator.free(speech_pcm);
+    std.debug.print("Done.\n", .{});
 
-    // Analyze channels (displayed while user keeps talking)
+    // Analyze channels
     std.debug.print("\n=== Channel Analysis ===\n", .{});
     std.debug.print("  {s:<10} | {s:>12} | {s:>12} | {s:>8}\n", .{ "Channel", "Silence (dB)", "Speech (dB)", "Delta" });
     std.debug.print("  {s:-<10}─┼─{s:-<12}─┼─{s:-<12}─┼─{s:-<8}\n", .{ "", "", "", "" });
@@ -168,15 +169,15 @@ pub fn detectChannel(allocator: std.mem.Allocator, target: ?[:0]const u8, durati
         }
     }
 
-    // Phase 3: Gain calibration — seamless, user keeps talking
+    // Phase 3: Gain calibration
     const channel_pos = channelPositionFromIndex(best_ch, num_channels);
-    std.debug.print("Calibrating auto-gain (keep talking)...\n", .{});
+    std.debug.print("Press ENTER to calibrate GAIN on {s} (talk normally, keep talking)...", .{chosen_name});
+    waitForEnter();
+    std.debug.print("Calibrating auto-gain for {d}s (keep talking)...\n", .{duration});
     const cal = calibrateGain(chosen_target, channel_pos, duration) catch |err| {
         std.debug.print("Gain calibration failed: {}\n", .{err});
         // Still emit parseable output so install.sh isn't broken
-        var buf: [64]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "\nCHANNEL={s}\nGAIN=1.0\n", .{chosen_name}) catch "\nCHANNEL=FL\nGAIN=1.0\n";
-        _ = posix.write(posix.STDOUT_FILENO, line) catch {};
+        emitConfig(chosen_target, chosen_name, 1.0);
         return;
     };
 
@@ -185,12 +186,23 @@ pub fn detectChannel(allocator: std.mem.Allocator, target: ?[:0]const u8, durati
         std.debug.print("Level OK — no gain boost needed.\n", .{});
     }
 
-    std.debug.print("\n  --audio-channel {s} --audio-gain {d:.1}\n", .{ chosen_name, cal.gain });
+    if (chosen_target) |t| {
+        std.debug.print("\n  --audio-target {s} --audio-channel {s} --audio-gain {d:.1}\n", .{ t, chosen_name, cal.gain });
+    } else {
+        std.debug.print("\n  --audio-channel {s} --audio-gain {d:.1}\n", .{ chosen_name, cal.gain });
+    }
 
-    // Write parseable output to stdout for install.sh
-    var out_buf: [64]u8 = undefined;
-    const out_line = std.fmt.bufPrint(&out_buf, "\nCHANNEL={s}\nGAIN={d:.1}\n", .{ chosen_name, cal.gain }) catch "\nCHANNEL=FL\nGAIN=1.0\n";
-    _ = posix.write(posix.STDOUT_FILENO, out_line) catch {};
+    emitConfig(chosen_target, chosen_name, cal.gain);
+}
+
+/// Write parseable TARGET/CHANNEL/GAIN lines to stdout for install.sh.
+fn emitConfig(target: ?[:0]const u8, channel: []const u8, gain: f32) void {
+    var buf: [512]u8 = undefined;
+    const line = if (target) |t|
+        std.fmt.bufPrint(&buf, "\nTARGET={s}\nCHANNEL={s}\nGAIN={d:.1}\n", .{ t, channel, gain }) catch "\nCHANNEL=FL\nGAIN=1.0\n"
+    else
+        std.fmt.bufPrint(&buf, "\nCHANNEL={s}\nGAIN={d:.1}\n", .{ channel, gain }) catch "\nCHANNEL=FL\nGAIN=1.0\n";
+    _ = posix.write(posix.STDOUT_FILENO, line) catch {};
 }
 
 // ─── Channel helpers ────────────────────────────────────────────────────────
