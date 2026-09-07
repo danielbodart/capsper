@@ -20,6 +20,38 @@ is linked by Zig, which sets its own ELF interpreter and RPATH.
 Unlike the release tarball, these are not built for `x86_64_v3`, so they run on
 any x86_64 machine.
 
+## Which variant on a laptop
+
+`capsper-cpu`, in most cases — and the reason is battery, not speed.
+
+NVIDIA's finegrained runtime power management is all-or-nothing: the discrete
+GPU drops to D3cold, which powers the device off, and any process holding a
+CUDA context pins it `active` instead. So an always-on `capsper-cuda` keeps the
+GPU out of D3cold for as long as the service runs.
+
+That is less dramatic than it sounds. Measured on an RTX 4070 Laptop with the
+model resident and no audio being sent, the GPU clocks itself down to 210MHz
+and idles at **~3.5W** (837MiB VRAM, 0% utilisation). But it is paid
+continuously, whereas the CPU build's cost is paid only while you speak:
+
+| | while speaking | while idle |
+|---|---|---|
+| `capsper-cpu` | ~1.4 cores | GPU suspended, 0W |
+| `capsper-cuda` | ~0.6 cores | ~3.5W, indefinitely |
+
+The CPU cost scales with how much you dictate; the GPU idle cost does not.
+Idling at 3.5W for sixteen hours is ~56Wh, against a couple of Wh for half an
+hour of dictation on CPU. For push-to-talk, which is intermittent by
+definition, that is decisive. On a desktop, where the idle watts do not matter,
+`capsper-cuda` is the better choice.
+
+**Suspending the GPU between presses is not a way out.** The model lives in
+VRAM and D3cold discards it, so the session has to be rebuilt from scratch:
+measured at 2.5-3.0s from a warm page cache, against ~2.0s for the CPU build.
+Three seconds before the first word is not a usable dictation latency, and
+there is no partial version — building the session *is* the expensive part, and
+CUDA offers no way to keep one alive while releasing the device.
+
 ## Install
 
 Two modules, because capsper straddles the system/user boundary. The system
@@ -62,6 +94,9 @@ imports = [ inputs.capsper.homeModules.default ];
 
 services.capsper = {
   enable = true;
+  # Defaults to capsper-cpu. Swap in capsper-cuda on a desktop -- see
+  # "Which variant on a laptop" above for why that is the wrong way round
+  # on battery.
   package = inputs.capsper.packages.x86_64-linux.capsper-cuda;
   audioChannel = "FL";
   # audioTarget, audioGain, dropTerms, lowLatency, port, recordDir ...
@@ -169,8 +204,3 @@ the previous behaviour, so the tarball build is unchanged.
 **Git LFS.** `dist/linux/lib/*.so` are LFS objects and arrive as pointer files
 when the flake is fetched from GitHub. The source filter excludes that
 directory entirely; nothing in the Nix build reads it.
-
-**PRIME laptops.** On a hybrid-graphics laptop using PRIME offload with
-finegrained power management, `capsper-cuda` run as an always-on service holds
-a CUDA context, which keeps the discrete GPU awake permanently — the opposite
-of what offload is for. `capsper-cpu` may be the better trade on battery.

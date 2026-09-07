@@ -73,10 +73,18 @@ in
         The capsper package to run. Set this to `capsper-cuda` for NVIDIA
         GPU inference.
 
-        On a laptop using PRIME offload with finegrained power management,
-        note that capsper as an always-on service holds a CUDA context, which
-        keeps the discrete GPU awake permanently -- the opposite of what
-        offload is for. The CPU build may be the better trade on battery.
+        On a laptop, prefer the CPU build. Holding a CUDA context keeps the
+        discrete GPU out of D3cold for as long as the service runs; measured
+        on an RTX 4070 Laptop that idles at ~3.5W with the model resident.
+        Small in itself, but it is paid continuously, whereas the CPU build's
+        cost is paid only while you are actually speaking (~1.4 cores) and
+        leaves the GPU suspended at 0W the rest of the time. For push-to-talk,
+        which is intermittent by definition, that favours the CPU build by a
+        wide margin on battery.
+
+        Releasing the GPU between presses is not a way out: the model lives in
+        VRAM, which D3cold discards, and rebuilding the session costs ~3s
+        before the first word.
       '';
     };
 
