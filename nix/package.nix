@@ -49,6 +49,10 @@ let
     installPhase = "mkdir -p $out && cp -r lib $out/";
   };
 
+  # Shared with the flake's devShell so the packaged binary and the one
+  # `./run build` produces load the same libraries. See ./runtime-libs.nix.
+  runtimeLibs = import ./runtime-libs.nix { inherit lib stdenv cudaPackages; };
+
   # The ORT headers must match the ORT being linked: capsper asks for
   # ORT_API_VERSION at runtime, and a 1.23.2 library returns null if handed
   # the 24 that nixpkgs' 1.24.4 headers declare.
@@ -128,16 +132,10 @@ stdenv.mkDerivation {
       --subst-var-by libpath ${
         lib.escapeShellArg (
           if cudaSupport then
-            lib.concatStringsSep ":" [
-              "${ortCuda}/lib"
-              "${lib.getLib stdenv.cc.cc}/lib"
-              "${lib.getLib cudaPackages.libcublas}/lib"
-              "${lib.getLib cudaPackages.libcurand}/lib"
-              "${lib.getLib cudaPackages.libcufft}/lib"
-              "${lib.getLib cudaPackages.cuda_cudart}/lib"
-              "${lib.getLib cudaPackages.cudnn}/lib"
-              "/run/opengl-driver/lib"
-            ]
+            # This build's ORT comes from the store; the rest is the shared
+            # list. The CPU build needs no LD_LIBRARY_PATH at all -- Zig gave
+            # it an RPATH covering nixpkgs' onnxruntime.
+            lib.concatStringsSep ":" ([ "${ortCuda}/lib" ] ++ runtimeLibs)
           else
             ""
         )

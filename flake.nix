@@ -31,6 +31,11 @@
         # consumer opt in globally.
         config.allowUnfree = true;
       };
+
+      # The same list nix/package.nix bakes into the packaged wrapper. Bound
+      # here so the devShell below exports exactly what the packaged build
+      # loads.
+      runtimeLibs = import ./nix/runtime-libs.nix { inherit (pkgs) lib stdenv cudaPackages; };
     in
     {
       packages.${system} = {
@@ -45,6 +50,39 @@
         # NVIDIA GPU wants `.#capsper-cuda` explicitly -- it adds a 240MB
         # onnxruntime fetch and the CUDA runtime on top.
         default = self.packages.${system}.capsper-cpu;
+      };
+
+      # What `./run` installs with apt everywhere else. bootstrap.sh enters
+      # this shell automatically on NixOS, where there is no apt to call, so
+      # the same `./run dev` works on both.
+      #
+      # Deliberately not the toolchain: zig, bun and shellcheck still come
+      # from mise, pinned in .mise.toml, so a local build uses the identical
+      # versions CI does rather than whatever nixpkgs happens to carry. This
+      # supplies only the system half -- the packages the Ubuntu job installs
+      # in .github/workflows/ci.yml, plus the two binaries `dist` shells out
+      # to.
+      devShells.${system}.default = pkgs.mkShell {
+        nativeBuildInputs = with pkgs; [
+          pkg-config
+          file # dist: checks the ORT libs really are ELF
+          binutils # dist: objdump, for the AVX-512 scan
+        ];
+
+        # buildInputs rather than nativeBuildInputs so pkg-config's setup hook
+        # puts libpipewire-0.3.pc on PKG_CONFIG_PATH -- build.zig finds
+        # PipeWire that way and no other.
+        buildInputs = [ pkgs.pipewire ];
+
+        # `./run build` symlinks bin/capsper to the CUDA variant and the
+        # integration tests start that, so the dev binary needs the same
+        # libraries the packaged one gets from its wrapper. Both read the
+        # single list in nix/runtime-libs.nix, which is the point of that
+        # file: these two cannot drift apart.
+        #
+        # No ORT entry here. This binary finds it in dist/linux/lib through an
+        # $ORIGIN-relative RPATH that build.zig sets.
+        LD_LIBRARY_PATH = pkgs.lib.concatStringsSep ":" runtimeLibs;
       };
 
       # The module's whole job is granting permissions a user cannot grant

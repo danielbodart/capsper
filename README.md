@@ -243,7 +243,8 @@ cd capsper
 
 This auto-detects your platform and handles everything:
 - Installs toolchain (mise, Zig 0.15, Bun) on first run via `bootstrap.sh`
-- Installs system packages (`libpipewire-0.3-dev`, `pv`, `ncat` on Linux; `shellcheck` on macOS)
+- Installs system packages (`libpipewire-0.3-dev` on Linux; `shellcheck` on macOS)
+- On NixOS, where there is no apt, `bootstrap.sh` re-runs the command inside the flake's `devShell`, which supplies that same set plus the CUDA libraries the dev binary loads. The toolchain still comes from mise either way, so a local build uses the versions CI uses
 - Downloads models if missing (~250 MB for ONNX, ~150 MB for CoreML)
 - Compiles the Zig binary (pre-built ONNX Runtime shared libs committed via Git LFS on Linux)
 - Runs unit tests, property tests, and short integration smoke tests

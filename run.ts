@@ -55,14 +55,19 @@ async function ensureDepsLinux() {
     const { exitCode: pwCheck } = await $`pkg-config --exists libpipewire-0.3`.quiet().nothrow();
     if (pwCheck !== 0) missing.push("libpipewire-0.3-dev");
 
-    // Streaming test deps
-    if (!await which("pv")) missing.push("pv");
-    if (!await which("nc") && !await which("ncat")) missing.push("ncat");
+    if (missing.length === 0) return;
 
-    if (missing.length > 0) {
-        console.log(`Installing missing packages: ${missing.join(", ")}`);
-        await $`sudo apt install -y ${missing}`;
+    // On NixOS these arrive from the flake's devShell, which bootstrap.sh
+    // enters before we get here -- so anything still missing means that did
+    // not happen, and apt is not the answer.
+    if (!await which("apt")) {
+        console.error(`Missing packages: ${missing.join(", ")}`);
+        console.error("No apt here. On NixOS run through the flake: nix develop --command ./run");
+        process.exit(1);
     }
+
+    console.log(`Installing missing packages: ${missing.join(", ")}`);
+    await $`sudo apt install -y ${missing}`;
 }
 
 function ensureBinary() {

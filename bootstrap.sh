@@ -53,6 +53,22 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     fi
 fi
 
+# ─── NixOS: re-enter through the flake's dev shell ────────────────────────
+# The build needs pkg-config, PipeWire's headers and a couple of binaries the
+# dist step shells out to. Every other Linux gets those from apt; there is no
+# apt here, so the flake supplies them instead and this re-runs the same
+# command inside that shell. CAPSPER_DEV_SHELL is what stops it recursing.
+#
+# Only the system half comes from Nix. mise still installs the toolchain
+# below, so the zig and bun that build the binary are the versions .mise.toml
+# pins -- exactly what CI uses.
+if [[ -z "${CAPSPER_DEV_SHELL:-}" && -e /etc/NIXOS && "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    export CAPSPER_DEV_SHELL=1
+    exec nix develop "$SCRIPT_DIR" \
+        --extra-experimental-features 'nix-command flakes' \
+        --command "$0" "$@"
+fi
+
 # ─── Common setup ─────────────────────────────────────────────────────────
 [[ -f "$MISE_INSTALL_PATH" ]] || http https://mise.run | sh
 git -C "$SCRIPT_DIR" submodule update --init --recursive --quiet
