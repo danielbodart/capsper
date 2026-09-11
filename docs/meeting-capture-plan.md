@@ -19,7 +19,7 @@ In scope:
 - Pass-through of that sink to the current default output, so the call is still
   audible.
 - Two capture tracks: the monitor of that sink (the far end), and the default
-  input (the host).
+  input (the near end).
 - Two gates per track: node connection, then VAD.
 - Both tracks through the existing pipeline, one connection each.
 - One WebVTT file per session, both tracks interleaved, speakers as voice spans.
@@ -32,6 +32,39 @@ Explicitly out of scope, and not to be added later without a separate decision:
 calendar integration, meeting detection heuristics, uploading anywhere,
 summarisation, speaker identification beyond the two tracks, any network access
 at all. Capsper's whole proposition is that nothing leaves the machine.
+
+## Naming: near end and far end
+
+The two sides are **near** and **far** throughout -- in the file names, in the
+voice spans, in the prose. Not host/guest, not local/remote, and not a mixture,
+which is what the first draft of this document was.
+
+Near-end and far-end are the standard vocabulary of echo cancellation and VoIP,
+which is exactly this signal topology: the near end is the microphone, the far end
+is what arrives from the call and comes out of the speaker. For an audio tool that
+is the right audience to be legible to.
+
+The other two candidates are already spoken for:
+
+- **local/remote** -- `local` means local audio capture as opposed to the TCP
+  transport throughout `server.zig` and `main.zig`, in comments, log lines and the
+  usage text. Reusing it for a speaker would give one word two meanings in one
+  file.
+- **host/guest** -- taken by the hardware. A Focusrite Vocaster exposes a Host
+  Microphone and a Guest Microphone, meaning two people in the same room. If
+  capsper ever captures that second mic, host/guest for the two ends of a call
+  leaves you with a host, a guest, and a remote guest.
+
+Near/far is also the only pair that survives that growth: near covers everyone in
+the room and far covers everyone on the call, so a third track needs no rename.
+
+One known weakness, accepted rather than solved: `<v Near>` and `<v Far>` are
+terse as labels for a human reading the transcript against the audio. They are the
+honest defaults, because we genuinely do not know who the far end is. Substituting
+real names is a later concern and not something the format needs to solve.
+
+The `remote host` in the directory layout section below is the networking sense
+and stays as it is.
 
 ## Why a sink and not a microphone
 
@@ -111,7 +144,7 @@ simply what was being said while recording a file with long gaps in it.
 
 Silence costs the same as speech, fractionally more. The encoder runs on every
 chunk regardless and the decoder emits blank. The far-end track is quiet for most
-of an hour whenever the host is the one talking, so that is close to a full core
+of an hour whenever the near end is the one talking, so that is close to a full core
 spent producing nothing.
 
 On the desktop that is two cores out of twenty-four, which is tolerable but
@@ -175,7 +208,7 @@ WEBVTT
 
 1
 00:00:04.120 --> 00:00:07.880
-<v Host>so the thing I wanted to raise was the routing
+<v Near>so the thing I wanted to raise was the routing
 
 2
 00:00:08.020 --> 00:00:11.400
@@ -184,8 +217,8 @@ WEBVTT
 
 Which buys:
 
-- **Speaker attribution as ground truth, not inference.** Two tracks means host
-  versus far end is known, not guessed. Better than what the commercial tools
+- **Speaker attribution as ground truth, not inference.** Two tracks means near
+  end versus far end is known, not guessed. Better than what the commercial tools
   produce by diarisation.
 - **One file, not two.** Cues from both tracks merge by audio position, which both
   connections share because they start together. The merge is a sort.
@@ -235,7 +268,7 @@ NOTE {"cycle":42,"state":"streaming","buf_ms":1680,"words":7,"rms_ema":0.031}
 
 3
 00:00:11.600 --> 00:00:14.050
-<v Host>right, that makes sense
+<v Near>right, that makes sense
 ```
 
 So the difference between a normal transcript and a debug one is exactly one
@@ -329,7 +362,7 @@ Sessions are user data, so `$XDG_DATA_HOME/capsper/sessions/` by default.
 ```
 sessions/2026/09/11/T143000Z/
   transcript.vtt
-  host.opus
+  near.opus
   far.opus
 ```
 
@@ -368,7 +401,7 @@ The meeting options live in the config file. The only new flag is:
 --config PATH           Config file location (default: $XDG_CONFIG_HOME/capsper/config.zon)
 ```
 
-The host track uses the existing source selection. Note that
+The near-end track uses the existing source selection. Note that
 `platform/linux/audio.zig` already omits `PW_KEY_TARGET_OBJECT` when no target is
 given and logs "PipeWire capture ready (default source)", and `want_local` is
 satisfied by `--trigger` alone -- so following the desktop's default input picker
