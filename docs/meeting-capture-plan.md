@@ -372,9 +372,11 @@ backwards compatible.
 
 ## Configuration
 
-New surface goes in a config file. The CLI keeps working exactly as it does, and
-keeps every flag it has, but the meeting options are config-only rather than
-growing another dozen flags onto a command line that already has twenty.
+Every current setting gets a config field, not just the new ones. The CLI keeps
+working exactly as it does and keeps every flag it has, including the `--pw-*` and
+`--stream-wav` aliases; the config is a second way to say the same things, plus
+the meeting options, which are config-only rather than growing another dozen flags
+onto a command line that already has twenty.
 
 **Format: ZON.** `std.zon.parse.fromSlice` is in the standard library as of the
 pinned toolchain (verified in Zig 0.15.2, with a `Diagnostics` type that reports
@@ -391,12 +393,49 @@ errors with source locations). That matters more than it sounds:
 - **The project already uses it.** `build.zig.zon` is ZON, with comments in it
   today. One format to know, not two.
 
-Sketch:
+Enum literals are worth calling out separately. `.FL`, `.capslock`, `.wait`,
+`.opus` are ZON natives and type check at parse time, so a typo is a diagnostic
+with a line number. Today an invalid `--audio-channel` prints a message and
+returns from `main` without starting anything, which is a worse version of the
+same idea.
+
+### The schema
 
 ```zig
 .{
+    .model = "~/.local/share/capsper/models/nemotron", // --model, -m
+    .verbose = false,                                  // --verbose, -v
+    .drop_terms = null,                                // --drop-terms
+
+    .audio = .{
+        .target = null,          // --audio-target; null follows the default source
+        .channel = .FL,          // --audio-channel
+        .gain = 1.0,             // --audio-gain
+        .auto_gain = true,       // --no-auto-gain
+        .on_device_lost = .wait, // --on-device-lost
+        .detect_duration = 5,    // --detect-duration
+    },
+
+    .trigger = .{
+        .key = .capslock,        // --trigger; null disables push-to-talk
+        .passthrough = false,    // --trigger-passthrough
+        .type_delay_us = 12_000, // --type-delay
+        .low_latency = false,    // --low-latency
+    },
+
+    .tcp_server = .{
+        .port = null,            // --port, -p; null means no server
+    },
+
+    .debug_recording = .{
+        .dir = null,             // --record-dir; null disables
+        .keep = 10,              // --record-keep
+        .audio_format = .wav,
+        .detail = .debug,
+    },
+
     .meeting = .{
-        .enabled = true,
+        .enabled = false,
         // The name this appears under in the desktop's output picker.
         .sink_name = "capsper_call",
         .dir = "~/.local/share/capsper/sessions",
@@ -406,18 +445,49 @@ Sketch:
         .idle_close_seconds = 30,
         .detail = .minimal, // or .debug, which adds NOTE blocks
     },
-    .debug_recording = .{
-        .dir = "~/.local/share/capsper/debug",
-        .keep = 10,
-        .audio_format = .wav,
-        .detail = .debug,
-    },
 }
 ```
 
-Resolution order: config file, then CLI flags, so a flag can always override a
-setting for one run. Search `$XDG_CONFIG_HOME/capsper/config.zon`, then the path
-given by a `--config` flag. A missing file is not an error; it means defaults.
+### Names that changed, and why
+
+Most flags keep their name with the prefix becoming the group, so
+`--audio-channel` is `audio.channel` and `--trigger-passthrough` is
+`trigger.passthrough`. Three do not:
+
+| flag | field | why |
+| --- | --- | --- |
+| `--no-auto-gain` | `audio.auto_gain` | a file should not carry negations; `no_auto_gain = false` is a double negative nobody reads correctly |
+| `--type-delay` | `trigger.type_delay_us` | a bare number in a file has no usage text beside it, so the unit belongs in the name |
+| `--record-dir`, `--record-keep` | `debug_recording.*` | named for what it is rather than what the flag was, now that a second kind of recording exists |
+
+`--low-latency` and `--type-delay` sit under `trigger` because both only affect
+the push-to-talk path, and grouping them there says so without a comment.
+
+### Not in the config
+
+**Commands, which stay CLI-only.** A config file describes a running service, so
+one-shot actions have no place in it: `--version`, `--dry-run`, `--audio-detect`,
+`--transcribe FILE`, `--stream FILE`.
+
+**Aliases**, which keep working on the command line but have no second spelling in
+the file: `--pw-target`, `--pw-channel`, `--pw-gain`, `--pw-detect`,
+`--stream-wav`.
+
+**The three no-ops, dropped entirely.** `--domain-terms` and `--warmup-file` warn
+and skip their argument today; `--no-warmup` does nothing at all. They exist only
+so old service files keep starting. They get no fields, and this is the moment to
+decide whether the CLI still needs them either.
+
+Two of those are still advertised in `README.md` as though they work, along with
+`--input tcp|local`, which `main.zig` does not parse at all -- it falls through to
+the unknown-option warning. The binary's own `printUsage` is correct and the
+README is stale; worth a separate fix, not this one.
+
+### Resolution
+
+Config file first, then CLI flags, so a flag always overrides a setting for one
+run. Look in `$XDG_CONFIG_HOME/capsper/config.zon` unless `--config` names another
+path. A missing file is not an error; it means defaults.
 
 ## Directory layout
 
@@ -480,10 +550,11 @@ Following the default means dropping the static gain, not just the target.
 ## Phases
 
 **Phase 0 -- the config file.** `std.zon.parse` into a config struct, XDG lookup,
-`--config` to override, flags winning over file. Nothing reads it yet beyond the
-settings that already exist as flags, which is the point: it lands and is proven
-before anything depends on it. Settle the field names here, because they are the
-part that is expensive to change later.
+`--config` to override, flags winning over file. Every existing setting gets a
+field; the three no-ops get dropped. Nothing new reads it yet, which is the point:
+it lands against the surface that already exists and is proven before anything
+depends on it. Settle the field names here, because they are the part that is
+expensive to change later.
 
 **Phase 1 -- the sink and the graph.** Create the virtual sink, pass it through to
 the default output, expose its monitor as a capture source. No transcription.
