@@ -23,7 +23,8 @@ In scope:
 - Two gates per track: node connection, then VAD.
 - Both tracks through the existing pipeline, one connection each.
 - One WebVTT file per session, both tracks interleaved, speakers as voice spans.
-- Per-track audio, format selectable.
+- One stereo audio file per session, near left and far right, format selectable.
+- A generated `index.html` that plays the two together.
 - Dated session directories.
 - A config file, since this is where the option count stops fitting on a command
   line. Existing flags keep working unchanged.
@@ -31,7 +32,8 @@ In scope:
 Explicitly out of scope, and not to be added later without a separate decision:
 calendar integration, meeting detection heuristics, uploading anywhere,
 summarisation, speaker identification beyond the two tracks, any network access
-at all. Capsper's whole proposition is that nothing leaves the machine.
+at all, and an HTTP server for the generated page. Capsper's whole proposition is
+that nothing leaves the machine.
 
 ## Naming: near end and far end
 
@@ -285,15 +287,38 @@ the writer, not a second implementation of it.
 
 ## Audio files
 
-Two tracks, kept separately -- they are the thing that makes the speaker
-attribution verifiable, and merging them at the audio level would destroy it. The
-transcript is where the two sides come together, not the audio.
+**One stereo file, near on the left, far on the right.** Not two mono files.
 
-WAV at 32000 bytes/sec is 115 MB per hour per track, so 230 MB for a meeting.
-Opus at 24 kbps mono is roughly 11 MB per track per hour, which is the difference
-between thinking about disk and not. Opus is also the right codec for the content
-by design, and libopus is a small C dependency of the kind the tree already
-carries.
+Channel separation is lossless separation, so nothing is given up: `ffmpeg` splits
+it back into two mono tracks in one invocation if anything ever wants them that
+way. What is gained is a single timeline. Two files have two, and if one capture
+starts a few tens of milliseconds after the other, or takes a dropout, they
+desync and neither file records that it happened. Interleaved samples cannot
+drift apart from each other or from the transcript.
+
+**The recording is never gated.** VAD gates the ASR encoder only, never the file.
+If elided silence reached the audio, it would stop lining up with the cue
+timestamps and the transcript would no longer be checkable against what was said,
+which is the entire reason the audio is kept. Two different things are called "the
+encoder" in this document; this is the line between them.
+
+Hard-panned stereo is tiring to listen to directly, and that is accepted rather
+than designed around -- the file is for checking a transcript, and the player in
+the next section routes either channel to both ears anyway.
+
+The channel assignment goes in a `NOTE` at the top of the transcript, so a
+recording found in two years says which side is which without this document.
+
+**This works because there are exactly two sides.** If the Vocaster guest
+microphone ever becomes a third track, stereo cannot hold it. Opus handles more
+channels through its mapping families and WAV handles it trivially, so the formats
+generalise, but the "it just plays" property does not survive past two. That is
+the boundary, stated rather than pretended away.
+
+WAV at 32000 bytes/sec is 115 MB per hour per channel. Opus couples stereo
+channels efficiently only when they correlate, and these two do not at all, so
+budget around 48 kbps rather than 24 -- roughly 20 MB an hour, which is the same
+total as two mono tracks would have been. No saving, no cost.
 
 Two formats, `wav` and `opus`, selectable per path rather than globally. Defaults:
 
@@ -305,6 +330,45 @@ Two formats, `wav` and `opus`, selectable per path rather than globally. Default
 Either can be set to either. The debug default is not a limitation to work around
 later -- raw is the right thing there, and the setting exists so an unusual case
 can say so, not because the default is in doubt.
+
+Channel count follows the number of tracks, so the debug path stays mono: it
+records one side of nothing.
+
+## The player
+
+An `index.html` written beside the transcript and the audio, referencing both as
+siblings. A small embedded script, no build step, no dependencies.
+
+What it does: an `<audio>` element for `audio.opus`, a `<track>` element for
+`transcript.vtt`, and a transcript that scrolls in step with playback -- near end
+on the left, far end on the right, like a chat log. Plus a Web Audio graph that
+routes either channel to both ears, so the hard panning becomes a near / far /
+both control rather than something to endure.
+
+**It uses the browser's own WebVTT parser.** No hand-written parsing. Set the
+track to `mode = "hidden"` and cue events fire without anything being rendered;
+`cue.text` carries the payload as authored, so the voice span prefix comes off
+with a regex and the rest is the line to display. This is the whole reason the
+cues stay as readable text rather than JSON: the standard parser already handles
+them, and the file still drops into mpv or any other player and works.
+
+The `NOTE` blocks are invisible here, which is correct. The native parser discards
+comments, so the debug detail costs the player nothing and needs no handling. It
+is there for a human reading the file and for whatever reads it later.
+
+**It assumes it is served over HTTP.** Capsper does not ship a server; point any
+static file server at the sessions directory. This is a deliberate simplification
+and it has one consequence worth knowing before anyone debugs it for an afternoon:
+opening `index.html` straight off the filesystem will look like it works and the
+channel control will be silent. Both Chrome and Firefox treat every `file://` URL
+as its own opaque origin, so `createMediaElementSource` on an audio element
+pointing at a sibling file outputs zeroes rather than failing. Chrome notes it in
+the console and carries on.
+
+**The page is a view, not the format.** The transcript and the audio are
+canonical, `index.html` is regenerable from them, and nothing may end up recorded
+only in the page. Otherwise the player quietly becomes a thing that has to stay
+backwards compatible.
 
 ## Configuration
 
@@ -361,9 +425,9 @@ Sessions are user data, so `$XDG_DATA_HOME/capsper/sessions/` by default.
 
 ```
 sessions/2026/09/11/T143000Z/
+  index.html
   transcript.vtt
-  near.opus
-  far.opus
+  audio.opus
 ```
 
 Date-nested rather than a flat directory of long names: a year of meetings is a
@@ -427,9 +491,9 @@ Success: select it in Google Meet, still hear the call, see the monitor carrying
 audio in `pw-dump`.
 
 **Phase 2 -- gate 1 and two-track capture.** Arm and disarm on stream link and
-state with the debounce. Write two audio files per session into the dated layout.
-Measure how Chrome actually behaves on call end and set the debounce from that.
-Still no transcription.
+state with the debounce. Write one interleaved stereo file per session into the
+dated layout, near left and far right. Measure how Chrome actually behaves on call
+end and set the debounce from that. Still no transcription.
 
 **Phase 3 -- transcription and WebVTT.** Two connections into the existing
 pipeline, cue closing from the emit and RMS signals, merge by audio position,
@@ -438,13 +502,18 @@ rotation, and reduce the debug log to `NOTE` blocks. The regression corpus is th
 test: the debug path must produce the same text it does today, with the diagnostic
 detail relocated rather than lost.
 
-**Phase 4 -- VAD.** Gate ahead of the encoder. Do the arrival-side position
-counting *first*, with a test that feeds a file with long silences and asserts the
-final cue timestamp matches the file duration. Then measure the saving against the
-table above and decide whether macOS gets it.
+**Phase 4 -- VAD.** Gate ahead of the ASR encoder, never the recording. Do the
+arrival-side position counting *first*, with a test that feeds a file with long
+silences and asserts the final cue timestamp matches the file duration. Then
+measure the saving against the table above and decide whether macOS gets it.
 
 **Phase 5 -- Opus.** libopus behind the format setting, so both paths can select
 either. Sessions default to it, debug recordings stay WAV.
 
+**Phase 6 -- the player.** `index.html` written beside each session. Native track
+parser, chat-style transcript synced to playback, Web Audio channel routing.
+Served over HTTP, with no server shipped.
+
 Phases 0 through 3 are a complete, useful tool on their own. Phase 4 is an
-optimisation with a sharp edge, and phase 5 is convenience.
+optimisation with a sharp edge, phase 5 is convenience, and phase 6 is the thing
+that makes a session pleasant to revisit rather than merely archived.
