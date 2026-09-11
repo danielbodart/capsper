@@ -23,8 +23,10 @@ In scope:
 - Two gates per track: node connection, then VAD.
 - Both tracks through the existing pipeline, one connection each.
 - One WebVTT file per session, both tracks interleaved, speakers as voice spans.
-- Per-track audio, compressed.
+- Per-track audio, format selectable.
 - Dated session directories.
+- A config file, since this is where the option count stops fitting on a command
+  line. Existing flags keep working unchanged.
 
 Explicitly out of scope, and not to be added later without a separate decision:
 calendar integration, meeting detection heuristics, uploading anywhere,
@@ -240,11 +242,13 @@ So the difference between a normal transcript and a debug one is exactly one
 thing: whether the `NOTE` blocks are written. Same writer, same file layout, one
 flag.
 
-**Open question.** The debug recorder is a ring buffer keyed on `seq % keep`,
-which is right for "keep the last ten utterances while I chase a bug" and wrong
-for meeting sessions, which should never be silently overwritten. Proposal: keep
-the ring for the PTT debug path, use dated directories for meeting sessions, and
-let the detail flag be orthogonal to both.
+The ring buffer stays. `seq % keep` is right for "keep the last ten utterances
+while I chase a bug", and it is wrong for meeting sessions, which must never be
+silently overwritten. So the two paths differ in exactly two ways -- rotation
+versus dated directories, and which audio format they default to -- and share
+everything else: the same writer, the same cue logic, the same `NOTE` emission
+controlled by the same detail setting. The rotation is a naming policy handed to
+the writer, not a second implementation of it.
 
 ## Audio files
 
@@ -258,35 +262,99 @@ between thinking about disk and not. Opus is also the right codec for the conten
 by design, and libopus is a small C dependency of the kind the tree already
 carries.
 
-Decision needed: Opus for everything, or keep WAV for the PTT debug path where the
-files are seconds long, lossless matters for regression comparisons, and the ring
-buffer bounds the size anyway. Leaning towards the second.
+Two formats, `wav` and `opus`, selectable per path rather than globally. Defaults:
+
+| path | default | why |
+| --- | --- | --- |
+| meeting sessions | `opus` | hours of audio, kept indefinitely |
+| PTT debug recordings | `wav` | seconds long, ring-bounded, and regression comparisons want the raw samples |
+
+Either can be set to either. The debug default is not a limitation to work around
+later -- raw is the right thing there, and the setting exists so an unusual case
+can say so, not because the default is in doubt.
+
+## Configuration
+
+New surface goes in a config file. The CLI keeps working exactly as it does, and
+keeps every flag it has, but the meeting options are config-only rather than
+growing another dozen flags onto a command line that already has twenty.
+
+**Format: ZON.** `std.zon.parse.fromSlice` is in the standard library as of the
+pinned toolchain (verified in Zig 0.15.2, with a `Diagnostics` type that reports
+errors with source locations). That matters more than it sounds:
+
+- **No dependency.** JSON is also in the stdlib but has no comments, and comments
+  are the whole point of a hand-edited config. JSON-with-comments means a
+  third-party parser for a file we read once at startup.
+- **Comments and multiline strings come free**, because ZON's grammar is a subset
+  of Zig's.
+- **The struct is the schema.** `fromSlice` parses into a Zig type, so the config
+  type checks at compile time and unknown or mistyped fields are a parse error
+  with a line number rather than a silent default.
+- **The project already uses it.** `build.zig.zon` is ZON, with comments in it
+  today. One format to know, not two.
+
+Sketch:
+
+```zig
+.{
+    .meeting = .{
+        .enabled = true,
+        // The name this appears under in the desktop's output picker.
+        .sink_name = "capsper_call",
+        .dir = "~/.local/share/capsper/sessions",
+        .audio_format = .opus,
+        // How long a sink can sit idle before the session is closed. Long
+        // enough to survive a screen-share renegotiation or a brief mute.
+        .idle_close_seconds = 30,
+        .detail = .minimal, // or .debug, which adds NOTE blocks
+    },
+    .debug_recording = .{
+        .dir = "~/.local/share/capsper/debug",
+        .keep = 10,
+        .audio_format = .wav,
+        .detail = .debug,
+    },
+}
+```
+
+Resolution order: config file, then CLI flags, so a flag can always override a
+setting for one run. Search `$XDG_CONFIG_HOME/capsper/config.zon`, then the path
+given by a `--config` flag. A missing file is not an error; it means defaults.
 
 ## Directory layout
 
-Sessions are user data, so `$XDG_DATA_HOME/capsper/sessions/` by default, with
-`--meeting-dir` to override.
+Sessions are user data, so `$XDG_DATA_HOME/capsper/sessions/` by default.
 
 ```
-sessions/2026/09/11/143000-a1b2/
+sessions/2026/09/11/T143000Z/
   transcript.vtt
   host.opus
   far.opus
 ```
 
-Date-nested directories rather than a flat directory of ISO-named files: a year of
-meetings is a lot of entries, and `YYYY/MM/DD` is the layout every photo and log
-tool converged on. The time-plus-short-id leaf keeps two meetings starting in the
-same minute apart without needing a lock.
+Date-nested rather than a flat directory of long names: a year of meetings is a
+lot of entries, and `YYYY/MM/DD` is the layout every photo and log tool converged
+on. The leaf is the ISO 8601 basic-format time with its designators, `T` marking
+a time and `Z` marking the zone, so the whole path reads as one ISO timestamp
+split across directories and sorts correctly at every level.
+
+**Dates are UTC**, which is what makes `Z` honest. The tradeoff to be aware of:
+a meeting at half past midnight BST files under the previous day. The alternative,
+local time, puts it where you would look for it but introduces an hour that
+happens twice a year. UTC is chosen for being unambiguous; it can be revisited if
+it turns out to be annoying in practice.
+
+Two sessions starting in the same second cannot happen given the idle-close
+window, so there is no suffix. If the directory somehow exists, fail rather than
+invent a name.
 
 ## Flags
 
-Sketch, to be settled during phase 1:
+The meeting options live in the config file. The only new flag is:
 
 ```
---meeting-dir DIR       Enable meeting capture, write sessions under DIR
---meeting-sink NAME     Name of the virtual sink (default: capsper_call)
---transcript-detail     minimal | debug  (debug adds NOTE blocks)
+--config PATH           Config file location (default: $XDG_CONFIG_HOME/capsper/config.zon)
 ```
 
 The host track uses the existing source selection. Note that
@@ -303,10 +371,16 @@ Following the default means dropping the static gain, not just the target.
 
 ## Phases
 
+**Phase 0 -- the config file.** `std.zon.parse` into a config struct, XDG lookup,
+`--config` to override, flags winning over file. Nothing reads it yet beyond the
+settings that already exist as flags, which is the point: it lands and is proven
+before anything depends on it. Settle the field names here, because they are the
+part that is expensive to change later.
+
 **Phase 1 -- the sink and the graph.** Create the virtual sink, pass it through to
 the default output, expose its monitor as a capture source. No transcription.
 Success: select it in Google Meet, still hear the call, see the monitor carrying
-audio in `pw-dump`. Settle the flag names here.
+audio in `pw-dump`.
 
 **Phase 2 -- gate 1 and two-track capture.** Arm and disarm on stream link and
 state with the debounce. Write two audio files per session into the dated layout.
@@ -315,16 +389,18 @@ Still no transcription.
 
 **Phase 3 -- transcription and WebVTT.** Two connections into the existing
 pipeline, cue closing from the emit and RMS signals, merge by audio position,
-voice spans, one file. Move `recorder.zig` onto the same writer and reduce the
-debug log to `NOTE` blocks.
+voice spans, one file. Move `recorder.zig` onto the same writer, keeping its
+rotation, and reduce the debug log to `NOTE` blocks. The regression corpus is the
+test: the debug path must produce the same text it does today, with the diagnostic
+detail relocated rather than lost.
 
 **Phase 4 -- VAD.** Gate ahead of the encoder. Do the arrival-side position
 counting *first*, with a test that feeds a file with long silences and asserts the
 final cue timestamp matches the file duration. Then measure the saving against the
 table above and decide whether macOS gets it.
 
-**Phase 5 -- Opus.** Compress the session tracks. Decide the PTT debug path
-separately.
+**Phase 5 -- Opus.** libopus behind the format setting, so both paths can select
+either. Sessions default to it, debug recordings stay WAV.
 
-Phases 1 through 3 are a complete, useful tool on their own. Phase 4 is an
+Phases 0 through 3 are a complete, useful tool on their own. Phase 4 is an
 optimisation with a sharp edge, and phase 5 is convenience.
