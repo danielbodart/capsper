@@ -339,6 +339,17 @@ on. The leaf is the ISO 8601 basic-format time with its designators, `T` marking
 a time and `Z` marking the zone, so the whole path reads as one ISO timestamp
 split across directories and sorts correctly at every level.
 
+**Basic format, not extended** -- `T143000Z` rather than `T14:30:00Z` -- and the
+reason is portability, not legality. Linux accepts a colon in a filename happily;
+only `/` and NUL are forbidden. But Windows reserves the colon outright, and
+`windows-port-plan.md` sits in this same directory, so a layout with colons in it
+is one that does not survive the port. macOS accepts it through the POSIX layer
+but Finder still renders it as a slash, a leftover from HFS. And on Unix generally
+the colon is the path-list separator, so colon-delimited `PATH`-style variables
+misparse, and `scp` and `rsync` read `host:path` and take the leading component
+for a remote host. ISO 8601 anticipated all of this: basic format is part of the
+standard rather than a workaround for it, and nothing but punctuation is lost.
+
 **Dates are UTC**, which is what makes `Z` honest. The tradeoff to be aware of:
 a meeting at half past midnight BST files under the previous day. The alternative,
 local time, puts it where you would look for it but introduces an hour that
