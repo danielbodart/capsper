@@ -1620,9 +1620,25 @@ struct pw_mic_level {
     /* Raised on the thread loop when the default moves, read and cleared by
        whoever is levelling. */
     _Atomic int changed;
+
+    /* Raised when a node is bound. */
+    _Atomic int bound;
+
+    /* The level asked for, applied as soon as there is something to apply it
+       to. The registry delivers its globals on the thread loop, so a caller
+       setting a level the moment it created this would be setting it on
+       nothing -- and following the default takes two steps, the metadata and
+       then the node it names. Remembering it here is what makes that a matter
+       of ordering rather than of waiting, which matters because the caller is
+       opening a session and a second spent here is a second of the call it
+       never captured.
+
+       Negative means nothing has been asked for yet. */
+    float pending_volume;
 };
 
 static void mic_level_bind_node(struct pw_mic_level *m, uint32_t id);
+static int mic_level_apply(struct pw_mic_level *m, float volume);
 
 static void
 on_mic_node_info(void *data, const struct pw_node_info *info)
@@ -1651,6 +1667,7 @@ mic_level_release_node(struct pw_mic_level *m)
     m->node = NULL;
     m->node_id = 0;
     m->channels = 1;
+    atomic_store(&m->bound, 0);
 }
 
 static int
@@ -1742,6 +1759,10 @@ mic_level_bind_node(struct pw_mic_level *m, uint32_t id)
     m->node_id = id;
     pw_node_add_listener((struct pw_node *)proxy, &m->node_listener,
                          &mic_node_events, m);
+    atomic_store(&m->bound, 1);
+
+    /* Whatever was asked for before there was anything to ask. */
+    if (m->pending_volume >= 0.0f) mic_level_apply(m, m->pending_volume);
 }
 
 /* `target` names the node to level, or is NULL to follow the desktop's
@@ -1754,6 +1775,7 @@ pw_mic_level_create(const char *target)
     struct pw_mic_level *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
     m->channels = 1;
+    m->pending_volume = -1.0f;
     if (target && target[0]) {
         m->pinned = 1;
         snprintf(m->node_name, sizeof(m->node_name), "%s", target);
@@ -1805,6 +1827,7 @@ pw_mic_level_create(const char *target)
     pw_registry_add_listener(m->registry, &m->registry_listener, &reg_events, m);
 
     pw_thread_loop_unlock(m->thread_loop);
+
     return m;
 }
 
@@ -1830,42 +1853,42 @@ pw_mic_level_destroy(struct pw_mic_level *m)
     free(m);
 }
 
-/* Set the microphone's level. Linear, so 1.0 is unity; PipeWire clamps at 10x.
-   Returns 0 on success, -1 if there is no microphone bound yet. */
+/* Set the level on the bound node. Caller holds the thread loop. */
+static int
+mic_level_apply(struct pw_mic_level *m, float volume)
+{
+    if (!m->node) return -1;
+
+    float vols[SPA_AUDIO_MAX_CHANNELS];
+    for (uint32_t i = 0; i < m->channels; i++) vols[i] = volume;
+
+    uint8_t buf[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    struct spa_pod *props_pod = spa_pod_builder_add_object(
+        &b,
+        SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+        SPA_PROP_channelVolumes,
+        SPA_POD_Array(sizeof(float), SPA_TYPE_Float, m->channels, vols));
+    if (!props_pod) return -1;
+
+    pw_node_set_param((struct pw_node *)m->node, SPA_PARAM_Props, 0, props_pod);
+    return 0;
+}
+
+/* Set the microphone-s level. Linear, so 1.0 is unity; PipeWire clamps at 10x.
+
+   Returns 0 when it reached a node. A -1 is not a failure to remember: the
+   value is kept and applied the moment one binds, which is what covers a
+   microphone that has not reached the registry yet and a default that moved
+   while nothing was bound. */
 int
 pw_mic_level_set(struct pw_mic_level *m, float volume)
 {
     if (!m) return -1;
 
-    int rc = -1;
     pw_thread_loop_lock(m->thread_loop);
-
-    /* A default that changed while nothing was bound, or a node that had not
-       reached the registry when it was first looked for. */
-    if (!m->node && m->node_name[0]) {
-        /* Nothing to do here: the registry listener binds it as it appears,
-           and until then there is no node to set a level on. */
-    }
-
-    if (m->node) {
-        float vols[SPA_AUDIO_MAX_CHANNELS];
-        for (uint32_t i = 0; i < m->channels; i++) vols[i] = volume;
-
-        uint8_t buf[1024];
-        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
-        struct spa_pod *props_pod = spa_pod_builder_add_object(
-            &b,
-            SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
-            SPA_PROP_channelVolumes,
-            SPA_POD_Array(sizeof(float), SPA_TYPE_Float, m->channels, vols));
-
-        if (props_pod) {
-            pw_node_set_param((struct pw_node *)m->node, SPA_PARAM_Props, 0,
-                              props_pod);
-            rc = 0;
-        }
-    }
-
+    m->pending_volume = volume;
+    int rc = mic_level_apply(m, volume);
     pw_thread_loop_unlock(m->thread_loop);
     return rc;
 }

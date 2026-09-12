@@ -166,3 +166,14 @@ pub extern fn pw_sink_watch_active_streams(w: *pw_sink_watch) u32;
 
 // Capture stream properties (variadic pw_properties_new lives in C)
 pub extern fn pw_build_capture_props(target: ?[*:0]const u8, capture_sink: c_int) ?*pw.struct_pw_properties;
+
+// The microphone's level, held open. Setting it per adjustment would mean
+// building a PipeWire context inside the capture loop, and this also reports
+// the desktop's default input moving, which is how a microphone switch is
+// noticed without polling for it. `target` null follows the default.
+pub const pw_mic_level = opaque {};
+pub extern fn pw_mic_level_create(target: ?[*:0]const u8) ?*pw_mic_level;
+pub extern fn pw_mic_level_destroy(m: *pw_mic_level) void;
+pub extern fn pw_mic_level_set(m: *pw_mic_level, volume: f32) c_int;
+pub extern fn pw_mic_level_take_changed(m: *pw_mic_level) c_int;
+pub extern fn pw_mic_level_node_name(m: *pw_mic_level) [*:0]const u8;

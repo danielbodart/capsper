@@ -26,6 +26,7 @@ const SinkWatch = sink_mod.SinkWatch;
 const EchoCanceller = sink_mod.EchoCanceller;
 const vad_backend = @import("../backend/vad.zig");
 const AutoGain = @import("auto_gain.zig").AutoGain;
+const MicLevel = @import("../platform/mic_level.zig").MicLevel;
 
 const log = std.log.scoped(.meeting);
 
@@ -381,6 +382,15 @@ const Session = struct {
     near_asr: TrackAsr,
     far_asr: TrackAsr,
 
+    /// The microphone.s own level, or null where levelling is unavailable.
+    /// Held for the session, because it also reports the desktop.s default
+    /// input moving, which is how a microphone switch mid-call is noticed.
+    level: ?MicLevel,
+
+    /// The figure to start from, and to return to when the microphone
+    /// changes. Kept because the config is not held past `open`.
+    configured_gain: f32,
+
     /// Levelling for the near track, or null when auto-gain is switched off.
     ///
     /// Near only. The far end arrives from the call already levelled by
@@ -454,18 +464,27 @@ const Session = struct {
             .channel = audio_channel,
         });
         errdefer near.deinit();
-        // The same starting gain dictation uses, because it is the same
-        // microphone in the same room and `--audio-detect` measured it there.
-        //
-        // Without this the near track is captured at unity while dictation
-        // runs at whatever was calibrated, so a meeting comes back far quieter
-        // than the same voice dictating -- measured at -57 dB mean and -23 dB
-        // peak against a -15 dB target, which is the whole of the configured
-        // 10x that was never being applied.
-        if (cfg.audio.gain > 1.01) {
-            if (cfg.meetingNear()) |src| _ = AudioCapture.setSourceVolume(src, cfg.audio.gain);
-        }
         near.setActive(true);
+
+        // The microphone's own level, on the node rather than on this capture
+        // of it. `meetingNear()` null means follow the desktop's default input
+        // and keep following it, which is what makes switching microphones
+        // mid-call work.
+        //
+        // Deliberately not fatal. A meeting recorded at the wrong level is
+        // worth having; one that refuses to start is not.
+        var level: ?MicLevel = MicLevel.init(cfg.meetingNear()) catch |err| blk: {
+            log.warn("levelling the microphone is unavailable: {}", .{err});
+            break :blk null;
+        };
+        errdefer if (level) |*l| l.deinit();
+
+        // The calibrated figure, applied before a word is spoken. Without it
+        // the near track sits at whatever the microphone was left at, which
+        // measured 20 dB below the same voice dictating.
+        if (level) |*l| {
+            if (cfg.audio.gain > 1.01) _ = l.set(cfg.audio.gain);
+        }
 
         // The far end is the sink's monitor. `capture_sink` is what makes that
         // the monitor rather than the default microphone.
@@ -503,6 +522,8 @@ const Session = struct {
             // between them, but a meeting recorded too quietly to hear is the
             // problem actually worth solving and the canceller's own tests
             // pin this off so they measure cancellation rather than levelling.
+            .level = level,
+            .configured_gain = cfg.audio.gain,
             .near_gain = if (cfg.audio.auto_gain)
                 AutoGain{ .current_gain = cfg.audio.gain }
             else
@@ -550,18 +571,44 @@ const Session = struct {
         // voice activity gate is what says whether this was speech and the
         // controller must see nothing else. A new gain takes effect on the
         // audio that follows, which is what a level controller always does.
-        if (track == .near) {
-            if (self.near_gain) |*g| {
-                if (self.near_asr.speech_rms) |rms| {
-                    if (g.update(rms)) |new_gain| _ = self.near.setGain(new_gain);
-                    self.near_asr.speech_rms = null;
-                }
-            }
-        }
+        if (track == .near) self.levelNear();
 
         // Put whatever that completed on disk, so the session being recorded
         // reads back as it happens rather than only once it has closed.
         self.transcript.saveIfChanged();
+    }
+
+    /// Track the level of the near end and adjust the microphone to suit.
+    ///
+    /// Driven by the voice activity gate rather than by every chunk, because a
+    /// level controller must only ever see speech. Fed silence it decides the
+    /// track is too quiet and winds the gain up, which on a meeting means
+    /// winding up the room tone between sentences and, with an echo canceller
+    /// in front, the residual it just removed.
+    ///
+    /// Near only. The far end arrives from the call already levelled by
+    /// whatever the other side is running.
+    fn levelNear(self: *Session) void {
+        var level = &(self.level orelse return);
+        const gain = &(self.near_gain orelse return);
+
+        // A different microphone is a different problem, so the controller
+        // starts again from the configured figure rather than carrying the old
+        // device's across. A quiet interface and a headset worn against the
+        // mouth are nowhere near each other.
+        if (level.tookChange()) {
+            gain.* = .{ .current_gain = self.configured_gain };
+            _ = level.set(self.configured_gain);
+            log.info("microphone changed to '{s}', levelling from {d:.1}x again", .{
+                level.nodeName(), self.configured_gain,
+            });
+            self.near_asr.speech_rms = null;
+            return;
+        }
+
+        const rms = self.near_asr.speech_rms orelse return;
+        self.near_asr.speech_rms = null;
+        if (gain.update(rms)) |new_gain| _ = level.set(new_gain);
     }
 
     fn close(self: *Session, gpa: std.mem.Allocator) void {
@@ -576,6 +623,7 @@ const Session = struct {
         self.far.deinit();
         // After the captures, so nothing is reading the cleaned microphone
         // when it leaves the graph.
+        if (self.level) |*l| l.deinit();
         if (self.aec) |*a| a.deinit();
 
         self.near_asr.finish(gpa, &self.transcript.doc) catch {};
