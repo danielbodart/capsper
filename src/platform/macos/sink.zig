@@ -6,6 +6,9 @@
 // already relies on) or a Core Audio taps entitlement. Both are decisions in
 // their own right, so meeting capture is Linux-only until one is made.
 
+const std = @import("std");
+const source = @import("../../shared/source.zig");
+
 pub const VirtualSink = struct {
     name: [:0]const u8,
 
@@ -55,6 +58,14 @@ pub const SinkWatch = struct {
     pub fn init(sink_name: [:0]const u8) !SinkWatch {
         _ = sink_name;
         return error.VirtualSinkUnsupported;
+    }
+
+    /// Nothing to describe while there is nothing to watch. Present so the
+    /// shared code writes its metadata file the same way on both platforms.
+    pub fn snapshot(self: *const SinkWatch, arena: std.mem.Allocator) ![]const source.Stream {
+        _ = self;
+        _ = arena;
+        return &.{};
     }
 
     pub fn deinit(self: *SinkWatch) void {

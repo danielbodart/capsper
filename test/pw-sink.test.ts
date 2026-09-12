@@ -509,6 +509,31 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
         expect(probe.stdout.toString()).toContain("sample_rate=16000");
     });
 
+    test("records who was playing into the sink beside the audio", async () => {
+        // The point of the file is that a recording found later can say where
+        // it came from. Captured when the session opens, while the player is
+        // still running, because by the time it closes the process is gone.
+        const files = sessionFiles();
+        const dir = files[files.length - 1].replace(/\/audio\.wav$/, "");
+        const meta = JSON.parse(readFileSync(join(dir, "audio.json"), "utf8"));
+
+        const linked = meta.streams.filter((s: any) => s.linked);
+        expect(linked.length).toBeGreaterThan(0);
+
+        // Verbatim, so the assertion is on what the client actually said.
+        expect(linked.map((s: any) => s.props["application.name"])).toContain("pw-play");
+
+        // `pw-play` speaks PipeWire directly and declares no process of its
+        // own, so the only pid here is the one its socket proves -- which is
+        // exactly the case that would be lost by trusting the node alone.
+        const pid = Number(linked[0].client["pipewire.sec.pid"]);
+        expect(pid).toBeGreaterThan(0);
+
+        const walked = meta.processes.find((p: any) => p.pid === pid);
+        expect(walked).toBeDefined();
+        expect(walked.cmdline).toContain("pw-play");
+    });
+
     test("puts the call on the right channel and the microphone on the left", async () => {
         // The failure this guards against is the far track being a second copy
         // of the near one, which is what happens if the capture stream misses

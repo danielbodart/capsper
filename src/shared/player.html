@@ -14,7 +14,10 @@
   handles them, and the file still drops into mpv and works.
 
   NOTE blocks are invisible here, which is correct -- the native parser
-  discards comments, so the debug detail costs the player nothing.
+  discards comments, so the debug detail costs the player nothing. It is also
+  why `audio.json` is a file of its own rather than a header comment in the
+  transcript: a comment the standard parser throws away is a comment this page
+  would have to re-parse the file by hand to read back.
 -->
 <meta charset="utf-8">
 <title>Capsper sessions</title>
@@ -122,6 +125,15 @@
   .line.far .who { color: var(--far); text-align: right; }
   .at { color: var(--muted); font-variant-numeric: tabular-nums; font-weight: 400; }
 
+  .source { margin: 0 0 1.25rem; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  .source > summary { cursor: pointer; padding: .6rem .85rem; font-size: .85rem; color: var(--muted); }
+  .source > div { padding: 0 .85rem .85rem; overflow-x: auto; }
+  .source h3 { margin: .75rem 0 .35rem; font-size: .8rem; letter-spacing: .04em; text-transform: uppercase; color: var(--accent); }
+  .source table { border-collapse: collapse; font-size: .8rem; width: 100%; }
+  .source td { padding: .2rem .6rem .2rem 0; vertical-align: top; border-top: 1px solid var(--line); }
+  .source td:first-child { color: var(--muted); white-space: nowrap; }
+  .source code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+
   .empty { color: var(--muted); font-style: italic; }
   [hidden] { display: none !important; }
 </style>
@@ -147,6 +159,10 @@
         <button type="button" data-route="far" aria-pressed="false">Far only</button>
       </div>
     </div>
+    <details class="source" id="source" hidden>
+      <summary id="sourceSummary">Where this came from</summary>
+      <div id="sourceBody"></div>
+    </details>
     <div id="transcript"></div>
   </section>
 </main>
@@ -351,6 +367,85 @@
     track.src = blobUrl;
   }
 
+  // ─── Where the audio came from ───────────────────────────────────────────
+  //
+  // `audio.json` is whatever PipeWire and the process table said about the
+  // application on the other end, recorded verbatim and never interpreted by
+  // the thing that wrote it. This renders it just as literally: no field is
+  // singled out or renamed, because the point of keeping the raw pairs is
+  // that the useful one may not be the one anyone would have picked.
+  //
+  // Sessions recorded before this existed have no file, and nothing is wrong
+  // with that, so a missing one simply hides the panel.
+
+  const text = (tag, value) => {
+    const el = document.createElement(tag);
+    el.textContent = value;
+    return el;
+  };
+
+  function pairTable(pairs) {
+    const table = document.createElement("table");
+    for (const [key, value] of pairs) {
+      const row = table.insertRow();
+      row.appendChild(text("td", key));
+      const cell = row.insertCell();
+      cell.appendChild(text("code", value));
+    }
+    return table;
+  }
+
+  function renderSource(doc) {
+    const body = $("sourceBody");
+    body.replaceChildren();
+
+    for (const stream of doc.streams || []) {
+      body.appendChild(text("h3", stream.linked
+        ? "Playing into the sink"
+        : "Same process, capturing"));
+      body.appendChild(pairTable(Object.entries(stream.props || {})));
+
+      const client = Object.entries(stream.client || {});
+      if (client.length) {
+        body.appendChild(text("h3", "Its connection"));
+        body.appendChild(pairTable(client));
+      }
+    }
+
+    for (const process of doc.processes || []) {
+      body.appendChild(text("h3", "Process " + process.pid));
+      body.appendChild(pairTable([
+        ["parent", process.ppid === null ? "unknown" : String(process.ppid)],
+        ["exe", process.exe || "unknown"],
+        ["command", (process.cmdline || []).join(" ")],
+      ]));
+    }
+
+    // A name to put on the summary line, so the common question is answered
+    // without opening anything. First linked stream wins; there is normally
+    // only one.
+    const name = (stream) => (stream.props || {})["application.name"]
+      || (stream.client || {})["application.name"];
+    const named = (doc.streams || []).filter((s) => s.linked).map(name).find(Boolean);
+    $("sourceSummary").textContent = named
+      ? "Recorded from " + named
+      : "Where this came from";
+
+    $("source").open = false;
+    $("source").hidden = !body.childElementCount;
+  }
+
+  async function loadSource(base) {
+    $("source").hidden = true;
+    try {
+      const response = await fetch(base + "audio.json");
+      if (!response.ok) return;
+      renderSource(await response.json());
+    } catch {
+      // Metadata is a bonus; a session still plays without it.
+    }
+  }
+
   function open(path) {
     const session = sessions.find((s) => s.path === path);
     const audioName = session ? session.audio : "audio.wav";
@@ -359,6 +454,7 @@
     list.innerHTML = '<p class="empty">Loading transcript…</p>';
     audio.src = base + audioName;
     audio.load();
+    loadSource(base);
 
     vttUrl = base + audioName.replace(/\.[^.]+$/, "") + ".vtt";
     lastVtt = null;

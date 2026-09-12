@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const pw = @import("pipewire_c.zig");
+const source = @import("../../shared/source.zig");
 
 pub const VirtualSink = struct {
     handle: *pw.pw_virtual_sink,
@@ -137,4 +138,49 @@ pub const SinkWatch = struct {
     pub fn activeStreams(self: *const SinkWatch) u32 {
         return pw.pw_sink_watch_active_streams(self.handle);
     }
+
+    /// Who is playing into the sink, and everything their clients declared
+    /// about themselves. Read at the moment a session opens rather than
+    /// later: a browser rebuilds its streams freely, and a second look would
+    /// describe a graph that is no longer the one being recorded.
+    ///
+    /// The allocator should be an arena the caller discards once the metadata
+    /// is written. Nothing here is needed for longer than that.
+    pub fn snapshot(self: *const SinkWatch, arena: std.mem.Allocator) ![]const source.Stream {
+        const snap = pw.pw_sink_watch_snapshot(self.handle) orelse return &.{};
+        defer pw.pw_stream_snapshot_destroy(snap);
+
+        const streams = try arena.alloc(source.Stream, pw.pw_stream_snapshot_count(snap));
+        for (streams, 0..) |*stream, i| {
+            const si: u32 = @intCast(i);
+            const props = try arena.alloc(source.Prop, pw.pw_stream_snapshot_prop_count(snap, si));
+            for (props, 0..) |*prop, j| {
+                const pj: u32 = @intCast(j);
+                prop.* = .{
+                    .key = try arena.dupe(u8, cstr(pw.pw_stream_snapshot_key(snap, si, pj))),
+                    .value = try arena.dupe(u8, cstr(pw.pw_stream_snapshot_value(snap, si, pj))),
+                };
+            }
+
+            const client = try arena.alloc(source.Prop, pw.pw_stream_snapshot_client_prop_count(snap, si));
+            for (client, 0..) |*prop, j| {
+                const pj: u32 = @intCast(j);
+                prop.* = .{
+                    .key = try arena.dupe(u8, cstr(pw.pw_stream_snapshot_client_key(snap, si, pj))),
+                    .value = try arena.dupe(u8, cstr(pw.pw_stream_snapshot_client_value(snap, si, pj))),
+                };
+            }
+
+            stream.* = .{
+                .linked = pw.pw_stream_snapshot_linked(snap, si) != 0,
+                .props = props,
+                .client = client,
+            };
+        }
+        return streams;
+    }
 };
+
+fn cstr(ptr: ?[*:0]const u8) []const u8 {
+    return if (ptr) |p| std.mem.span(p) else "";
+}

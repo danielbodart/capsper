@@ -164,6 +164,19 @@ pub extern fn pw_sink_watch_create(sink_name: [*:0]const u8) ?*pw_sink_watch;
 pub extern fn pw_sink_watch_destroy(w: *pw_sink_watch) void;
 pub extern fn pw_sink_watch_active_streams(w: *pw_sink_watch) u32;
 
+// Who is playing into the sink, snapshotted so it survives the graph changing
+pub const pw_stream_snapshot = opaque {};
+pub extern fn pw_sink_watch_snapshot(w: *pw_sink_watch) ?*pw_stream_snapshot;
+pub extern fn pw_stream_snapshot_destroy(s: *pw_stream_snapshot) void;
+pub extern fn pw_stream_snapshot_count(s: *const pw_stream_snapshot) u32;
+pub extern fn pw_stream_snapshot_linked(s: *const pw_stream_snapshot, i: u32) c_int;
+pub extern fn pw_stream_snapshot_prop_count(s: *const pw_stream_snapshot, i: u32) u32;
+pub extern fn pw_stream_snapshot_key(s: *const pw_stream_snapshot, i: u32, j: u32) ?[*:0]const u8;
+pub extern fn pw_stream_snapshot_value(s: *const pw_stream_snapshot, i: u32, j: u32) ?[*:0]const u8;
+pub extern fn pw_stream_snapshot_client_prop_count(s: *const pw_stream_snapshot, i: u32) u32;
+pub extern fn pw_stream_snapshot_client_key(s: *const pw_stream_snapshot, i: u32, j: u32) ?[*:0]const u8;
+pub extern fn pw_stream_snapshot_client_value(s: *const pw_stream_snapshot, i: u32, j: u32) ?[*:0]const u8;
+
 // Capture stream properties (variadic pw_properties_new lives in C)
 pub extern fn pw_build_capture_props(target: ?[*:0]const u8, capture_sink: c_int) ?*pw.struct_pw_properties;
 

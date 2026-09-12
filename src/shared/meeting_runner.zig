@@ -16,6 +16,7 @@ const config = @import("config.zig");
 const meeting = @import("meeting.zig");
 const utils = @import("utils.zig");
 const webvtt = @import("webvtt.zig");
+const source = @import("source.zig");
 const opus = @import("opus.zig");
 const server_mod = @import("server.zig");
 const PipelineFactory = server_mod.PipelineFactory;
@@ -131,7 +132,6 @@ const SessionFile = struct {
     }
 };
 
-
 /// Run until the process is killed. Returns only on a failure that makes
 /// carrying on pointless.
 pub fn run(
@@ -157,7 +157,7 @@ pub fn run(
         switch (gate.update(watch.activeStreams(), now)) {
             .none => {},
             .opened => {
-                session = Session.open(gpa, cfg, audio_channel, factory) catch |err| blk: {
+                session = Session.open(gpa, cfg, audio_channel, factory, &watch) catch |err| blk: {
                     log.err("could not start a session: {}", .{err});
                     // Give up on this one rather than retrying every poll; the
                     // next call will try again from scratch.
@@ -406,6 +406,7 @@ const Session = struct {
         cfg: *const config.Config,
         audio_channel: u32,
         factory: PipelineFactory,
+        watch: *const SinkWatch,
     ) !Session {
         var path_buf: [64]u8 = undefined;
         const rel = try meeting.sessionPath(&path_buf, std.time.timestamp());
@@ -415,6 +416,11 @@ const Session = struct {
 
         var transcript = try Transcript.create(gpa, file.dir, cfg.meeting.detail, SessionFile.audioName(cfg.meeting.audio_format));
         errdefer transcript.deinit();
+
+        // Before anything else is set up, because what is being recorded is
+        // the graph that opened the session and a browser will not hold it
+        // still while a model loads.
+        writeSourceMetadata(gpa, file.dir, watch);
 
         var near_asr = try TrackAsr.init(gpa, .near, factory, cfg);
         errdefer near_asr.deinit(gpa);
@@ -640,6 +646,41 @@ const Session = struct {
         std.debug.print("[meeting] session closed ({d:.1}s of audio)\n", .{seconds});
     }
 };
+
+/// Where the process table lives. A constant rather than a setting: the
+/// alternative is somewhere this cannot read, and then there is nothing to
+/// configure it to.
+const proc_root = "/proc";
+
+/// Record who was playing into the sink as the session opened, in
+/// `audio.json` beside the audio and the transcript.
+///
+/// Best effort from top to bottom. A recording with nothing beside it saying
+/// where it came from is worth enormously more than no recording, so every
+/// failure here is logged and stepped over rather than returned.
+fn writeSourceMetadata(gpa: std.mem.Allocator, dir: std.fs.Dir, watch: *const SinkWatch) void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const streams = watch.snapshot(arena) catch |err| {
+        log.warn("could not read who is playing into the sink: {}", .{err});
+        return;
+    };
+    const doc = source.capture(arena, streams, proc_root) catch |err| {
+        log.warn("could not read the processes behind the call: {}", .{err});
+        return;
+    };
+    const bytes = source.render(arena, doc) catch |err| {
+        log.warn("could not render audio.json: {}", .{err});
+        return;
+    };
+
+    if (dir.createFile("audio.json", .{})) |out| {
+        defer out.close();
+        out.writeAll(bytes) catch |err| log.err("could not write audio.json: {}", .{err});
+    } else |err| log.err("could not create audio.json: {}", .{err});
+}
 
 /// The session's `transcript.vtt`.
 ///

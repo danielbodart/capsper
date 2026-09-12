@@ -199,8 +199,7 @@ fn collect(arena: std.mem.Allocator, root: []const u8) ![]Session {
 
     while (try walker.next()) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.startsWith(u8, entry.basename, "audio.")) continue;
-        if (std.mem.endsWith(u8, entry.basename, ".vtt")) continue;
+        if (!isAudio(entry.basename)) continue;
 
         const parent = std.fs.path.dirname(entry.path) orelse continue;
 
@@ -218,6 +217,20 @@ fn collect(arena: std.mem.Allocator, root: []const u8) ![]Session {
         }
     }.newestFirst);
     return sessions;
+}
+
+/// The recording itself, as against the transcript and the metadata that
+/// share its name.
+///
+/// Named outright rather than by excluding what a session is known to contain
+/// besides: the exclusions were what broke when `audio.json` arrived, quietly
+/// listing the metadata as the thing to play. Anything else put in a session
+/// directory from now on is ignored until it is added here on purpose.
+fn isAudio(basename: []const u8) bool {
+    for ([_][]const u8{ "audio.wav", "audio.opus" }) |name| {
+        if (std.mem.eql(u8, basename, name)) return true;
+    }
+    return false;
 }
 
 /// How long a session's audio runs. Only ever used to label a row in the list,
@@ -354,6 +367,7 @@ fn isSafe(rel: []const u8) bool {
 
 fn contentType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".vtt")) return "text/vtt";
+    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
     if (std.mem.endsWith(u8, path, ".wav")) return "audio/wav";
     if (std.mem.endsWith(u8, path, ".opus")) return "audio/ogg";
     return "application/octet-stream";
@@ -405,6 +419,14 @@ test "a path that climbs out of the sessions directory is refused" {
     try testing.expect(!isSafe(""));
 }
 
+test "only the recording is listed as a session, not what sits beside it" {
+    try testing.expect(isAudio("audio.wav"));
+    try testing.expect(isAudio("audio.opus"));
+    try testing.expect(!isAudio("audio.vtt"));
+    try testing.expect(!isAudio("audio.json"));
+    try testing.expect(!isAudio("notes.txt"));
+}
+
 test "an ordinary session path is allowed" {
     try testing.expect(isSafe("2026/09/12/T063554Z/audio.wav"));
     try testing.expect(isSafe("2026/09/12/T063554Z/audio.vtt"));
@@ -433,6 +455,7 @@ test "ranges that cannot be honoured are declined rather than guessed at" {
 test "content types are the ones a browser needs to play the files" {
     // text/vtt in particular: a track element ignores anything else.
     try testing.expectEqualStrings("text/vtt", contentType("2026/x/audio.vtt"));
+    try testing.expectEqualStrings("application/json", contentType("2026/x/audio.json"));
     try testing.expectEqualStrings("audio/wav", contentType("2026/x/audio.wav"));
     try testing.expectEqualStrings("audio/ogg", contentType("2026/x/audio.opus"));
 }

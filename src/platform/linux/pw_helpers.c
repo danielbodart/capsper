@@ -887,6 +887,12 @@ pw_echo_canceller_mic_name(struct pw_echo_canceller *e)
 
 struct pw_sink_watch;
 
+/* One property as the graph reported it, copied so it outlives the event. */
+struct prop_pair {
+    char *key;
+    char *value;
+};
+
 struct watched_stream {
     struct pw_sink_watch *watch;
     struct spa_hook        listener;
@@ -894,7 +900,124 @@ struct watched_stream {
     uint32_t               node_id;
     enum pw_node_state     state;
     int                    used;
+    /* Only output streams can link into the sink, so only they arm the gate.
+       Input streams are tracked anyway, because the microphone stream an app
+       opens alongside its playback is what tells a call from a video, and it
+       is worth recording as metadata even though it never counts. */
+    int                    is_input;
+    /* The node's properties as last reported. Deep-copied, because the dict
+       the event hands over belongs to the loop and does not outlive the
+       callback. */
+    struct prop_pair      *props;
+    uint32_t               n_props;
 };
+
+static void
+watched_stream_free_props(struct watched_stream *s)
+{
+    for (uint32_t i = 0; i < s->n_props; i++) {
+        free(s->props[i].key);
+        free(s->props[i].value);
+    }
+    free(s->props);
+    s->props = NULL;
+    s->n_props = 0;
+}
+
+static void copy_props(struct prop_pair **dst, uint32_t *dst_n, const struct spa_dict *d);
+
+/* An info event carries only what changed, and `props` is NULL on the ones
+   that changed something else.
+
+   Every stream sends several: the first arrives with the properties and the
+   node still idle, and the later ones say it is running and carry nothing.
+   Copying unconditionally therefore threw the properties away moments after
+   receiving them, and did it just before the gate opened -- so the metadata
+   was reliably empty by the time anything came to read it, while the gate,
+   the recording and the transcript all carried on working perfectly. */
+static void
+watched_stream_copy_props(struct watched_stream *s, const struct pw_node_info *info)
+{
+    if (!(info->change_mask & PW_NODE_CHANGE_MASK_PROPS) || !info->props)
+        return;
+    watched_stream_free_props(s);
+    copy_props(&s->props, &s->n_props, info->props);
+}
+
+static const char *
+props_lookup(const struct prop_pair *props, uint32_t n, const char *key)
+{
+    for (uint32_t i = 0; i < n; i++)
+        if (strcmp(props[i].key, key) == 0)
+            return props[i].value;
+    return NULL;
+}
+
+static const char *
+watched_stream_prop(const struct watched_stream *s, const char *key)
+{
+    return props_lookup(s->props, s->n_props, key);
+}
+
+/* The client behind a stream, tracked separately because the node does not
+   carry everything its client declared -- and because the one identifier in
+   the whole set that a client cannot lie about lives here.
+
+   `application.process.id` on the node is whatever the application said about
+   itself through the PulseAudio compatibility layer. A native PipeWire client
+   such as `pw-play` does not set it at all. `pipewire.sec.pid` on the client
+   is the peer credential of the socket, which the kernel supplies and no
+   client can choose. For an application connecting through pipewire-pulse it
+   names the pulse server rather than the application, so it is a fallback
+   rather than a replacement -- but it is the only one there is when an
+   application says nothing about itself. */
+struct watched_client {
+    struct pw_sink_watch *watch;
+    struct spa_hook        listener;
+    struct pw_proxy       *proxy;
+    uint32_t               client_id;
+    struct prop_pair      *props;
+    uint32_t               n_props;
+    int                    used;
+};
+
+static void
+watched_client_free_props(struct watched_client *c)
+{
+    for (uint32_t i = 0; i < c->n_props; i++) {
+        free(c->props[i].key);
+        free(c->props[i].value);
+    }
+    free(c->props);
+    c->props = NULL;
+    c->n_props = 0;
+}
+
+/* Same copy as a stream's, against a different owner. */
+static void
+copy_props(struct prop_pair **dst, uint32_t *dst_n, const struct spa_dict *d)
+{
+    if (!d || d->n_items == 0)
+        return;
+    struct prop_pair *copy = calloc(d->n_items, sizeof(*copy));
+    if (!copy)
+        return;
+
+    uint32_t n = 0;
+    const struct spa_dict_item *item;
+    spa_dict_for_each(item, d) {
+        if (!item->key || !item->value)
+            continue;
+        char *k = strdup(item->key);
+        char *v = strdup(item->value);
+        if (!k || !v) { free(k); free(v); continue; }
+        copy[n].key = k;
+        copy[n].value = v;
+        n++;
+    }
+    *dst = copy;
+    *dst_n = n;
+}
 
 struct watched_link {
     uint32_t link_id;
@@ -913,6 +1036,7 @@ struct pw_sink_watch {
     uint32_t sink_id;   /* 0 until the sink shows up in the registry */
 
     struct watched_stream streams[SINK_WATCH_MAX];
+    struct watched_client clients[SINK_WATCH_MAX];
     struct watched_link   links[SINK_WATCH_MAX];
 
     /* Read from the main thread; written only on the thread loop. */
@@ -951,6 +1075,7 @@ on_watched_stream_info(void *data, const struct pw_node_info *info)
     struct watched_stream *s = data;
     if (!info) return;
     s->state = info->state;
+    watched_stream_copy_props(s, info);
     sink_watch_recount(s->watch);
 }
 
@@ -960,7 +1085,8 @@ static const struct pw_node_events watched_stream_events = {
 };
 
 static void
-sink_watch_add_stream(struct pw_sink_watch *w, uint32_t id, uint32_t version)
+sink_watch_add_stream(struct pw_sink_watch *w, uint32_t id, uint32_t version,
+                      int is_input)
 {
     if (sink_watch_find_stream(w, id))
         return;
@@ -976,12 +1102,68 @@ sink_watch_add_stream(struct pw_sink_watch *w, uint32_t id, uint32_t version)
         s->node_id = id;
         s->proxy = proxy;
         s->watch = w;
+        s->is_input = is_input;
         s->state = PW_NODE_STATE_CREATING;
         spa_zero(s->listener);
         pw_node_add_listener((struct pw_node *)proxy, &s->listener,
                              &watched_stream_events, s);
         return;
     }
+}
+
+static void
+on_watched_client_info(void *data, const struct pw_client_info *info)
+{
+    struct watched_client *c = data;
+    if (!info) return;
+    // Same partial-update rule as a node's.
+    if (!(info->change_mask & PW_CLIENT_CHANGE_MASK_PROPS) || !info->props)
+        return;
+    watched_client_free_props(c);
+    copy_props(&c->props, &c->n_props, info->props);
+}
+
+static const struct pw_client_events watched_client_events = {
+    PW_VERSION_CLIENT_EVENTS,
+    .info = on_watched_client_info,
+};
+
+static void
+sink_watch_add_client(struct pw_sink_watch *w, uint32_t id, uint32_t version)
+{
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++)
+        if (w->clients[i].used && w->clients[i].client_id == id)
+            return;
+
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        struct watched_client *c = &w->clients[i];
+        if (c->used)
+            continue;
+        struct pw_proxy *proxy = pw_registry_bind(w->registry, id,
+                                                  PW_TYPE_INTERFACE_Client, version, 0);
+        if (!proxy)
+            return;
+        c->used = 1;
+        c->client_id = id;
+        c->proxy = proxy;
+        c->watch = w;
+        spa_zero(c->listener);
+        pw_client_add_listener((struct pw_client *)proxy, &c->listener,
+                               &watched_client_events, c);
+        return;
+    }
+}
+
+static struct watched_client *
+sink_watch_find_client(struct pw_sink_watch *w, const char *id)
+{
+    if (!id)
+        return NULL;
+    uint32_t want = (uint32_t)atoi(id);
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++)
+        if (w->clients[i].used && w->clients[i].client_id == want)
+            return &w->clients[i];
+    return NULL;
 }
 
 static void
@@ -1024,7 +1206,14 @@ on_sink_watch_global(void *data, uint32_t id, uint32_t permissions,
             return;
         }
         if (media_class && strcmp(media_class, "Stream/Output/Audio") == 0)
-            sink_watch_add_stream(w, id, version);
+            sink_watch_add_stream(w, id, version, 0);
+        else if (media_class && strcmp(media_class, "Stream/Input/Audio") == 0)
+            sink_watch_add_stream(w, id, version, 1);
+        return;
+    }
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Client) == 0) {
+        sink_watch_add_client(w, id, version);
         return;
     }
 
@@ -1056,9 +1245,20 @@ on_sink_watch_global_remove(void *data, uint32_t id)
         if (s->used && s->node_id == id) {
             spa_hook_remove(&s->listener);
             pw_proxy_destroy(s->proxy);
+            watched_stream_free_props(s);
             s->used = 0;
             s->proxy = NULL;
             changed = 1;
+        }
+    }
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        struct watched_client *c = &w->clients[i];
+        if (c->used && c->client_id == id) {
+            spa_hook_remove(&c->listener);
+            pw_proxy_destroy(c->proxy);
+            watched_client_free_props(c);
+            c->used = 0;
+            c->proxy = NULL;
         }
     }
     if (w->sink_id == id)
@@ -1139,7 +1339,14 @@ pw_sink_watch_destroy(struct pw_sink_watch *w)
         if (w->streams[i].used) {
             spa_hook_remove(&w->streams[i].listener);
             pw_proxy_destroy(w->streams[i].proxy);
+            watched_stream_free_props(&w->streams[i]);
             w->streams[i].used = 0;
+        }
+        if (w->clients[i].used) {
+            spa_hook_remove(&w->clients[i].listener);
+            pw_proxy_destroy(w->clients[i].proxy);
+            watched_client_free_props(&w->clients[i]);
+            w->clients[i].used = 0;
         }
     }
     pw_core_disconnect(w->core);
@@ -1156,6 +1363,211 @@ uint32_t
 pw_sink_watch_active_streams(struct pw_sink_watch *w)
 {
     return w ? atomic_load(&w->running_count) : 0;
+}
+
+/* Who is playing into the sink, and what the graph knows about them.
+
+   The gate says a call is happening; this says whose. Both readings come from
+   the same registry, so the metadata recorded against a session is the state
+   that opened it rather than a second look taken later, by which time a
+   browser may have torn the stream down and built another.
+
+   Two kinds of stream are included. The ones linked into the sink are the
+   call's audio and the reason the session exists. Alongside them go any
+   streams sharing a process with those, which in practice means the
+   microphone an app captures while it is on a call: a property of the same
+   application, reported by the same client, and the clearest evidence in the
+   graph that this is a conversation rather than a video playing.
+
+   Everything is copied under the loop lock into memory the caller owns, so
+   the snapshot stays readable after the graph has moved on. Nothing is
+   parsed or interpreted here; the values are what the client said about
+   itself, verbatim, for something later to make sense of. */
+
+struct snap_stream {
+    int linked;
+    uint32_t n_props;
+    struct prop_pair *props;
+    /* What the client behind the stream declared, kept apart from the node's
+       own properties rather than merged: the two disagree on purpose, and
+       which one said a thing is part of what it is worth. */
+    uint32_t n_client_props;
+    struct prop_pair *client_props;
+};
+
+struct pw_stream_snapshot {
+    uint32_t n;
+    struct snap_stream *streams;
+};
+
+static int
+dup_props(struct prop_pair **dst, uint32_t *dst_n,
+          const struct prop_pair *src, uint32_t n)
+{
+    *dst_n = 0;
+    *dst = calloc(n ? n : 1, sizeof(**dst));
+    if (!*dst)
+        return -1;
+    for (uint32_t i = 0; i < n; i++) {
+        char *k = strdup(src[i].key);
+        char *v = strdup(src[i].value);
+        if (!k || !v) { free(k); free(v); continue; }
+        (*dst)[*dst_n].key = k;
+        (*dst)[*dst_n].value = v;
+        (*dst_n)++;
+    }
+    return 0;
+}
+
+static int
+snap_copy(struct snap_stream *dst, struct pw_sink_watch *w,
+          const struct watched_stream *src)
+{
+    if (dup_props(&dst->props, &dst->n_props, src->props, src->n_props) != 0)
+        return -1;
+
+    struct watched_client *client =
+        sink_watch_find_client(w, watched_stream_prop(src, PW_KEY_CLIENT_ID));
+    if (client)
+        dup_props(&dst->client_props, &dst->n_client_props,
+                  client->props, client->n_props);
+    return 0;
+}
+
+struct pw_stream_snapshot *
+pw_sink_watch_snapshot(struct pw_sink_watch *w)
+{
+    if (!w) return NULL;
+
+    struct pw_stream_snapshot *snap = calloc(1, sizeof(*snap));
+    if (!snap) return NULL;
+    snap->streams = calloc(SINK_WATCH_MAX, sizeof(*snap->streams));
+    if (!snap->streams) { free(snap); return NULL; }
+
+    pw_thread_loop_lock(w->thread_loop);
+
+    /* Pass one: the streams actually feeding the sink. */
+    int linked_slot[SINK_WATCH_MAX] = {0};
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        if (!w->links[i].used)
+            continue;
+        struct watched_stream *s = sink_watch_find_stream(w, w->links[i].out_node_id);
+        if (!s || !s->used)
+            continue;
+        for (uint32_t j = 0; j < SINK_WATCH_MAX; j++) {
+            if (&w->streams[j] != s)
+                continue;
+            if (linked_slot[j])
+                break;          /* two links from one stream is one stream */
+            linked_slot[j] = 1;
+            struct snap_stream *dst = &snap->streams[snap->n];
+            dst->linked = 1;
+            if (snap_copy(dst, w, s) == 0)
+                snap->n++;
+            break;
+        }
+    }
+
+    /* Pass two: everything else the same processes are doing with audio. */
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        struct watched_stream *s = &w->streams[i];
+        if (!s->used || linked_slot[i] || snap->n >= SINK_WATCH_MAX)
+            continue;
+        const char *pid = watched_stream_prop(s, PW_KEY_APP_PROCESS_ID);
+        if (!pid)
+            continue;
+
+        int related = 0;
+        for (uint32_t j = 0; j < SINK_WATCH_MAX && !related; j++) {
+            if (!linked_slot[j])
+                continue;
+            const char *other = watched_stream_prop(&w->streams[j], PW_KEY_APP_PROCESS_ID);
+            related = other && strcmp(other, pid) == 0;
+        }
+        if (!related)
+            continue;
+
+        struct snap_stream *dst = &snap->streams[snap->n];
+        dst->linked = 0;
+        if (snap_copy(dst, w, s) == 0)
+            snap->n++;
+    }
+
+    pw_thread_loop_unlock(w->thread_loop);
+    return snap;
+}
+
+void
+pw_stream_snapshot_destroy(struct pw_stream_snapshot *snap)
+{
+    if (!snap) return;
+    for (uint32_t i = 0; i < snap->n; i++) {
+        struct snap_stream *s = &snap->streams[i];
+        for (uint32_t j = 0; j < s->n_props; j++) {
+            free(s->props[j].key);
+            free(s->props[j].value);
+        }
+        free(s->props);
+        for (uint32_t j = 0; j < s->n_client_props; j++) {
+            free(s->client_props[j].key);
+            free(s->client_props[j].value);
+        }
+        free(s->client_props);
+    }
+    free(snap->streams);
+    free(snap);
+}
+
+uint32_t
+pw_stream_snapshot_count(const struct pw_stream_snapshot *snap)
+{
+    return snap ? snap->n : 0;
+}
+
+int
+pw_stream_snapshot_linked(const struct pw_stream_snapshot *snap, uint32_t i)
+{
+    return (snap && i < snap->n) ? snap->streams[i].linked : 0;
+}
+
+uint32_t
+pw_stream_snapshot_prop_count(const struct pw_stream_snapshot *snap, uint32_t i)
+{
+    return (snap && i < snap->n) ? snap->streams[i].n_props : 0;
+}
+
+const char *
+pw_stream_snapshot_key(const struct pw_stream_snapshot *snap, uint32_t i, uint32_t j)
+{
+    if (!snap || i >= snap->n || j >= snap->streams[i].n_props) return NULL;
+    return snap->streams[i].props[j].key;
+}
+
+const char *
+pw_stream_snapshot_value(const struct pw_stream_snapshot *snap, uint32_t i, uint32_t j)
+{
+    if (!snap || i >= snap->n || j >= snap->streams[i].n_props) return NULL;
+    return snap->streams[i].props[j].value;
+}
+
+uint32_t
+pw_stream_snapshot_client_prop_count(const struct pw_stream_snapshot *snap, uint32_t i)
+{
+    return (snap && i < snap->n) ? snap->streams[i].n_client_props : 0;
+}
+
+const char *
+pw_stream_snapshot_client_key(const struct pw_stream_snapshot *snap, uint32_t i, uint32_t j)
+{
+    if (!snap || i >= snap->n || j >= snap->streams[i].n_client_props) return NULL;
+    return snap->streams[i].client_props[j].key;
+}
+
+const char *
+pw_stream_snapshot_client_value(const struct pw_stream_snapshot *snap, uint32_t i, uint32_t j)
+{
+    if (!snap || i >= snap->n || j >= snap->streams[i].n_client_props) return NULL;
+    return snap->streams[i].client_props[j].value;
 }
 
 /* Build the properties for a capture stream.
