@@ -98,16 +98,58 @@ services.capsper = {
   # "Which variant on a laptop" above for why that is the wrong way round
   # on battery.
   package = inputs.capsper.packages.x86_64-linux.capsper-cuda;
-  audioChannel = "FL";
-  # audioTarget, audioGain, dropTerms, lowLatency, port, recordDir ...
+
+  settings = {
+    trigger.key = "capslock";
+    audio = {
+      target = "vocaster_hostmic";
+      channel = "FL";
+      gain = 10.0;
+    };
+    # meeting.enabled, tcp_server.port, debug_recording.dir ...
+  };
 };
 ```
 
 Group membership only takes effect on the next login, so log out and back in
 after the first `nixos-rebuild switch`.
 
-Run `capsper --audio-detect` once to find the right `audioChannel` and
-`audioGain` for your microphone, then put them in the config.
+Run `capsper --audio-detect` once to find the right `audio.channel` and
+`audio.gain` for your microphone, then put them in the config.
+
+### Settings
+
+`settings` is capsper's own `Config`, from `src/shared/config.zig`, written as
+a Nix attribute set. The module renders it to the ZON file capsper reads and
+passes `--config`. There is no option per flag: the flags cover only the part
+of the settings that predates the config file, so meeting capture, the voice
+activity gate and echo cancellation had no way to be set from here at all.
+
+Anything left out keeps capsper's default rather than one chosen by this
+module, so the rendered file names only what you set.
+
+Enum-valued settings are plain strings — `trigger.key = "capslock"`,
+`audio.channel = "FR"` — and the renderer turns them into ZON enum literals.
+It knows which settings those are from a list in `nix/to-zon.nix`; for an enum
+added to capsper since, `capsper.lib.zon.tag "value"` says so at the point of
+use.
+
+The rendered file is parsed by capsper during the build, so a misspelled field
+or an invalid value fails `nixos-rebuild` with capsper's own diagnostic rather
+than leaving a service that will not start.
+
+To move an existing command line over, let capsper do it:
+
+```bash
+capsper --trigger capslock --audio-target vocaster_hostmic --audio-gain 10 \
+        --write-config
+```
+
+It prints the settings those flags mean, naming only what differs from the
+defaults, which transcribes straight into `settings`.
+
+`extraArgs` still appends flags to the command line. Flags are applied over the
+file, so anything there wins over `settings` for that one setting.
 
 ## Models
 

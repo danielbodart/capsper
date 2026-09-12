@@ -85,10 +85,71 @@
         LD_LIBRARY_PATH = pkgs.lib.concatStringsSep ":" runtimeLibs;
       };
 
-      # The module's whole job is granting permissions a user cannot grant
-      # themselves, and nothing but a real NixOS system can confirm it worked.
-      # Boots one in a VM and checks the device nodes and group membership.
       checks.${system} = {
+        # The home-manager module renders `settings` to ZON, and a renderer
+        # that emits the wrong shape produces a service that will not start.
+        # Checked two ways: against the exact text, because the enum literals
+        # and the container syntax are where this goes wrong, and by handing
+        # the result to capsper, because being valid ZON is not the same as
+        # being settings capsper accepts.
+        zon-renderer =
+          let
+            zon = import ./nix/to-zon.nix { inherit (pkgs) lib; };
+            rendered = zon.toZON zon.enumPaths {
+              model = "~/models/nemotron";
+              audio = {
+                target = "vocaster_hostmic";
+                channel = "FR";
+                gain = 10.0;
+                auto_gain = false;
+              };
+              trigger.key = "capslock";
+              tcp_server.port = 43007;
+              meeting = {
+                enabled = true;
+                output = null;
+                vad.onset = 0.45;
+                detail = zon.tag "debug";
+              };
+            };
+            expected = ''
+              .{
+                  .audio = .{
+                      .auto_gain = false,
+                      .channel = .FR,
+                      .gain = 10.000000,
+                      .target = "vocaster_hostmic",
+                  },
+                  .meeting = .{
+                      .detail = .debug,
+                      .enabled = true,
+                      .output = null,
+                      .vad = .{
+                          .onset = 0.450000,
+                      },
+                  },
+                  .model = "~/models/nemotron",
+                  .tcp_server = .{
+                      .port = 43007,
+                  },
+                  .trigger = .{
+                      .key = .capslock,
+                  },
+              }
+            '';
+          in
+          pkgs.runCommand "capsper-zon-renderer" { } ''
+            diff -u ${pkgs.writeText "expected.zon" expected} \
+                    ${pkgs.writeText "rendered.zon" rendered}
+            ${pkgs.lib.getExe self.packages.${system}.capsper-cpu} \
+              --config ${pkgs.writeText "rendered.zon" rendered} --write-config > /dev/null
+            touch $out
+          '';
+
+        # The module's whole job is granting permissions a user cannot grant
+        # themselves, and nothing but a real NixOS system can confirm it
+        # worked. Boots one in a VM and checks the device nodes and group
+        # membership.
         nixos-module = pkgs.testers.runNixOSTest {
           name = "capsper-nixos-module";
 
@@ -127,6 +188,10 @@
       # The dictation service itself, which is per-user (it grabs the session's
       # keyboards and talks to that user's PipeWire).
       homeModules.default = import ./nix/home-manager-module.nix { inherit self; };
+
+      # Exposed for `tag`, which says "this string is a ZON enum literal" for a
+      # setting the renderer's own list does not cover yet.
+      lib.zon = import ./nix/to-zon.nix { inherit (pkgs) lib; };
 
       formatter.${system} = pkgs.nixfmt-tree;
     };

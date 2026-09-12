@@ -12,9 +12,13 @@
 # atomic switch plus rollback is what `nixos-rebuild` already does. Updates
 # come from bumping this flake's input.
 #
-# It also means the configuration lives here rather than being parsed back out
-# of the generated ExecStart line, which is what install.sh's
-# extract_service_config has to do on every upgrade.
+# Settings go through `settings`, which is rendered to the ZON config file
+# capsper already reads, rather than through an option per command line flag.
+# capsper has one settings type and the file names all of it, while the flags
+# cover only the part that predates the file -- meeting capture, the voice
+# activity gate and echo cancellation have no flags at all and were therefore
+# unreachable from here. A freeform attribute set tracks that type without
+# this module having to grow an option every time it gains a field.
 { self }:
 {
   config,
@@ -26,38 +30,29 @@
 let
   cfg = config.services.capsper;
 
+  zon = import ./to-zon.nix { inherit lib; };
+
+  rendered = pkgs.writeText "config.zon" (zon.toZON zon.enumPaths cfg.settings);
+
+  # Rendering valid ZON is not the same as rendering settings capsper accepts:
+  # an unknown field or a misspelled enum is a parse error, and finding it at
+  # `nixos-rebuild` time beats finding it when the service will not start.
+  # `--write-config` parses the file and exits before touching a model, a
+  # device or the network, so this is cheap and runs in the sandbox.
+  configFile = pkgs.runCommand "capsper-config.zon" { } ''
+    ${lib.getExe cfg.package} --config ${rendered} --write-config > /dev/null
+    cp ${rendered} $out
+  '';
+
   args = [
+    # Stays a flag rather than a setting because bin/capsper is a wrapper that
+    # always passes --model, to move the default off the read-only store. A
+    # `model` in the file would be overridden by it and silently do nothing;
+    # the wrapper's arguments come first, so this one wins.
     "--model"
     cfg.modelDir
-  ]
-  ++ lib.optionals (cfg.trigger != null) [
-    "--trigger"
-    cfg.trigger
-  ]
-  ++ lib.optionals (cfg.audioTarget != null) [
-    "--audio-target"
-    cfg.audioTarget
-  ]
-  ++ [
-    "--audio-channel"
-    cfg.audioChannel
-  ]
-  ++ lib.optionals (cfg.audioGain != null) [
-    "--audio-gain"
-    (toString cfg.audioGain)
-  ]
-  ++ lib.optionals (cfg.dropTerms != null) [
-    "--drop-terms"
-    (toString cfg.dropTerms)
-  ]
-  ++ lib.optionals (cfg.recordDir != null) [
-    "--record-dir"
-    cfg.recordDir
-  ]
-  ++ lib.optional cfg.lowLatency "--low-latency"
-  ++ lib.optionals (cfg.port != null) [
-    "--port"
-    (toString cfg.port)
+    "--config"
+    configFile
   ]
   ++ cfg.extraArgs;
 in
@@ -100,71 +95,45 @@ in
       '';
     };
 
-    trigger = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = "capslock";
-      description = ''
-        Push-to-talk key. Set to null for always-live capture, which requires
-        `audioTarget` to be set.
+    settings = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+      example = lib.literalExpression ''
+        {
+          audio = {
+            target = "alsa_input.usb-Focusrite_Vocaster-00.analog-stereo";
+            gain = 10.0;
+          };
+          trigger.key = "capslock";
+          meeting.enabled = true;
+        }
       '';
-    };
-
-    audioTarget = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "alsa_input.pci-0000_00_1f.3.analog-stereo";
       description = ''
-        PipeWire node to capture from. Leave null to use the default source.
-        `capsper --audio-detect` lists candidates.
+        capsper's settings, rendered to the ZON config file it reads. The
+        structure is capsper's `Config` type in `src/shared/config.zig`, and
+        anything absent keeps capsper's own default rather than a default
+        chosen here.
+
+        Enum-valued settings are written as ordinary strings, so
+        `trigger.key = "capslock"` and `audio.channel = "FR"` are what you
+        want. The rendered file is parsed by capsper at build time, so a
+        misspelled field or value fails the rebuild rather than the service.
+
+        Run `capsper --audio-detect` once to find the right `audio.channel`
+        and `audio.gain` for your microphone. An existing command line can be
+        converted with `capsper <its flags> --write-config`, which prints the
+        settings those flags mean.
       '';
-    };
-
-    audioChannel = lib.mkOption {
-      type = lib.types.str;
-      default = "FL";
-      description = "Channel to capture. `capsper --audio-detect` recommends one.";
-    };
-
-    audioGain = lib.mkOption {
-      type = lib.types.nullOr lib.types.float;
-      default = null;
-      example = 2.5;
-      description = "Input gain multiplier. `capsper --audio-detect` recommends one.";
-    };
-
-    dropTerms = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
-      description = "File of filler phrases to suppress, one per line.";
-    };
-
-    recordDir = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = "Save audio snippets and transcription logs here, for troubleshooting.";
-    };
-
-    lowLatency = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = ''
-        Keep the microphone stream open between presses, saving ~300ms on
-        first-emit latency. The desktop microphone indicator then stays
-        visible at all times, not just while speaking.
-      '';
-    };
-
-    port = lib.mkOption {
-      type = lib.types.nullOr lib.types.port;
-      default = null;
-      example = 43007;
-      description = "Listen for remote transcription clients on this TCP port.";
     };
 
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
-      description = "Extra arguments appended to the capsper command line.";
+      description = ''
+        Extra arguments appended to the capsper command line. Flags are
+        applied over the config file, so anything here wins over `settings`
+        for that setting.
+      '';
     };
   };
 
@@ -193,8 +162,19 @@ in
 
     assertions = [
       {
-        assertion = cfg.trigger != null || cfg.audioTarget != null;
-        message = "services.capsper: with no trigger (always-live capture), audioTarget must be set.";
+        # capsper needs a mode: push-to-talk, always-live capture, the TCP
+        # server or meeting capture. With none of them it prints its usage and
+        # exits, which under `Restart=always` is a restart loop rather than an
+        # error anybody sees.
+        assertion =
+          (cfg.settings.trigger.key or null) != null
+          || (cfg.settings.audio.target or null) != null
+          || (cfg.settings.tcp_server.port or null) != null
+          || (cfg.settings.meeting.enabled or false);
+        message = ''
+          services.capsper.settings gives capsper nothing to do. Set one of
+          trigger.key, audio.target, tcp_server.port or meeting.enabled.
+        '';
       }
     ];
   };
