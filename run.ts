@@ -2,6 +2,7 @@
 import { $ } from "bun";
 import { existsSync } from "fs";
 import { join } from "path";
+import { manualEchoTest } from "./scripts/echo-manual-test";
 
 process.env.FORCE_COLOR = "1";
 
@@ -155,7 +156,7 @@ export async function dev() {
     if (IS_MACOS) {
         await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/ca-stream.test.ts`;
     } else {
-        await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/pw-stream.test.ts test/pw-sink.test.ts`;
+        await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/pw-stream.test.ts test/pw-sink.test.ts test/echo-cancel.test.ts`;
     }
 }
 
@@ -394,6 +395,10 @@ const commands: Record<string, Function> = {
     "medium-test": mediumTest,
     "long-test": longTest,
     "slow-test": slowTest,
+    // Deliberately in no aggregate above: it plays sound out loud through the
+    // real speakers and records the real microphone, so it runs when a person
+    // asks for it by name and at no other time.
+    "manual-echo-test": manualEchoTest,
 };
 
 const command = process.argv[2] || "dev";

@@ -481,9 +481,23 @@ pw_device_monitor_set_on_appeared(struct pw_device_monitor *m,
    carries the audio on to the real default output so the call is still
    audible.
 
+   `state.restore-props = false` on both ends, and it is load-bearing. The
+   session manager otherwise saves whatever volume it last saw and hands it
+   back to the next node with the same `media.name` -- which is derived from
+   the description, so every capsper pass-through shares one. Muting a sink
+   once, in a test, saved a zero against that shared name, and every meeting
+   sink afterwards came up silent: linked correctly to the speakers, carrying
+   the call, at volume zero. Capsper owns its own levels; the session manager
+   must not remember them for it.
+
    The playback end is `node.passive`, so the whole thing sits in `suspended`
    when no application is holding the sink. That is what lets the graph answer
-   "is a call happening?" rather than being permanently busy. */
+   "is a call happening?" rather than being permanently busy, and it is why the
+   echo canceller below is a separate module with a separate lifetime rather
+   than part of this one. Folding the two together works and costs exactly that
+   property: the canceller schedules the sink alongside its own streams, so the
+   sink never goes idle and the machine processes audio around the clock for
+   the sake of calls that are not happening. */
 
 struct pw_virtual_sink {
     struct pw_thread_loop *thread_loop;
@@ -493,7 +507,8 @@ struct pw_virtual_sink {
 };
 
 struct pw_virtual_sink *
-pw_virtual_sink_create(const char *node_name, const char *description)
+pw_virtual_sink_create(const char *node_name, const char *description,
+                       const char *output_target)
 {
     if (!node_name || !node_name[0])
         return NULL;
@@ -505,9 +520,24 @@ pw_virtual_sink_create(const char *node_name, const char *description)
     struct pw_virtual_sink *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
 
+    const char *desc = description ? description : node_name;
+
+    /* Null follows the default output, which is the ordinary case. Naming one
+       is what lets a test send the call somewhere it owns instead of at
+       whoever is in the room. */
+    char out[320] = "";
+    if (output_target && output_target[0])
+        snprintf(out, sizeof(out), "target.object = \"%s\" ", output_target);
+
     /* Stereo on both ends: the sink has to look like ordinary speakers to the
        meeting app, and the monitor's two channels are what the far end is
-       eventually mixed down from. */
+       eventually mixed down from.
+
+       `node.nick` carries the same text as `node.description` because the two
+       are read inconsistently: pavucontrol and GNOME show the description,
+       while patchbay-style tools prefer the nick. Setting one and not the
+       other means the sink is labelled properly in some pickers and shows its
+       bare node name in the rest. */
     char args[1024];
     snprintf(args, sizeof(args),
              "{ "
@@ -515,17 +545,21 @@ pw_virtual_sink_create(const char *node_name, const char *description)
                  "media.class = Audio/Sink "
                  "node.name = \"%s\" "
                  "node.description = \"%s\" "
+                 "node.nick = \"%s\" "
+                 "state.restore-props = false "
                  "audio.position = [ FL FR ] "
              "} "
              "playback.props = { "
                  "node.name = \"%s.passthrough\" "
                  "node.description = \"%s (pass-through)\" "
                  "node.passive = true "
+                 "state.restore-props = false "
+                 "%s"
                  "audio.position = [ FL FR ] "
              "} "
              "}",
-             node_name, description ? description : node_name,
-             node_name, description ? description : node_name);
+             node_name, desc, desc,
+             node_name, desc, out);
 
     s->thread_loop = pw_thread_loop_new("capsper-sink", NULL);
     if (!s->thread_loop) { free(s); return NULL; }
@@ -590,6 +624,243 @@ pw_virtual_sink_destroy(struct pw_virtual_sink *s)
     pw_context_destroy(s->context);
     pw_thread_loop_destroy(s->thread_loop);
     free(s);
+}
+
+/* ─── Echo canceller ────────────────────────────────────────────────────────
+
+   Speakers and an open microphone in one room means the call comes back in a
+   few tens of milliseconds later, so the near track carries a quieter copy of
+   everything the far end said and the far end lands in the transcript twice:
+   once as itself, once putting words in the near end's mouth.
+
+   `libpipewire-module-echo-cancel` in `monitor.mode`, which makes no sink of
+   its own. Instead it captures a reference, captures the microphone, and
+   exposes one Source carrying the microphone with the reference subtracted
+   out. Two properties on that reference stream are what point it at capsper's
+   sink rather than at the desktop's default output: `target.object` names the
+   sink, and `stream.capture.sink` is what turns naming a sink into capturing
+   its monitor. Without the second one it silently takes the default microphone
+   instead, which is the same trap the far-end capture has to avoid.
+
+   Taking the reference from capsper's own sink rather than from the default
+   output is what makes this the call being removed rather than everything the
+   speakers are playing, and it means the cancellation does not depend on which
+   output happens to be the default -- something capsper does not control.
+
+   It lives and dies with a session, not with the process. Idle, it would
+   otherwise hold the whole graph running to cancel echo from calls that are
+   not happening, which costs a core on a laptop for nothing. The price is that
+   the filter reconverges each time a session opens; calls tend to start with
+   the far end talking, which is the signal it needs.
+
+   `priority.session = 0` keeps WirePlumber from making the cleaned microphone
+   the desktop's default input. It has to be the only thing doing that job.
+   Declaring the class Audio/Source/Virtual instead, or as well, is the obvious
+   way to hide a synthetic node and it does hide it -- from capsper too. The
+   near track's own capture is matched by the same session manager, so a class
+   that says "not a real microphone" leaves that stream with nothing to link to
+   and the near track records digital silence.
+
+   And there is deliberately no `audio.position` on the microphone, however
+   obvious one looks next to a mono mic. Pinning the capture to a single
+   channel while the reference stays stereo makes WebRTC reject every frame as
+   kBadNumberChannelsError, and it reports that nowhere capsper can see: the
+   module loads, announces its plugin, builds all its nodes, links them
+   correctly, and cancels nothing. Measured 1733 failed frames in eighteen
+   seconds with a position set, and none without one. */
+
+struct pw_echo_canceller {
+    struct pw_thread_loop *thread_loop;
+    struct pw_context     *context;
+    struct pw_core        *core;
+    struct pw_impl_module *module;
+    struct pw_registry    *registry;
+    struct spa_hook        registry_listener;
+
+    char     mic_name[256];
+    /* Read from the main thread; written only on the thread loop. */
+    _Atomic uint32_t mic_id;
+};
+
+static void
+on_aec_global(void *data, uint32_t id, uint32_t permissions,
+              const char *type, uint32_t version,
+              const struct spa_dict *props)
+{
+    struct pw_echo_canceller *e = data;
+    (void)permissions;
+    (void)version;
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0 || !props)
+        return;
+
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (name && strcmp(name, e->mic_name) == 0)
+        atomic_store(&e->mic_id, id);
+}
+
+static void
+on_aec_global_remove(void *data, uint32_t id)
+{
+    struct pw_echo_canceller *e = data;
+    if (atomic_load(&e->mic_id) == id)
+        atomic_store(&e->mic_id, 0);
+}
+
+static const struct pw_registry_events aec_events = {
+    PW_VERSION_REGISTRY_EVENTS,
+    .global = on_aec_global,
+    .global_remove = on_aec_global_remove,
+};
+
+/* `sink_name` is the sink whose monitor is the reference. `mic_target` names
+   the microphone to clean, null meaning follow the desktop's default input.
+   The cleaned microphone is named `<sink_name>.mic`, derived rather than
+   configured for the same reason the pass-through end's name is. */
+struct pw_echo_canceller *
+pw_echo_canceller_create(const char *sink_name, const char *description,
+                         const char *mic_target)
+{
+    if (!sink_name || !sink_name[0])
+        return NULL;
+
+    pw_init(NULL, NULL);
+
+    struct pw_echo_canceller *e = calloc(1, sizeof(*e));
+    if (!e) return NULL;
+    snprintf(e->mic_name, sizeof(e->mic_name), "%s.mic", sink_name);
+
+    char mic_desc[320];
+    snprintf(mic_desc, sizeof(mic_desc), "%s (microphone)",
+             description ? description : sink_name);
+
+    char target[320] = "";
+    if (mic_target && mic_target[0])
+        snprintf(target, sizeof(target), "target.object = \"%s\" ", mic_target);
+
+    char args[1536];
+    snprintf(args, sizeof(args),
+             "{ "
+             "monitor.mode = true "
+             "library.name = aec/libspa-aec-webrtc "
+             /* Off rather than left at their defaults: the plugin can also
+                apply gain control, noise suppression and a high-pass filter,
+                and all three would move the near track's levels, which the cue
+                logic reads to decide when a speaker has stopped. Removing the
+                echo is the change being made here. */
+             "aec.args = { "
+                 "webrtc.gain_control = false "
+                 "webrtc.noise_suppression = false "
+                 "webrtc.high_pass_filter = false "
+             "} "
+             "sink.props = { "
+                 "target.object = \"%s\" "
+                 "stream.capture.sink = true "
+             "} "
+             "capture.props = { "
+                 "%s"
+             "} "
+             "source.props = { "
+                 "node.name = \"%s\" "
+                 "node.description = \"%s\" "
+                 "node.nick = \"%s\" "
+                 "priority.session = 0 "
+                 /* Same reason as the sink: a remembered zero here would be a
+                    near track of digital silence. */
+                 "state.restore-props = false "
+             "} "
+             "}",
+             sink_name, target, e->mic_name, mic_desc, mic_desc);
+
+    e->thread_loop = pw_thread_loop_new("capsper-aec", NULL);
+    if (!e->thread_loop) { free(e); return NULL; }
+
+    e->context = pw_context_new(pw_thread_loop_get_loop(e->thread_loop), NULL, 0);
+    if (!e->context) {
+        pw_thread_loop_destroy(e->thread_loop);
+        free(e); return NULL;
+    }
+
+    pw_thread_loop_lock(e->thread_loop);
+
+    if (pw_thread_loop_start(e->thread_loop) < 0) {
+        pw_thread_loop_unlock(e->thread_loop);
+        pw_context_destroy(e->context);
+        pw_thread_loop_destroy(e->thread_loop);
+        free(e); return NULL;
+    }
+
+    e->core = pw_context_connect(e->context, NULL, 0);
+    if (!e->core) {
+        pw_thread_loop_unlock(e->thread_loop);
+        pw_thread_loop_stop(e->thread_loop);
+        pw_context_destroy(e->context);
+        pw_thread_loop_destroy(e->thread_loop);
+        free(e); return NULL;
+    }
+
+    /* Watching before loading, so the cleaned microphone cannot appear in the
+       window between the two and go unnoticed. */
+    e->registry = pw_core_get_registry(e->core, PW_VERSION_REGISTRY, 0);
+    if (e->registry)
+        pw_registry_add_listener(e->registry, &e->registry_listener, &aec_events, e);
+
+    /* A null here means the module itself is missing. The cancellation engine
+       behind it loads separately and later, so this succeeding does not mean
+       cancellation works, which is why the caller waits for the cleaned
+       microphone rather than trusting this. */
+    e->module = pw_context_load_module(e->context,
+                                       "libpipewire-module-echo-cancel", args, NULL);
+    if (!e->module) {
+        fprintf(stderr, "[aec] Failed to load libpipewire-module-echo-cancel\n");
+        if (e->registry) {
+            spa_hook_remove(&e->registry_listener);
+            pw_proxy_destroy((struct pw_proxy *)e->registry);
+        }
+        pw_core_disconnect(e->core);
+        pw_thread_loop_unlock(e->thread_loop);
+        pw_thread_loop_stop(e->thread_loop);
+        pw_context_destroy(e->context);
+        pw_thread_loop_destroy(e->thread_loop);
+        free(e); return NULL;
+    }
+
+    pw_thread_loop_unlock(e->thread_loop);
+    return e;
+}
+
+void
+pw_echo_canceller_destroy(struct pw_echo_canceller *e)
+{
+    if (!e) return;
+
+    pw_thread_loop_lock(e->thread_loop);
+    if (e->registry) {
+        spa_hook_remove(&e->registry_listener);
+        pw_proxy_destroy((struct pw_proxy *)e->registry);
+    }
+    if (e->core)
+        pw_core_disconnect(e->core);
+    pw_thread_loop_unlock(e->thread_loop);
+
+    pw_thread_loop_stop(e->thread_loop);
+    pw_context_destroy(e->context);
+    pw_thread_loop_destroy(e->thread_loop);
+    free(e);
+}
+
+/* Has the cleaned microphone appeared in the graph? Safe from any thread. */
+int
+pw_echo_canceller_ready(struct pw_echo_canceller *e)
+{
+    return (e && atomic_load(&e->mic_id) != 0) ? 1 : 0;
+}
+
+/* The cleaned microphone's node name. Owned by the canceller. */
+const char *
+pw_echo_canceller_mic_name(struct pw_echo_canceller *e)
+{
+    return e ? e->mic_name : NULL;
 }
 
 /* ─── Sink usage watch (gate 1) ─────────────────────────────────────────────
@@ -903,6 +1174,27 @@ pw_build_capture_props(const char *target, int capture_sink)
         PW_KEY_MEDIA_TYPE,     "Audio",
         PW_KEY_MEDIA_CATEGORY, "Capture",
         PW_KEY_MEDIA_ROLE,     "Communication",
+        /* Capsper owns its own gain, and the session manager must not save it
+           or hand it back.
+
+           Without this, WirePlumber stores whatever volume it last saw on one
+           of these streams and restores it onto the next, keyed on the role
+           above -- which every capture here shares. Three things went wrong
+           because of it, and none of them looked like a volume problem.
+
+           Auto-gain climbs and never attenuates below unity, which is safe
+           only because it starts at unity. Restored, it starts wherever it
+           last finished and can still only climb, so the gain ratchets upward
+           across restarts.
+
+           The far-end track inherits it too. That track is the sink's monitor,
+           a digital signal that has never needed gain, and it arrived clipped
+           at full scale.
+
+           And it lifts whatever the echo canceller just removed back up, which
+           is how 19 dB of measured cancellation became a near track louder
+           than the microphone it came from. */
+        "state.restore-props",  "false",
         NULL);
     if (!props)
         return NULL;

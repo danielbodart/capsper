@@ -21,7 +21,9 @@ const server_mod = @import("server.zig");
 const PipelineFactory = server_mod.PipelineFactory;
 const Pipeline = @import("../backend/pipeline.zig").Pipeline;
 const AudioCapture = @import("../platform/audio.zig").AudioCapture;
-const SinkWatch = @import("../platform/sink.zig").SinkWatch;
+const sink_mod = @import("../platform/sink.zig");
+const SinkWatch = sink_mod.SinkWatch;
+const EchoCanceller = sink_mod.EchoCanceller;
 const vad_backend = @import("../backend/vad.zig");
 
 const log = std.log.scoped(.meeting);
@@ -353,6 +355,9 @@ const TrackAsr = struct {
 const Session = struct {
     near: AudioCapture,
     far: AudioCapture,
+    /// Up only while this session is. Null when cancellation was not asked
+    /// for, or was and could not be had.
+    aec: ?EchoCanceller,
     mixer: meeting.TrackMixer,
     file: SessionFile,
     transcript: Transcript,
@@ -381,11 +386,46 @@ const Session = struct {
         var far_asr = try TrackAsr.init(gpa, .far, factory, cfg);
         errdefer far_asr.deinit(gpa);
 
-        // The near end follows whatever the desktop's input is set to when no
-        // target is configured, which is the same selection the user already
-        // made for every other application.
-        var near = try AudioCapture.init(.{
-            .target = cfg.audio.target,
+        // Echo cancellation comes up with the session and goes away with it,
+        // so an idle machine is not processing audio for a call that is not
+        // happening. Its absence is a cost rather than a failure -- said once
+        // and then not mentioned again, the same shape as a missing voice
+        // activity model -- because a recorded meeting with echo in it is
+        // worth far more than no recording at all.
+        var aec: ?EchoCanceller = if (cfg.meeting.aec.enabled)
+            EchoCanceller.init(
+                cfg.meeting.sink_name,
+                cfg.meeting.sink_description,
+                cfg.meetingNear(),
+            ) catch |err| blk: {
+                log.warn("no echo cancellation ({s}); the near track will hear the speakers", .{@errorName(err)});
+                break :blk null;
+            }
+        else
+            null;
+        errdefer if (aec) |*a| a.deinit();
+
+        // The near end reads the echo-cancelled microphone when there is one,
+        // and the microphone itself when there is not. Both cases are one
+        // capture on one target, so everything downstream is identical: the
+        // recording and the encoder are fed from the same pipe, which is what
+        // keeps the audio a check on the transcript rather than a second
+        // opinion about it.
+        //
+        // MONO on the cleaned source because it is stereo, being built from a
+        // stereo reference, and the channel has already been chosen upstream
+        // by whatever the canceller was pointed at. Only the raw microphone
+        // needs `audio_channel`, where it picks one input of a multi-channel
+        // interface.
+        //
+        // Without a target the raw case follows whatever the desktop's input
+        // is set to, which is the same selection the user already made for
+        // every other application.
+        var near = try AudioCapture.init(if (aec) |a| .{
+            .target = a.mic,
+            .channel = AudioCapture.mono_channel,
+        } else .{
+            .target = cfg.meetingNear(),
             .channel = audio_channel,
         });
         errdefer near.deinit();
@@ -393,9 +433,20 @@ const Session = struct {
 
         // The far end is the sink's monitor. `capture_sink` is what makes that
         // the monitor rather than the default microphone.
+        //
+        // MONO rather than the FL the near end uses, and the difference is not
+        // cosmetic. PipeWire's converter routes by channel position, so asking
+        // a stereo monitor for FL hands back the left channel alone and
+        // discards the right entirely -- measured at -91 dBFS against -17.6
+        // for a tone panned hard right. Asking for MONO makes it downmix
+        // instead, so a meeting app that pans, or sends one speaker per
+        // channel, is heard rather than half-heard. The near end keeps FL
+        // because there the channel is a deliberate choice of one input on a
+        // multi-channel interface, where a downmix would be a mixture of every
+        // microphone on the device.
         var far = try AudioCapture.init(.{
             .target = cfg.meeting.sink_name,
-            .channel = AudioCapture.default_channel,
+            .channel = AudioCapture.mono_channel,
             .capture_sink = true,
         });
         errdefer far.deinit();
@@ -405,6 +456,7 @@ const Session = struct {
         return .{
             .near = near,
             .far = far,
+            .aec = aec,
             .mixer = .{},
             .file = file,
             .transcript = transcript,
@@ -460,6 +512,9 @@ const Session = struct {
         self.far.setActive(false);
         self.near.deinit();
         self.far.deinit();
+        // After the captures, so nothing is reading the cleaned microphone
+        // when it leaves the graph.
+        if (self.aec) |*a| a.deinit();
 
         self.near_asr.finish(gpa, &self.transcript.doc) catch {};
         self.far_asr.finish(gpa, &self.transcript.doc) catch {};

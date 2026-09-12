@@ -292,12 +292,28 @@ is the audio path.
 .{
     .meeting = .{
         .enabled = true,
-        .sink_name = "capsper_call",                  // name in the output picker
+        .sink_name = "capsper_transcribe",            // how pw-link addresses it
+        .sink_description = "Capsper: Transcribe",    // what the picker shows
+        .output = null,                               // null follows your default output
+        .near = null,                                 // null follows audio.target
         .dir = "~/.local/share/capsper/sessions",
         .idle_close_seconds = 30,
+        .aec = .{ .enabled = true },
     },
 }
 ```
+
+The two names do different jobs. `sink_name` is the identifier: it is what
+`pw-link` and `pactl` address, and what the sink is called as a JACK client,
+so it stays lowercase and underscored like every `alsa_output.*` beside it.
+`sink_description` is the label, is free text, and is what a picker shows. The
+monitor takes its own label from it, as "Monitor of Capsper: Transcribe", so
+there is nothing to set for the far end.
+
+Change the description whenever you like. Changing `sink_name` is the one to
+think about: WirePlumber keys your saved default output on it, and meeting apps
+remember a chosen device by it, so a rename drops both back to the system
+default without saying so.
 
 With this on, capsper creates a virtual output device of that name. Select it
 as the output in the meeting app, and the far end of the call goes into it
@@ -329,6 +345,37 @@ would need, because Opus couples stereo channels efficiently only when they
 correlate and these two do not at all — the same total two mono tracks would
 have cost. `.audio_format = .wav` instead if you want the raw samples, at
 115 MB per channel per hour.
+
+### Echo cancellation
+
+Speakers and an open microphone in one room means the call comes back in a few
+tens of milliseconds later, so the near track carries a quieter copy of
+everything the far end said and the far end lands in the transcript twice: once
+as itself, and once putting words in your mouth. Measured on a real desktop,
+with the speakers at ordinary volume and an overhead microphone, the near track
+transcribed the far end's speech in full.
+
+`aec.enabled` is on by default and fixes that. The cancellation is WebRTC's
+AEC3, running as a PipeWire node rather than a stage inside capsper, and what it
+subtracts is capsper's own sink — so it removes the call rather than everything
+your speakers happen to be playing. Same room, same measurement, with it on: the
+near track is empty and the far track is unchanged, 12.6 dB removed.
+
+It comes up when a session opens and goes away when it closes. Left running it
+would schedule the sink alongside its own streams and hold the graph turning
+over between calls, which on a laptop is a core spent on nothing.
+
+Only meeting capture is touched. Push-to-talk dictation, its debug recordings
+and the TCP server all read the microphone directly, because nothing points them
+at the cleaned source. `meeting.near` names the microphone to clean, falling
+back to `audio.target`, so dictation and meeting capture can listen to different
+inputs — which matters, because they now run at the same time. Mute yourself in
+a call, dictate a note into another window, and the meeting goes on recording.
+
+`meeting.output` names where the sink passes the call on to. Unset, it follows
+your default output, which is what you want. Naming one is for a machine whose
+default is the wrong device, and for tests, which point it at a sink of their
+own so they can never make a sound.
 
 The path is a single ISO 8601 timestamp split across directories, in UTC. One
 stereo file rather than two mono ones, with the microphone on the left and the

@@ -3,7 +3,7 @@ import { $, spawn } from "bun";
 import { writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync, readdirSync, statSync } from "fs";
 import { join } from "path";
 import { connect } from "net";
-import { BINARY, ensureBinary, tmpFile, trackProc, waitForLog, until } from "./helpers";
+import { BINARY, ensureBinary, tmpFile, trackProc, waitForLog, until, createNullSink, removeNullSink } from "./helpers";
 
 const isLinux = process.platform === "linux";
 
@@ -13,7 +13,7 @@ const isLinux = process.platform === "linux";
 const SLOW = !!process.env.SLOW_TESTS;
 
 // Named for this test so a stray node from a crashed run is obvious, and can
-// never be mistaken for the real `capsper_call` a user is running.
+// never be mistaken for the real `capsper_transcribe` a user is running.
 const SINK = "test_capsper_sink";
 const AUDIO_SINK = "test_capsper_audio_sink";
 
@@ -67,19 +67,20 @@ function defaultSinkName(objects: any[]): string | undefined {
     return undefined;
 }
 
-/**
- * Silence the sink's pass-through end.
- *
- * The pass-through is what keeps a real call audible, and in a test it is what
- * makes the machine play sine tones at whoever is sitting there. Muting it
- * stops anything reaching the speakers while leaving the sink and its monitor
- * working, so capture and transcription are still exercised in full.
- */
-async function mutePassthrough(sink: string): Promise<void> {
-    const node = nodes(await dump()).find((n) => n.name === `${sink}.passthrough`);
-    if (!node) throw new Error(`no ${sink}.passthrough to mute`);
-    await $`wpctl set-volume ${node.id} 0`.quiet().nothrow();
-}
+// Where the pass-through sends the call during a test: a sink of the test's
+// own that goes nowhere, named per block so two blocks cannot collide.
+//
+// This replaced muting the pass-through. Muting stopped the sound but left the
+// sink wired to the machine's real speakers, which meant it could only reach
+// `suspended` when nothing else was using them -- so "sits suspended while
+// nothing is playing" failed whenever someone had music on. Owning the
+// destination makes the sound impossible rather than merely inaudible, and
+// makes the idle state depend on nothing outside the test.
+const OUTPUT_SINKS = {
+    graph: "test_capsper_out_graph",
+    capture: "test_capsper_out_capture",
+    opus: "test_capsper_out_opus",
+};
 
 /** Peak dBFS of a WAV, via ffmpeg's volumedetect. -91 or so means silence. */
 async function peakDb(path: string): Promise<number> {
@@ -117,6 +118,7 @@ function walkAudio(dir: string, ext: string, found: string[] = []): string[] {
 /** Start capsper with meeting capture on, and wait for the sink to come up. */
 async function startCapsper(opts: {
     sink: string;
+    output: string;
     sessionsDir: string;
     httpPort: number;
     idleCloseSeconds: number;
@@ -126,6 +128,7 @@ async function startCapsper(opts: {
     writeFileSync(
         configFile,
         `.{ .meeting = .{ .enabled = true, .sink_name = "${opts.sink}",` +
+            ` .output = "${opts.output}",` +
             ` .idle_close_seconds = ${opts.idleCloseSeconds}, .dir = "${opts.sessionsDir}",` +
             ` .audio_format = .${opts.audioFormat ?? "opus"},` +
             ` .http = .{ .port = ${opts.httpPort} } } }\n`,
@@ -146,7 +149,6 @@ async function startCapsper(opts: {
     // creates its nodes on its own loop.
     await until(`${opts.sink} to reach the graph`, async () =>
         nodes(await dump()).some((n) => n.name === `${opts.sink}.passthrough`));
-    await mutePassthrough(opts.sink);
 
     // The server binds before the sink is announced, but wait for it rather
     // than assume the ordering.
@@ -173,8 +175,11 @@ describe.skipIf(!isLinux)("virtual sink", () => {
     // serve without a recording having to be made in real time first.
     const SESSION = "2026/09/11/T143000Z";
 
+    let outputModule = "";
+
     beforeAll(async () => {
         ensureBinary();
+        outputModule = await createNullSink(OUTPUT_SINKS.graph);
 
         sessionsDir = tmpFile("capsper-sessions", "");
         mkdirSync(join(sessionsDir, SESSION), { recursive: true });
@@ -188,6 +193,7 @@ describe.skipIf(!isLinux)("virtual sink", () => {
 
         capsper = await startCapsper({
             sink: SINK,
+            output: OUTPUT_SINKS.graph,
             sessionsDir,
             httpPort: HTTP_PORT,
             idleCloseSeconds: 3,
@@ -200,6 +206,7 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         for (const path of [capsper?.configFile, capsper?.logFile]) {
             if (path) try { unlinkSync(path); } catch {}
         }
+        await removeNullSink(outputModule);
         try { rmSync(sessionsDir, { recursive: true, force: true }); } catch {}
     });
 
@@ -213,11 +220,21 @@ describe.skipIf(!isLinux)("virtual sink", () => {
     test("sits suspended while nothing is playing into it", () => {
         // Not merely tidy: an idle sink is what lets the graph answer "is a
         // call happening?" rather than being permanently busy.
+        //
+        // Only reliable because `meeting.output` points this sink at one the
+        // test owns. Following the desktop's default output instead, the sink
+        // cannot suspend while anything else on the machine is using the
+        // speakers, and this fails whenever someone has music on.
         const sink = nodes(objects).find((n) => n.name === SINK);
         expect(sink!.state).toBe("suspended");
     });
 
-    test("passes through to the default output, so the call stays audible", () => {
+    test("passes the call on to the configured output, so it stays audible", () => {
+        // The destination here is the test's own null sink, named by
+        // `meeting.output`. With that unset -- the shipped default, and what a
+        // real user runs -- the same link reaches whatever the desktop's
+        // output is instead. Asserting against a sink the test owns is what
+        // keeps this from depending on the machine it runs on.
         const passthrough = nodes(objects).find((n) => n.name === `${SINK}.passthrough`);
         expect(passthrough).toBeDefined();
 
@@ -226,7 +243,7 @@ describe.skipIf(!isLinux)("virtual sink", () => {
 
         const byId = new Map(nodes(objects).map((n) => [n.id, n]));
         const reached = targets.map((id) => byId.get(id)?.name);
-        expect(reached).toContain(defaultSinkName(objects));
+        expect(reached).toContain(OUTPUT_SINKS.graph);
     });
 
     test("its monitor reads as digital silence while nothing is playing", async () => {
@@ -349,9 +366,11 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
     let capsper: Awaited<ReturnType<typeof startCapsper>>;
     let sessionsDir = "";
     let speech = "";
+    let outputModule = "";
 
     beforeAll(async () => {
         ensureBinary();
+        outputModule = await createNullSink(OUTPUT_SINKS.capture);
         sessionsDir = tmpFile("capsper-audio-sessions", "");
         mkdirSync(sessionsDir, { recursive: true });
 
@@ -362,6 +381,7 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
 
         capsper = await startCapsper({
             sink: AUDIO_SINK,
+            output: OUTPUT_SINKS.capture,
             sessionsDir,
             httpPort: AUDIO_HTTP_PORT,
             idleCloseSeconds: 3,
@@ -377,6 +397,7 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
         for (const path of [capsper?.configFile, capsper?.logFile, speech]) {
             if (path) try { unlinkSync(path); } catch {}
         }
+        await removeNullSink(outputModule);
         try { rmSync(sessionsDir, { recursive: true, force: true }); } catch {}
     });
 
@@ -562,9 +583,11 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: opus", () => {
     let capsper: Awaited<ReturnType<typeof startCapsper>>;
     let sessionsDir = "";
     let speech = "";
+    let outputModule = "";
 
     beforeAll(async () => {
         ensureBinary();
+        outputModule = await createNullSink(OUTPUT_SINKS.opus);
         sessionsDir = tmpFile("capsper-opus-sessions", "");
         mkdirSync(sessionsDir, { recursive: true });
 
@@ -573,6 +596,7 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: opus", () => {
 
         capsper = await startCapsper({
             sink: OPUS_SINK,
+            output: OUTPUT_SINKS.opus,
             sessionsDir,
             httpPort: OPUS_HTTP_PORT,
             idleCloseSeconds: 3,
@@ -586,6 +610,7 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: opus", () => {
         for (const path of [capsper?.configFile, capsper?.logFile, speech]) {
             if (path) try { unlinkSync(path); } catch {}
         }
+        await removeNullSink(outputModule);
         try { rmSync(sessionsDir, { recursive: true, force: true }); } catch {}
     });
 

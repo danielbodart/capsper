@@ -1,0 +1,19 @@
+{
+  "_comment": "Thresholds for test/echo-cancel.test.ts. Words only the far end says, so finding one in the near track means echo got through. Verified absent from test/working-test.txt, which is the near end.",
+  "markerWords": ["fellow", "americans", "country"],
+
+  "_echoGain": "How loudly the synthetic room returns the far end to the microphone. 0.25 is about -12 dB, a speaker at conversational volume into an open mic a metre or so away.",
+  "echoGain": 0.25,
+
+  "_minEchoRemovedDb": "Measured 7.2, 7.6, 11.2 and 14.0 dB against this fixture across four runs of identical code; the spread is how the two playback processes happen to line up, not quality. Measured 12.6 dB in a real room through real speakers via ./run.ts manual-echo-test. Floor set 2.2 dB below the worst observed run: high enough to fail outright when the canceller stops working, which is the failure we actually hit, and low enough not to fail on a good build that got unlucky.",
+  "minEchoRemovedDb": 5,
+
+  "_maxFarMarkersOnNearTrack": "Zero, and it holds: with the canceller working the near transcript carries none of the far end's words. This is the assertion the feature exists for.",
+  "maxFarMarkersOnNearTrack": 0,
+
+  "_minNearCoverage": "Guards the degenerate canceller that passes by muting everything.",
+  "minNearCoverage": 70,
+
+  "_minFarMarkersOnFarTrack": "The control: the far track must still carry the far end.",
+  "minFarMarkersOnFarTrack": 3
+}

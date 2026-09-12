@@ -9,13 +9,42 @@
 pub const VirtualSink = struct {
     name: [:0]const u8,
 
-    pub fn init(name: [:0]const u8, description: [:0]const u8) !VirtualSink {
+    pub fn init(
+        name: [:0]const u8,
+        description: [:0]const u8,
+        output_target: ?[:0]const u8,
+    ) !VirtualSink {
         _ = name;
         _ = description;
+        _ = output_target;
         return error.VirtualSinkUnsupported;
     }
 
     pub fn deinit(self: *VirtualSink) void {
+        _ = self;
+    }
+};
+
+/// Unreachable alongside `VirtualSink`, and present so the shared code takes
+/// the same arguments on both platforms. When meeting capture does reach
+/// macOS, the counterpart is CoreAudio's voice processing I/O unit, which
+/// cancels in the system rather than in the graph -- a different shape, not a
+/// port of this one.
+pub const EchoCanceller = struct {
+    mic: [:0]const u8,
+
+    pub fn init(
+        sink_name: [:0]const u8,
+        description: [:0]const u8,
+        mic_target: ?[:0]const u8,
+    ) !EchoCanceller {
+        _ = sink_name;
+        _ = description;
+        _ = mic_target;
+        return error.EchoCancelUnsupported;
+    }
+
+    pub fn deinit(self: *EchoCanceller) void {
         _ = self;
     }
 };

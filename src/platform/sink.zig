@@ -6,3 +6,4 @@ else
 
 pub const VirtualSink = impl.VirtualSink;
 pub const SinkWatch = impl.SinkWatch;
+pub const EchoCanceller = impl.EchoCanceller;

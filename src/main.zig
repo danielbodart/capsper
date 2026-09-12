@@ -128,7 +128,7 @@ pub fn main() !void {
     // while the model is still being read rather than a minute later.
     var sink: ?VirtualSink = null;
     if (want_meeting and !cli.dry_run) {
-        sink = VirtualSink.init(cfg.meeting.sink_name, "Capsper Call") catch |err| {
+        sink = VirtualSink.init(cfg.meeting.sink_name, cfg.meeting.sink_description, cfg.meeting.output) catch |err| {
             std.debug.print("Failed to create virtual sink '{s}': {}\n", .{ cfg.meeting.sink_name, err });
             return;
         };
@@ -386,6 +386,40 @@ pub fn main() !void {
         try input_handler.?.start();
     }
 
+    // Meeting capture runs beside dictation and the TCP server rather than
+    // instead of them, because the case for it is ordinary: mute yourself in a
+    // call, dictate a note about what was just said into another window, and
+    // let the meeting go on being recorded throughout. The model is already
+    // shared across concurrent pipelines, so a third caller costs its own
+    // decoder state and nothing else.
+    //
+    // On its own thread because `server.run()` does not return while there is
+    // anything for it to serve. When meeting capture is the only thing
+    // enabled, it returns immediately and the `join` below is what keeps the
+    // process alive instead.
+    //
+    // Either way the process stays up for as long as it is left running, and
+    // the loop inside waits for a call rather than expecting one: the sink is
+    // in the graph from startup, sessions open whenever something plays into
+    // it, and nothing has to be started or restarted in time with a meeting.
+    // Days of silence between two calls is the ordinary case, not a lapse.
+    var meeting_thread: ?std.Thread = null;
+    if (want_meeting and !cli.dry_run) {
+        if (cfg.meeting.http.port) |http_port| {
+            session_server.start(allocator, .{
+                .root = cfg.meeting.dir,
+                .port = http_port,
+                .bind = cfg.meeting.http.bind,
+            }) catch {};
+        }
+        meeting_thread = std.Thread.spawn(.{}, runMeeting, .{
+            allocator, &cfg, audio_channel, pipeline_factory,
+        }) catch |err| blk: {
+            std.debug.print("Could not start meeting capture: {}\n", .{err});
+            break :blk null;
+        };
+    }
+
     // Start server
     var server = Server.init(allocator, pipeline_factory, .{
         .cfg = &cfg,
@@ -397,18 +431,18 @@ pub fn main() !void {
     });
     try server.run();
 
-    // With nothing else enabled, the meeting loop is the thing that keeps the
-    // process (and so the sink) alive.
-    if (want_meeting and !want_local and !want_tcp) {
-        if (cfg.meeting.http.port) |http_port| {
-            session_server.start(allocator, .{
-                .root = cfg.meeting.dir,
-                .port = http_port,
-                .bind = cfg.meeting.http.bind,
-            }) catch {};
-        }
-        try meeting_runner.run(allocator, &cfg, audio_channel, pipeline_factory);
-    }
+    if (meeting_thread) |t| t.join();
+}
+
+/// `meeting_runner.run` with its error swallowed, because a thread entry point
+/// that fails has nobody to return to. It already logs whatever went wrong.
+fn runMeeting(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    audio_channel: u32,
+    factory: PipelineFactory,
+) void {
+    meeting_runner.run(allocator, cfg, audio_channel, factory) catch {};
 }
 
 

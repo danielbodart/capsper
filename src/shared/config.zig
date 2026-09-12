@@ -137,6 +137,35 @@ pub const Vad = struct {
     min_silence_ms: u32 = 1000,
 };
 
+/// Echo cancellation on the near track, so the far end is not transcribed
+/// twice.
+///
+/// Speakers plus an open microphone means the call comes back in through the
+/// mic a few tens of milliseconds later, and the near track ends up carrying a
+/// quieter copy of everything the far end said. Headphones make the problem go
+/// away; this is for the case where the user would rather not wear any.
+///
+/// WebRTC's AEC3, through PipeWire's own module, rather than one of the ONNX
+/// echo cancellers. The model is not the hard part -- estimating how far
+/// behind the microphone hears the speakers, and tracking it as the two clocks
+/// drift, is the hard part, and AEC3 is the only one of the candidates that
+/// does it rather than expecting the caller to have done it already.
+///
+/// It runs as a node in the graph, not as a stage in capsper: PipeWire gets
+/// the microphone and the speaker reference, and capsper reads what comes out.
+/// That placement is what keeps the cleaning off the paths that must not have
+/// it. Push-to-talk dictation, its debug recordings, and the TCP server all
+/// go on reading the microphone directly, because nothing points them here.
+///
+/// Linux only, as meeting capture is.
+/// The cleaned microphone's node name has no setting. It is `sink_name` with
+/// `.mic` on the end, the way the sink's pass-through end is named, because
+/// one module makes all of them and a second name to keep in step would only
+/// be a second thing to get wrong.
+pub const Aec = struct {
+    enabled: bool = true,
+};
+
 /// Browsing and playing back recorded sessions.
 pub const MeetingHttp = struct {
     /// Null disables the server. Runs whenever meeting capture is on, because
@@ -150,8 +179,38 @@ pub const MeetingHttp = struct {
 
 pub const Meeting = struct {
     enabled: bool = false,
-    /// The name this appears under in the desktop's output picker.
-    sink_name: [:0]const u8 = "capsper_call",
+    /// The node name, which is an identifier rather than a label: it is what
+    /// `pw-link` and `pactl` address the sink by, and what it is called as a
+    /// JACK client. Lowercase and underscores, following `alsa_output.*`.
+    ///
+    /// Treat it as fixed once shipped. WirePlumber keys the saved default
+    /// output on it, and meeting apps remember a chosen device by it, so
+    /// renaming silently drops both back to the system default.
+    sink_name: [:0]const u8 = "capsper_transcribe",
+    /// The label the desktop's output picker shows, which is free text and may
+    /// have capitals and punctuation. The sink's monitor derives its own label
+    /// from this one, as "Monitor of ...", so it needs no setting of its own.
+    sink_description: [:0]const u8 = "Capsper: Transcribe",
+    /// Where the sink passes the call on to, so it is still audible. Null
+    /// follows the desktop's default output, which is what anyone actually
+    /// running a meeting wants.
+    ///
+    /// Naming one is for the case where the default is the wrong device, and
+    /// for tests: a run that points this at a sink of its own can never make a
+    /// sound, and its sink's idle state stops depending on whether something
+    /// else on the machine happens to be using the speakers.
+    output: ?[:0]const u8 = null,
+    /// The source the near end is captured from, overriding `audio.target`
+    /// for this mode alone. Null takes `audio.target`, and if that is null too
+    /// the near end follows whatever the desktop's input is set to.
+    ///
+    /// Named for the track rather than for the hardware, because that is the
+    /// vocabulary everywhere else here: near is the microphone, far is what
+    /// arrives from the call. A separate setting because the two modes can run
+    /// at once and need not listen to the same thing -- dictating a note
+    /// during a meeting is the case that makes this real, and it may well want
+    /// a different microphone from the one the meeting is recorded through.
+    near: ?[:0]const u8 = null,
     dir: [:0]const u8 = "~/.local/share/capsper/sessions",
     /// Opus here because these are hours of audio, kept indefinitely.
     audio_format: AudioFormat = .opus,
@@ -161,6 +220,7 @@ pub const Meeting = struct {
     detail: Detail = .minimal,
     http: MeetingHttp = .{},
     vad: Vad = .{},
+    aec: Aec = .{},
 };
 
 pub const Config = struct {
@@ -175,6 +235,15 @@ pub const Config = struct {
     tcp_server: TcpServer = .{},
     debug_recording: DebugRecording = .{},
     meeting: Meeting = .{},
+
+    /// The source the meeting's near track listens to: its own setting if it
+    /// has one, otherwise the one every mode shares. Resolved in one place so
+    /// the capture and the echo canceller cannot end up listening to two
+    /// different microphones, which would leave the canceller subtracting an
+    /// echo from a signal that never had it.
+    pub fn meetingNear(self: *const Config) ?[:0]const u8 {
+        return self.meeting.near orelse self.audio.target;
+    }
 
     /// Expand a leading `~/` in every field that names a path. Done once,
     /// after the file and the flags have both been applied, so nothing

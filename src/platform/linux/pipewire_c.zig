@@ -122,8 +122,24 @@ pub const PW_KEY_NODE_NAME = pw.PW_KEY_NODE_NAME;
 
 // Virtual sink (the far end of a call, captured from its monitor)
 pub const pw_virtual_sink = opaque {};
-pub extern fn pw_virtual_sink_create(node_name: [*:0]const u8, description: [*:0]const u8) ?*pw_virtual_sink;
+pub extern fn pw_virtual_sink_create(
+    node_name: [*:0]const u8,
+    description: [*:0]const u8,
+    output_target: ?[*:0]const u8,
+) ?*pw_virtual_sink;
 pub extern fn pw_virtual_sink_destroy(s: *pw_virtual_sink) void;
+
+// Echo canceller: the near end with the sink's own audio subtracted out.
+// Separate from the sink because it lives only while a session is open.
+pub const pw_echo_canceller = opaque {};
+pub extern fn pw_echo_canceller_create(
+    sink_name: [*:0]const u8,
+    description: [*:0]const u8,
+    mic_target: ?[*:0]const u8,
+) ?*pw_echo_canceller;
+pub extern fn pw_echo_canceller_destroy(e: *pw_echo_canceller) void;
+pub extern fn pw_echo_canceller_ready(e: *pw_echo_canceller) c_int;
+pub extern fn pw_echo_canceller_mic_name(e: *pw_echo_canceller) ?[*:0]const u8;
 
 // Sink usage watch (gate 1: is anything playing into our sink?)
 pub const pw_sink_watch = opaque {};

@@ -53,6 +53,11 @@ pub const AudioCapture = struct {
     /// Default channel: 0 = first/mono channel on macOS (zero-indexed).
     pub const default_channel: u32 = 0;
 
+    /// The Linux counterpart names a downmix of every channel. macOS has no
+    /// sink to monitor and so no caller that wants one; it is here so the two
+    /// platforms take the same options, and it selects the first channel.
+    pub const mono_channel: u32 = default_channel;
+
     pub const Options = struct {
         target: ?[:0]const u8 = null,
         channel: u32 = default_channel,

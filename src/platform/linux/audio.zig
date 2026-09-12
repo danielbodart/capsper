@@ -27,6 +27,13 @@ pub const AudioCapture = struct {
     /// Default channel: PipeWire SPA_AUDIO_CHANNEL_FL.
     pub const default_channel: u32 = pw.SPA_AUDIO_CHANNEL_FL;
 
+    /// Ask for the whole source mixed down rather than one channel of it.
+    /// PipeWire's converter routes by position, so naming a real position
+    /// selects that channel and drops the others; naming MONO is what makes it
+    /// downmix. For a stereo monitor that is the difference between hearing
+    /// the call and hearing half of it.
+    pub const mono_channel: u32 = pw.SPA_AUDIO_CHANNEL_MONO;
+
     /// Parse channel name to SPA audio channel position constant.
     pub fn parseChannelName(name: []const u8) ?u32 {
         if (std.ascii.eqlIgnoreCase(name, "MONO")) return pw.SPA_AUDIO_CHANNEL_MONO;

@@ -436,8 +436,12 @@ same idea.
 
     .meeting = .{
         .enabled = false,
-        // The name this appears under in the desktop's output picker.
-        .sink_name = "capsper_call",
+        // The identifier `pw-link` and `pactl` address the sink by, and its
+        // JACK client name. Lowercase and underscored, like `alsa_output.*`.
+        .sink_name = "capsper_transcribe",
+        // The label a picker shows. Free text; the monitor derives its own
+        // from it, as "Monitor of ...".
+        .sink_description = "Capsper: Transcribe",
         .dir = "~/.local/share/capsper/sessions",
         .audio_format = .opus,
         // How long a sink can sit idle before the session is closed. Long

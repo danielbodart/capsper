@@ -328,6 +328,137 @@ export function readPcm(wavFile: string): Buffer {
     return readFileSync(wavFile).subarray(44);
 }
 
+/**
+ * A sink that goes nowhere, for a test to send audio to.
+ *
+ * Capsper's meeting sink passes the call on so it stays audible, and left to
+ * itself that is the machine's real speakers. A test that lets it do so plays
+ * sine tones at whoever is sitting there, and — less obviously — inherits their
+ * state: the meeting sink cannot reach `suspended` while anything else is using
+ * those speakers, so an assertion about an idle sink fails whenever someone has
+ * music on. Pointing `meeting.output` at one of these fixes both at once.
+ *
+ * Returns the module id, to be handed back to `removeNullSink`.
+ */
+export async function createNullSink(name: string): Promise<string> {
+    const { stdout } = await $`pactl load-module module-null-sink sink_name=${name}`.quiet().nothrow();
+    const id = stdout.toString().trim();
+    await until(`the null sink ${name} to appear`, async () => {
+        const { stdout: sinks } = await $`pactl list short sinks`.quiet().nothrow();
+        return sinks.toString().includes(name);
+    });
+    return id;
+}
+
+export async function removeNullSink(id: string): Promise<void> {
+    if (id) await $`pactl unload-module ${id}`.quiet().nothrow();
+}
+
+/** Write 16 kHz mono S16LE PCM as a WAV, the format every fixture here uses. */
+export function writeWav(path: string, pcm: Int16Array): void {
+    const bytes = pcm.length * 2;
+    const buf = Buffer.alloc(44 + bytes);
+    buf.write("RIFF", 0);
+    buf.writeUInt32LE(36 + bytes, 4);
+    buf.write("WAVEfmt ", 8);
+    buf.writeUInt32LE(16, 16);
+    buf.writeUInt16LE(1, 20);       // PCM
+    buf.writeUInt16LE(1, 22);       // mono
+    buf.writeUInt32LE(16000, 24);
+    buf.writeUInt32LE(32000, 28);   // byte rate
+    buf.writeUInt16LE(2, 32);       // block align
+    buf.writeUInt16LE(16, 34);      // bits
+    buf.write("data", 36);
+    buf.writeUInt32LE(bytes, 40);
+    for (let i = 0; i < pcm.length; i++) buf.writeInt16LE(pcm[i], 44 + i * 2);
+    writeFileSync(path, buf);
+}
+
+export function pcmToSamples(pcm: Buffer): Int16Array {
+    const out = new Int16Array(pcm.length >> 1);
+    for (let i = 0; i < out.length; i++) out[i] = pcm.readInt16LE(i * 2);
+    return out;
+}
+
+/**
+ * A room, as a handful of taps rather than a measured impulse response.
+ *
+ * Generated in code so nothing binary is committed and the shape of the echo
+ * is readable: a direct arrival a few milliseconds out, then reflections
+ * thinning and quietening over about a sixth of a second. It is not anyone's
+ * actual room, and it is not meant to be. What it has to be is *correlated*
+ * with the signal that caused it and spread over a realistic delay, because
+ * those are the two things an echo canceller has to cope with.
+ */
+export const ROOM_TAPS: { delayMs: number; gain: number }[] = [
+    { delayMs: 3, gain: 1.0 },
+    { delayMs: 11, gain: 0.55 },
+    { delayMs: 19, gain: 0.38 },
+    { delayMs: 34, gain: 0.24 },
+    { delayMs: 52, gain: 0.15 },
+    { delayMs: 78, gain: 0.09 },
+    { delayMs: 115, gain: 0.05 },
+    { delayMs: 168, gain: 0.02 },
+];
+
+/** What a microphone in that room would pick up of a signal played into it. */
+export function roomEcho(source: Int16Array, gain: number, hz = 16000): Float32Array {
+    const longest = Math.max(...ROOM_TAPS.map((t) => t.delayMs));
+    const out = new Float32Array(source.length + Math.ceil((longest * hz) / 1000));
+    for (const tap of ROOM_TAPS) {
+        const offset = Math.round((tap.delayMs * hz) / 1000);
+        const g = tap.gain * gain;
+        for (let i = 0; i < source.length; i++) out[i + offset] += source[i] * g;
+    }
+    return out;
+}
+
+/** Sum signals of differing lengths into one, clipped to the S16 range. */
+export function mixToPcm(...signals: (Int16Array | Float32Array)[]): Int16Array {
+    const out = new Int16Array(Math.max(...signals.map((s) => s.length)));
+    for (const s of signals) {
+        for (let i = 0; i < s.length; i++) {
+            out[i] = Math.max(-32768, Math.min(32767, Math.round(out[i] + s[i])));
+        }
+    }
+    return out;
+}
+
+/** Silence, for spacing one signal away from another in a fixture. */
+export function silence(ms: number, hz = 16000): Int16Array {
+    return new Int16Array(Math.round((ms * hz) / 1000));
+}
+
+export function concatPcm(...parts: Int16Array[]): Int16Array {
+    const out = new Int16Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.length; }
+    return out;
+}
+
+/**
+ * How many times each marker word appears in `text`.
+ *
+ * Whole words only, so "country" is not found inside "countryside", and
+ * normalized first so punctuation and case do not decide the answer.
+ */
+export function countWords(text: string, markers: string[]): Record<string, number> {
+    const words = normalize(text).split(/\s+/).filter(Boolean);
+    const counts: Record<string, number> = {};
+    for (const m of markers) counts[m] = words.filter((w) => w === m).length;
+    return counts;
+}
+
+/** Cue payloads for one speaker, from a WebVTT transcript. */
+export function voiceCues(vtt: string, voice: "Near" | "Far"): string[] {
+    const out: string[] = [];
+    for (const line of vtt.split("\n")) {
+        const match = line.match(new RegExp(`^<v ${voice}>(.*)$`));
+        if (match) out.push(match[1]);
+    }
+    return out;
+}
+
 /** Stream PCM data to a TCP server at real-time rate, return server response.
  *  Sends ~100ms chunks at 32000 bytes/sec, then shuts down the write side
  *  so the server sees EOF immediately and flushes.
