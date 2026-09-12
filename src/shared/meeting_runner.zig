@@ -21,6 +21,7 @@ const PipelineFactory = server_mod.PipelineFactory;
 const Pipeline = @import("../backend/pipeline.zig").Pipeline;
 const AudioCapture = @import("../platform/audio.zig").AudioCapture;
 const SinkWatch = @import("../platform/sink.zig").SinkWatch;
+const vad_backend = @import("../backend/vad.zig");
 
 const log = std.log.scoped(.meeting);
 
@@ -141,6 +142,22 @@ pub fn run(
     }
 }
 
+/// Load the voice activity model from the models directory, beside the ASR
+/// model it gates. Null when it is missing or the backend has no gate; that is a
+/// cost, not a failure, so nothing here reports it as one.
+fn loadVad(gpa: std.mem.Allocator, cfg: *const config.Config) ?*vad_backend.Vad {
+    const bin_dir = std.fs.selfExeDirPathAlloc(gpa) catch return null;
+    defer gpa.free(bin_dir);
+    const path = std.fs.path.joinZ(gpa, &.{ bin_dir, "../models/silero_vad.onnx" }) catch return null;
+    defer gpa.free(path);
+
+    return vad_backend.load(gpa, path, .{
+        .onset = cfg.meeting.vad.onset,
+        .offset = cfg.meeting.vad.offset,
+        .min_silence_ms = cfg.meeting.vad.min_silence_ms,
+    });
+}
+
 /// The transcription half of one track: its own pipeline, its own cue
 /// builder, and its own count of the audio that has reached it.
 ///
@@ -152,6 +169,11 @@ const TrackAsr = struct {
     voice: webvtt.Voice,
     pipeline: *Pipeline,
     cues: webvtt.CueBuilder,
+
+    /// One gate per track, because each carries its own recurrent state and
+    /// the two sides go quiet at different times. Null when there is no model
+    /// -- everything still works, it just costs more.
+    vad: ?*vad_backend.Vad,
 
     /// Audio that has reached this track, counted on arrival -- ahead of the
     /// encoder, and ahead of anything that might one day elide audio before
@@ -174,17 +196,29 @@ const TrackAsr = struct {
 
     const chunk_bytes: usize = 17_920;
 
-    fn init(gpa: std.mem.Allocator, voice: webvtt.Voice, factory: PipelineFactory) !TrackAsr {
+    fn init(
+        gpa: std.mem.Allocator,
+        voice: webvtt.Voice,
+        factory: PipelineFactory,
+        cfg: *const config.Config,
+    ) !TrackAsr {
         const pipeline = try factory.create(gpa);
         errdefer {
             pipeline.deinit();
             gpa.destroy(pipeline);
         }
         pipeline.resetSegment();
-        return .{ .voice = voice, .pipeline = pipeline, .cues = webvtt.CueBuilder.init(gpa, voice) };
+
+        return .{
+            .voice = voice,
+            .pipeline = pipeline,
+            .cues = webvtt.CueBuilder.init(gpa, voice),
+            .vad = if (cfg.meeting.vad.enabled) loadVad(gpa, cfg) else null,
+        };
     }
 
     fn deinit(self: *TrackAsr, gpa: std.mem.Allocator) void {
+        if (self.vad) |v| v.deinit();
         self.cues.deinit();
         self.buffer.deinit(gpa);
         self.pipeline.deinit();
@@ -219,6 +253,10 @@ const TrackAsr = struct {
         var owned: ?[]const u8 = null;
         defer if (owned) |t| gpa.free(t);
 
+        // The voice activity gate, where there is one. It answers for the whole
+        // chunk, because the encoder is fed whole chunks.
+        const wanted = if (self.vad) |v| v.shouldEncode(pcm) else true;
+
         // Digital zero is never speech, so it is not worth an encoder pass.
         // Skipping it is the same rule `ChunkedReader` applies to every other
         // transport, so the encoder sees what the regression corpus has always
@@ -239,7 +277,7 @@ const TrackAsr = struct {
         // The position still advances below, which is the part that matters:
         // audio skipped before the encoder must still move the recording's
         // clock, or every cue after it drifts early.
-        if (!std.mem.allEqual(u8, pcm, 0)) {
+        if (wanted and !std.mem.allEqual(u8, pcm, 0)) {
             const samples = try utils.pcmToFloat(gpa, pcm);
             defer gpa.free(samples);
 
@@ -301,9 +339,9 @@ const Session = struct {
         var transcript = try Transcript.create(gpa, file.dir, cfg.meeting.detail);
         errdefer transcript.deinit();
 
-        var near_asr = try TrackAsr.init(gpa, .near, factory);
+        var near_asr = try TrackAsr.init(gpa, .near, factory, cfg);
         errdefer near_asr.deinit(gpa);
-        var far_asr = try TrackAsr.init(gpa, .far, factory);
+        var far_asr = try TrackAsr.init(gpa, .far, factory, cfg);
         errdefer far_asr.deinit(gpa);
 
         // The near end follows whatever the desktop's input is set to when no

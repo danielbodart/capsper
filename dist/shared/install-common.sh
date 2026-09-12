@@ -321,6 +321,12 @@ install_files() {
     cp "$SCRIPT_DIR/VERSION" "$release_dir/"
     mkdir -p "$release_dir/models"
 
+    # Models small enough to ship in the tarball (the voice activity model).
+    # The big ASR model is downloaded separately by download_models.
+    if [ -d "$SCRIPT_DIR/models" ]; then
+        cp -a "$SCRIPT_DIR/models/." "$release_dir/models/"
+    fi
+
     # On Linux, create bin/capsper symlink to the right variant for this machine
     create_capsper_symlink "$release_dir/bin"
 

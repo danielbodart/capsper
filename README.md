@@ -369,9 +369,46 @@ Both the port and the interface are configurable:
 },
 ```
 
-Not yet built: a voice activity gate for the near end, and Opus. See
-`docs/meeting-capture-plan.md`. macOS is not supported, because a program
-cannot create a virtual output device for itself there.
+### Not paying to transcribe silence
+
+An unattended meeting is mostly one side being quiet while the other talks, and
+the ASR encoder costs the same for silence as for speech. A
+[Silero](https://github.com/snakers4/silero-vad) voice activity model sits in
+front of it, so only audio that sounds like speech is transcribed.
+
+Measured on 28 seconds of audio that is four seconds of speech, twenty seconds
+of quiet room tone, then four more seconds of speech:
+
+| | CPU |
+|---|---|
+| gate on | 10.1 s |
+| gate off | 55.6 s |
+
+Both produce the same transcript. The gate never touches the recording — only
+the encoder — so the audio still lines up with the cue timestamps, which is the
+whole reason it is kept.
+
+```zig
+.meeting = .{
+    .vad = .{
+        .enabled = true,
+        .onset = 0.3,           // probability at which speech starts
+        .offset = 0.1,          // and under which it may stop
+        .min_silence_ms = 1000, // how long it must stay quiet to close
+    },
+},
+```
+
+Two thresholds rather than one, because a single one chatters at the boundary.
+Speech starts at `onset` and stops only after staying under `offset` for
+`min_silence_ms`, so a breath between sentences keeps the gate open.
+
+Linux only. The CoreML build does not link ONNX Runtime, so there is no gate on
+macOS until the model is converted.
+
+Not yet built: Opus. See `docs/meeting-capture-plan.md`. macOS does not support
+meeting capture at all, because a program cannot create a virtual output device
+for itself there.
 
 ### Trigger keys
 

@@ -240,6 +240,11 @@ async function distLinux() {
     await $`rm -rf ${staging}`;
     await $`mkdir -p ${staging}`;
     await $`cp -a ${PLATFORM_DIR}/bin ${staging}/`;
+    // The voice activity model ships rather than being downloaded: it is two
+    // megabytes, it never changes, and a meeting should not be the first thing
+    // to discover it is missing.
+    await $`mkdir -p ${staging}/models`;
+    await $`cp models/silero_vad.onnx ${staging}/models/`;
     await $`mkdir -p ${staging}/lib`;
     await Bun.write(`${staging}/lib/DEPS_VERSION`, depsVersion);
     for (const script of ["install.sh", "capsper-update.sh", "capsper-apply-update.sh", "capsper-rollback.sh"]) {

@@ -115,6 +115,28 @@ pub const DebugRecording = struct {
     detail: Detail = .debug,
 };
 
+/// The voice activity gate in front of the ASR encoder.
+///
+/// For cost, not correctness: Nemotron does not hallucinate into silence, so
+/// nothing is broken by transcribing some. What it saves is the encoder pass,
+/// which costs the same for silence as for speech -- and an unattended meeting
+/// is mostly one side being quiet while the other talks.
+///
+/// Linux only. The CoreML build does not link ONNX Runtime, so there is no
+/// gate there until the model is converted.
+pub const Vad = struct {
+    enabled: bool = true,
+    /// Probability at which speech starts. Low: opening late clips a word,
+    /// opening early wastes one encoder pass.
+    onset: f32 = 0.3,
+    /// Probability under which it may stop. Lower than `onset`, which is what
+    /// stops the gate chattering at the boundary.
+    offset: f32 = 0.1,
+    /// How long it must stay quiet before the gate closes, so a breath between
+    /// sentences does not close it.
+    min_silence_ms: u32 = 1000,
+};
+
 /// Browsing and playing back recorded sessions.
 pub const MeetingHttp = struct {
     /// Null disables the server. Runs whenever meeting capture is on, because
@@ -138,6 +160,7 @@ pub const Meeting = struct {
     idle_close_seconds: u32 = 30,
     detail: Detail = .minimal,
     http: MeetingHttp = .{},
+    vad: Vad = .{},
 };
 
 pub const Config = struct {

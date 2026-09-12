@@ -55,6 +55,11 @@ pub fn build(b: *std.Build) void {
     // Install warmup file next to the binary (e.g. dist/macos/bin/jfk.wav)
     b.installFile("test/jfk.wav", "bin/jfk.wav");
 
+    // The voice activity model, in the models directory beside the ASR one.
+    // Two megabytes and fixed, so it ships in the tarball rather than being
+    // downloaded on first run like the big one.
+    b.installFile("models/silero_vad.onnx", "models/silero_vad.onnx");
+
     // --- Run step ---
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -80,6 +85,7 @@ pub fn build(b: *std.Build) void {
         "src/shared/meeting.zig",
         "src/shared/webvtt.zig",
         "src/shared/session_server.zig",
+        "src/shared/vad.zig",
     }) |src| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
