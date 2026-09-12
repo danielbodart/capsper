@@ -22,6 +22,7 @@ const sink_mod = @import("platform/sink.zig");
 const VirtualSink = sink_mod.VirtualSink;
 const SinkWatch = sink_mod.SinkWatch;
 const meeting_runner = @import("shared/meeting_runner.zig");
+const session_server = @import("shared/session_server.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
@@ -399,6 +400,13 @@ pub fn main() !void {
     // With nothing else enabled, the meeting loop is the thing that keeps the
     // process (and so the sink) alive.
     if (want_meeting and !want_local and !want_tcp) {
+        if (cfg.meeting.http.port) |http_port| {
+            session_server.start(allocator, .{
+                .root = cfg.meeting.dir,
+                .port = http_port,
+                .bind = cfg.meeting.http.bind,
+            }) catch {};
+        }
         try meeting_runner.run(allocator, &cfg, audio_channel, pipeline_factory);
     }
 }

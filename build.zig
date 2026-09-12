@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) void {
         "src/shared/config.zig",
         "src/shared/meeting.zig",
         "src/shared/webvtt.zig",
+        "src/shared/session_server.zig",
     }) |src| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{

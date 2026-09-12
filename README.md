@@ -317,10 +317,12 @@ Each session writes a directory:
 
 ```
 ~/.local/share/capsper/sessions/2026/09/11/T143000Z/
-  audio.wav         both sides, near left and far right
-  transcript.vtt    both sides, merged by time
-  index.html        plays the two together
+  audio.wav    both sides, near left and far right
+  audio.vtt    both sides, merged by time
 ```
+
+The transcript shares the audio file's name, which is the convention media
+players use to pair the two, so dropping either into a player picks up both.
 
 The path is a single ISO 8601 timestamp split across directories, in UTC. One
 stereo file rather than two mono ones, with the microphone on the left and the
@@ -347,22 +349,25 @@ converting it to SRT is a timestamp separator substitution.
 
 ### Playing a session back
 
-`index.html` plays the audio with the transcript scrolling in step, near end on
-the left and far end on the right, and a control that sends either channel to
-both ears so the hard panning is a choice rather than something to endure.
-Clicking a line plays from there.
+With meeting capture on, capsper serves its sessions at
+[http://127.0.0.1:43008](http://127.0.0.1:43008). The page lists every
+recording newest first; picking one plays the audio with the transcript
+scrolling in step, near end on the left and far end on the right. Clicking a
+line plays from there, and a control sends either channel to both ears so the
+hard panning is a choice rather than something to endure.
 
-It needs to be served over HTTP. Capsper ships no server — point any static
-file server at the sessions directory:
+It binds to loopback, so the recordings are not reachable from the network.
+Both the port and the interface are configurable:
 
-```bash
-cd ~/.local/share/capsper/sessions && python3 -m http.server
+```zig
+.meeting = .{
+    .enabled = true,
+    .http = .{
+        .port = 43008,        // null disables the server
+        .bind = "127.0.0.1",  // "0.0.0.0" to reach it from the network
+    },
+},
 ```
-
-Opening it straight off the filesystem will look like it works and the channel
-control will be silent, because browsers treat every `file://` URL as its own
-opaque origin and reading the audio returns zeroes rather than failing. The
-page says so itself when that happens.
 
 Not yet built: a voice activity gate for the near end, and Opus. See
 `docs/meeting-capture-plan.md`. macOS is not supported, because a program

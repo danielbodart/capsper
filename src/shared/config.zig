@@ -115,6 +115,17 @@ pub const DebugRecording = struct {
     detail: Detail = .debug,
 };
 
+/// Browsing and playing back recorded sessions.
+pub const MeetingHttp = struct {
+    /// Null disables the server. Runs whenever meeting capture is on, because
+    /// a pile of session directories you have to find yourself is not much of
+    /// a feature.
+    port: ?u16 = 43008,
+    /// Loopback only by default. These are recordings of private
+    /// conversations; reaching them from the network should take saying so.
+    bind: [:0]const u8 = "127.0.0.1",
+};
+
 pub const Meeting = struct {
     enabled: bool = false,
     /// The name this appears under in the desktop's output picker.
@@ -126,6 +137,7 @@ pub const Meeting = struct {
     /// to survive a screen-share renegotiation or a brief mute.
     idle_close_seconds: u32 = 30,
     detail: Detail = .minimal,
+    http: MeetingHttp = .{},
 };
 
 pub const Config = struct {

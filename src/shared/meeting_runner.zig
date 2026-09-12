@@ -55,7 +55,6 @@ const SessionFile = struct {
         const file = try dir.createFile("audio.wav", .{});
         errdefer file.close();
 
-        try writePlayer(dir, "audio.wav");
 
         // Placeholder sizes; a session's length is not known when it starts.
         var header: std.ArrayListUnmanaged(u8) = .{};
@@ -90,42 +89,6 @@ const SessionFile = struct {
     }
 };
 
-/// The page that plays a session: the audio, the transcript scrolling in step
-/// with it, and a control that routes either hard-panned channel to both ears.
-///
-/// Embedded rather than built, so it stays an ordinary HTML file that can be
-/// opened and edited on its own, and so a session directory needs nothing
-/// fetched to be useful.
-const player_template = @embedFile("player.html");
-
-/// Written when the session is created rather than when it closes, so a
-/// session interrupted by a kill is still playable.
-///
-/// It assumes it is served over HTTP. Capsper ships no server -- point any
-/// static file server at the sessions directory. The page says so itself when
-/// opened from the filesystem, because that case fails silently rather than
-/// loudly: browsers treat every `file://` URL as its own opaque origin, so
-/// reading the audio for the channel control returns zeroes instead of an
-/// error.
-fn writePlayer(dir: std.fs.Dir, audio_name: []const u8) !void {
-    const marker = "__AUDIO_FILE__";
-    // Every occurrence, not the first. The first version of this substituted
-    // only once and silently filled in a mention of the marker in a comment,
-    // leaving the audio element pointing at the placeholder -- a page that
-    // rendered its transcript perfectly and played nothing.
-    if (std.mem.indexOf(u8, player_template, marker) == null) return error.PlayerTemplateBroken;
-
-    var file = try dir.createFile("index.html", .{});
-    defer file.close();
-
-    var rest: []const u8 = player_template;
-    while (std.mem.indexOf(u8, rest, marker)) |cut| {
-        try file.writeAll(rest[0..cut]);
-        try file.writeAll(audio_name);
-        rest = rest[cut + marker.len ..];
-    }
-    try file.writeAll(rest);
-}
 
 /// Run until the process is killed. Returns only on a failure that makes
 /// carrying on pointless.
@@ -256,16 +219,22 @@ const TrackAsr = struct {
         var owned: ?[]const u8 = null;
         defer if (owned) |t| gpa.free(t);
 
-        // Digital zero is never speech, and on the far track it is most of a
-        // meeting: a sink nobody is playing into produces exact zeros, not
-        // room tone. Measured, an idle monitor yields not one non-zero byte.
-        //
+        // Digital zero is never speech, so it is not worth an encoder pass.
         // Skipping it is the same rule `ChunkedReader` applies to every other
         // transport, so the encoder sees what the regression corpus has always
-        // validated rather than something new. Measured on this machine, a
-        // minute of digital zero costs 0.20 CPU-seconds per audio-second
-        // against 1.13 for room tone, so this is the whole of the far track's
-        // idle cost and none of the near track's.
+        // validated rather than something new. Measured here, a minute of
+        // digital zero costs 0.20 CPU-seconds per audio-second against 1.13
+        // for room tone.
+        //
+        // How much this actually saves during a meeting is NOT known. What was
+        // measured is a sink nobody is holding, which produces exact zeros --
+        // so this certainly covers the gaps between calls and the debounce
+        // window at the end of one. Whether a conferencing app holding the
+        // sink also sends exact zeros while the far end is quiet, or sends
+        // comfort noise, has not been tested, and cannot be tested with
+        // anything but a real call. If it sends comfort noise this saves
+        // nothing during the call itself and the near-end gate is doing all
+        // the work.
         //
         // The position still advances below, which is the part that matters:
         // audio skipped before the encoder must still move the recording's
@@ -463,10 +432,10 @@ const Transcript = struct {
     fn finish(self: *Transcript) void {
         if (self.doc.render(&header_notes)) |bytes| {
             defer self.doc.gpa.free(bytes);
-            if (self.dir.createFile("transcript.vtt", .{})) |file| {
+            if (self.dir.createFile("audio.vtt", .{})) |file| {
                 defer file.close();
-                file.writeAll(bytes) catch |err| log.err("could not write transcript.vtt: {}", .{err});
-            } else |err| log.err("could not create transcript.vtt: {}", .{err});
+                file.writeAll(bytes) catch |err| log.err("could not write audio.vtt: {}", .{err});
+            } else |err| log.err("could not create audio.vtt: {}", .{err});
         } else |err| log.err("could not render the transcript: {}", .{err});
         self.doc.deinit();
     }
