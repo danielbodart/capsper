@@ -192,9 +192,10 @@ Running `capsper` with no arguments prints usage and exits.
 ```
 capsper [OPTIONS]
 
+  --config PATH             Config file (default: $XDG_CONFIG_HOME/capsper/config.zon)
   --model, -m PATH          Model directory path (default: ../models/nemotron relative to binary)
-  --port, -p PORT           TCP port (default: 43007, use 0 for OS-assigned)
-  --input tcp|local         Input mode: tcp (socket) or local (audio capture)
+  --port, -p PORT           TCP port (use 0 for OS-assigned; omit for no server)
+  --stream FILE             Stream a WAV file through the pipeline and exit
   --trigger KEY             Trigger key for push-to-talk (see Trigger keys below)
   --trigger-passthrough     Forward trigger key to OS after interception
   --type-delay US           Delay between injected keystrokes in microseconds (default: 12000)
@@ -209,12 +210,77 @@ capsper [OPTIONS]
   --record-keep N           Number of recording pairs to keep (default: 10, ring buffer)
   --transcribe FILE         Batch-transcribe a WAV file (non-streaming) and exit
   --no-auto-gain            Disable automatic gain adjustment
-  --warmup-file FILE        WAV file for inference warmup at startup
-  --no-warmup               Skip warmup inference
+  --on-device-lost MODE     exit or wait when the capture device disappears (default: wait)
   --verbose, -v             Enable verbose logging
   --dry-run                 Load models, run warmup, then exit (validates setup)
   --version                 Print version and exit
 ```
+
+An unrecognised flag is a warning, not an error, so a service file carrying a
+flag from an older version still starts.
+
+## Config file
+
+Every option above except the one-shot commands can also be set in a config
+file, which is where the settings that do not fit comfortably on a command line
+live. Flags are applied over the file, so a flag always wins for one run.
+
+Capsper reads `$XDG_CONFIG_HOME/capsper/config.zon`, falling back to
+`~/.config/capsper/config.zon`, unless `--config` names another path. A missing
+file is not an error; it means defaults. A file that is present but does not
+parse stops startup, with the line and column of the problem.
+
+The format is [ZON](https://ziglang.org/documentation/master/#Zig-Object-Notation),
+which is what `build.zig.zon` already uses. It has comments, which JSON does
+not, and the schema is a Zig type, so an unknown field or a misspelled enum is
+a diagnostic rather than a silent default. Every field has a default, so name
+only what you want to change.
+
+```zig
+.{
+    // --model, -m; null means the copy shipped beside the binary
+    .model = null,
+    .verbose = false,    // --verbose, -v
+    .drop_terms = null,  // --drop-terms
+
+    .audio = .{
+        .target = null,          // --audio-target; null follows the default source
+        .channel = .FL,          // --audio-channel
+        .gain = 1.0,             // --audio-gain
+        .auto_gain = true,       // --no-auto-gain
+        .on_device_lost = .wait, // --on-device-lost
+        .detect_duration = 5,    // --detect-duration
+    },
+
+    .trigger = .{
+        .key = .capslock,        // --trigger; null disables push-to-talk
+        .passthrough = false,    // --trigger-passthrough
+        .type_delay_us = 12_000, // --type-delay
+        .low_latency = false,    // --low-latency
+    },
+
+    .tcp_server = .{
+        .port = null,            // --port, -p; null means no server
+    },
+
+    .debug_recording = .{
+        .dir = null,             // --record-dir; null disables
+        .keep = 10,              // --record-keep
+        .audio_format = .wav,
+        .detail = .debug,
+    },
+}
+```
+
+Three names differ from the flag they mirror. `audio.auto_gain` is positive
+because a file should not carry negations. `trigger.type_delay_us` carries its
+unit, because a bare number in a file has no usage text beside it.
+`debug_recording.*` is named for what it is rather than what the flag was.
+
+One-shot actions stay on the command line and have no field: `--version`,
+`--dry-run`, `--audio-detect`, `--transcribe`, `--stream`. The `--pw-*` and
+`--stream-wav` aliases likewise keep working as flags but have no second
+spelling in the file.
 
 ### Trigger keys
 

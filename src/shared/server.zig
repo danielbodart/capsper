@@ -8,6 +8,7 @@ const utils = @import("utils.zig");
 const recorder_mod = @import("recorder.zig");
 const Recorder = recorder_mod.Recorder;
 const session = @import("session.zig");
+const Config = @import("config.zig").Config;
 const EventSource = session.EventSource;
 const Event = session.Event;
 
@@ -226,55 +227,47 @@ pub const PipelineFactory = struct {
 pub const Server = struct {
     allocator: std.mem.Allocator,
     pipeline_factory: PipelineFactory,
-    port: ?u16,
-    want_local: bool,
-    audio_target: ?[:0]const u8,
+    /// Every setting the server reads. Borrowed, and outlives the server.
+    cfg: *const Config,
+    /// `cfg.audio.channel` resolved to this platform's channel position.
+    /// Resolved once, by whoever built the config, so the server never has to
+    /// deal with a name the platform cannot map.
     audio_channel: u32,
-    verbose: bool,
-    low_latency: bool,
+    want_local: bool,
     type_callback: ?TypeCallback,
     drop_terms: []const []const u8,
     recorder: ?*Recorder,
-    initial_gain: f32,
-    no_auto_gain: bool,
-    exit_on_device_lost: bool,
+
+    /// Named rather than positional: this used to be fourteen arguments in a
+    /// row, six of which were bools.
+    pub const Options = struct {
+        cfg: *const Config,
+        audio_channel: u32,
+        want_local: bool = false,
+        type_callback: ?TypeCallback = null,
+        drop_terms: []const []const u8 = &.{},
+        recorder: ?*Recorder = null,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
         pipeline_factory: PipelineFactory,
-        port: ?u16,
-        want_local: bool,
-        audio_target: ?[:0]const u8,
-        audio_channel: u32,
-        verbose: bool,
-        low_latency: bool,
-        type_callback: ?TypeCallback,
-        drop_terms: []const []const u8,
-        recorder: ?*Recorder,
-        initial_gain: f32,
-        no_auto_gain: bool,
-        exit_on_device_lost: bool,
+        opts: Options,
     ) Server {
         return .{
             .allocator = allocator,
             .pipeline_factory = pipeline_factory,
-            .port = port,
-            .want_local = want_local,
-            .audio_target = audio_target,
-            .audio_channel = audio_channel,
-            .verbose = verbose,
-            .low_latency = low_latency,
-            .type_callback = type_callback,
-            .drop_terms = drop_terms,
-            .recorder = recorder,
-            .initial_gain = initial_gain,
-            .no_auto_gain = no_auto_gain,
-            .exit_on_device_lost = exit_on_device_lost,
+            .cfg = opts.cfg,
+            .audio_channel = opts.audio_channel,
+            .want_local = opts.want_local,
+            .type_callback = opts.type_callback,
+            .drop_terms = opts.drop_terms,
+            .recorder = opts.recorder,
         };
     }
 
     pub fn run(self: *Server) !void {
-        if (self.want_local and self.port != null) {
+        if (self.want_local and self.cfg.tcp_server.port != null) {
             // Both modes: spawn local capture in background, run TCP in calling thread.
             const t = std.Thread.spawn(.{}, runLocalCaptureThread, .{self});
             if (t) |thread| {
@@ -284,7 +277,7 @@ pub const Server = struct {
                 return err;
             }
             try self.runTcp();
-        } else if (self.port != null) {
+        } else if (self.cfg.tcp_server.port != null) {
             try self.runTcp();
         } else if (self.want_local) {
             try self.runLocalCapture();
@@ -292,7 +285,7 @@ pub const Server = struct {
     }
 
     fn runTcp(self: *Server) !void {
-        const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.port.?);
+        const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.cfg.tcp_server.port.?);
         const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
         defer posix.close(listener);
 
@@ -301,7 +294,7 @@ pub const Server = struct {
         try posix.bind(listener, &address.any, address.getOsSockLen());
         try posix.listen(listener, 8);
 
-        // Query actual port (needed when self.port == 0 for OS-assigned port)
+        // Query actual port (needed when self.cfg.tcp_server.port == 0 for OS-assigned port)
         var bound: net.Address = undefined;
         var addr_len: posix.socklen_t = @sizeOf(@TypeOf(bound.any));
         try posix.getsockname(listener, &bound.any, &addr_len);
@@ -352,7 +345,7 @@ pub const Server = struct {
     fn runLocalCapture(self: *Server) !void {
         std.debug.print("Starting local audio capture...\n", .{});
 
-        var capture = AudioCapture.init(self.audio_target, self.audio_channel) catch |err| {
+        var capture = AudioCapture.init(self.cfg.audio.target, self.audio_channel) catch |err| {
             std.debug.print("Failed to start audio capture: {}\n", .{err});
             return err;
         };
@@ -362,17 +355,17 @@ pub const Server = struct {
         capture_ptr.store(&capture, .monotonic);
         defer capture_ptr.store(null, .monotonic);
 
-        if (self.exit_on_device_lost) {
+        if (self.cfg.audio.on_device_lost == .exit) {
             capture.setExitOnDeviceLost();
         }
 
         // Apply calibrated initial gain (from --pw-gain) before first audio arrives
-        if (self.initial_gain > 1.01) {
-            capture.setGain(self.initial_gain);
-            std.debug.print("Auto-gain starting at {d:.1}x\n", .{self.initial_gain});
+        if (self.cfg.audio.gain > 1.01) {
+            capture.setGain(self.cfg.audio.gain);
+            std.debug.print("Auto-gain starting at {d:.1}x\n", .{self.cfg.audio.gain});
         }
 
-        if (self.low_latency) {
+        if (self.cfg.trigger.low_latency) {
             // Low-latency mode: connect the stream once and leave it active for
             // the process lifetime. PTT gating is done in software by the
             // SessionDriver (non-live audio is discarded), so the stream is never
@@ -440,7 +433,7 @@ pub const Server = struct {
             self.allocator.destroy(asr);
         }
 
-        var auto_gain = AutoGain{ .current_gain = self.initial_gain };
+        var auto_gain = AutoGain{ .current_gain = self.cfg.audio.gain };
         var driver = session.SessionDriver.init(live_at_start);
         var level_mon = session.InputLevelMonitor{};
         var total_audio_bytes: usize = 0;
@@ -460,11 +453,11 @@ pub const Server = struct {
                         .audio => log.info("audio detected ({d:.0} dBFS)", .{level_mon.levelDb()}),
                         .silence => log.info("silence detected ({d:.0} dBFS)", .{level_mon.levelDb()}),
                     };
-                    if (!self.no_auto_gain) {
+                    if (self.cfg.audio.auto_gain) {
                         if (capture) |cap| {
                             if (auto_gain.update(rms)) |new_gain| {
                                 cap.setGain(new_gain);
-                                if (self.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
+                                if (self.cfg.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
                             }
                         }
                     }
@@ -477,7 +470,7 @@ pub const Server = struct {
                 .start_recording => {
                     level_mon.reset();
                     if (self.recorder) |rec| rec.startRecording();
-                    if (self.verbose) {
+                    if (self.cfg.verbose) {
                         var ts_buf: [32]u8 = undefined;
                         std.debug.print("[{s}s] PTT press — streaming start\n", .{formatAudioTime(&ts_buf, total_audio_bytes)});
                     }
@@ -519,7 +512,7 @@ pub const Server = struct {
             if (result.text.len > 0 and !result.was_rewind) {
                 if (!self.isDropTerm(result.text)) {
                     self.emitDelta(output_fd, total_audio_bytes, result.text, type_cb) catch return error.BrokenPipe;
-                    if (self.verbose) {
+                    if (self.cfg.verbose) {
                         var ts_buf: [32]u8 = undefined;
                         std.debug.print("    [{s}s] emit: \"{s}\" ({d:.0}ms)\n", .{
                             formatAudioTime(&ts_buf, total_audio_bytes),

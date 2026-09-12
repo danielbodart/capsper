@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
         "src/shared/context_graph.zig",
         "src/shared/nemo_mel_state.zig",
         "src/shared/session.zig",
+        "src/shared/config.zig",
     }) |src| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
