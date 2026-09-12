@@ -2,13 +2,25 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { $, spawn } from "bun";
 import { writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync, readdirSync, statSync } from "fs";
 import { join } from "path";
-import { BINARY, ensureBinary, tmpFile, trackProc, waitForLog } from "./helpers";
+import { connect } from "net";
+import { BINARY, ensureBinary, tmpFile, trackProc, waitForLog, until } from "./helpers";
 
 const isLinux = process.platform === "linux";
+
+// Playing audio through the sink is the only way to exercise capture, and it
+// takes real time to do it -- a ten-second recording takes ten seconds. Those
+// tests are opt-in; the rest run in a couple of seconds and play nothing.
+const SLOW = !!process.env.SLOW_TESTS;
 
 // Named for this test so a stray node from a crashed run is obvious, and can
 // never be mistaken for the real `capsper_call` a user is running.
 const SINK = "test_capsper_sink";
+const AUDIO_SINK = "test_capsper_audio_sink";
+
+// Off the defaults, so a test run never collides with a capsper the user is
+// actually running.
+const HTTP_PORT = 43918;
+const AUDIO_HTTP_PORT = 43919;
 
 interface Node {
     id: number;
@@ -55,6 +67,20 @@ function defaultSinkName(objects: any[]): string | undefined {
     return undefined;
 }
 
+/**
+ * Silence the sink's pass-through end.
+ *
+ * The pass-through is what keeps a real call audible, and in a test it is what
+ * makes the machine play sine tones at whoever is sitting there. Muting it
+ * stops anything reaching the speakers while leaving the sink and its monitor
+ * working, so capture and transcription are still exercised in full.
+ */
+async function mutePassthrough(sink: string): Promise<void> {
+    const node = nodes(await dump()).find((n) => n.name === `${sink}.passthrough`);
+    if (!node) throw new Error(`no ${sink}.passthrough to mute`);
+    await $`wpctl set-volume ${node.id} 0`.quiet().nothrow();
+}
+
 /** Peak dBFS of a WAV, via ffmpeg's volumedetect. -91 or so means silence. */
 async function peakDb(path: string): Promise<number> {
     const { stderr } = await $`ffmpeg -i ${path} -af volumedetect -f null - `.quiet().nothrow();
@@ -78,7 +104,7 @@ async function bandDb(path: string, channel: 0 | 1, hz: number): Promise<number>
     return match ? parseFloat(match[1]) : -Infinity;
 }
 
-/** Every session audio file under a sessions root, oldest path first. */
+/** Every session audio file under a sessions root. */
 function walkWavs(dir: string, found: string[] = []): string[] {
     for (const entry of readdirSync(dir)) {
         const path = join(dir, entry);
@@ -88,108 +114,92 @@ function walkWavs(dir: string, found: string[] = []): string[] {
     return found;
 }
 
-/**
- * Record the sink's monitor, optionally playing a file into the sink partway
- * through, and return the peak level of what the monitor carried.
- *
- * `stream.capture.sink` is the part that matters: it is what makes a capture
- * stream attach to a sink's monitor ports rather than to a source.
- */
-async function recordMonitor(leadInMs: number, play: string | null): Promise<number> {
-    const recorded = tmpFile("capsper-sink-monitor", ".wav");
-
-    const rec = spawn(
-        ["pw-record", "-P", "{ stream.capture.sink=true }", "--target", SINK, recorded],
-        { stdout: "ignore", stderr: "ignore" },
+/** Start capsper with meeting capture on, and wait for the sink to come up. */
+async function startCapsper(opts: {
+    sink: string;
+    sessionsDir: string;
+    httpPort: number;
+    idleCloseSeconds: number;
+}) {
+    const configFile = tmpFile("capsper-sink-config", ".zon");
+    writeFileSync(
+        configFile,
+        `.{ .meeting = .{ .enabled = true, .sink_name = "${opts.sink}",` +
+            ` .idle_close_seconds = ${opts.idleCloseSeconds}, .dir = "${opts.sessionsDir}",` +
+            ` .http = .{ .port = ${opts.httpPort} } } }\n`,
     );
-    trackProc(rec);
-    await Bun.sleep(leadInMs);
 
-    if (play) {
-        const player = spawn(["pw-play", "--target", SINK, play], {
-            stdout: "ignore",
-            stderr: "ignore",
-        });
-        trackProc(player);
-        await player.exited;
-    }
-    await Bun.sleep(500);
+    const logFile = tmpFile("capsper-sink", ".log");
+    const proc = spawn([BINARY, "--config", configFile], {
+        stdout: "ignore",
+        stderr: Bun.file(logFile),
+    });
+    trackProc(proc);
 
-    try { rec.kill(); } catch {}
-    await Bun.sleep(500);
+    // 180s: the model still loads before the process settles, and a first CUDA
+    // run compiles PTX.
+    await waitForLog(logFile, new RegExp(`Virtual sink '${opts.sink}' ready`), proc, 180);
 
-    const peak = await peakDb(recorded);
-    try { unlinkSync(recorded); } catch {}
-    return peak;
+    // "Ready" and "visible in the graph" are not the same instant: the module
+    // creates its nodes on its own loop.
+    await until(`${opts.sink} to reach the graph`, async () =>
+        nodes(await dump()).some((n) => n.name === `${opts.sink}.passthrough`));
+    await mutePassthrough(opts.sink);
+
+    // The server binds before the sink is announced, but wait for it rather
+    // than assume the ordering.
+    await until(`the session server on ${opts.httpPort}`, async () =>
+        (await fetch(`http://127.0.0.1:${opts.httpPort}/sessions.json`)).ok);
+
+    return { proc, configFile, logFile };
 }
 
+/** Wait for a process to be gone, so cleanup does not race the next test. */
+async function waitForExit(proc: ReturnType<typeof spawn>): Promise<void> {
+    try { proc.kill(); } catch {}
+    await until("capsper to exit", () => proc.exitCode !== null || proc.signalCode !== null);
+}
+
+// ─── The graph and the server, playing nothing ───────────────────────────────
+
 describe.skipIf(!isLinux)("virtual sink", () => {
-    let configFile = "";
-    let toneFile = "";
-    let logFile = "";
+    let capsper: Awaited<ReturnType<typeof startCapsper>>;
     let sessionsDir = "";
-    let server: ReturnType<typeof spawn> | undefined;
     let objects: any[] = [];
+
+    // A session written straight to disk, so the server has something real to
+    // serve without a recording having to be made in real time first.
+    const SESSION = "2026/09/11/T143000Z";
 
     beforeAll(async () => {
         ensureBinary();
 
-        configFile = tmpFile("capsper-sink-config", ".zon");
-        // A sessions directory of its own, so a test run never writes into the
-        // recordings a real install is keeping.
         sessionsDir = tmpFile("capsper-sessions", "");
-        mkdirSync(sessionsDir, { recursive: true });
-        // A three-second idle window rather than the thirty a real meeting
-        // wants: the debounce arithmetic is unit-tested in meeting.zig, so
-        // what this has to show is that the graph drives it at all.
+        mkdirSync(join(sessionsDir, SESSION), { recursive: true });
+        await $`ffmpeg -y -f lavfi -i ${"sine=frequency=440:duration=2:sample_rate=16000"} -ac 2 -c:a pcm_s16le ${join(sessionsDir, SESSION, "audio.wav")}`
+            .quiet()
+            .nothrow();
         writeFileSync(
-            configFile,
-            `.{ .meeting = .{ .enabled = true, .sink_name = "${SINK}",` +
-                ` .idle_close_seconds = 3, .dir = "${sessionsDir}" } }\n`,
+            join(sessionsDir, SESSION, "audio.vtt"),
+            "WEBVTT\n\nNOTE capsper meeting transcript\n\n1\n00:00:00.500 --> 00:00:01.500\n<v Far>hello there\n",
         );
 
-        // Quiet enough not to be alarming if the machine's speakers are live:
-        // the pass-through is a real path to the real output, which is the
-        // whole point of the test.
-        toneFile = tmpFile("capsper-sink-tone", ".wav");
-        await $`ffmpeg -y -f lavfi -i sine=frequency=440:duration=1:sample_rate=48000 -af volume=-40dB -ac 2 ${toneFile}`.quiet().nothrow();
-
-        logFile = tmpFile("capsper-sink", ".log");
-        server = spawn([BINARY, "--config", configFile], {
-            stdout: "ignore",
-            stderr: Bun.file(logFile),
+        capsper = await startCapsper({
+            sink: SINK,
+            sessionsDir,
+            httpPort: HTTP_PORT,
+            idleCloseSeconds: 3,
         });
-        trackProc(server);
-
-        // 180s: the model still loads before the process settles, and a first
-        // CUDA run compiles PTX.
-        await waitForLog(logFile, new RegExp(`Virtual sink '${SINK}' ready`), server, 180);
-        await Bun.sleep(1000); // let the module's nodes reach the daemon
         objects = await dump();
     });
 
     afterAll(async () => {
-        try { server?.kill(); } catch {}
-        await Bun.sleep(1000);
-        for (const path of [configFile, toneFile]) {
-            try { unlinkSync(path); } catch {}
+        if (capsper) await waitForExit(capsper.proc);
+        for (const path of [capsper?.configFile, capsper?.logFile]) {
+            if (path) try { unlinkSync(path); } catch {}
         }
         try { rmSync(sessionsDir, { recursive: true, force: true }); } catch {}
     });
-
-    const count = (needle: string) =>
-        readFileSync(logFile, "utf8").split(needle).length - 1;
-
-    const sessionFiles = () => walkWavs(sessionsDir).sort();
-
-    /** Wait until no session is open, so a count-based assertion starts level. */
-    async function settle(): Promise<void> {
-        for (let i = 0; i < 20; i++) {
-            if (count("session opened") === count("session closed")) return;
-            await Bun.sleep(1000);
-        }
-        throw new Error("a meeting session never closed");
-    }
 
     test("appears in the graph as a sink", () => {
         const sink = nodes(objects).find((n) => n.name === SINK);
@@ -217,52 +227,196 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         expect(reached).toContain(defaultSinkName(objects));
     });
 
-    test("its monitor is silent until something plays, then carries it", async () => {
-        // Both halves matter. `pw-record --target NAME` on its own attaches to
-        // the default *source* -- the microphone -- and happily returns room
-        // noise, which would pass a "there is audio" assertion without the
-        // monitor being involved at all. `stream.capture.sink` is what asks
-        // for the monitor, and the silent reading is what proves we got it.
-        const idle = await recordMonitor(1500, null);
-        console.error(`  monitor idle peak:    ${idle} dBFS`);
-        expect(idle).toBeLessThan(-80);
+    test("its monitor reads as digital silence while nothing is playing", async () => {
+        // `pw-record --target NAME` on its own attaches to the default
+        // *source* -- the microphone -- and happily returns room noise.
+        // `stream.capture.sink` is what asks for the monitor instead, and a
+        // reading of pure silence is what proves we got it.
+        const recorded = tmpFile("capsper-sink-monitor", ".wav");
+        const rec = spawn(
+            ["pw-record", "-P", "{ stream.capture.sink=true }", "--target", SINK, recorded],
+            { stdout: "ignore", stderr: "ignore" },
+        );
+        trackProc(rec);
 
-        const playing = await recordMonitor(500, toneFile);
-        console.error(`  monitor playing peak: ${playing} dBFS`);
-        expect(playing).toBeGreaterThan(idle + 20);
+        // Enough captured audio to judge, rather than a guess at how long that
+        // takes: a second of 16-bit stereo at 48 kHz is comfortably past this.
+        await until("the monitor to record something", () => statSync(recorded).size > 64_000);
+        try { rec.kill(); } catch {}
+        await until("the recording to be flushed", () => statSync(recorded).size > 64_000);
+
+        const peak = await peakDb(recorded);
+        console.error(`  monitor idle peak: ${peak} dBFS`);
+        expect(peak).toBeLessThan(-80);
+
+        try { unlinkSync(recorded); } catch {}
     }, 30_000);
+
+    test("serves the sessions directory", async () => {
+        const base = `http://127.0.0.1:${HTTP_PORT}`;
+
+        const index = await fetch(`${base}/`);
+        expect(index.status).toBe(200);
+        expect(index.headers.get("content-type")).toContain("text/html");
+
+        const listing = await fetch(`${base}/sessions.json`);
+        expect(listing.status).toBe(200);
+        const sessions = await listing.json();
+
+        expect(sessions.map((s: any) => s.path)).toContain(SESSION);
+        const found = sessions.find((s: any) => s.path === SESSION);
+        expect(found.audio).toBe("audio.wav");
+        expect(found.seconds).toBeCloseTo(2, 0);
+    });
+
+    test("lists sessions newest first", async () => {
+        // The dated layout gives this for free by sorting the paths
+        // descending, which is one of the reasons the leaf is an ISO
+        // timestamp.
+        const older = "2026/09/10/T090000Z";
+        mkdirSync(join(sessionsDir, older), { recursive: true });
+        writeFileSync(join(sessionsDir, older, "audio.wav"), "");
+
+        const sessions = await (await fetch(`http://127.0.0.1:${HTTP_PORT}/sessions.json`)).json();
+        const paths = sessions.map((s: any) => s.path);
+        expect(paths).toEqual([...paths].sort().reverse());
+        expect(paths.indexOf(SESSION)).toBeLessThan(paths.indexOf(older));
+    });
+
+    test("serves both files of a session with the types a browser needs", async () => {
+        const base = `http://127.0.0.1:${HTTP_PORT}/s/${SESSION}`;
+
+        const audio = await fetch(`${base}/audio.wav`);
+        expect(audio.status).toBe(200);
+        expect(audio.headers.get("accept-ranges")).toBe("bytes");
+
+        // A track element ignores a transcript served as anything but text/vtt.
+        const vtt = await fetch(`${base}/audio.vtt`);
+        expect(vtt.status).toBe(200);
+        expect(vtt.headers.get("content-type")).toBe("text/vtt");
+        expect(await vtt.text()).toContain("WEBVTT");
+    });
+
+    test("serves byte ranges, so a browser can seek without downloading it all", async () => {
+        const url = `http://127.0.0.1:${HTTP_PORT}/s/${SESSION}/audio.wav`;
+
+        const part = await fetch(url, { headers: { Range: "bytes=1000-1999" } });
+        expect(part.status).toBe(206);
+        expect((await part.arrayBuffer()).byteLength).toBe(1000);
+        expect(part.headers.get("content-range")).toMatch(/^bytes 1000-1999\/\d+$/);
+    });
+
+    test("refuses a path that climbs out of the sessions directory", async () => {
+        // `fetch` normalises `..` away before sending, so this has to go out as
+        // a raw request to be testing anything at all.
+        const raw = await new Promise<string>((resolve, reject) => {
+            const sock = connect(HTTP_PORT, "127.0.0.1", () => {
+                sock.write("GET /s/../../../../etc/passwd HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            });
+            let data = "";
+            sock.on("data", (d: Buffer) => { data += d.toString(); });
+            sock.on("close", () => resolve(data));
+            sock.on("error", reject);
+        });
+        expect(raw).toMatch(/^HTTP\/1\.1 403/);
+        expect(raw).not.toContain("root:");
+    });
+
+    test("is reachable on loopback but not from the network", async () => {
+        // These are recordings of private conversations. Reaching them from
+        // the network should take saying so in the config.
+        const { stdout } = await $`ss -ltn`.quiet().nothrow();
+        const line = stdout.toString().split("\n").find((l) => l.includes(`:${HTTP_PORT} `));
+        expect(line).toBeDefined();
+        expect(line).toContain("127.0.0.1");
+        expect(line).not.toContain("0.0.0.0:" + HTTP_PORT);
+    });
+
+    test("is gone once capsper exits", async () => {
+        await waitForExit(capsper.proc);
+
+        const gone = await until("the sink to leave the graph", async () =>
+            nodes(await dump()).filter((n) => n.name.startsWith(SINK)).length === 0);
+        expect(gone).toBe(true);
+    });
+});
+
+// ─── Capture, which needs audio actually played ──────────────────────────────
+
+describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
+    let capsper: Awaited<ReturnType<typeof startCapsper>>;
+    let sessionsDir = "";
+    let speech = "";
+
+    beforeAll(async () => {
+        ensureBinary();
+        sessionsDir = tmpFile("capsper-audio-sessions", "");
+        mkdirSync(sessionsDir, { recursive: true });
+
+        // Four seconds of real speech rather than the whole clip: these play in
+        // real time, so every second of fixture is a second of test.
+        speech = tmpFile("capsper-speech", ".wav");
+        await $`ffmpeg -y -i test/jfk.wav -t 4 -ar 48000 -ac 2 ${speech}`.quiet().nothrow();
+
+        capsper = await startCapsper({
+            sink: AUDIO_SINK,
+            sessionsDir,
+            httpPort: AUDIO_HTTP_PORT,
+            idleCloseSeconds: 3,
+        });
+    });
+
+    afterAll(async () => {
+        if (capsper) await waitForExit(capsper.proc);
+        for (const path of [capsper?.configFile, capsper?.logFile, speech]) {
+            if (path) try { unlinkSync(path); } catch {}
+        }
+        try { rmSync(sessionsDir, { recursive: true, force: true }); } catch {}
+    });
+
+    const count = (needle: string) =>
+        readFileSync(capsper.logFile, "utf8").split(needle).length - 1;
+
+    const sessionFiles = () => walkWavs(sessionsDir).sort();
+
+    /** Wait until no session is open, so a count-based assertion starts level. */
+    const settle = () =>
+        until("any open session to close", () => count("session opened") === count("session closed"), { timeoutSec: 30 });
+
+    /** Wait for one more of `needle` than there were before. */
+    const waitForOneMore = (needle: string, before: number) =>
+        until(`another "${needle}"`, () => count(needle) === before + 1, { timeoutSec: 30 });
+
+    /** Wait for one more session file than there were before. */
+    const waitForNewSession = (before: number) =>
+        until("a new session file", () => sessionFiles().length === before + 1, { timeoutSec: 30 });
+
+    async function play(file: string): Promise<void> {
+        const proc = spawn(["pw-play", "--target", AUDIO_SINK, file], {
+            stdout: "ignore",
+            stderr: "ignore",
+        });
+        trackProc(proc);
+        await proc.exited;
+    }
 
     test("opens a session when something plays, and closes it when that stops", async () => {
         // Gate 1 end to end: the user selecting the sink in a meeting app is
         // what says a call is happening, and this is that signal arriving.
-        //
-        // Counted rather than matched, because the monitor test above plays
-        // into the same sink and so opens a session of its own. That the gate
-        // fired for a test that was not trying to trigger it is the point
-        // working, not interference -- but it does mean this cannot assume it
-        // starts from nothing.
         await settle();
         const openedBefore = count("session opened");
         const closedBefore = count("session closed");
 
-        const play = spawn(["pw-play", "--target", SINK, toneFile], {
-            stdout: "ignore",
-            stderr: "ignore",
-        });
-        trackProc(play);
-        await play.exited;
-        await Bun.sleep(1500);
+        await play(speech);
 
-        expect(count("session opened")).toBe(openedBefore + 1);
-        // Still inside the three-second window, so a brief gap has not ended it.
+        await waitForOneMore("session opened", openedBefore);
+        // Still inside the idle window, so a brief gap has not ended it.
         expect(count("session closed")).toBe(closedBefore);
 
-        await Bun.sleep(5000);
-        expect(count("session closed")).toBe(closedBefore + 1);
+        await waitForOneMore("session closed", closedBefore);
 
         // The session is named for when it started, as a path that sorts.
-        const opened = readFileSync(logFile, "utf8").match(/session opened: (\S+)/);
-        expect(opened).not.toBeNull();
+        const opened = readFileSync(capsper.logFile, "utf8").match(/session opened: (\S+)/);
         expect(opened![1]).toMatch(/^\d{4}\/\d{2}\/\d{2}\/T\d{6}Z$/);
     }, 60_000);
 
@@ -270,8 +424,6 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         const files = sessionFiles();
         expect(files.length).toBeGreaterThan(0);
 
-        // `YYYY/MM/DD/THHMMSSZ/audio.wav` relative to the sessions root: one
-        // ISO timestamp split across directories, so it sorts at every level.
         const relative = files[0].slice(sessionsDir.length + 1);
         expect(relative).toMatch(/^\d{4}\/\d{2}\/\d{2}\/T\d{6}Z\/audio\.wav$/);
 
@@ -283,68 +435,50 @@ describe.skipIf(!isLinux)("virtual sink", () => {
     });
 
     test("puts the call on the right channel and the microphone on the left", async () => {
-        // The failure this is really guarding against is the far track being a
-        // second copy of the near one, which is what happens if the capture
-        // stream misses `stream.capture.sink` and silently falls back to the
-        // default source. Both channels would carry audio and look fine.
+        // The failure this guards against is the far track being a second copy
+        // of the near one, which is what happens if the capture stream misses
+        // `stream.capture.sink` and falls back to the default source. Both
+        // channels would carry audio and look fine.
         //
         // So it is measured in the tone's own narrow band rather than overall:
-        // the tone was played into the sink and exists nowhere else, so it has
-        // to be much stronger on the right than on the left.
+        // the tone was played into the sink and exists nowhere else.
         await settle();
         const before = sessionFiles().length;
 
-        const loud = tmpFile("capsper-sink-loud", ".wav");
-        await $`ffmpeg -y -f lavfi -i sine=frequency=880:duration=3:sample_rate=48000 -af volume=-20dB -ac 2 ${loud}`
+        const tone = tmpFile("capsper-tone", ".wav");
+        await $`ffmpeg -y -f lavfi -i ${"sine=frequency=880:duration=3:sample_rate=48000"} -af volume=-20dB -ac 2 ${tone}`
             .quiet()
             .nothrow();
 
-        const play = spawn(["pw-play", "--target", SINK, loud], {
-            stdout: "ignore",
-            stderr: "ignore",
-        });
-        trackProc(play);
-        await play.exited;
-        await Bun.sleep(5000); // let the idle window close the session
+        await play(tone);
+        await waitForNewSession(before);
 
         const files = sessionFiles();
-        expect(files.length).toBe(before + 1);
         const audio = files[files.length - 1];
 
         const left = await bandDb(audio, 0, 880);
         const right = await bandDb(audio, 1, 880);
         console.error(`  880Hz band — left: ${left} dBFS, right: ${right} dBFS`);
-
-        // The tone is on the right. A far track that was secretly the
-        // microphone would put these within a few dB of each other.
         expect(right).toBeGreaterThan(left + 10);
 
-        try { unlinkSync(loud); } catch {}
+        try { unlinkSync(tone); } catch {}
     }, 60_000);
 
     test("transcribes the call into a WebVTT file beside the audio", async () => {
         await settle();
+        const closedBefore = count("session closed");
 
-        // Real speech rather than a tone, because a tone transcribes to
-        // nothing. Resampled to what the sink expects.
-        const speech = tmpFile("capsper-sink-speech", ".wav");
-        await $`ffmpeg -y -i test/jfk.wav -ar 48000 -ac 2 ${speech}`.quiet().nothrow();
-
-        const play = spawn(["pw-play", "--target", SINK, speech], {
-            stdout: "ignore",
-            stderr: "ignore",
-        });
-        trackProc(play);
-        await play.exited;
-        await Bun.sleep(5000);
+        await play(speech);
+        // The transcript is written when the session closes, so that is the
+        // thing to wait for.
+        await waitForOneMore("session closed", closedBefore);
 
         const dir = sessionFiles().pop()!.replace(/audio\.wav$/, "");
-        const vtt = readFileSync(join(dir, "transcript.vtt"), "utf8");
-        console.error(vtt.split("\n").slice(0, 12).join("\n"));
+        const vtt = readFileSync(join(dir, "audio.vtt"), "utf8");
 
         expect(vtt.startsWith("WEBVTT\n")).toBe(true);
-        // The channel assignment travels with the recording, so a session
-        // found in two years says which side is which.
+        // The channel assignment travels with the recording, so a session found
+        // in two years says which side is which.
         expect(vtt).toContain("near end (microphone) = left");
 
         // The speech played into the sink is the far end, and it is attributed
@@ -359,27 +493,24 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         );
         expect(starts.length).toBeGreaterThan(0);
         expect([...starts].sort((a, b) => a - b)).toEqual(starts);
-
-        try { unlinkSync(speech); } catch {}
     }, 90_000);
 
     test("keeps cue timestamps in step with the recording across a long silence", async () => {
         // The trap this guards against does not exist yet, and that is the
-        // point of writing it now. Cue positions are counted as audio
-        // arrives, ahead of the encoder. Today everything that arrives is
-        // encoded, so the two agree and this passes trivially.
+        // point of writing it now. Cue positions are counted as audio arrives,
+        // ahead of the encoder. Today everything that arrives is encoded, so
+        // the two agree and this passes trivially.
         //
-        // The moment a VAD sits in front of the encoder to stop paying for
-        // silence, they diverge: a position derived from what the encoder
-        // consumed would skip the elided silence, so every cue after the
-        // first pause drifts earlier by the total silence skipped. On an
-        // hour-long meeting the end would be minutes out, and nothing about
-        // the file would look wrong.
+        // The moment a VAD sits in front of the encoder, they diverge: a
+        // position derived from what the encoder consumed would skip the
+        // elided silence, so every cue after the first pause drifts earlier by
+        // the total silence skipped. On an hour-long meeting the end would be
+        // minutes out, and nothing about the file would look wrong.
         await settle();
+        const closedBefore = count("session closed");
 
-        // Speech, then ten seconds of nothing, then the same speech again.
-        const gapped = tmpFile("capsper-sink-gapped", ".wav");
-        await $`ffmpeg -y -i test/jfk.wav -i test/jfk.wav -filter_complex ${"[0:a]apad=pad_dur=10[a];[a][1:a]concat=n=2:v=0:a=1"} -ar 48000 -ac 2 ${gapped}`
+        const gapped = tmpFile("capsper-gapped", ".wav");
+        await $`ffmpeg -y -i ${speech} -i ${speech} -filter_complex ${"[0:a]apad=pad_dur=6[a];[a][1:a]concat=n=2:v=0:a=1"} -ar 48000 -ac 2 ${gapped}`
             .quiet()
             .nothrow();
 
@@ -388,16 +519,11 @@ describe.skipIf(!isLinux)("virtual sink", () => {
             .nothrow();
         const durationMs = parseFloat(probe.stdout.toString()) * 1000;
 
-        const play = spawn(["pw-play", "--target", SINK, gapped], {
-            stdout: "ignore",
-            stderr: "ignore",
-        });
-        trackProc(play);
-        await play.exited;
-        await Bun.sleep(5000);
+        await play(gapped);
+        await waitForOneMore("session closed", closedBefore);
 
         const dir = sessionFiles().pop()!.replace(/audio\.wav$/, "");
-        const vtt = readFileSync(join(dir, "transcript.vtt"), "utf8");
+        const vtt = readFileSync(join(dir, "audio.vtt"), "utf8");
 
         const cues = [...vtt.matchAll(/^(\d{2}):(\d{2}):(\d{2})\.(\d{3}) --> (\d{2}):(\d{2}):(\d{2})\.(\d{3})$/gm)].map(
             (m) => ({
@@ -407,43 +533,16 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         );
         expect(cues.length).toBeGreaterThan(1);
 
+        const lastStart = Math.max(...cues.map((c) => c.start));
         const lastEnd = Math.max(...cues.map((c) => c.end));
         console.error(`  played ${(durationMs / 1000).toFixed(1)}s, last cue ends at ${(lastEnd / 1000).toFixed(1)}s`);
 
         // The second half of the speech has to be attributed after the
         // silence, not folded back onto the first half.
-        const lastStart = Math.max(...cues.map((c) => c.start));
-        expect(lastStart).toBeGreaterThan(15_000);
-
+        expect(lastStart).toBeGreaterThan(8000);
         // And the transcript must not run past the recording it describes.
         expect(lastEnd).toBeLessThanOrEqual(durationMs + 2000);
 
         try { unlinkSync(gapped); } catch {}
     }, 120_000);
-
-    test("writes a player beside the session that points at both siblings", () => {
-        const dir = sessionFiles().pop()!.replace(/audio\.wav$/, "");
-        const html = readFileSync(join(dir, "index.html"), "utf8");
-
-        // The bug this exists for: the placeholder appeared twice, once in a
-        // comment explaining it, so substituting the first occurrence filled
-        // in the comment and left the audio element pointing at the
-        // placeholder. The page rendered its transcript perfectly and played
-        // nothing.
-        expect(html).not.toContain("__AUDIO_FILE__");
-
-        expect(html).toContain('src="audio.wav"');
-        expect(html).toContain('src="transcript.vtt"');
-        // Hidden, so the native parser fires cue events without drawing
-        // subtitles over the audio element; the page renders them itself.
-        expect(html).toContain('mode = "hidden"');
-    });
-
-    test("is gone once capsper exits", async () => {
-        try { server?.kill(); } catch {}
-        await Bun.sleep(1500);
-
-        const after = nodes(await dump()).filter((n) => n.name.startsWith(SINK));
-        expect(after).toHaveLength(0);
-    });
 });

@@ -65,6 +65,33 @@ export async function waitForLog(logFile: string, pattern: RegExp, proc: ReturnT
     throw new Error(`Timed out waiting for ${pattern} after ${timeoutSec}s. Log:\n${log.slice(-2000)}`);
 }
 
+/**
+ * Poll until `check` returns something truthy, then return it.
+ *
+ * For waiting on the thing that has to happen rather than on a duration that
+ * ought to be long enough. A fixed sleep is either longer than it needs to be
+ * or, on a loaded machine, not long enough -- and the second failure looks
+ * like a broken feature rather than a broken test.
+ */
+export async function until<T>(
+    what: string,
+    check: () => T | Promise<T>,
+    { timeoutSec = 30, intervalMs = 50 }: { timeoutSec?: number; intervalMs?: number } = {},
+): Promise<NonNullable<T>> {
+    const deadline = Date.now() + timeoutSec * 1000;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+        try {
+            const value = await check();
+            if (value) return value as NonNullable<T>;
+        } catch (e) {
+            lastError = e;
+        }
+        await Bun.sleep(intervalMs);
+    }
+    throw new Error(`Timed out after ${timeoutSec}s waiting for ${what}` + (lastError ? `: ${lastError}` : ""));
+}
+
 /** Start the capsper server with given args, wait for ready, return handle. */
 export async function startServer(args: string[]): Promise<{ proc: ReturnType<typeof spawn>; port: number; logFile: string; kill: () => void }> {
     const logFile = tmpFile("capsper-server", ".log");
