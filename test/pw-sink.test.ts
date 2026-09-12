@@ -322,6 +322,47 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         try { unlinkSync(loud); } catch {}
     }, 60_000);
 
+    test("transcribes the call into a WebVTT file beside the audio", async () => {
+        await settle();
+
+        // Real speech rather than a tone, because a tone transcribes to
+        // nothing. Resampled to what the sink expects.
+        const speech = tmpFile("capsper-sink-speech", ".wav");
+        await $`ffmpeg -y -i test/jfk.wav -ar 48000 -ac 2 ${speech}`.quiet().nothrow();
+
+        const play = spawn(["pw-play", "--target", SINK, speech], {
+            stdout: "ignore",
+            stderr: "ignore",
+        });
+        trackProc(play);
+        await play.exited;
+        await Bun.sleep(5000);
+
+        const dir = sessionFiles().pop()!.replace(/audio\.wav$/, "");
+        const vtt = readFileSync(join(dir, "transcript.vtt"), "utf8");
+        console.error(vtt.split("\n").slice(0, 12).join("\n"));
+
+        expect(vtt.startsWith("WEBVTT\n")).toBe(true);
+        // The channel assignment travels with the recording, so a session
+        // found in two years says which side is which.
+        expect(vtt).toContain("near end (microphone) = left");
+
+        // The speech played into the sink is the far end, and it is attributed
+        // as such rather than guessed at by diarisation.
+        expect(vtt).toContain("<v Far>");
+        expect(vtt.toLowerCase()).toContain("my fellow americans");
+
+        // Start times must not decrease: cues complete when their own track
+        // goes quiet, so they finish out of order and have to be merged.
+        const starts = [...vtt.matchAll(/^(\d{2}):(\d{2}):(\d{2})\.(\d{3}) --> /gm)].map(
+            (m) => ((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000 + +m[4],
+        );
+        expect(starts.length).toBeGreaterThan(0);
+        expect([...starts].sort((a, b) => a - b)).toEqual(starts);
+
+        try { unlinkSync(speech); } catch {}
+    }, 90_000);
+
     test("is gone once capsper exits", async () => {
         try { server?.kill(); } catch {}
         await Bun.sleep(1500);

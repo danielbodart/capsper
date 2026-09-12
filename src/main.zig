@@ -396,7 +396,7 @@ pub fn main() !void {
     // With nothing else enabled, the meeting loop is the thing that keeps the
     // process (and so the sink) alive.
     if (want_meeting and !want_local and !want_tcp) {
-        try meeting_runner.run(allocator, &cfg, audio_channel);
+        try meeting_runner.run(allocator, &cfg, audio_channel, pipeline_factory);
     }
 }
 
