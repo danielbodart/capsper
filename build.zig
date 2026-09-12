@@ -36,6 +36,30 @@ pub fn build(b: *std.Build) void {
     // it means the Nix build needs no git submodule.
     const system_opus = b.option(bool, "system-opus", "Link the system libopus instead of the vendored source") orelse false;
 
+    // --- Settings documentation ---
+    //
+    // The prose describing each setting lives beside it, as its doc comment in
+    // src/shared/config.zig. `@typeInfo` cannot see a doc comment, so this
+    // parses the source and hands them back as data -- see
+    // build/gen_config_docs.zig for why that is a parse and not a grep, and
+    // src/shared/config_docs.zig for what reads the result.
+    //
+    // Built for the host rather than the target: it runs here, during the
+    // build, and never ships.
+    const config_docs = blk: {
+        const gen = b.addExecutable(.{
+            .name = "gen-config-docs",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("build/gen_config_docs.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const run = b.addRunArtifact(gen);
+        run.addFileArg(b.path("src/shared/config.zig"));
+        break :blk run.addOutputFileArg("config_field_docs.zig");
+    };
+
     // --- Binary name ---
     const exe_name: []const u8 = switch (backend) {
         .coreml => "capsper",
@@ -53,6 +77,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", options);
+    exe.root_module.addAnonymousImport("config_field_docs", .{ .root_source_file = config_docs });
     addBackendDeps(b, exe, backend, ort_include);
     addOpus(b, exe, system_opus);
     addPlatformDeps(b, exe, is_macos, ort_lib);
@@ -90,6 +115,7 @@ pub fn build(b: *std.Build) void {
         "src/shared/nemo_mel_state.zig",
         "src/shared/session.zig",
         "src/shared/config.zig",
+        "src/shared/config_docs.zig",
         "src/shared/meeting.zig",
         "src/shared/webvtt.zig",
         "src/shared/session_server.zig",
@@ -102,6 +128,9 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        // Only config_docs.zig imports it, but an unused import costs nothing
+        // and singling one file out of the loop would cost a branch.
+        t.root_module.addAnonymousImport("config_field_docs", .{ .root_source_file = config_docs });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 

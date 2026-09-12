@@ -18,6 +18,7 @@ const utils = @import("shared/utils.zig");
 const audio_detect = @import("platform/detect.zig");
 const Recorder = @import("shared/recorder.zig").Recorder;
 const config = @import("shared/config.zig");
+const config_docs = @import("shared/config_docs.zig");
 const sink_mod = @import("platform/sink.zig");
 const VirtualSink = sink_mod.VirtualSink;
 const SinkWatch = sink_mod.SinkWatch;
@@ -73,7 +74,7 @@ pub fn main() !void {
     if (cli.write_config) {
         var buf: [4096]u8 = undefined;
         var out = std.fs.File.stdout().writer(&buf);
-        try config.write(&cfg, &out.interface);
+        try config_docs.write(&cfg, &out.interface);
         try out.interface.flush();
         return;
     }

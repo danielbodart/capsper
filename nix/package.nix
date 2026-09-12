@@ -73,6 +73,7 @@ let
       ../build.zig
       ../build.zig.zon
       ../src
+      ../build/gen_config_docs.zig # build step: harvests the settings' descriptions
       ../test/jfk.wav # installed beside the binary as the warmup clip
       ../models # the voice activity model, installed into the models directory
       ../dist/linux/include # ORT headers, plain text (not LFS)

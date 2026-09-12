@@ -81,20 +81,34 @@ pub const Channel = blk: {
 pub const Audio = struct {
     /// Capture device node name. Null follows the desktop's default input.
     target: ?[:0]const u8 = null,
+    /// Which channel of the capture device carries the voice. A USB interface
+    /// often presents many, of which one is the microphone.
     channel: Channel = .FL,
+    /// Multiplier applied to the incoming samples before anything else sees
+    /// them. Measured rather than guessed: `--audio-detect` reports one.
     gain: f32 = 1.0,
+    /// Track the speaking level and adjust the gain as it drifts, so `gain` is
+    /// a starting point rather than a ceiling.
     auto_gain: bool = true,
+    /// What to do when the capture device disappears, as a USB interface does
+    /// when it is unplugged.
     on_device_lost: OnDeviceLost = .wait,
+    /// How many seconds `--audio-detect` listens for before reporting.
     detect_duration: u32 = 5,
 };
 
 pub const Trigger = struct {
     /// Push-to-talk key. Null disables push-to-talk.
     key: ?TriggerKey = null,
+    /// Let the trigger key reach the focused window as well as capsper, so
+    /// holding it still does whatever it normally does.
     passthrough: bool = false,
     /// Named for its unit, because a bare number in a file has no usage text
     /// beside it to say what the number means.
     type_delay_us: u64 = 12_000,
+    /// Keep the microphone stream open between presses, saving about 300ms on
+    /// the first word. The desktop's microphone indicator then stays lit
+    /// whether or not anyone is speaking.
     low_latency: bool = false,
 };
 
@@ -112,6 +126,8 @@ pub const DebugRecording = struct {
     /// WAV here because these are seconds long, ring-bounded, and regression
     /// comparisons want the raw samples.
     audio_format: AudioFormat = .wav,
+    /// How much the transcript beside each recording says. `.debug` here,
+    /// because troubleshooting is the only reason these exist.
     detail: Detail = .debug,
 };
 
@@ -125,6 +141,8 @@ pub const DebugRecording = struct {
 /// Linux only. The CoreML build does not link ONNX Runtime, so there is no
 /// gate there until the model is converted.
 pub const Vad = struct {
+    /// Turning this off transcribes the silence too, which costs encoder
+    /// passes rather than accuracy.
     enabled: bool = true,
     /// Probability at which speech starts. Low: opening late clips a word,
     /// opening early wastes one encoder pass.
@@ -163,6 +181,8 @@ pub const Vad = struct {
 /// one module makes all of them and a second name to keep in step would only
 /// be a second thing to get wrong.
 pub const Aec = struct {
+    /// Turning this off is right when you wear headphones, where there is no
+    /// echo to cancel and the cleaning can only cost you.
     enabled: bool = true,
 };
 
@@ -178,6 +198,9 @@ pub const MeetingHttp = struct {
 };
 
 pub const Meeting = struct {
+    /// Record and transcribe both sides of a call. Publishes a sink to select
+    /// as the meeting app's output, and runs alongside dictation rather than
+    /// instead of it.
     enabled: bool = false,
     /// The node name, which is an identifier rather than a label: it is what
     /// `pw-link` and `pactl` address the sink by, and what it is called as a
@@ -211,15 +234,22 @@ pub const Meeting = struct {
     /// during a meeting is the case that makes this real, and it may well want
     /// a different microphone from the one the meeting is recorded through.
     near: ?[:0]const u8 = null,
+    /// Where each session's audio and transcript are written, one directory
+    /// per call. Nothing prunes it: these are kept until you delete them.
     dir: [:0]const u8 = "~/.local/share/capsper/sessions",
     /// Opus here because these are hours of audio, kept indefinitely.
     audio_format: AudioFormat = .opus,
     /// How long a sink can sit idle before the session is closed. Long enough
     /// to survive a screen-share renegotiation or a brief mute.
     idle_close_seconds: u32 = 30,
+    /// How much each transcript says. `.minimal` here, because these are read
+    /// as a record of the conversation rather than to debug the decoder.
     detail: Detail = .minimal,
+    /// The server that lists the recorded sessions and plays them back.
     http: MeetingHttp = .{},
+    /// The voice activity gate in front of the encoder.
     vad: Vad = .{},
+    /// Echo cancellation on the near track.
     aec: Aec = .{},
 };
 
@@ -227,13 +257,25 @@ pub const Config = struct {
     /// Null resolves to `../models/nemotron` relative to the binary, which is
     /// what makes an unpacked dist tarball run without configuring anything.
     model: ?[:0]const u8 = null,
+    /// Log what the decoder is doing as it does it, which is a great deal of
+    /// output and belongs to troubleshooting rather than to running.
     verbose: bool = false,
+    /// A file of filler phrases to suppress, one per line, so "um" and the
+    /// like never reach the window being typed into.
     drop_terms: ?[:0]const u8 = null,
 
+    /// Where the audio comes from and how loud it arrives.
     audio: Audio = .{},
+    /// Push-to-talk: the key held to speak, and how the text is typed out.
     trigger: Trigger = .{},
+    /// The server remote dictation clients connect to. Nothing to do with the
+    /// meeting one, which serves recordings over HTTP.
     tcp_server: TcpServer = .{},
+    /// Keeping the last few seconds of audio and its transcript on disk, for
+    /// working out why a particular phrase came out wrong.
     debug_recording: DebugRecording = .{},
+    /// Recording and transcribing calls, as opposed to dictating into a
+    /// window.
     meeting: Meeting = .{},
 
     /// The source the meeting's near track listens to: its own setting if it
@@ -496,29 +538,6 @@ pub fn load(arena: Allocator, path: []const u8) !?Config {
         return err;
     };
 }
-/// Write `cfg` as ZON, naming only the settings that differ from their
-/// defaults.
-///
-/// Only the differences, because a config file should record what you chose.
-/// Writing every field out would freeze today's defaults into the file, so a
-/// later change to one of them would reach new users and silently miss
-/// everyone who had ever run this.
-///
-/// `emit_default_optional_fields = false` is what does it: `std.zon.stringify`
-/// compares each field against the default in the type and omits the ones that
-/// match, nested structs included. A struct whose every field matches vanishes
-/// with them, so an unconfigured section costs no lines.
-///
-/// Call this before `expandPaths`. Afterwards `~/` has already become an
-/// absolute path, and writing that into a file is a worse answer than the
-/// tilde the user would have typed.
-pub fn write(cfg: *const Config, writer: *std.Io.Writer) !void {
-    try std.zon.stringify.serialize(cfg.*, .{
-        .emit_default_optional_fields = false,
-    }, writer);
-    try writer.writeByte('\n');
-}
-
 /// Where the config lives when `--config` does not say otherwise:
 /// `$XDG_CONFIG_HOME/capsper/config.zon`, falling back to the base directory
 /// spec's own default of `~/.config` when that variable is unset.
@@ -838,88 +857,4 @@ test "a bare tilde is treated as a filename, not a home directory" {
     var cfg = Config{ .model = "~" };
     try cfg.expandPaths(arena_state.allocator());
     try testing.expectEqualStrings("~", cfg.model.?);
-}
-
-/// Serialize into an allocated string, which is what every `write` test wants.
-fn writeToString(arena: Allocator, cfg: *const Config) ![]const u8 {
-    var buf: std.Io.Writer.Allocating = .init(arena);
-    try write(cfg, &buf.writer);
-    return buf.written();
-}
-
-test "writing the defaults says nothing at all" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-
-    const cfg = Config{};
-    const text = try writeToString(arena_state.allocator(), &cfg);
-    try testing.expectEqualStrings(".{}\n", text);
-}
-
-test "writing names the settings that differ and nothing else" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-
-    var cfg = Config{};
-    cfg.audio.gain = 10.0;
-    const text = try writeToString(arena_state.allocator(), &cfg);
-
-    try testing.expect(std.mem.indexOf(u8, text, "gain") != null);
-    // The section carrying it appears; the ones left alone do not.
-    try testing.expect(std.mem.indexOf(u8, text, "audio") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "meeting") == null);
-    try testing.expect(std.mem.indexOf(u8, text, "tcp_server") == null);
-    // Nor do that section's own untouched fields.
-    try testing.expect(std.mem.indexOf(u8, text, "detect_duration") == null);
-}
-
-test "flags written out and read back give the same settings" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // A spread of kinds: enum, float, optional string, bool, integer, and a
-    // setting nested two deep.
-    var cfg = Config{};
-    var cli = Cli{};
-    try testing.expect(parseArgs(&cfg, &cli, argv(&.{
-        "capsper",       "--trigger",     "capslock",
-        "--audio-target", "vocaster",     "--audio-channel",
-        "FR",            "--audio-gain",  "10.0",
-        "--port",        "43007",         "--no-auto-gain",
-        "--record-keep", "3",
-    })) == null);
-    cfg.meeting.enabled = true;
-    cfg.meeting.vad.onset = 0.45;
-
-    const text = try writeToString(arena, &cfg);
-    const source = try arena.dupeZ(u8, text);
-    const reparsed = try parse(arena, source, null);
-
-    // Compared as text rather than with `expectEqual`, which compares the
-    // string fields by pointer and so fails on two equal strings that were
-    // allocated separately. Writing the reparsed config is also the property
-    // that matters: the file a migration produces has to survive being read
-    // back and written again unchanged.
-    try testing.expectEqualStrings(text, try writeToString(arena, &reparsed));
-
-    // And it is not vacuously stable: the values really did make the journey.
-    try testing.expectEqual(TriggerKey.capslock, reparsed.trigger.key.?);
-    try testing.expectEqualStrings("vocaster", reparsed.audio.target.?);
-    try testing.expectEqual(Channel.FR, reparsed.audio.channel);
-    try testing.expectEqual(@as(f32, 10.0), reparsed.audio.gain);
-    try testing.expect(!reparsed.audio.auto_gain);
-    try testing.expectEqual(@as(u16, 43007), reparsed.tcp_server.port.?);
-    try testing.expectEqual(@as(usize, 3), reparsed.debug_recording.keep);
-    try testing.expect(reparsed.meeting.enabled);
-    try testing.expectEqual(@as(f32, 0.45), reparsed.meeting.vad.onset);
-}
-
-test "writing keeps a tilde, because expandPaths has not run yet" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-
-    const cfg = Config{ .model = "~/models/nemotron" };
-    const text = try writeToString(arena_state.allocator(), &cfg);
-    try testing.expect(std.mem.indexOf(u8, text, "~/models/nemotron") != null);
 }
