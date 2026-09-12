@@ -124,3 +124,9 @@ pub const PW_KEY_NODE_NAME = pw.PW_KEY_NODE_NAME;
 pub const pw_virtual_sink = opaque {};
 pub extern fn pw_virtual_sink_create(node_name: [*:0]const u8, description: [*:0]const u8) ?*pw_virtual_sink;
 pub extern fn pw_virtual_sink_destroy(s: *pw_virtual_sink) void;
+
+// Sink usage watch (gate 1: is anything playing into our sink?)
+pub const pw_sink_watch = opaque {};
+pub extern fn pw_sink_watch_create(sink_name: [*:0]const u8) ?*pw_sink_watch;
+pub extern fn pw_sink_watch_destroy(w: *pw_sink_watch) void;
+pub extern fn pw_sink_watch_active_streams(w: *pw_sink_watch) u32;

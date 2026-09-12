@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { $, spawn } from "bun";
-import { writeFileSync, unlinkSync } from "fs";
+import { writeFileSync, readFileSync, unlinkSync } from "fs";
 import { BINARY, ensureBinary, tmpFile, trackProc, waitForLog } from "./helpers";
 
 const isLinux = process.platform === "linux";
@@ -99,6 +99,7 @@ async function recordMonitor(leadInMs: number, play: string | null): Promise<num
 describe.skipIf(!isLinux)("virtual sink", () => {
     let configFile = "";
     let toneFile = "";
+    let logFile = "";
     let server: ReturnType<typeof spawn> | undefined;
     let objects: any[] = [];
 
@@ -106,7 +107,13 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         ensureBinary();
 
         configFile = tmpFile("capsper-sink-config", ".zon");
-        writeFileSync(configFile, `.{ .meeting = .{ .enabled = true, .sink_name = "${SINK}" } }\n`);
+        // A three-second idle window rather than the thirty a real meeting
+        // wants: the debounce arithmetic is unit-tested in meeting.zig, so
+        // what this has to show is that the graph drives it at all.
+        writeFileSync(
+            configFile,
+            `.{ .meeting = .{ .enabled = true, .sink_name = "${SINK}", .idle_close_seconds = 3 } }\n`,
+        );
 
         // Quiet enough not to be alarming if the machine's speakers are live:
         // the pass-through is a real path to the real output, which is the
@@ -114,7 +121,7 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         toneFile = tmpFile("capsper-sink-tone", ".wav");
         await $`ffmpeg -y -f lavfi -i sine=frequency=440:duration=1:sample_rate=48000 -af volume=-40dB -ac 2 ${toneFile}`.quiet().nothrow();
 
-        const logFile = tmpFile("capsper-sink", ".log");
+        logFile = tmpFile("capsper-sink", ".log");
         server = spawn([BINARY, "--config", configFile], {
             stdout: "ignore",
             stderr: Bun.file(logFile),
@@ -135,6 +142,18 @@ describe.skipIf(!isLinux)("virtual sink", () => {
             try { unlinkSync(path); } catch {}
         }
     });
+
+    const count = (needle: string) =>
+        readFileSync(logFile, "utf8").split(needle).length - 1;
+
+    /** Wait until no session is open, so a count-based assertion starts level. */
+    async function settle(): Promise<void> {
+        for (let i = 0; i < 20; i++) {
+            if (count("session opened") === count("session closed")) return;
+            await Bun.sleep(1000);
+        }
+        throw new Error("a meeting session never closed");
+    }
 
     test("appears in the graph as a sink", () => {
         const sink = nodes(objects).find((n) => n.name === SINK);
@@ -176,6 +195,40 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         console.error(`  monitor playing peak: ${playing} dBFS`);
         expect(playing).toBeGreaterThan(idle + 20);
     }, 30_000);
+
+    test("opens a session when something plays, and closes it when that stops", async () => {
+        // Gate 1 end to end: the user selecting the sink in a meeting app is
+        // what says a call is happening, and this is that signal arriving.
+        //
+        // Counted rather than matched, because the monitor test above plays
+        // into the same sink and so opens a session of its own. That the gate
+        // fired for a test that was not trying to trigger it is the point
+        // working, not interference -- but it does mean this cannot assume it
+        // starts from nothing.
+        await settle();
+        const openedBefore = count("session opened");
+        const closedBefore = count("session closed");
+
+        const play = spawn(["pw-play", "--target", SINK, toneFile], {
+            stdout: "ignore",
+            stderr: "ignore",
+        });
+        trackProc(play);
+        await play.exited;
+        await Bun.sleep(1500);
+
+        expect(count("session opened")).toBe(openedBefore + 1);
+        // Still inside the three-second window, so a brief gap has not ended it.
+        expect(count("session closed")).toBe(closedBefore);
+
+        await Bun.sleep(5000);
+        expect(count("session closed")).toBe(closedBefore + 1);
+
+        // The session is named for when it started, as a path that sorts.
+        const opened = readFileSync(logFile, "utf8").match(/session opened: (\S+)/);
+        expect(opened).not.toBeNull();
+        expect(opened![1]).toMatch(/^\d{4}\/\d{2}\/\d{2}\/T\d{6}Z$/);
+    }, 60_000);
 
     test("is gone once capsper exits", async () => {
         try { server?.kill(); } catch {}

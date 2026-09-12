@@ -591,3 +591,297 @@ pw_virtual_sink_destroy(struct pw_virtual_sink *s)
     pw_thread_loop_destroy(s->thread_loop);
     free(s);
 }
+
+/* ─── Sink usage watch (gate 1) ─────────────────────────────────────────────
+
+   Answers one question: how many applications are currently playing into
+   capsper's sink? That is the arm/disarm signal for a meeting, and it comes
+   free with the dedicated sink -- an application holding the sink creates a
+   Stream/Output/Audio node linked to it, and the node's state distinguishes
+   playing from paused.
+
+   Matching is on links whose *input* is the sink. capsper's own far-end
+   capture attaches to the sink's monitor, which puts it on the output side of
+   its link, so it is ignored without needing to be named. The loopback's
+   pass-through end is likewise invisible here: its link goes into the real
+   default output, not into the sink.
+
+   Counting only `running` streams is what makes a paused call disarm: a
+   paused client keeps its node but drops to `idle`. The debounce that stops a
+   brief mute from splitting a meeting in two lives in Zig, not here -- this
+   reports the instantaneous graph and nothing more. */
+
+#define SINK_WATCH_MAX 32
+
+struct pw_sink_watch;
+
+struct watched_stream {
+    struct pw_sink_watch *watch;
+    struct spa_hook        listener;
+    struct pw_proxy       *proxy;
+    uint32_t               node_id;
+    enum pw_node_state     state;
+    int                    used;
+};
+
+struct watched_link {
+    uint32_t link_id;
+    uint32_t out_node_id;
+    int      used;
+};
+
+struct pw_sink_watch {
+    struct pw_thread_loop *thread_loop;
+    struct pw_context     *context;
+    struct pw_core        *core;
+    struct pw_registry    *registry;
+    struct spa_hook        registry_listener;
+
+    char     sink_name[256];
+    uint32_t sink_id;   /* 0 until the sink shows up in the registry */
+
+    struct watched_stream streams[SINK_WATCH_MAX];
+    struct watched_link   links[SINK_WATCH_MAX];
+
+    /* Read from the main thread; written only on the thread loop. */
+    _Atomic uint32_t running_count;
+};
+
+static struct watched_stream *
+sink_watch_find_stream(struct pw_sink_watch *w, uint32_t node_id)
+{
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++)
+        if (w->streams[i].used && w->streams[i].node_id == node_id)
+            return &w->streams[i];
+    return NULL;
+}
+
+/* Recount from scratch rather than tracking deltas: the inputs are two small
+   fixed arrays, and a count that can drift out of step with the graph is the
+   one bug that would be invisible until a meeting failed to record. */
+static void
+sink_watch_recount(struct pw_sink_watch *w)
+{
+    uint32_t running = 0;
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        if (!w->links[i].used)
+            continue;
+        struct watched_stream *s = sink_watch_find_stream(w, w->links[i].out_node_id);
+        if (s && s->state == PW_NODE_STATE_RUNNING)
+            running++;
+    }
+    atomic_store(&w->running_count, running);
+}
+
+static void
+on_watched_stream_info(void *data, const struct pw_node_info *info)
+{
+    struct watched_stream *s = data;
+    if (!info) return;
+    s->state = info->state;
+    sink_watch_recount(s->watch);
+}
+
+static const struct pw_node_events watched_stream_events = {
+    PW_VERSION_NODE_EVENTS,
+    .info = on_watched_stream_info,
+};
+
+static void
+sink_watch_add_stream(struct pw_sink_watch *w, uint32_t id, uint32_t version)
+{
+    if (sink_watch_find_stream(w, id))
+        return;
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        struct watched_stream *s = &w->streams[i];
+        if (s->used)
+            continue;
+        struct pw_proxy *proxy = pw_registry_bind(w->registry, id,
+                                                  PW_TYPE_INTERFACE_Node, version, 0);
+        if (!proxy)
+            return;
+        s->used = 1;
+        s->node_id = id;
+        s->proxy = proxy;
+        s->watch = w;
+        s->state = PW_NODE_STATE_CREATING;
+        spa_zero(s->listener);
+        pw_node_add_listener((struct pw_node *)proxy, &s->listener,
+                             &watched_stream_events, s);
+        return;
+    }
+}
+
+static void
+sink_watch_add_link(struct pw_sink_watch *w, uint32_t link_id, uint32_t out_node_id)
+{
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        if (w->links[i].used && w->links[i].link_id == link_id)
+            return;
+    }
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        if (w->links[i].used)
+            continue;
+        w->links[i].used = 1;
+        w->links[i].link_id = link_id;
+        w->links[i].out_node_id = out_node_id;
+        sink_watch_recount(w);
+        return;
+    }
+}
+
+static void
+on_sink_watch_global(void *data, uint32_t id, uint32_t permissions,
+                     const char *type, uint32_t version,
+                     const struct spa_dict *props)
+{
+    struct pw_sink_watch *w = data;
+    (void)permissions;
+
+    if (!props)
+        return;
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) == 0) {
+        const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+        const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+
+        if (media_class && name &&
+            strcmp(media_class, "Audio/Sink") == 0 &&
+            strcmp(name, w->sink_name) == 0) {
+            w->sink_id = id;
+            return;
+        }
+        if (media_class && strcmp(media_class, "Stream/Output/Audio") == 0)
+            sink_watch_add_stream(w, id, version);
+        return;
+    }
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Link) == 0) {
+        const char *in_node = spa_dict_lookup(props, PW_KEY_LINK_INPUT_NODE);
+        const char *out_node = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_NODE);
+        if (!in_node || !out_node || w->sink_id == 0)
+            return;
+        if ((uint32_t)atoi(in_node) != w->sink_id)
+            return;
+        sink_watch_add_link(w, id, (uint32_t)atoi(out_node));
+    }
+}
+
+static void
+on_sink_watch_global_remove(void *data, uint32_t id)
+{
+    struct pw_sink_watch *w = data;
+    int changed = 0;
+
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        if (w->links[i].used && w->links[i].link_id == id) {
+            w->links[i].used = 0;
+            changed = 1;
+        }
+    }
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        struct watched_stream *s = &w->streams[i];
+        if (s->used && s->node_id == id) {
+            spa_hook_remove(&s->listener);
+            pw_proxy_destroy(s->proxy);
+            s->used = 0;
+            s->proxy = NULL;
+            changed = 1;
+        }
+    }
+    if (w->sink_id == id)
+        w->sink_id = 0;
+
+    if (changed)
+        sink_watch_recount(w);
+}
+
+struct pw_sink_watch *
+pw_sink_watch_create(const char *sink_name)
+{
+    if (!sink_name || !sink_name[0])
+        return NULL;
+
+    pw_init(NULL, NULL);
+
+    struct pw_sink_watch *w = calloc(1, sizeof(*w));
+    if (!w) return NULL;
+    snprintf(w->sink_name, sizeof(w->sink_name), "%s", sink_name);
+
+    w->thread_loop = pw_thread_loop_new("capsper-sinkwatch", NULL);
+    if (!w->thread_loop) { free(w); return NULL; }
+
+    w->context = pw_context_new(pw_thread_loop_get_loop(w->thread_loop), NULL, 0);
+    if (!w->context) {
+        pw_thread_loop_destroy(w->thread_loop);
+        free(w); return NULL;
+    }
+
+    pw_thread_loop_lock(w->thread_loop);
+
+    if (pw_thread_loop_start(w->thread_loop) < 0) {
+        pw_thread_loop_unlock(w->thread_loop);
+        pw_context_destroy(w->context);
+        pw_thread_loop_destroy(w->thread_loop);
+        free(w); return NULL;
+    }
+
+    w->core = pw_context_connect(w->context, NULL, 0);
+    if (!w->core) {
+        pw_thread_loop_unlock(w->thread_loop);
+        pw_thread_loop_stop(w->thread_loop);
+        pw_context_destroy(w->context);
+        pw_thread_loop_destroy(w->thread_loop);
+        free(w); return NULL;
+    }
+
+    w->registry = pw_core_get_registry(w->core, PW_VERSION_REGISTRY, 0);
+    if (!w->registry) {
+        pw_core_disconnect(w->core);
+        pw_thread_loop_unlock(w->thread_loop);
+        pw_thread_loop_stop(w->thread_loop);
+        pw_context_destroy(w->context);
+        pw_thread_loop_destroy(w->thread_loop);
+        free(w); return NULL;
+    }
+
+    static const struct pw_registry_events reg_events = {
+        PW_VERSION_REGISTRY_EVENTS,
+        .global = on_sink_watch_global,
+        .global_remove = on_sink_watch_global_remove,
+    };
+    spa_zero(w->registry_listener);
+    pw_registry_add_listener(w->registry, &w->registry_listener, &reg_events, w);
+
+    pw_thread_loop_unlock(w->thread_loop);
+    return w;
+}
+
+void
+pw_sink_watch_destroy(struct pw_sink_watch *w)
+{
+    if (!w) return;
+
+    pw_thread_loop_lock(w->thread_loop);
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
+        if (w->streams[i].used) {
+            spa_hook_remove(&w->streams[i].listener);
+            pw_proxy_destroy(w->streams[i].proxy);
+            w->streams[i].used = 0;
+        }
+    }
+    pw_core_disconnect(w->core);
+    pw_thread_loop_unlock(w->thread_loop);
+
+    pw_thread_loop_stop(w->thread_loop);
+    pw_context_destroy(w->context);
+    pw_thread_loop_destroy(w->thread_loop);
+    free(w);
+}
+
+/* Applications currently playing into the sink. Safe to call from any thread. */
+uint32_t
+pw_sink_watch_active_streams(struct pw_sink_watch *w)
+{
+    return w ? atomic_load(&w->running_count) : 0;
+}

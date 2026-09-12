@@ -19,3 +19,21 @@ pub const VirtualSink = struct {
         _ = self;
     }
 };
+
+/// Unimplemented alongside `VirtualSink`: with no sink to watch there is
+/// nothing for gate 1 to read.
+pub const SinkWatch = struct {
+    pub fn init(sink_name: [:0]const u8) !SinkWatch {
+        _ = sink_name;
+        return error.VirtualSinkUnsupported;
+    }
+
+    pub fn deinit(self: *SinkWatch) void {
+        _ = self;
+    }
+
+    pub fn activeStreams(self: *const SinkWatch) u32 {
+        _ = self;
+        return 0;
+    }
+};

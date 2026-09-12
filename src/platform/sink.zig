@@ -5,3 +5,4 @@ else
     @import("linux/sink.zig");
 
 pub const VirtualSink = impl.VirtualSink;
+pub const SinkWatch = impl.SinkWatch;

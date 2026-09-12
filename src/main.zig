@@ -18,7 +18,10 @@ const utils = @import("shared/utils.zig");
 const audio_detect = @import("platform/detect.zig");
 const Recorder = @import("shared/recorder.zig").Recorder;
 const config = @import("shared/config.zig");
-const VirtualSink = @import("platform/sink.zig").VirtualSink;
+const sink_mod = @import("platform/sink.zig");
+const VirtualSink = sink_mod.VirtualSink;
+const SinkWatch = sink_mod.SinkWatch;
+const meeting = @import("shared/meeting.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
@@ -390,13 +393,42 @@ pub fn main() !void {
     });
     try server.run();
 
-    // The sink lives only as long as this process, so with nothing else
-    // enabled there has to be something to wait on. There is nothing to wait
-    // *for* yet -- arming on the graph and capturing the two tracks are the
-    // next phase -- so for now it simply holds the sink open.
+    // With nothing else enabled, the meeting loop is the thing that keeps the
+    // process (and so the sink) alive.
     if (want_meeting and !want_local and !want_tcp) {
-        std.debug.print("Meeting sink '{s}' is up; select it as your output. Nothing else to do yet.\n", .{cfg.meeting.sink_name});
-        while (true) std.Thread.sleep(std.time.ns_per_s);
+        try runMeetingLoop(&cfg);
+    }
+}
+
+/// Poll gate 1 and report sessions opening and closing.
+///
+/// One second is a long interval for an event loop and the right one here: the
+/// thing being waited for is a meeting, the debounce is measured in tens of
+/// seconds, and a graph watcher that wakes up constantly to learn nothing is
+/// exactly the cost this design set out to avoid.
+fn runMeetingLoop(cfg: *const config.Config) !void {
+    var watch = SinkWatch.init(cfg.meeting.sink_name) catch |err| {
+        std.debug.print("Failed to watch sink '{s}': {}\n", .{ cfg.meeting.sink_name, err });
+        return;
+    };
+    defer watch.deinit();
+
+    var gate = meeting.ArmGate.init(cfg.meeting.idle_close_seconds);
+
+    std.debug.print("Meeting sink '{s}' is up; select it as your output.\n", .{cfg.meeting.sink_name});
+
+    while (true) {
+        const now: u64 = @intCast(std.time.nanoTimestamp());
+        switch (gate.update(watch.activeStreams(), now)) {
+            .none => {},
+            .opened => {
+                var buf: [64]u8 = undefined;
+                const path = meeting.sessionPath(&buf, std.time.timestamp()) catch "?";
+                std.debug.print("[meeting] session opened: {s}\n", .{path});
+            },
+            .closed => std.debug.print("[meeting] session closed\n", .{}),
+        }
+        std.Thread.sleep(std.time.ns_per_s);
     }
 }
 

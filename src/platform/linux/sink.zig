@@ -36,3 +36,28 @@ pub const VirtualSink = struct {
         pw.pw_virtual_sink_destroy(self.handle);
     }
 };
+
+/// Watches how many applications are currently playing into the sink.
+///
+/// This is gate 1: the user selecting the sink in a meeting app is the signal
+/// that a call is happening, and the graph reports it without capsper having
+/// to guess from calendars or window titles. Only `running` streams count, so
+/// a paused call reads as zero -- the debounce that stops a brief mute ending
+/// a session lives in `shared/meeting.zig`.
+pub const SinkWatch = struct {
+    handle: *pw.pw_sink_watch,
+
+    pub fn init(sink_name: [:0]const u8) !SinkWatch {
+        const handle = pw.pw_sink_watch_create(sink_name.ptr) orelse
+            return error.SinkWatchFailed;
+        return .{ .handle = handle };
+    }
+
+    pub fn deinit(self: *SinkWatch) void {
+        pw.pw_sink_watch_destroy(self.handle);
+    }
+
+    pub fn activeStreams(self: *const SinkWatch) u32 {
+        return pw.pw_sink_watch_active_streams(self.handle);
+    }
+};
