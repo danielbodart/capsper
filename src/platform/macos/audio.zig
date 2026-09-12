@@ -53,8 +53,17 @@ pub const AudioCapture = struct {
     /// Default channel: 0 = first/mono channel on macOS (zero-indexed).
     pub const default_channel: u32 = 0;
 
-    pub fn init(target: ?[:0]const u8, _channel_position: u32) !AudioCapture {
-        _ = _channel_position; // Channel selection deferred — mono only for now
+    pub const Options = struct {
+        target: ?[:0]const u8 = null,
+        channel: u32 = default_channel,
+        /// Never set here: macOS has no virtual sink to monitor. Present so
+        /// the two platforms take the same options.
+        capture_sink: bool = false,
+    };
+
+    pub fn init(opts: Options) !AudioCapture {
+        const target = opts.target;
+        _ = opts.channel; // Channel selection deferred — mono only for now
 
         // Request microphone permission once via AVFoundation before CoreAudio
         // touches the mic. Without this, coreaudiod fires multiple parallel

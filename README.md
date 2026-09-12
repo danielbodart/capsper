@@ -292,7 +292,9 @@ is the audio path.
 .{
     .meeting = .{
         .enabled = true,
-        .sink_name = "capsper_call",
+        .sink_name = "capsper_call",                  // name in the output picker
+        .dir = "~/.local/share/capsper/sessions",
+        .idle_close_seconds = 30,
     },
 }
 ```
@@ -305,11 +307,25 @@ sink's monitor.
 
 A dedicated sink rather than the default output's monitor, because selecting
 it *is* the declaration of intent: nothing else is ever in it, so there is no
-music or notification audio to filter out afterwards. The sink exists only
-while capsper runs, and sits suspended until an application plays into it.
+music or notification audio to filter out afterwards. That selection is also
+the arm signal. An application playing into the sink starts a session, and a
+session ends once nothing has played into it for `idle_close_seconds` — long
+enough that a mute or a screen-share renegotiation does not split one meeting
+into two files.
 
-Not yet built: arming on the call starting and stopping, capturing the near
-end alongside it, the transcript, and the session files. See
+Each session writes one file:
+
+```
+~/.local/share/capsper/sessions/2026/09/11/T143000Z/audio.wav
+```
+
+The path is a single ISO 8601 timestamp split across directories, in UTC. One
+stereo file rather than two mono ones, with the microphone on the left and the
+call on the right. Channel separation loses nothing — `ffmpeg` splits them
+apart again in one invocation — and what it buys is a single timeline, so the
+two sides cannot drift apart from each other.
+
+Not yet built: the transcript, the generated player, and Opus. See
 `docs/meeting-capture-plan.md`. macOS is not supported, because a program
 cannot create a virtual output device for itself there.
 

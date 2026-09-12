@@ -130,3 +130,6 @@ pub const pw_sink_watch = opaque {};
 pub extern fn pw_sink_watch_create(sink_name: [*:0]const u8) ?*pw_sink_watch;
 pub extern fn pw_sink_watch_destroy(w: *pw_sink_watch) void;
 pub extern fn pw_sink_watch_active_streams(w: *pw_sink_watch) u32;
+
+// Capture stream properties (variadic pw_properties_new lives in C)
+pub extern fn pw_build_capture_props(target: ?[*:0]const u8, capture_sink: c_int) ?*pw.struct_pw_properties;

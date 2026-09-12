@@ -885,3 +885,32 @@ pw_sink_watch_active_streams(struct pw_sink_watch *w)
 {
     return w ? atomic_load(&w->running_count) : 0;
 }
+
+/* Build the properties for a capture stream.
+
+   In C because `pw_properties_new` is variadic and the set of pairs varies:
+   a target may or may not be given, and capturing a *sink* needs one more
+   property than capturing a source.
+
+   `stream.capture.sink` is the one that is easy to get wrong. Without it, a
+   stream targeting a sink by name does not fail -- it falls back to the
+   default source and records the microphone, so the far-end track quietly
+   becomes a second copy of the near end. */
+struct pw_properties *
+pw_build_capture_props(const char *target, int capture_sink)
+{
+    struct pw_properties *props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE,     "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Capture",
+        PW_KEY_MEDIA_ROLE,     "Communication",
+        NULL);
+    if (!props)
+        return NULL;
+
+    if (target && target[0])
+        pw_properties_set(props, PW_KEY_TARGET_OBJECT, target);
+    if (capture_sink)
+        pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
+
+    return props;
+}

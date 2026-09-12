@@ -55,7 +55,20 @@ pub const AudioCapture = struct {
         .trigger_done = null,
     };
 
-    pub fn init(target: ?[:0]const u8, channel_position: u32) !AudioCapture {
+    pub const Options = struct {
+        /// Node to capture from. Null follows the desktop's default input.
+        target: ?[:0]const u8 = null,
+        channel: u32 = default_channel,
+        /// Capture the target's *monitor* rather than the target itself.
+        /// Required when the target is a sink, and quietly essential: without
+        /// it the stream falls back to the default source and records the
+        /// microphone instead. See `sink.zig`.
+        capture_sink: bool = false,
+    };
+
+    pub fn init(opts: Options) !AudioCapture {
+        const target = opts.target;
+        const channel_position = opts.channel;
         // Create pipe for passing PCM from PipeWire thread to main thread
         const pipe_fds = try posix.pipe();
         errdefer {
@@ -80,22 +93,12 @@ pub const AudioCapture = struct {
 
         const loop = pw.pw_thread_loop_get_loop(thread_loop);
 
-        // Build stream properties
-        const props = if (target) |t|
-            pw.pw_properties_new(
-                pw.PW_KEY_MEDIA_TYPE,     "Audio",
-                pw.PW_KEY_MEDIA_CATEGORY, "Capture",
-                pw.PW_KEY_MEDIA_ROLE,     "Communication",
-                pw.PW_KEY_TARGET_OBJECT,  t.ptr,
-                @as(?[*]const u8, null),
-            )
-        else
-            pw.pw_properties_new(
-                pw.PW_KEY_MEDIA_TYPE,     "Audio",
-                pw.PW_KEY_MEDIA_CATEGORY, "Capture",
-                pw.PW_KEY_MEDIA_ROLE,     "Communication",
-                @as(?[*]const u8, null),
-            );
+        // Built in C: pw_properties_new is variadic, and the pairs vary with
+        // whether a target was given and whether it is a sink.
+        const props = pw.pw_build_capture_props(
+            if (target) |t| t.ptr else null,
+            @intFromBool(opts.capture_sink),
+        );
 
         if (props == null) {
             log.err("Failed to create PipeWire properties", .{});
@@ -126,9 +129,12 @@ pub const AudioCapture = struct {
             return error.PipeWireInitFailed;
         }
 
-        // Create device monitor for hotplug detection when a target is specified
-        const monitor: ?*pw.pw_device_monitor = if (target) |t|
-            pw.pw_device_monitor_create(t.ptr)
+        // Hotplug detection, for a named source device that can be unplugged.
+        // Not for a sink monitor: capsper created that sink itself, so it goes
+        // away only when capsper does, and the monitor looks for Audio/Source
+        // nodes anyway.
+        const monitor: ?*pw.pw_device_monitor = if (target != null and !opts.capture_sink)
+            pw.pw_device_monitor_create(target.?.ptr)
         else
             null;
 

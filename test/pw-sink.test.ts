@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { $, spawn } from "bun";
-import { writeFileSync, readFileSync, unlinkSync } from "fs";
+import { writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync, readdirSync, statSync } from "fs";
+import { join } from "path";
 import { BINARY, ensureBinary, tmpFile, trackProc, waitForLog } from "./helpers";
 
 const isLinux = process.platform === "linux";
@@ -62,6 +63,32 @@ async function peakDb(path: string): Promise<number> {
 }
 
 /**
+ * Mean dBFS of one channel of a stereo file, narrowed to a band around `hz`.
+ *
+ * Narrowed because the comparison that matters is "is this particular tone
+ * here?", and a broadband level would be dominated by whatever else the
+ * microphone picked up.
+ */
+async function bandDb(path: string, channel: 0 | 1, hz: number): Promise<number> {
+    const pan = channel === 0 ? "pan=mono|c0=c0" : "pan=mono|c0=c1";
+    const { stderr } = await $`ffmpeg -i ${path} -af ${`${pan},bandpass=f=${hz}:width_type=h:w=40,volumedetect`} -f null - `
+        .quiet()
+        .nothrow();
+    const match = stderr.toString().match(/mean_volume:\s*(-?[\d.]+) dB/);
+    return match ? parseFloat(match[1]) : -Infinity;
+}
+
+/** Every session audio file under a sessions root, oldest path first. */
+function walkWavs(dir: string, found: string[] = []): string[] {
+    for (const entry of readdirSync(dir)) {
+        const path = join(dir, entry);
+        if (statSync(path).isDirectory()) walkWavs(path, found);
+        else if (entry.endsWith(".wav")) found.push(path);
+    }
+    return found;
+}
+
+/**
  * Record the sink's monitor, optionally playing a file into the sink partway
  * through, and return the peak level of what the monitor carried.
  *
@@ -100,6 +127,7 @@ describe.skipIf(!isLinux)("virtual sink", () => {
     let configFile = "";
     let toneFile = "";
     let logFile = "";
+    let sessionsDir = "";
     let server: ReturnType<typeof spawn> | undefined;
     let objects: any[] = [];
 
@@ -107,12 +135,17 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         ensureBinary();
 
         configFile = tmpFile("capsper-sink-config", ".zon");
+        // A sessions directory of its own, so a test run never writes into the
+        // recordings a real install is keeping.
+        sessionsDir = tmpFile("capsper-sessions", "");
+        mkdirSync(sessionsDir, { recursive: true });
         // A three-second idle window rather than the thirty a real meeting
         // wants: the debounce arithmetic is unit-tested in meeting.zig, so
         // what this has to show is that the graph drives it at all.
         writeFileSync(
             configFile,
-            `.{ .meeting = .{ .enabled = true, .sink_name = "${SINK}", .idle_close_seconds = 3 } }\n`,
+            `.{ .meeting = .{ .enabled = true, .sink_name = "${SINK}",` +
+                ` .idle_close_seconds = 3, .dir = "${sessionsDir}" } }\n`,
         );
 
         // Quiet enough not to be alarming if the machine's speakers are live:
@@ -141,10 +174,13 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         for (const path of [configFile, toneFile]) {
             try { unlinkSync(path); } catch {}
         }
+        try { rmSync(sessionsDir, { recursive: true, force: true }); } catch {}
     });
 
     const count = (needle: string) =>
         readFileSync(logFile, "utf8").split(needle).length - 1;
+
+    const sessionFiles = () => walkWavs(sessionsDir).sort();
 
     /** Wait until no session is open, so a count-based assertion starts level. */
     async function settle(): Promise<void> {
@@ -228,6 +264,62 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         const opened = readFileSync(logFile, "utf8").match(/session opened: (\S+)/);
         expect(opened).not.toBeNull();
         expect(opened![1]).toMatch(/^\d{4}\/\d{2}\/\d{2}\/T\d{6}Z$/);
+    }, 60_000);
+
+    test("writes one stereo session file into a dated directory", async () => {
+        const files = sessionFiles();
+        expect(files.length).toBeGreaterThan(0);
+
+        // `YYYY/MM/DD/THHMMSSZ/audio.wav` relative to the sessions root: one
+        // ISO timestamp split across directories, so it sorts at every level.
+        const relative = files[0].slice(sessionsDir.length + 1);
+        expect(relative).toMatch(/^\d{4}\/\d{2}\/\d{2}\/T\d{6}Z\/audio\.wav$/);
+
+        const probe = await $`ffprobe -v error -show_entries stream=channels,sample_rate -of default=noprint_wrappers=1 ${files[0]}`
+            .quiet()
+            .nothrow();
+        expect(probe.stdout.toString()).toContain("channels=2");
+        expect(probe.stdout.toString()).toContain("sample_rate=16000");
+    });
+
+    test("puts the call on the right channel and the microphone on the left", async () => {
+        // The failure this is really guarding against is the far track being a
+        // second copy of the near one, which is what happens if the capture
+        // stream misses `stream.capture.sink` and silently falls back to the
+        // default source. Both channels would carry audio and look fine.
+        //
+        // So it is measured in the tone's own narrow band rather than overall:
+        // the tone was played into the sink and exists nowhere else, so it has
+        // to be much stronger on the right than on the left.
+        await settle();
+        const before = sessionFiles().length;
+
+        const loud = tmpFile("capsper-sink-loud", ".wav");
+        await $`ffmpeg -y -f lavfi -i sine=frequency=880:duration=3:sample_rate=48000 -af volume=-20dB -ac 2 ${loud}`
+            .quiet()
+            .nothrow();
+
+        const play = spawn(["pw-play", "--target", SINK, loud], {
+            stdout: "ignore",
+            stderr: "ignore",
+        });
+        trackProc(play);
+        await play.exited;
+        await Bun.sleep(5000); // let the idle window close the session
+
+        const files = sessionFiles();
+        expect(files.length).toBe(before + 1);
+        const audio = files[files.length - 1];
+
+        const left = await bandDb(audio, 0, 880);
+        const right = await bandDb(audio, 1, 880);
+        console.error(`  880Hz band — left: ${left} dBFS, right: ${right} dBFS`);
+
+        // The tone is on the right. A far track that was secretly the
+        // microphone would put these within a few dB of each other.
+        expect(right).toBeGreaterThan(left + 10);
+
+        try { unlinkSync(loud); } catch {}
     }, 60_000);
 
     test("is gone once capsper exits", async () => {

@@ -153,26 +153,44 @@ pub fn rmsToDb(rms: f64) f64 {
 /// Write a RIFF/WAVE file (16kHz mono S16_LE PCM).
 /// Inverse of parseWavHeader(). Takes any writer for testability.
 pub fn writeWav(writer: anytype, pcm_bytes: []const u8) !void {
-    const data_size: u32 = @intCast(pcm_bytes.len);
-    const file_size: u32 = 36 + data_size;
-    // RIFF header
-    try writer.writeAll("RIFF");
-    try writer.writeInt(u32, file_size, .little);
-    try writer.writeAll("WAVE");
-    // fmt chunk (16kHz, mono, 16-bit PCM)
-    try writer.writeAll("fmt ");
-    try writer.writeInt(u32, 16, .little);
-    try writer.writeInt(u16, 1, .little);
-    try writer.writeInt(u16, 1, .little);
-    try writer.writeInt(u32, 16000, .little);
-    try writer.writeInt(u32, 32000, .little);
-    try writer.writeInt(u16, 2, .little);
-    try writer.writeInt(u16, 16, .little);
-    // data chunk
-    try writer.writeAll("data");
-    try writer.writeInt(u32, data_size, .little);
+    return writeWavChannels(writer, pcm_bytes, 1);
+}
+
+/// Write a 16 kHz 16-bit PCM WAV with the given channel count. Meeting
+/// sessions are stereo -- near end left, far end right -- and everything else
+/// is mono.
+pub fn writeWavChannels(writer: anytype, pcm_bytes: []const u8, channels: u16) !void {
+    try writeWavHeader(writer, @intCast(pcm_bytes.len), channels);
     try writer.writeAll(pcm_bytes);
 }
+
+/// Just the 44-byte header, for a file written as it is captured rather than
+/// all at once. A session's length is not known when it starts, so the header
+/// goes down with a placeholder size and is rewritten on close.
+pub fn writeWavHeader(writer: anytype, data_size: u32, channels: u16) !void {
+    const block_align: u16 = channels * 2;
+    const byte_rate: u32 = 16000 * @as(u32, block_align);
+
+    try writer.writeAll("RIFF");
+    try writer.writeInt(u32, 36 +| data_size, .little);
+    try writer.writeAll("WAVE");
+
+    try writer.writeAll("fmt ");
+    try writer.writeInt(u32, 16, .little);
+    try writer.writeInt(u16, 1, .little); // PCM
+    try writer.writeInt(u16, channels, .little);
+    try writer.writeInt(u32, 16000, .little);
+    try writer.writeInt(u32, byte_rate, .little);
+    try writer.writeInt(u16, block_align, .little);
+    try writer.writeInt(u16, 16, .little); // bits per sample
+
+    try writer.writeAll("data");
+    try writer.writeInt(u32, data_size, .little);
+}
+
+/// The size of the header `writeWavHeader` produces, and so where the audio
+/// starts in a file it wrote.
+pub const wav_header_bytes: u64 = 44;
 
 // ============================================================
 // Tests

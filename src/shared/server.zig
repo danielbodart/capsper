@@ -345,7 +345,7 @@ pub const Server = struct {
     fn runLocalCapture(self: *Server) !void {
         std.debug.print("Starting local audio capture...\n", .{});
 
-        var capture = AudioCapture.init(self.cfg.audio.target, self.audio_channel) catch |err| {
+        var capture = AudioCapture.init(.{ .target = self.cfg.audio.target, .channel = self.audio_channel }) catch |err| {
             std.debug.print("Failed to start audio capture: {}\n", .{err});
             return err;
         };
