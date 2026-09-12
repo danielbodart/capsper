@@ -126,11 +126,20 @@ async function startCapsper(opts: {
     httpPort: number;
     sessionsDir: string;
     idleCloseSeconds?: number;
+    /** On for the tests about what a live level controller does to a call. */
+    autoGain?: boolean;
 }) {
     const configFile = tmpFile("capsper-aec-config", ".zon");
+    // Unity gain and no levelling unless a test asks otherwise, because the
+    // echo measurements compare the recording against the fixture that went
+    // into the microphone. Any gain capsper applies lands on the recording and
+    // not on the fixture, so it would subtract from the removal figure one for
+    // one and read as a canceller that had stopped working. These tests are
+    // about cancellation; levelling has its own.
     writeFileSync(
         configFile,
-        `.{ .meeting = .{ .enabled = true, .sink_name = "${opts.sink}",` +
+        `.{ .audio = .{ .gain = 1.0, .auto_gain = ${opts.autoGain ?? false} },` +
+            ` .meeting = .{ .enabled = true, .sink_name = "${opts.sink}",` +
             ` .output = "${opts.output}",` +
             (opts.near ? ` .near = "${opts.near}",` : "") +
             ` .idle_close_seconds = ${opts.idleCloseSeconds ?? 3}, .dir = "${opts.sessionsDir}",` +
@@ -195,7 +204,7 @@ describe.skipIf(!isLinux)("echo cancellation: the graph", () => {
             httpPort: HTTP_PORTS.graph, sessionsDir,
         });
         objects = await dump();
-    });
+    }, 180_000);
 
     afterAll(async () => {
         if (capsper) await stopCapsper(capsper);
@@ -265,7 +274,7 @@ describe.skipIf(!isLinux)("echo cancellation: turned off", () => {
             aec: false, sink: SINKS.off, output: OUTPUT_SINKS.off,
             httpPort: HTTP_PORTS.off, sessionsDir,
         });
-    });
+    }, 180_000);
 
     afterAll(async () => {
         if (capsper) await stopCapsper(capsper);

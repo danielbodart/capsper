@@ -362,7 +362,7 @@ pub const Server = struct {
 
         // Apply calibrated initial gain (from --pw-gain) before first audio arrives
         if (self.cfg.audio.gain > 1.01) {
-            capture.setGain(self.cfg.audio.gain);
+            _ = capture.setGain(self.cfg.audio.gain);
             std.debug.print("Auto-gain starting at {d:.1}x\n", .{self.cfg.audio.gain});
         }
 
@@ -468,7 +468,7 @@ pub const Server = struct {
                     if (self.cfg.audio.auto_gain) {
                         if (capture) |cap| {
                             if (auto_gain.update(rms)) |new_gain| {
-                                cap.setGain(new_gain);
+                                _ = cap.setGain(new_gain);
                                 if (self.cfg.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
                             }
                         }

@@ -25,6 +25,7 @@ const sink_mod = @import("../platform/sink.zig");
 const SinkWatch = sink_mod.SinkWatch;
 const EchoCanceller = sink_mod.EchoCanceller;
 const vad_backend = @import("../backend/vad.zig");
+const AutoGain = @import("auto_gain.zig").AutoGain;
 
 const log = std.log.scoped(.meeting);
 
@@ -214,6 +215,18 @@ const TrackAsr = struct {
     /// -- everything still works, it just costs more.
     vad: ?*vad_backend.Vad,
 
+    /// The level of the last chunk the gate accepted as speech, for whatever
+    /// wants to level this track. Null when the last chunk was not speech.
+    ///
+    /// A level controller must only ever see speech. Fed silence it decides
+    /// the track is too quiet and winds the gain up, and on a meeting that
+    /// means winding up the room tone between sentences and, with an echo
+    /// canceller in front, the residual it just removed. Measured: feeding it
+    /// every chunk lifted the echo left on the near track from -34.8 dBFS to
+    /// -21.1. Dictation avoids this by only adapting while the key is held,
+    /// which is the same rule expressed by the only gate a meeting has.
+    speech_rms: ?f64 = null,
+
     /// Audio that has reached this track, counted on arrival -- ahead of the
     /// encoder, and ahead of anything that might one day elide audio before
     /// it. Today everything received is fed through, so this and the encoder's
@@ -296,6 +309,10 @@ const TrackAsr = struct {
         // chunk, because the encoder is fed whole chunks.
         const wanted = if (self.vad) |v| v.shouldEncode(pcm) else true;
 
+        // The same answer drives the level controller, so it adapts to speech
+        // and to nothing else. See `speech_rms`.
+        self.speech_rms = if (wanted) rms else null;
+
         // Digital zero is never speech, so it is not worth an encoder pass.
         // Skipping it is the same rule `ChunkedReader` applies to every other
         // transport, so the encoder sees what the regression corpus has always
@@ -363,6 +380,14 @@ const Session = struct {
     transcript: Transcript,
     near_asr: TrackAsr,
     far_asr: TrackAsr,
+
+    /// Levelling for the near track, or null when auto-gain is switched off.
+    ///
+    /// Near only. The far end arrives from the call already levelled by
+    /// whatever the other side is running, and a second controller on top of
+    /// theirs would be two loops chasing the same signal.
+    near_gain: ?AutoGain,
+
     pending: std.ArrayListUnmanaged(u8) = .{},
     read_buf: [8192]u8 = undefined,
 
@@ -429,6 +454,17 @@ const Session = struct {
             .channel = audio_channel,
         });
         errdefer near.deinit();
+        // The same starting gain dictation uses, because it is the same
+        // microphone in the same room and `--audio-detect` measured it there.
+        //
+        // Without this the near track is captured at unity while dictation
+        // runs at whatever was calibrated, so a meeting comes back far quieter
+        // than the same voice dictating -- measured at -57 dB mean and -23 dB
+        // peak against a -15 dB target, which is the whole of the configured
+        // 10x that was never being applied.
+        if (cfg.audio.gain > 1.01) {
+            if (cfg.meetingNear()) |src| _ = AudioCapture.setSourceVolume(src, cfg.audio.gain);
+        }
         near.setActive(true);
 
         // The far end is the sink's monitor. `capture_sink` is what makes that
@@ -462,6 +498,15 @@ const Session = struct {
             .transcript = transcript,
             .near_asr = near_asr,
             .far_asr = far_asr,
+            // Runs whether or not the echo canceller does. It lifts the
+            // residual along with the speech, so it cannot improve the ratio
+            // between them, but a meeting recorded too quietly to hear is the
+            // problem actually worth solving and the canceller's own tests
+            // pin this off so they measure cancellation rather than levelling.
+            .near_gain = if (cfg.audio.auto_gain)
+                AutoGain{ .current_gain = cfg.audio.gain }
+            else
+                null,
         };
     }
 
@@ -500,6 +545,23 @@ const Session = struct {
         asr.feed(gpa, pcm, &self.transcript.doc) catch |err| {
             log.warn("transcription failed on the {s} track: {}", .{ @tagName(track), err });
         };
+
+        // Levelling, after transcription rather than before it, because the
+        // voice activity gate is what says whether this was speech and the
+        // controller must see nothing else. A new gain takes effect on the
+        // audio that follows, which is what a level controller always does.
+        if (track == .near) {
+            if (self.near_gain) |*g| {
+                if (self.near_asr.speech_rms) |rms| {
+                    if (g.update(rms)) |new_gain| _ = self.near.setGain(new_gain);
+                    self.near_asr.speech_rms = null;
+                }
+            }
+        }
+
+        // Put whatever that completed on disk, so the session being recorded
+        // reads back as it happens rather than only once it has closed.
+        self.transcript.saveIfChanged();
     }
 
     fn close(self: *Session, gpa: std.mem.Allocator) void {
@@ -533,14 +595,24 @@ const Session = struct {
 
 /// The session's `transcript.vtt`.
 ///
-/// Collected in memory and written when the session closes, because cues from
-/// the two tracks have to be merged by audio position before anything is
-/// written -- a cue completes when its own track goes quiet, so they finish
-/// out of order. An hour of transcript is tens of kilobytes, nothing beside
-/// the audio it accompanies.
+/// Held in memory and rewritten whole every time a cue completes, so a meeting
+/// in progress can be read while it is still running rather than only once it
+/// has ended.
+///
+/// Whole rather than appended, because cues from the two tracks have to be
+/// merged by audio position: a cue completes when its own track goes quiet, so
+/// they finish out of order and a far cue can belong above a near cue already
+/// on disk. Rendering the lot costs nothing at these sizes -- an hour of
+/// transcript is tens of kilobytes, against hundreds of megabytes of audio
+/// beside it -- and it is the only version that is always correct.
 const Transcript = struct {
     doc: webvtt.Transcript,
     dir: std.fs.Dir,
+
+    /// How many cues the file on disk holds. An audio chunk that completed no
+    /// cue changes nothing, and most do not, so this is what keeps the
+    /// rewrite to once per cue rather than once per chunk.
+    written_cues: usize = 0,
 
     /// So a recording found in two years says which side is which without
     /// needing this repository to explain it.
@@ -566,16 +638,63 @@ const Transcript = struct {
         };
     }
 
+    /// Rewrite the file if a cue has completed since the last time.
+    ///
+    /// Called after every audio chunk, which is why the cheap check comes
+    /// first: transcribing a chunk usually extends the cue being built rather
+    /// than finishing one, and a render and a write per chunk would be
+    /// hundreds of times the work for the same bytes.
+    fn saveIfChanged(self: *Transcript) void {
+        if (self.doc.cues.items.len == self.written_cues) return;
+        self.save();
+    }
+
+    /// Render the whole transcript and put it in place atomically.
+    ///
+    /// Written to a temporary name and renamed, because the session server may
+    /// be serving this file to a browser at any moment and a reader that
+    /// arrives mid-write would get a truncated transcript. `rename` within a
+    /// directory is atomic, so a reader sees either the previous version or
+    /// the new one.
+    ///
+    /// The temporary name starts with a dot rather than with `audio.`, which
+    /// is not cosmetic: the session server finds sessions by looking for a
+    /// file called `audio.something`, and a stray `audio.vtt.tmp` would be
+    /// collected as if it were a recording.
+    fn save(self: *Transcript) void {
+        const tmp = ".audio.vtt.tmp";
+        const header_notes = [_][]const u8{ "capsper meeting transcript", self.channels_note };
+
+        const bytes = self.doc.render(&header_notes) catch |err| {
+            log.err("could not render the transcript: {}", .{err});
+            return;
+        };
+        defer self.doc.gpa.free(bytes);
+
+        if (self.dir.createFile(tmp, .{})) |file| {
+            defer file.close();
+            file.writeAll(bytes) catch |err| {
+                log.err("could not write the transcript: {}", .{err});
+                return;
+            };
+        } else |err| {
+            log.err("could not create the transcript: {}", .{err});
+            return;
+        }
+
+        self.dir.rename(tmp, "audio.vtt") catch |err| {
+            log.err("could not put audio.vtt in place: {}", .{err});
+            return;
+        };
+        self.written_cues = self.doc.cues.items.len;
+    }
+
     fn finish(self: *Transcript) void {
         defer self.doc.gpa.free(self.channels_note);
-        const header_notes = [_][]const u8{ "capsper meeting transcript", self.channels_note };
-        if (self.doc.render(&header_notes)) |bytes| {
-            defer self.doc.gpa.free(bytes);
-            if (self.dir.createFile("audio.vtt", .{})) |file| {
-                defer file.close();
-                file.writeAll(bytes) catch |err| log.err("could not write audio.vtt: {}", .{err});
-            } else |err| log.err("could not create audio.vtt: {}", .{err});
-        } else |err| log.err("could not render the transcript: {}", .{err});
+        // Unconditional rather than saveIfChanged: closing flushes the cue
+        // each track still had open, and those are exactly the ones a running
+        // save has never seen.
+        self.save();
         self.doc.deinit();
     }
 

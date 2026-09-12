@@ -290,11 +290,15 @@ pub const AudioCapture = struct {
     /// software gain in the capture callback if hardware is unavailable.
     ///
     /// gain is a linear multiplier: 1.0 = unity, 10.0 = +20 dB.
-    pub fn setGain(self: *AudioCapture, gain: f32) void {
+    ///
+    /// Always true here, unlike the PipeWire path: the software fallback in
+    /// the capture callback applies whatever hardware would not, so there is
+    /// no state in which asking does nothing.
+    pub fn setGain(self: *AudioCapture, gain: f32) bool {
         // Always store for software fallback
         self.callback_data.gain.store(gain, .monotonic);
 
-        if (!self.has_hardware_gain) return;
+        if (!self.has_hardware_gain) return true;
 
         // Convert linear gain to dB: dB = 20 * log10(gain)
         const gain_db: f32 = 20.0 * @log10(gain);
@@ -321,6 +325,14 @@ pub const AudioCapture = struct {
             // Hardware gain applied — disable software gain so we don't double-amplify
             self.callback_data.gain.store(1.0, .monotonic);
         }
+        return true;
+    }
+
+    /// Not implemented on macOS. CoreAudio levels the device through
+    /// `setGain` above, which already prefers the hardware control, so there
+    /// is no second mechanism to reach for here.
+    pub fn setSourceVolume(_: [:0]const u8, _: f32) bool {
+        return false;
     }
 
     /// No-op on macOS — device monitoring not yet implemented.

@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { $, spawn } from "bun";
-import { writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync, readdirSync, statSync } from "fs";
+import { writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync, readdirSync, statSync, existsSync } from "fs";
 import { join } from "path";
 import { connect } from "net";
 import { BINARY, ensureBinary, tmpFile, trackProc, waitForLog, until, createNullSink, removeNullSink } from "./helpers";
@@ -105,6 +105,23 @@ async function bandDb(path: string, channel: 0 | 1, hz: number): Promise<number>
     return match ? parseFloat(match[1]) : -Infinity;
 }
 
+/**
+ * Peak dBFS of one channel of a stereo file, narrowed to a band around `hz`.
+ *
+ * Peak rather than mean, for anything comparing a recording against the signal
+ * that went in. A mean is dragged down by however much of the recording is
+ * silence, which depends on when a session happened to open and close; a peak
+ * is the same number whether the tone ran for half the file or all of it.
+ */
+async function bandPeakDb(path: string, channel: 0 | 1, hz: number): Promise<number> {
+    const pan = channel === 0 ? "pan=mono|c0=c0" : "pan=mono|c0=c1";
+    const { stderr } = await $`ffmpeg -i ${path} -af ${`${pan},bandpass=f=${hz}:width_type=h:w=40,volumedetect`} -f null - `
+        .quiet()
+        .nothrow();
+    const match = stderr.toString().match(/max_volume:\s*(-?[\d.]+) dB/);
+    return match ? parseFloat(match[1]) : -Infinity;
+}
+
 /** Every session audio file of the given extension under a sessions root. */
 function walkAudio(dir: string, ext: string, found: string[] = []): string[] {
     for (const entry of readdirSync(dir)) {
@@ -123,14 +140,32 @@ async function startCapsper(opts: {
     httpPort: number;
     idleCloseSeconds: number;
     audioFormat?: "wav" | "opus";
+    /** Node the near track captures from, instead of the desktop's input. */
+    near?: string;
+    /** Starting capture gain, as `--audio-detect` would have measured one. */
+    gain?: number;
+    /** Off makes a recorded level depend on `gain` alone, not on a loop. */
+    autoGain?: boolean;
+    /** Off keeps the near capture on `near` rather than the cleaned node. */
+    aec?: boolean;
+    /** Capture channel. MONO for a mono virtual source. */
+    channel?: "MONO" | "FL" | "FR";
 }) {
     const configFile = tmpFile("capsper-sink-config", ".zon");
+    const audio =
+        opts.gain === undefined && opts.autoGain === undefined
+            ? ""
+            : ` .audio = .{ .gain = ${(opts.gain ?? 1).toFixed(1)},` +
+              ` .auto_gain = ${opts.autoGain ?? true},` +
+              ` .channel = .${opts.channel ?? "FL"} },`;
     writeFileSync(
         configFile,
-        `.{ .meeting = .{ .enabled = true, .sink_name = "${opts.sink}",` +
+        `.{${audio} .meeting = .{ .enabled = true, .sink_name = "${opts.sink}",` +
             ` .output = "${opts.output}",` +
+            (opts.near ? ` .near = "${opts.near}",` : "") +
             ` .idle_close_seconds = ${opts.idleCloseSeconds}, .dir = "${opts.sessionsDir}",` +
             ` .audio_format = .${opts.audioFormat ?? "opus"},` +
+            (opts.aec === undefined ? "" : ` .aec = .{ .enabled = ${opts.aec} },`) +
             ` .http = .{ .port = ${opts.httpPort} } } }\n`,
     );
 
@@ -199,7 +234,7 @@ describe.skipIf(!isLinux)("virtual sink", () => {
             idleCloseSeconds: 3,
         });
         objects = await dump();
-    });
+    }, 240_000);
 
     afterAll(async () => {
         if (capsper) await waitForExit(capsper.proc);
@@ -366,6 +401,7 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
     let capsper: Awaited<ReturnType<typeof startCapsper>>;
     let sessionsDir = "";
     let speech = "";
+    let gapped = "";
     let outputModule = "";
 
     beforeAll(async () => {
@@ -379,6 +415,18 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
         speech = tmpFile("capsper-speech", ".wav");
         await $`ffmpeg -y -i test/jfk.wav -t 4 -ar 48000 -ac 2 ${speech}`.quiet().nothrow();
 
+        // The same speech twice with a gap between, for the mid-session test.
+        // jfk.wav has no pause long enough to close a cue on its own, and a
+        // cue closes only when its track goes quiet -- so without a deliberate
+        // gap the first cue would not exist until playback had already ended,
+        // which is precisely the case the test is trying not to be.
+        gapped = tmpFile("capsper-gapped-speech", ".wav");
+        await $`ffmpeg -y -i test/jfk.wav -filter_complex ${
+            "[0:a]atrim=0:4,asetpts=PTS-STARTPTS,apad=pad_dur=2.5[a];" +
+            "[0:a]atrim=0:4,asetpts=PTS-STARTPTS[b];" +
+            "[a][b]concat=n=2:v=0:a=1[out]"
+        } -map ${"[out]"} -ar 48000 -ac 2 ${gapped}`.quiet().nothrow();
+
         capsper = await startCapsper({
             sink: AUDIO_SINK,
             output: OUTPUT_SINKS.capture,
@@ -390,11 +438,11 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
             // a direct measurement rather than one through a codec.
             audioFormat: "wav",
         });
-    });
+    }, 240_000);
 
     afterAll(async () => {
         if (capsper) await waitForExit(capsper.proc);
-        for (const path of [capsper?.configFile, capsper?.logFile, speech]) {
+        for (const path of [capsper?.configFile, capsper?.logFile, speech, gapped]) {
             if (path) try { unlinkSync(path); } catch {}
         }
         await removeNullSink(outputModule);
@@ -491,13 +539,51 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
         try { unlinkSync(tone); } catch {}
     }, 60_000);
 
+    test("makes the transcript readable while the session is still open", async () => {
+        // A meeting is worth reading while it is happening, not only once it
+        // has ended, so the transcript is rewritten every time a cue completes
+        // rather than at close.
+        await settle();
+        const closedBefore = count("session closed");
+        const filesBefore = sessionFiles().length;
+
+        // Deliberately not awaited: the claim is about a session that is still
+        // running, so the file has to be read while the audio is still playing.
+        const playing = spawn(["pw-play", "--target", AUDIO_SINK, gapped], {
+            stdout: "ignore",
+            stderr: "ignore",
+        });
+        trackProc(playing);
+
+        await waitForNewSession(filesBefore);
+        const vtt = sessionFiles().pop()!.replace(/audio\.wav$/, "audio.vtt");
+
+        // The gap in the fixture closes the first cue, and the speech after it
+        // keeps the session open while this looks.
+        await until(
+            "the transcript to appear mid-session",
+            () => existsSync(vtt) && readFileSync(vtt, "utf8").includes(" --> "),
+            { timeoutSec: 30 },
+        );
+
+        // The whole point: that happened before the session closed. Without
+        // it, this file does not exist yet.
+        expect(count("session closed")).toBe(closedBefore);
+
+        const partial = readFileSync(vtt, "utf8");
+        expect(partial.startsWith("WEBVTT\n")).toBe(true);
+        expect(partial).toContain("<v Far>");
+
+        await playing.exited;
+    }, 120_000);
+
     test("transcribes the call into a WebVTT file beside the audio", async () => {
         await settle();
         const closedBefore = count("session closed");
 
         await play(speech);
-        // The transcript is written when the session closes, so that is the
-        // thing to wait for.
+        // Closing flushes the cue each track still had open, so the complete
+        // transcript is the one written then.
         await waitForOneMore("session closed", closedBefore);
 
         const dir = sessionFiles().pop()!.replace(/audio\.wav$/, "");
@@ -603,7 +689,7 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: opus", () => {
             // The default, spelled out because it is the point of this block.
             audioFormat: "opus",
         });
-    });
+    }, 240_000);
 
     afterAll(async () => {
         if (capsper) await waitForExit(capsper.proc);
@@ -666,4 +752,161 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: opus", () => {
         expect(audio.status).toBe(200);
         expect(audio.headers.get("content-type")).toBe("audio/ogg");
     }, 30_000);
+});
+
+
+
+// ─── The near track's level ──────────────────────────────────────────────────
+//
+// The near end is a microphone in a room, so it needs the same levelling
+// dictation applies to one. Two bugs met here, and both were silent.
+//
+// The meeting's near capture was created with no gain at all: the configured
+// value and the auto-gain loop both lived on the dictation capture. And the
+// configured value never landed anywhere, because it was set before the stream
+// connected, where PipeWire has no volume control yet and answers -EIO. The
+// return code was discarded, so nothing said so. Auto-gain hid it on the
+// dictation path by setting the gain again later, once audio was flowing.
+//
+// Measured against a microphone of the test's own rather than the desktop's,
+// because a test cannot depend on a room. Same pw-loopback bridge the echo
+// cancellation tests use.
+
+describe.skipIf(!isLinux || !SLOW)("virtual sink: near level", () => {
+    let sessionsDir = "";
+    let outputModule = "";
+    let loopback: ReturnType<typeof spawn> | null = null;
+    let tone = "";
+    let farTone = "";
+
+    const SINK_NAME = "test_capsper_level_sink";
+    const MIC_SINK = "test-capsper-level-mic-sink";
+    const MIC_SOURCE = "test-capsper-level-mic-source";
+    const OUT = "test_capsper_out_level";
+    const LEVEL_HTTP_PORT = 43920;
+
+    // Four times, which is +12 dB. Far enough above unity to be unmistakable,
+    // and far enough below the 10x ceiling that this measures the gain rather
+    // than the clamp.
+    const GAIN = 4;
+    const TONE_DB = -40;
+    const TONE_HZ = 660;
+
+    beforeAll(async () => {
+        ensureBinary();
+        outputModule = await createNullSink(OUT);
+
+        sessionsDir = tmpFile("capsper-level-sessions", "");
+        mkdirSync(sessionsDir, { recursive: true });
+
+        // A microphone capsper can be pointed at. 16 kHz so the graph does not
+        // resample twice, which would put the measurement at the mercy of a
+        // converter rather than of the gain.
+        loopback = spawn([
+            "pw-loopback",
+            `--capture-props={"media.class":"Audio/Sink", "node.name":"${MIC_SINK}", "audio.rate":16000}`,
+            `--playback-props={"media.class":"Audio/Source", "node.name":"${MIC_SOURCE}", "audio.rate":16000}`,
+            "-C", "1", "-m", "MONO",
+        ], { stdout: "ignore", stderr: "ignore" });
+        trackProc(loopback);
+        await until(`${MIC_SOURCE} to appear in the graph`, async () => {
+            const { exitCode } = await $`pw-link -o 2>/dev/null | grep -q ${MIC_SOURCE}`.quiet().nothrow();
+            return exitCode === 0;
+        });
+
+        tone = tmpFile("capsper-level-tone", ".wav");
+        await $`ffmpeg -y -f lavfi -i ${`sine=frequency=${TONE_HZ}:duration=6:sample_rate=16000`} -af ${`volume=${TONE_DB}dB`} -ac 1 ${tone}`
+            .quiet()
+            .nothrow();
+
+        // Played into the meeting sink, which is what opens a session at all.
+        // A different frequency so it could never be mistaken for the near
+        // tone if the two tracks were ever crossed.
+        farTone = tmpFile("capsper-level-far", ".wav");
+        await $`ffmpeg -y -f lavfi -i ${"sine=frequency=220:duration=6:sample_rate=48000"} -af volume=-20dB -ac 2 ${farTone}`
+            .quiet()
+            .nothrow();
+    }, 240_000);
+
+    afterAll(async () => {
+        for (const path of [tone, farTone]) {
+            if (path) try { unlinkSync(path); } catch {}
+        }
+        try { loopback?.kill(); } catch {}
+        await removeNullSink(outputModule);
+        try { rmSync(sessionsDir, { recursive: true, force: true }); } catch {}
+    });
+
+    /**
+     * Record the tone through a capsper configured at `gain`, and return the
+     * peak level of the near channel in the tone's band.
+     *
+     * A whole capsper per measurement, because the gain is a setting read at
+     * startup. That is what makes the assertion self-calibrating: the band
+     * filter and the graph's conversions cost the same on both runs, so
+     * comparing two of these leaves only the gain.
+     */
+    async function nearPeakAt(gain: number): Promise<number> {
+        const dir = join(sessionsDir, `g${gain}`);
+        mkdirSync(dir, { recursive: true });
+
+        const capsper = await startCapsper({
+            sink: SINK_NAME,
+            output: OUT,
+            sessionsDir: dir,
+            httpPort: LEVEL_HTTP_PORT,
+            idleCloseSeconds: 3,
+            audioFormat: "wav",
+            near: MIC_SOURCE,
+            gain,
+            // Off, so what lands on disk is the configured gain and nothing
+            // else. With the loop running the level would be chasing a target
+            // and this would be measuring convergence instead.
+            autoGain: false,
+            // Off, so the near capture reads `near` directly. With it on the
+            // near track comes from the cancelled node, which is a different
+            // measurement with its own tests.
+            aec: false,
+            // The virtual microphone is one channel, and with cancellation off
+            // the near capture takes the configured channel rather than mono.
+            // Asking a mono node for front-left routes by position and finds
+            // nothing there.
+            channel: "MONO",
+        });
+
+        try {
+            // Both at once: the far tone holds the session open while the near
+            // tone is the one being measured.
+            const far = spawn(["pw-play", "--target", SINK_NAME, farTone], { stdout: "ignore", stderr: "ignore" });
+            const near = spawn(["pw-cat", "-p", `--target=${MIC_SINK}`, "--rate=16000", "--channels=1", "--format=s16", tone], { stdout: "ignore", stderr: "ignore" });
+            trackProc(far);
+            trackProc(near);
+            await far.exited;
+            await near.exited;
+
+            await waitForLog(capsper.logFile, /session closed/, capsper.proc, 40);
+            const audio = walkAudio(dir, ".wav").sort().pop()!;
+            return await bandPeakDb(audio, 0, TONE_HZ);
+        } finally {
+            await waitForExit(capsper.proc);
+            for (const path of [capsper.configFile, capsper.logFile]) {
+                try { unlinkSync(path); } catch {}
+            }
+        }
+    }
+
+    test("captures the near end at the configured gain", async () => {
+        const unity = await nearPeakAt(1);
+        const boosted = await nearPeakAt(GAIN);
+        const lift = boosted - unity;
+        console.error(`  near peak at 1x: ${unity.toFixed(1)} dBFS, at ${GAIN}x: ${boosted.toFixed(1)} dBFS`);
+        console.error(`  lift: ${lift.toFixed(1)} dB (expected ${(20 * Math.log10(GAIN)).toFixed(1)})`);
+
+        // The difference between the two runs is the gain and nothing else.
+        // Before the fix this was 0: the near capture was given no gain, and
+        // the one the dictation path asked for was rejected unheard.
+        const expected = 20 * Math.log10(GAIN);
+        expect(lift).toBeGreaterThan(expected - 3);
+        expect(lift).toBeLessThan(expected + 3);
+    }, 240_000);
 });

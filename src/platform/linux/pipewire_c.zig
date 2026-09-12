@@ -41,6 +41,7 @@ pub const PW_STREAM_FLAG_RT_PROCESS: c_uint = pw.PW_STREAM_FLAG_RT_PROCESS;
 // Stream state
 pub const pw_stream_state = pw.enum_pw_stream_state;
 pub const PW_STREAM_STATE_ERROR = pw.PW_STREAM_STATE_ERROR;
+pub const PW_STREAM_STATE_STREAMING = pw.PW_STREAM_STATE_STREAMING;
 
 // Stream control
 pub const pw_stream_disconnect = pw.pw_stream_disconnect;
@@ -81,6 +82,14 @@ pub extern fn pw_set_stream_gain(
     stream: *pw_stream,
     gain: f32,
     n_channels: u32,
+) c_int;
+
+// C helper to set a source node's own volume, by node name. Linear, so 1.0
+// is unity. This is the level every application sees and WirePlumber saves it,
+// unlike the per-stream gain above which is private to one capture.
+pub extern fn pw_set_source_volume(
+    node_name: [*:0]const u8,
+    volume: f32,
 ) c_int;
 
 // C helper to connect a capture stream for multi-channel recording (channel detection).

@@ -1206,3 +1206,194 @@ pw_build_capture_props(const char *target, int capture_sink)
 
     return props;
 }
+
+/* ─── Source node volume ──────────────────────────────────────────────────────
+
+   Setting the level on the microphone itself rather than on our own capture
+   stream, which is the difference between levelling the signal and levelling
+   our view of it.
+
+   Two reasons it belongs here. It lands before the echo canceller, which reads
+   the source node, so the canceller sees a properly levelled microphone rather
+   than having its own output adjusted after the fact. And it is one mechanism
+   for every path: dictation has no canceller, and this works the same for it.
+
+   The consequences are worth naming. This is the volume every other
+   application sees, and WirePlumber saves it, so it outlives capsper. That is
+   the same control a desktop's input slider drives, which is the argument for
+   it as much as against.
+
+   Like the stream volume, PipeWire clamps this to 10x (+20 dB). Measured on a
+   real microphone: asking for 400%, which the cubic scale pactl prints calls
+   +36 dB, produced 19.9 dB. */
+
+struct set_volume_data {
+    const char *node_name;
+    float volume;
+
+    struct pw_main_loop *loop;
+    struct pw_registry *registry;
+    struct pw_core *core;
+    int pending_sync;
+
+    struct pw_proxy *node;
+    struct spa_hook node_listener;
+    /* How many volumes the array needs. SPA_PROP_channelVolumes is per
+       channel, and a node rejects an array that is not its own width. */
+    uint32_t channels;
+    int applied;
+};
+
+static void
+on_volume_node_info(void *data, const struct pw_node_info *info)
+{
+    struct set_volume_data *d = data;
+    if (!info || !info->props) return;
+
+    const char *ch = spa_dict_lookup(info->props, "audio.channels");
+    if (ch) {
+        int n = atoi(ch);
+        if (n > 0 && n <= SPA_AUDIO_MAX_CHANNELS) d->channels = (uint32_t)n;
+    }
+}
+
+static const struct pw_node_events volume_node_events = {
+    PW_VERSION_NODE_EVENTS,
+    .info = on_volume_node_info,
+};
+
+static void
+on_volume_registry_global(void *data, uint32_t id, uint32_t permissions,
+                          const char *type, uint32_t version,
+                          const struct spa_dict *props)
+{
+    struct set_volume_data *d = data;
+    (void)permissions;
+    (void)version;
+
+    if (d->node) return; /* already found it */
+    if (!props || !type || strcmp(type, PW_TYPE_INTERFACE_Node) != 0) return;
+
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (!name || strcmp(name, d->node_name) != 0) return;
+
+    struct pw_proxy *proxy = pw_registry_bind(d->registry, id, type,
+                                              PW_VERSION_NODE, 0);
+    if (!proxy) return;
+
+    d->node = proxy;
+    pw_node_add_listener((struct pw_node *)proxy, &d->node_listener,
+                         &volume_node_events, d);
+}
+
+static void
+on_volume_core_done(void *data, uint32_t id, int seq)
+{
+    struct set_volume_data *d = data;
+    if (id == PW_ID_CORE && seq == d->pending_sync)
+        pw_main_loop_quit(d->loop);
+}
+
+/* Set a source node's volume by node name. `volume` is linear, so 1.0 is
+   unity and 4.0 is +12 dB, matching pw_set_stream_gain rather than the cubic
+   percentage pactl prints.
+
+   Returns 0 on success, -1 if the node was not found or the volume was not
+   accepted. Synchronous: it connects, finds the node, sets the parameter and
+   waits for the server to acknowledge it before returning. */
+int
+pw_set_source_volume(const char *node_name, float volume)
+{
+    if (!node_name) return -1;
+
+    pw_init(NULL, NULL);
+
+    int rc = -1;
+    struct pw_main_loop *loop = NULL;
+    struct pw_context *context = NULL;
+    struct pw_core *core = NULL;
+    struct pw_registry *registry = NULL;
+
+    loop = pw_main_loop_new(NULL);
+    if (!loop) goto out;
+
+    context = pw_context_new(pw_main_loop_get_loop(loop), NULL, 0);
+    if (!context) goto out;
+
+    core = pw_context_connect(context, NULL, 0);
+    if (!core) goto out;
+
+    registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+    if (!registry) goto out;
+
+    struct set_volume_data data = {
+        .node_name = node_name,
+        .volume = volume,
+        .loop = loop,
+        .registry = registry,
+        .core = core,
+        .channels = 1,
+    };
+
+    static const struct pw_registry_events reg_events = {
+        PW_VERSION_REGISTRY_EVENTS,
+        .global = on_volume_registry_global,
+    };
+    struct spa_hook reg_listener;
+    spa_zero(reg_listener);
+    pw_registry_add_listener(registry, &reg_listener, &reg_events, &data);
+
+    static const struct pw_core_events core_events = {
+        PW_VERSION_CORE_EVENTS,
+        .done = on_volume_core_done,
+    };
+    struct spa_hook core_listener;
+    spa_zero(core_listener);
+    pw_core_add_listener(core, &core_listener, &core_events, &data);
+
+    /* First roundtrip finds the node and binds it. */
+    data.pending_sync = pw_core_sync(core, PW_ID_CORE, 0);
+    pw_main_loop_run(loop);
+
+    if (data.node) {
+        /* Second roundtrip lets the node's info arrive, which is where the
+           channel count comes from. */
+        data.pending_sync = pw_core_sync(core, PW_ID_CORE, 0);
+        pw_main_loop_run(loop);
+
+        float vols[SPA_AUDIO_MAX_CHANNELS];
+        for (uint32_t i = 0; i < data.channels; i++) vols[i] = volume;
+
+        uint8_t buf[1024];
+        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+        struct spa_pod *props_pod = spa_pod_builder_add_object(
+            &b,
+            SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+            SPA_PROP_channelVolumes,
+            SPA_POD_Array(sizeof(float), SPA_TYPE_Float, data.channels, vols));
+
+        if (props_pod) {
+            pw_node_set_param((struct pw_node *)data.node, SPA_PARAM_Props, 0,
+                              props_pod);
+            /* Wait for the server to have processed it, so a caller that
+               returns and immediately measures is not racing the graph. */
+            data.pending_sync = pw_core_sync(core, PW_ID_CORE, 0);
+            pw_main_loop_run(loop);
+            rc = 0;
+        }
+
+        spa_hook_remove(&data.node_listener);
+        pw_proxy_destroy(data.node);
+    }
+
+    spa_hook_remove(&reg_listener);
+    spa_hook_remove(&core_listener);
+
+out:
+    if (registry) pw_proxy_destroy((struct pw_proxy *)registry);
+    if (core) pw_core_disconnect(core);
+    if (context) pw_context_destroy(context);
+    if (loop) pw_main_loop_destroy(loop);
+    pw_deinit();
+    return rc;
+}

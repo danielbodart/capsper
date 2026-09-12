@@ -157,11 +157,13 @@
 
   const $ = (id) => document.getElementById(id);
   const listView = $("listView"), playView = $("playView");
-  const audio = $("audio"), track = $("track"), list = $("transcript");
+  const audio = $("audio"), list = $("transcript");
 
-  // Hidden rather than showing: cue events still fire, but nothing is drawn
-  // over the audio element, because this page draws the transcript itself.
-  track.track.mode = "hidden";
+  // Replaced wholesale every time the transcript changes, so `let`. Setting
+  // src on a track element that already has cues leaves the old ones in
+  // place; a fresh element is the only reliable way to start empty.
+  let track = $("track");
+  wireTrack();
 
   const clock = (seconds) => {
     const s = Math.max(0, Math.floor(seconds || 0));
@@ -281,18 +283,73 @@
   }
 
   let active = new Set();
-  track.track.addEventListener("cuechange", () => {
-    for (const cue of active) rendered.get(cue)?.classList.remove("active");
-    active = new Set(track.track.activeCues || []);
-    for (const cue of active) {
-      const el = rendered.get(cue);
-      if (!el) continue;
-      el.classList.add("active");
-      el.scrollIntoView({ block: "center", behavior: "smooth" });
-    }
-  });
 
-  track.addEventListener("load", renderTranscript);
+  // Everything the track element needs, in one place, because a live session
+  // replaces the element rather than re-pointing it and the handlers have to
+  // follow it across.
+  function wireTrack() {
+    // Hidden rather than showing: cue events still fire, but nothing is drawn
+    // over the audio element, because this page draws the transcript itself.
+    track.track.mode = "hidden";
+    track.addEventListener("load", renderTranscript);
+    track.track.addEventListener("cuechange", () => {
+      for (const cue of active) rendered.get(cue)?.classList.remove("active");
+      active = new Set(track.track.activeCues || []);
+      for (const cue of active) {
+        const el = rendered.get(cue);
+        if (!el) continue;
+        el.classList.add("active");
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
+    });
+  }
+
+  // ─── Keeping up with a session still being recorded ──────────────────────
+  //
+  // The transcript is rewritten whole every time a cue completes, so a meeting
+  // in progress grows a file under the page. This re-reads it and swaps the
+  // cues in when it has changed.
+  //
+  // Compared as text before anything is rebuilt, so a poll that finds nothing
+  // new costs one small request and no work at all. A session that ended
+  // simply stops changing, which is why nothing here has to know whether one
+  // is live.
+
+  const poll_ms = 4000;
+  let vttUrl = null, lastVtt = null, poller = null, blobUrl = null;
+
+  async function refreshTranscript() {
+    if (!vttUrl) return;
+    let text;
+    try {
+      const res = await fetch(vttUrl, { cache: "no-store" });
+      // A session that has not produced a cue yet has no file. Not an error:
+      // it means keep waiting.
+      if (!res.ok) return;
+      text = await res.text();
+    } catch { return; }
+
+    if (text === lastVtt) return;
+    lastVtt = text;
+
+    // Handed to the track as a blob rather than re-fetched by URL, so the
+    // element loads exactly the bytes just compared and no cache sits between
+    // the two.
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
+    blobUrl = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
+
+    const fresh = document.createElement("track");
+    fresh.id = "track";
+    fresh.kind = "subtitles";
+    fresh.srclang = "en";
+    fresh.label = "Transcript";
+    fresh.default = true;
+    track.replaceWith(fresh);
+    track = fresh;
+    active = new Set();
+    wireTrack();
+    track.src = blobUrl;
+  }
 
   function open(path) {
     const session = sessions.find((s) => s.path === path);
@@ -301,10 +358,13 @@
 
     list.innerHTML = '<p class="empty">Loading transcript…</p>';
     audio.src = base + audioName;
-    // Replacing src alone leaves the old cues in place, so the track element
-    // is swapped out rather than re-pointed.
-    track.src = base + audioName.replace(/\.[^.]+$/, "") + ".vtt";
     audio.load();
+
+    vttUrl = base + audioName.replace(/\.[^.]+$/, "") + ".vtt";
+    lastVtt = null;
+    refreshTranscript();
+    clearInterval(poller);
+    poller = setInterval(refreshTranscript, poll_ms);
 
     const { day, time } = when(path);
     $("title").textContent = time ? `${time} · ${day}` : path;
@@ -315,6 +375,9 @@
   }
 
   function showList() {
+    clearInterval(poller);
+    poller = null;
+    vttUrl = null;
     audio.pause();
     audio.removeAttribute("src");
     audio.load();

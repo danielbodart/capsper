@@ -9,6 +9,19 @@ const log = std.log.scoped(.audio_capture);
 const StreamData = struct {
     stream: ?*pw.pw_stream = null,
     pipe_write_fd: posix.fd_t,
+
+    /// The gain asked for, kept because asking is not the same as it landing.
+    ///
+    /// A stream has no volume control until it is connected: `set_control`
+    /// before then returns -EIO and changes nothing. Callers set the gain
+    /// where it reads naturally, which is while they are setting everything
+    /// else up, and that is too early. So the value is remembered here and
+    /// applied again when the stream reaches `streaming`, which is the first
+    /// moment the control exists.
+    ///
+    /// Null once it has been applied, so the state callback does its work
+    /// once rather than on every transition.
+    pending_gain: ?f32 = null,
 };
 
 pub const AudioCapture = struct {
@@ -196,10 +209,36 @@ pub const AudioCapture = struct {
     }
 
     /// Set software gain on the PipeWire capture stream (1.0 = unity, 4.0 = ~12 dB boost).
-    pub fn setGain(self: *AudioCapture, gain: f32) void {
+    /// Set the level on a source node itself, by name, rather than on one
+    /// capture of it.
+    ///
+    /// Before the echo canceller, which reads the node, and shared by every
+    /// path: dictation has no canceller and this works the same for it. The
+    /// cost is that this is the level every application sees, and WirePlumber
+    /// saves it, so it outlives the process.
+    ///
+    /// Linear, matching `setGain`: 1.0 is unity. PipeWire clamps it to 10x.
+    pub fn setSourceVolume(node_name: [:0]const u8, volume: f32) bool {
+        if (pw.pw_set_source_volume(node_name.ptr, volume) == 0) return true;
+        log.warn("could not set the level on source '{s}'", .{node_name});
+        return false;
+    }
+
+    /// Returns false when PipeWire would not take it, which happens when the
+    /// stream is not connected yet. The value is remembered and applied when
+    /// it is, so a caller setting the calibrated gain during startup gets what
+    /// it asked for rather than silence about not getting it.
+    pub fn setGain(self: *AudioCapture, gain: f32) bool {
         pw.pw_thread_loop_lock(self.thread_loop);
         defer pw.pw_thread_loop_unlock(self.thread_loop);
-        _ = pw.pw_set_stream_gain(self.stream, gain, 1);
+
+        if (pw.pw_set_stream_gain(self.stream, gain, 1) == 0) {
+            self.stream_data.pending_gain = null;
+            return true;
+        }
+
+        self.stream_data.pending_gain = gain;
+        return false;
     }
 
     /// Reconnect the capture stream to the target device. Called by the device
@@ -270,6 +309,23 @@ pub const AudioCapture = struct {
 /// so the server's read() returns EOF instead of hanging.
 fn onStateChanged(userdata: ?*anyopaque, _: pw.pw_stream_state, state: pw.pw_stream_state, err: ?[*:0]const u8) callconv(.c) void {
     const data: *StreamData = @ptrCast(@alignCast(userdata orelse return));
+
+    // Streaming is the first state in which the stream has a volume control,
+    // so it is the first moment a gain asked for during setup can be given.
+    // Already locked: this runs on PipeWire's own thread.
+    if (state == pw.PW_STREAM_STATE_STREAMING) {
+        if (data.pending_gain) |gain| {
+            if (data.stream) |stream| {
+                if (pw.pw_set_stream_gain(stream, gain, 1) == 0) {
+                    data.pending_gain = null;
+                    log.info("gain {d:.1}x applied", .{gain});
+                } else {
+                    log.warn("PipeWire would not take a gain of {d:.1}x", .{gain});
+                }
+            }
+        }
+    }
+
     // PW_STREAM_STATE_ERROR = -1
     if (state == pw.PW_STREAM_STATE_ERROR) {
         if (err) |e| {
