@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll } from "bun:test";
 import { $, spawn, file } from "bun";
-import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, trackProc, saveLog } from "./helpers";
+import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, trackProc, saveLog, until } from "./helpers";
 
 const isLinux = process.platform === "linux";
 
@@ -25,12 +25,13 @@ describe.skipIf(!isLinux)("pw-stream", () => {
         ], { stdout: "ignore", stderr: "ignore" });
         trackProc(loopback);
 
-        await Bun.sleep(1000);
-
         try {
-            // Verify loopback created the source node
-            const { exitCode: linkCheck } = await $`pw-link -o 2>/dev/null | grep -q ${LOOPBACK_SOURCE}`.quiet().nothrow();
-            expect(linkCheck).toBe(0); // PipeWire loopback must be available
+            // The loopback creates its nodes on its own loop, so starting the
+            // process and the source existing are not the same instant.
+            await until(`${LOOPBACK_SOURCE} to appear in the graph`, async () => {
+                const { exitCode } = await $`pw-link -o 2>/dev/null | grep -q ${LOOPBACK_SOURCE}`.quiet().nothrow();
+                return exitCode === 0;
+            });
 
             const server = await startLocalServer([
                 "--audio-target", LOOPBACK_SOURCE,
@@ -57,8 +58,9 @@ describe.skipIf(!isLinux)("pw-stream", () => {
                 // hotplug monitor detects target removal → closes audio pipe →
                 // server's ChunkedReader gets EOF → clean exit.
                 try { loopback.kill(); } catch {}
-                await Bun.sleep(500); // let PipeWire propagate node destruction
 
+                // Waiting for the log line is waiting for the propagation:
+                // the node going away is what closes the audio pipe.
                 await waitForLog(server.logFile, /session ended/, server.proc, 10);
 
                 const output = await file(server.outputFile).text();

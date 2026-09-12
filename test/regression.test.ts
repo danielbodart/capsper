@@ -7,7 +7,7 @@ import {
     startServer, startLocalServer, readPcm,
     streamPcmFast, streamPcm, streamWavDirect,
     assertTranscript, printScorecard, saveLog, saveScoring,
-    wavDuration, trackProc, waitForLog,
+    wavDuration, trackProc, waitForLog, until,
     type Thresholds, type TranscriptResult,
 } from "./helpers";
 
@@ -154,7 +154,13 @@ async function streamPcmPipeWire(
         "-C", "1", "-m", "MONO",
     ], { stdout: "ignore", stderr: "ignore" });
     trackProc(loopback);
-    await Bun.sleep(500); // let PipeWire register the nodes
+
+    // The loopback creates its nodes on its own loop. Starting the server
+    // before the source exists would have it capture the default input.
+    await until(`${LOOPBACK_SOURCE} to appear in the graph`, async () => {
+        const { exitCode } = await $`pw-link -o 2>/dev/null | grep -q ${LOOPBACK_SOURCE}`.quiet().nothrow();
+        return exitCode === 0;
+    });
 
     const server = await startLocalServer([
         "--audio-target", LOOPBACK_SOURCE,
@@ -176,8 +182,9 @@ async function streamPcmPipeWire(
 
         // Kill loopback → hotplug monitor closes audio pipe → clean EOF exit.
         try { loopback.kill(); } catch {}
-        await Bun.sleep(500);
 
+        // Waiting for the log line is waiting for the propagation: the node
+        // going away is what closes the audio pipe.
         await waitForLog(server.logFile, /session ended/, server.proc, 10);
 
         const output = await file(server.outputFile).text();

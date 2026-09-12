@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeAll } from "bun:test";
 import { $, spawn, file } from "bun";
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
-import { ensureBinary, ensureFile, wavDuration, trackProc, saveLog } from "./helpers";
+import { ensureBinary, ensureFile, wavDuration, trackProc, saveLog, until, untilSettled, GiveUp } from "./helpers";
 
 const HELPERS = "test/macos-audio-helpers";
 const BINARY = "./dist/macos/bin/capsper";
@@ -84,27 +84,26 @@ async function launchService(args: string[]): Promise<{ outFile: string; logFile
     createPlist(args, outFile, logFile);
     await $`launchctl load ${PLIST_PATH}`.quiet();
 
-    // Wait for capture to start (up to 120s for model load + warmup)
-    const deadline = Date.now() + 120_000;
-    let started = false;
-    while (Date.now() < deadline) {
-        await Bun.sleep(500);
-        try {
+    // Up to 120s, because the model loads and warms up before capture starts.
+    // The failure lines are checked too, so a server that is never going to
+    // start is reported as that rather than as two minutes of nothing.
+    try {
+        await until("the server to start capturing", () => {
             const log = readFileSync(logFile, "utf-8");
-            if (log.includes("Capturing audio")) { started = true; break; }
             if (log.includes("error.AudioInitFailed") || log.includes("Failed to")) {
-                throw new Error(`Server failed to start: ${log.slice(-500)}`);
+                throw new GiveUp(`Server failed to start:\n${log.slice(-500)}`);
             }
             if (log.includes("permission denied") || log.includes("Microphone permission")) {
-                throw new Error(`Microphone permission denied — grant access via System Settings or dismiss pending dialogs on the Mac desktop`);
+                throw new GiveUp(
+                    "Microphone permission denied — grant access via System Settings" +
+                        " or dismiss pending dialogs on the Mac desktop",
+                );
             }
-        } catch (e: any) {
-            if (e.message?.startsWith("Server failed") || e.message?.startsWith("Microphone")) throw e;
-        }
-    }
-    if (!started) {
-        const log = readFileSync(logFile, "utf-8");
-        throw new Error(`Server did not start capturing within 120s. Last log:\n${log.slice(-500)}`);
+            return log.includes("Capturing audio");
+        }, { timeoutSec: 120, intervalMs: 500 });
+    } catch (e) {
+        if (e instanceof GiveUp) throw e;
+        throw new Error(`${e}\nLast log:\n${readFileSync(logFile, "utf-8").slice(-500)}`);
     }
 
     const stop = async () => {
@@ -152,9 +151,12 @@ describe.skipIf(!isMacOS || !hasBinary || !hasModel || !blackhole)("ca-stream", 
         try {
             console.error("Server capturing, playing audio via BlackHole...");
 
-            // Route audio to BlackHole
+            // Route audio to BlackHole. CoreAudio applies the change
+            // asynchronously, so wait for it to report back rather than
+            // assuming it has landed.
             await setDefaultOutput(blackholeId);
-            await Bun.sleep(500);
+            await until("the default output to become BlackHole", async () =>
+                (await getDefaultOutput()) === blackholeId);
 
             // Play WAV (afplay uses default output = BlackHole)
             const play = spawn(["afplay", wavFile], { stdout: "ignore", stderr: "ignore" });
@@ -166,8 +168,17 @@ describe.skipIf(!isMacOS || !hasBinary || !hasModel || !blackhole)("ca-stream", 
             // Restore default output
             await setDefaultOutput(originalOutput);
 
-            // Wait for pipeline to flush
-            await Bun.sleep(5000);
+            // Transcription lags the audio by a chunk or so, and there is no
+            // marker for the last emission while the server is still running.
+            // Wait for the output to stop growing rather than guessing how
+            // long that takes; if nothing ever arrives, fall through and let
+            // the word count below be the failure.
+            try {
+                await untilSettled("transcription to finish", server.outFile, {
+                    quietMs: 2000,
+                    timeoutSec: 30,
+                });
+            } catch {}
 
             const output = readFileSync(server.outFile, "utf-8");
             const log = readFileSync(server.logFile, "utf-8");

@@ -66,12 +66,31 @@ export async function waitForLog(logFile: string, pattern: RegExp, proc: ReturnT
 }
 
 /**
+ * Thrown from an `until` predicate to stop waiting immediately.
+ *
+ * For the cases where a test can tell the difference between "not yet" and
+ * "this is never going to happen" -- a log line saying the server failed to
+ * start, say. Without it, a definite failure would be reported as a timeout,
+ * which reads like a slow machine rather than a broken one.
+ */
+export class GiveUp extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "GiveUp";
+    }
+}
+
+/**
  * Poll until `check` returns something truthy, then return it.
  *
  * For waiting on the thing that has to happen rather than on a duration that
  * ought to be long enough. A fixed sleep is either longer than it needs to be
  * or, on a loaded machine, not long enough -- and the second failure looks
  * like a broken feature rather than a broken test.
+ *
+ * Ordinary exceptions from `check` are treated as "not yet" and retried, so a
+ * file that does not exist for the first second is not a failure. Throw
+ * `GiveUp` to stop immediately.
  */
 export async function until<T>(
     what: string,
@@ -85,11 +104,39 @@ export async function until<T>(
             const value = await check();
             if (value) return value as NonNullable<T>;
         } catch (e) {
+            if (e instanceof GiveUp) throw e;
             lastError = e;
         }
         await Bun.sleep(intervalMs);
     }
     throw new Error(`Timed out after ${timeoutSec}s waiting for ${what}` + (lastError ? `: ${lastError}` : ""));
+}
+
+/**
+ * Wait for a file to stop growing, for output that arrives in pieces with no
+ * marker for the last one.
+ *
+ * Weaker than waiting for a specific line and used only where there is nothing
+ * better to wait for, but it still measures the thing itself rather than
+ * guessing how long it takes.
+ */
+export async function untilSettled(
+    what: string,
+    path: string,
+    { quietMs = 1500, timeoutSec = 60 }: { quietMs?: number; timeoutSec?: number } = {},
+): Promise<void> {
+    let size = -1;
+    let unchangedSince = Date.now();
+
+    await until(what, () => {
+        const now = statSync(path).size;
+        if (now !== size) {
+            size = now;
+            unchangedSince = Date.now();
+            return false;
+        }
+        return size > 0 && Date.now() - unchangedSince >= quietMs;
+    }, { timeoutSec, intervalMs: 100 });
 }
 
 /** Start the capsper server with given args, wait for ready, return handle. */
