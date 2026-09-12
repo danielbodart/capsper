@@ -67,6 +67,17 @@ pub fn main() !void {
         config.reportArgError(arg_err);
         std.process.exit(1);
     }
+    // Before expandPaths, so a `~/` the user wrote is still a `~/` when it is
+    // written back out. Nothing else has run yet either, so this reports the
+    // settings and not the state of a half-started service.
+    if (cli.write_config) {
+        var buf: [4096]u8 = undefined;
+        var out = std.fs.File.stdout().writer(&buf);
+        try config.write(&cfg, &out.interface);
+        try out.interface.flush();
+        return;
+    }
+
     try cfg.expandPaths(cfg_arena);
 
     if (cli.show_version) {
@@ -511,6 +522,7 @@ fn printUsage() void {
         \\  --detect-duration SECS   Audio detection duration (default: 5)
         \\  --verbose, -v            Verbose logging
         \\  --dry-run                Load model and exit (verify setup)
+        \\  --write-config           Print these settings as ZON, then exit
         \\  --version                Show version
         \\
         \\Examples:
@@ -518,6 +530,7 @@ fn printUsage() void {
         \\  capsper --trigger capslock --audio-target my-mic --port 43007
         \\  capsper --port 0
         \\  capsper --stream recording.wav
+        \\  capsper --trigger capslock --write-config > ~/.config/capsper/config.zon
         \\
     , .{});
 }

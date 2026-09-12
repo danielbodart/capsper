@@ -268,6 +268,10 @@ pub const Cli = struct {
     audio_detect: bool = false,
     stream: ?[:0]const u8 = null,
     transcribe: ?[:0]const u8 = null,
+    /// Print the settings this run would use as ZON, then exit. The point is
+    /// migrating a service file full of flags into a config file without
+    /// transcribing it by hand.
+    write_config: bool = false,
 };
 
 // ─── Argument parsing ────────────────────────────────────────────────────────
@@ -323,6 +327,8 @@ pub fn parseArgs(cfg: *Config, cli: *Cli, args: []const [:0]const u8) ?ArgError 
             cfg.verbose = true;
         } else if (eql(arg, "--dry-run")) {
             cli.dry_run = true;
+        } else if (eql(arg, "--write-config")) {
+            cli.write_config = true;
         } else if (eql(arg, "--audio-detect") or eql(arg, "--pw-detect")) {
             cli.audio_detect = true;
         } else if (eql(arg, "--trigger-passthrough")) {
@@ -490,6 +496,29 @@ pub fn load(arena: Allocator, path: []const u8) !?Config {
         return err;
     };
 }
+/// Write `cfg` as ZON, naming only the settings that differ from their
+/// defaults.
+///
+/// Only the differences, because a config file should record what you chose.
+/// Writing every field out would freeze today's defaults into the file, so a
+/// later change to one of them would reach new users and silently miss
+/// everyone who had ever run this.
+///
+/// `emit_default_optional_fields = false` is what does it: `std.zon.stringify`
+/// compares each field against the default in the type and omits the ones that
+/// match, nested structs included. A struct whose every field matches vanishes
+/// with them, so an unconfigured section costs no lines.
+///
+/// Call this before `expandPaths`. Afterwards `~/` has already become an
+/// absolute path, and writing that into a file is a worse answer than the
+/// tilde the user would have typed.
+pub fn write(cfg: *const Config, writer: *std.Io.Writer) !void {
+    try std.zon.stringify.serialize(cfg.*, .{
+        .emit_default_optional_fields = false,
+    }, writer);
+    try writer.writeByte('\n');
+}
+
 /// Where the config lives when `--config` does not say otherwise:
 /// `$XDG_CONFIG_HOME/capsper/config.zon`, falling back to the base directory
 /// spec's own default of `~/.config` when that variable is unset.
@@ -809,4 +838,88 @@ test "a bare tilde is treated as a filename, not a home directory" {
     var cfg = Config{ .model = "~" };
     try cfg.expandPaths(arena_state.allocator());
     try testing.expectEqualStrings("~", cfg.model.?);
+}
+
+/// Serialize into an allocated string, which is what every `write` test wants.
+fn writeToString(arena: Allocator, cfg: *const Config) ![]const u8 {
+    var buf: std.Io.Writer.Allocating = .init(arena);
+    try write(cfg, &buf.writer);
+    return buf.written();
+}
+
+test "writing the defaults says nothing at all" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const cfg = Config{};
+    const text = try writeToString(arena_state.allocator(), &cfg);
+    try testing.expectEqualStrings(".{}\n", text);
+}
+
+test "writing names the settings that differ and nothing else" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var cfg = Config{};
+    cfg.audio.gain = 10.0;
+    const text = try writeToString(arena_state.allocator(), &cfg);
+
+    try testing.expect(std.mem.indexOf(u8, text, "gain") != null);
+    // The section carrying it appears; the ones left alone do not.
+    try testing.expect(std.mem.indexOf(u8, text, "audio") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "meeting") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "tcp_server") == null);
+    // Nor do that section's own untouched fields.
+    try testing.expect(std.mem.indexOf(u8, text, "detect_duration") == null);
+}
+
+test "flags written out and read back give the same settings" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A spread of kinds: enum, float, optional string, bool, integer, and a
+    // setting nested two deep.
+    var cfg = Config{};
+    var cli = Cli{};
+    try testing.expect(parseArgs(&cfg, &cli, argv(&.{
+        "capsper",       "--trigger",     "capslock",
+        "--audio-target", "vocaster",     "--audio-channel",
+        "FR",            "--audio-gain",  "10.0",
+        "--port",        "43007",         "--no-auto-gain",
+        "--record-keep", "3",
+    })) == null);
+    cfg.meeting.enabled = true;
+    cfg.meeting.vad.onset = 0.45;
+
+    const text = try writeToString(arena, &cfg);
+    const source = try arena.dupeZ(u8, text);
+    const reparsed = try parse(arena, source, null);
+
+    // Compared as text rather than with `expectEqual`, which compares the
+    // string fields by pointer and so fails on two equal strings that were
+    // allocated separately. Writing the reparsed config is also the property
+    // that matters: the file a migration produces has to survive being read
+    // back and written again unchanged.
+    try testing.expectEqualStrings(text, try writeToString(arena, &reparsed));
+
+    // And it is not vacuously stable: the values really did make the journey.
+    try testing.expectEqual(TriggerKey.capslock, reparsed.trigger.key.?);
+    try testing.expectEqualStrings("vocaster", reparsed.audio.target.?);
+    try testing.expectEqual(Channel.FR, reparsed.audio.channel);
+    try testing.expectEqual(@as(f32, 10.0), reparsed.audio.gain);
+    try testing.expect(!reparsed.audio.auto_gain);
+    try testing.expectEqual(@as(u16, 43007), reparsed.tcp_server.port.?);
+    try testing.expectEqual(@as(usize, 3), reparsed.debug_recording.keep);
+    try testing.expect(reparsed.meeting.enabled);
+    try testing.expectEqual(@as(f32, 0.45), reparsed.meeting.vad.onset);
+}
+
+test "writing keeps a tilde, because expandPaths has not run yet" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const cfg = Config{ .model = "~/models/nemotron" };
+    const text = try writeToString(arena_state.allocator(), &cfg);
+    try testing.expect(std.mem.indexOf(u8, text, "~/models/nemotron") != null);
 }
