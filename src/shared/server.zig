@@ -4,6 +4,7 @@ const Pipeline = pipeline_mod.Pipeline;
 const backend_init = @import("../backend/init.zig");
 const AudioCapture = @import("../platform/audio.zig").AudioCapture;
 const AutoGain = @import("auto_gain.zig").AutoGain;
+const MicLevel = @import("../platform/mic_level.zig").MicLevel;
 const utils = @import("utils.zig");
 const recorder_mod = @import("recorder.zig");
 const Recorder = recorder_mod.Recorder;
@@ -360,10 +361,27 @@ pub const Server = struct {
             capture.setExitOnDeviceLost();
         }
 
-        // Apply calibrated initial gain (from --pw-gain) before first audio arrives
-        if (self.cfg.audio.gain > 1.01) {
-            _ = capture.setGain(self.cfg.audio.gain);
-            std.debug.print("Auto-gain starting at {d:.1}x\n", .{self.cfg.audio.gain});
+        // The microphone's own level, set on the node rather than on this
+        // capture of it, which is where meeting capture sets it too. One
+        // mechanism, and the one the rest of the desktop already uses.
+        //
+        // A null target follows whatever the desktop calls the default input
+        // and keeps following it, so unplugging one microphone and speaking
+        // into another needs nothing said here.
+        //
+        // Not fatal when it is unavailable: dictation at the wrong level still
+        // dictates.
+        var level: ?MicLevel = MicLevel.init(self.cfg.audio.target) catch |err| blk: {
+            log.warn("levelling the microphone is unavailable: {}", .{err});
+            break :blk null;
+        };
+        defer if (level) |*l| l.deinit();
+
+        if (level) |*l| {
+            if (self.cfg.audio.gain > 1.01) {
+                _ = l.set(self.cfg.audio.gain);
+                std.debug.print("Auto-gain starting at {d:.1}x\n", .{self.cfg.audio.gain});
+            }
         }
 
         if (self.cfg.trigger.low_latency) {
@@ -402,7 +420,7 @@ pub const Server = struct {
         }
 
         var evsrc = session.LocalPttEventSource.init(capture.getFd(), ptt_pipe[0], STREAMING_CHUNK_BYTES, true);
-        self.handleSession(evsrc.source(), stdout_fd, self.type_callback, &capture, is_live.load(.monotonic)) catch |err| {
+        self.handleSession(evsrc.source(), stdout_fd, self.type_callback, if (level) |*l| l else null, is_live.load(.monotonic)) catch |err| {
             std.debug.print("Local capture error: {}\n", .{err});
             return err;
         };
@@ -425,7 +443,10 @@ pub const Server = struct {
         src: EventSource,
         output_fd: posix.fd_t,
         type_cb: ?TypeCallback,
-        capture: ?*AudioCapture,
+        /// The microphone's level, where one could be had. Not a capture of it:
+        /// this addresses the node, which is what the level belongs on. Null
+        /// for a session arriving over TCP, which owns no microphone.
+        level: ?*MicLevel,
         live_at_start: bool,
     ) !void {
         const asr = try self.pipeline_factory.create(self.allocator);
@@ -466,9 +487,20 @@ pub const Server = struct {
                         .silence => log.info("silence detected ({d:.0} dBFS)", .{level_mon.levelDb()}),
                     };
                     if (self.cfg.audio.auto_gain) {
-                        if (capture) |cap| {
-                            if (auto_gain.update(rms)) |new_gain| {
-                                _ = cap.setGain(new_gain);
+                        if (level) |l| {
+                            // A different microphone is a different problem, so
+                            // the controller starts again from the configured
+                            // figure rather than carrying the old device's
+                            // across. The change arrives as an event; nothing
+                            // here goes looking for it.
+                            if (l.tookChange()) {
+                                auto_gain = .{ .current_gain = self.cfg.audio.gain };
+                                _ = l.set(self.cfg.audio.gain);
+                                log.info("microphone changed to '{s}', levelling from {d:.1}x again", .{
+                                    l.nodeName(), self.cfg.audio.gain,
+                                });
+                            } else if (auto_gain.update(rms)) |new_gain| {
+                                _ = l.set(new_gain);
                                 if (self.cfg.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
                             }
                         }
