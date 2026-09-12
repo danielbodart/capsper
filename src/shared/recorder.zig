@@ -45,7 +45,12 @@ pub const Recorder = struct {
         version: []const u8,
         detail: webvtt.Detail,
     ) !Recorder {
-        const dir = try std.fs.cwd().openDir(dir_path, .{});
+        // Created rather than merely opened, matching the meeting runner's
+        // root (meeting_runner.zig). A missing directory is the ordinary case
+        // on a fresh machine, and failing here is worse than it looks: main
+        // prints and returns, which under the service's Restart=always is a
+        // restart loop rather than an error anybody reads.
+        const dir = try std.fs.cwd().makeOpenPath(dir_path, .{});
         return .{
             .allocator = allocator,
             .dir = dir,
@@ -170,3 +175,59 @@ pub const Recorder = struct {
         return @intCast(@max(0, @divTrunc(elapsed_ns, 1_000_000)));
     }
 };
+
+const testing = std.testing;
+
+test "init creates the record directory when it does not exist" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A path under the tmp dir that nothing has created, which is the state
+    // on a fresh machine the first time `debug_recording.dir` is set.
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    const nested = try std.fs.path.join(testing.allocator, &.{ path, "recordings" });
+    defer testing.allocator.free(nested);
+
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(nested, .{}));
+
+    var rec = try Recorder.init(testing.allocator, nested, 10, "test", .debug);
+    defer rec.deinit();
+
+    try std.fs.cwd().access(nested, .{});
+}
+
+test "init creates missing parents, not just the leaf" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    const deep = try std.fs.path.join(testing.allocator, &.{ path, "a", "b", "recordings" });
+    defer testing.allocator.free(deep);
+
+    var rec = try Recorder.init(testing.allocator, deep, 10, "test", .debug);
+    defer rec.deinit();
+
+    try std.fs.cwd().access(deep, .{});
+}
+
+test "init reuses an existing directory rather than failing on it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("recordings");
+    const path = try tmp.dir.realpathAlloc(testing.allocator, "recordings");
+    defer testing.allocator.free(path);
+
+    // Left behind by an earlier run: reopening must not clobber it, because
+    // the ring is meant to survive a restart.
+    try tmp.dir.writeFile(.{ .sub_path = "recordings/000.wav", .data = "existing" });
+
+    var rec = try Recorder.init(testing.allocator, path, 10, "test", .debug);
+    defer rec.deinit();
+
+    var buf: [16]u8 = undefined;
+    const n = try rec.dir.readFile("000.wav", &buf);
+    try testing.expectEqualStrings("existing", n);
+}

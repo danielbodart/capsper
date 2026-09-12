@@ -121,6 +121,7 @@ pub fn build(b: *std.Build) void {
         "src/shared/session_server.zig",
         "src/shared/source.zig",
         "src/shared/vad.zig",
+        "src/shared/recorder.zig",
     }) |src| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
