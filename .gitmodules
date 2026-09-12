@@ -1,0 +1,3 @@
+[submodule "vendor/libopus"]
+	path = vendor/libopus
+	url = https://github.com/xiph/opus.git

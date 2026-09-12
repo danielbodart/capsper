@@ -317,12 +317,18 @@ Each session writes a directory:
 
 ```
 ~/.local/share/capsper/sessions/2026/09/11/T143000Z/
-  audio.wav    both sides, near left and far right
+  audio.opus   both sides, near left and far right
   audio.vtt    both sides, merged by time
 ```
 
 The transcript shares the audio file's name, which is the convention media
 players use to pair the two, so dropping either into a player picks up both.
+
+Opus at about 48 kbps, which is roughly 20 MB an hour. Twice what one voice
+would need, because Opus couples stereo channels efficiently only when they
+correlate and these two do not at all — the same total two mono tracks would
+have cost. `.audio_format = .wav` instead if you want the raw samples, at
+115 MB per channel per hour.
 
 The path is a single ISO 8601 timestamp split across directories, in UTC. One
 stereo file rather than two mono ones, with the microphone on the left and the

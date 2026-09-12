@@ -26,6 +26,7 @@
   zig_0_15,
   pkg-config,
   pipewire,
+  libopus,
   onnxruntime,
   cudaPackages,
   version,
@@ -73,6 +74,7 @@ let
       ../build.zig.zon
       ../src
       ../test/jfk.wav # installed beside the binary as the warmup clip
+      ../models # the voice activity model, installed into the models directory
       ../dist/linux/include # ORT headers, plain text (not LFS)
     ];
   };
@@ -90,6 +92,7 @@ stdenv.mkDerivation {
 
   buildInputs = [
     pipewire
+    libopus
   ]
   ++ lib.optionals (!cudaSupport) [ onnxruntime ];
 
@@ -108,6 +111,7 @@ stdenv.mkDerivation {
       -Doptimize=ReleaseSafe \
       -Dversion=${version} \
       -Dprop-tests=false \
+      -Dsystem-opus=true \
       -Dort-include=${ortInclude} \
       -Dort-lib=${ortLib} \
       -Drpath=${ortLib} \

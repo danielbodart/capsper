@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # libopus is a submodule, compiled into the binary.
+          submodules: recursive
       - uses: actions/cache@v4
         with:
           path: .git/lfs
@@ -44,6 +46,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # libopus is a submodule, compiled into the binary.
+          submodules: recursive
       - uses: actions/cache@v4
         with:
           path: tools

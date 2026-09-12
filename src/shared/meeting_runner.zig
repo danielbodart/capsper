@@ -16,6 +16,7 @@ const config = @import("config.zig");
 const meeting = @import("meeting.zig");
 const utils = @import("utils.zig");
 const webvtt = @import("webvtt.zig");
+const opus = @import("opus.zig");
 const server_mod = @import("server.zig");
 const PipelineFactory = server_mod.PipelineFactory;
 const Pipeline = @import("../backend/pipeline.zig").Pipeline;
@@ -37,9 +38,16 @@ const poll_interval_ms: i32 = 200;
 const SessionFile = struct {
     dir: std.fs.Dir,
     file: std.fs.File,
-    bytes_written: u32 = 0,
 
-    fn create(root: []const u8, rel_path: []const u8) !SessionFile {
+    /// Opus for a meeting, which is hours kept indefinitely; WAV when the
+    /// setting asks for it. Either way the audio is never gated -- it has to
+    /// line up with the cue timestamps, which is the whole reason it is kept.
+    encoder: union(config.AudioFormat) {
+        wav: struct { bytes: u32 = 0 },
+        opus: opus.Writer,
+    },
+
+    fn create(root: []const u8, rel_path: []const u8, gpa: std.mem.Allocator, format: config.AudioFormat) !SessionFile {
         var root_dir = try std.fs.cwd().makeOpenPath(root, .{});
         defer root_dir.close();
 
@@ -53,40 +61,69 @@ const SessionFile = struct {
         var dir = try root_dir.openDir(rel_path, .{});
         errdefer dir.close();
 
-        const file = try dir.createFile("audio.wav", .{});
+        const file = try dir.createFile(audioName(format), .{});
         errdefer file.close();
 
+        switch (format) {
+            .wav => {
+                // Placeholder sizes; a session's length is not known when it
+                // starts, so the header is rewritten on close.
+                var header: std.ArrayListUnmanaged(u8) = .{};
+                defer header.deinit(gpa);
+                try utils.writeWavHeader(header.writer(gpa), 0, 2);
+                try file.writeAll(header.items);
+                return .{ .dir = dir, .file = file, .encoder = .{ .wav = .{} } };
+            },
+            .opus => return .{
+                .dir = dir,
+                .file = file,
+                .encoder = .{ .opus = try opus.Writer.create(gpa, file, 2, opus.default_bitrate) },
+            },
+        }
+    }
 
-        // Placeholder sizes; a session's length is not known when it starts.
-        var header: std.ArrayListUnmanaged(u8) = .{};
-        defer header.deinit(std.heap.page_allocator);
-        try utils.writeWavHeader(header.writer(std.heap.page_allocator), 0, 2);
-        try file.writeAll(header.items);
-
-        return .{ .dir = dir, .file = file };
+    /// The audio file's name, which the transcript beside it shares: media
+    /// players pair a subtitle file with a media file by matching basenames.
+    fn audioName(format: config.AudioFormat) [:0]const u8 {
+        return switch (format) {
+            .wav => "audio.wav",
+            .opus => "audio.opus",
+        };
     }
 
     fn append(self: *SessionFile, bytes: []const u8) !void {
         if (bytes.len == 0) return;
-        try self.file.writeAll(bytes);
-        self.bytes_written +|= @intCast(bytes.len);
+        switch (self.encoder) {
+            .wav => |*w| {
+                try self.file.writeAll(bytes);
+                w.bytes +|= @intCast(bytes.len);
+            },
+            .opus => |*w| try w.write(bytes),
+        }
     }
 
-    /// Rewrite the header with the real sizes, then close.
-    fn finish(self: *SessionFile) void {
-        var header: std.ArrayListUnmanaged(u8) = .{};
-        defer header.deinit(std.heap.page_allocator);
-        if (utils.writeWavHeader(header.writer(std.heap.page_allocator), self.bytes_written, 2)) {
-            self.file.seekTo(0) catch {};
-            self.file.writeAll(header.items) catch {};
-        } else |_| {}
+    fn finish(self: *SessionFile, gpa: std.mem.Allocator) void {
+        switch (self.encoder) {
+            .wav => |w| {
+                var header: std.ArrayListUnmanaged(u8) = .{};
+                defer header.deinit(gpa);
+                if (utils.writeWavHeader(header.writer(gpa), w.bytes, 2)) {
+                    self.file.seekTo(0) catch {};
+                    self.file.writeAll(header.items) catch {};
+                } else |_| {}
+            },
+            .opus => |*w| w.finish(),
+        }
         self.file.close();
         self.dir.close();
     }
 
     fn durationSeconds(self: *const SessionFile) f64 {
-        // 16 kHz, two channels, two bytes a sample.
-        return @as(f64, @floatFromInt(self.bytes_written)) / 64_000.0;
+        return switch (self.encoder) {
+            // 16 kHz, two channels, two bytes a sample.
+            .wav => |w| @as(f64, @floatFromInt(w.bytes)) / 64_000.0,
+            .opus => |w| w.durationSeconds(),
+        };
     }
 };
 
@@ -333,10 +370,10 @@ const Session = struct {
         var path_buf: [64]u8 = undefined;
         const rel = try meeting.sessionPath(&path_buf, std.time.timestamp());
 
-        var file = try SessionFile.create(cfg.meeting.dir, rel);
-        errdefer file.finish();
+        var file = try SessionFile.create(cfg.meeting.dir, rel, gpa, cfg.meeting.audio_format);
+        errdefer file.finish(gpa);
 
-        var transcript = try Transcript.create(gpa, file.dir, cfg.meeting.detail);
+        var transcript = try Transcript.create(gpa, file.dir, cfg.meeting.detail, SessionFile.audioName(cfg.meeting.audio_format));
         errdefer transcript.deinit();
 
         var near_asr = try TrackAsr.init(gpa, .near, factory, cfg);
@@ -434,7 +471,7 @@ const Session = struct {
         self.pending.deinit(gpa);
 
         const seconds = self.file.durationSeconds();
-        self.file.finish();
+        self.file.finish(gpa);
         std.debug.print("[meeting] session closed ({d:.1}s of audio)\n", .{seconds});
     }
 };
@@ -450,24 +487,33 @@ const Transcript = struct {
     doc: webvtt.Transcript,
     dir: std.fs.Dir,
 
-    // So a recording found in two years says which side is which without
-    // needing this repository to explain it.
-    const header_notes = [_][]const u8{
-        "capsper meeting transcript",
-        "audio.wav: near end (microphone) = left, far end (call) = right",
-    };
+    /// So a recording found in two years says which side is which without
+    /// needing this repository to explain it.
+    channels_note: []const u8,
 
-    fn create(gpa: std.mem.Allocator, dir: std.fs.Dir, detail: config.Detail) !Transcript {
+    fn create(
+        gpa: std.mem.Allocator,
+        dir: std.fs.Dir,
+        detail: config.Detail,
+        audio_name: []const u8,
+    ) !Transcript {
         return .{
             .doc = webvtt.Transcript.init(gpa, switch (detail) {
                 .minimal => .minimal,
                 .debug => .debug,
             }),
             .dir = dir,
+            .channels_note = try std.fmt.allocPrint(
+                gpa,
+                "{s}: near end (microphone) = left, far end (call) = right",
+                .{audio_name},
+            ),
         };
     }
 
     fn finish(self: *Transcript) void {
+        defer self.doc.gpa.free(self.channels_note);
+        const header_notes = [_][]const u8{ "capsper meeting transcript", self.channels_note };
         if (self.doc.render(&header_notes)) |bytes| {
             defer self.doc.gpa.free(bytes);
             if (self.dir.createFile("audio.vtt", .{})) |file| {
@@ -479,6 +525,7 @@ const Transcript = struct {
     }
 
     fn deinit(self: *Transcript) void {
+        self.doc.gpa.free(self.channels_note);
         self.doc.deinit();
     }
 };

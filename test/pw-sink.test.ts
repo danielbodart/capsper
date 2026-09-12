@@ -104,12 +104,12 @@ async function bandDb(path: string, channel: 0 | 1, hz: number): Promise<number>
     return match ? parseFloat(match[1]) : -Infinity;
 }
 
-/** Every session audio file under a sessions root. */
-function walkWavs(dir: string, found: string[] = []): string[] {
+/** Every session audio file of the given extension under a sessions root. */
+function walkAudio(dir: string, ext: string, found: string[] = []): string[] {
     for (const entry of readdirSync(dir)) {
         const path = join(dir, entry);
-        if (statSync(path).isDirectory()) walkWavs(path, found);
-        else if (entry.endsWith(".wav")) found.push(path);
+        if (statSync(path).isDirectory()) walkAudio(path, ext, found);
+        else if (entry.endsWith(ext)) found.push(path);
     }
     return found;
 }
@@ -120,12 +120,14 @@ async function startCapsper(opts: {
     sessionsDir: string;
     httpPort: number;
     idleCloseSeconds: number;
+    audioFormat?: "wav" | "opus";
 }) {
     const configFile = tmpFile("capsper-sink-config", ".zon");
     writeFileSync(
         configFile,
         `.{ .meeting = .{ .enabled = true, .sink_name = "${opts.sink}",` +
             ` .idle_close_seconds = ${opts.idleCloseSeconds}, .dir = "${opts.sessionsDir}",` +
+            ` .audio_format = .${opts.audioFormat ?? "opus"},` +
             ` .http = .{ .port = ${opts.httpPort} } } }\n`,
     );
 
@@ -363,6 +365,10 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
             sessionsDir,
             httpPort: AUDIO_HTTP_PORT,
             idleCloseSeconds: 3,
+            // WAV here, not the Opus a real session defaults to: these check
+            // what the capture put in each channel, and raw samples make that
+            // a direct measurement rather than one through a codec.
+            audioFormat: "wav",
         });
     });
 
@@ -377,7 +383,7 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
     const count = (needle: string) =>
         readFileSync(capsper.logFile, "utf8").split(needle).length - 1;
 
-    const sessionFiles = () => walkWavs(sessionsDir).sort();
+    const sessionFiles = () => walkAudio(sessionsDir, ".wav").sort();
 
     /** Wait until no session is open, so a count-based assertion starts level. */
     const settle = () =>
@@ -545,4 +551,94 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
 
         try { unlinkSync(gapped); } catch {}
     }, 120_000);
+});
+
+// ─── The format a real session actually uses ─────────────────────────────────
+
+describe.skipIf(!isLinux || !SLOW)("virtual sink: opus", () => {
+    const OPUS_SINK = "test_capsper_opus_sink";
+    const OPUS_HTTP_PORT = 43920;
+
+    let capsper: Awaited<ReturnType<typeof startCapsper>>;
+    let sessionsDir = "";
+    let speech = "";
+
+    beforeAll(async () => {
+        ensureBinary();
+        sessionsDir = tmpFile("capsper-opus-sessions", "");
+        mkdirSync(sessionsDir, { recursive: true });
+
+        speech = tmpFile("capsper-opus-speech", ".wav");
+        await $`ffmpeg -y -i test/jfk.wav -t 4 -ar 48000 -ac 2 ${speech}`.quiet().nothrow();
+
+        capsper = await startCapsper({
+            sink: OPUS_SINK,
+            sessionsDir,
+            httpPort: OPUS_HTTP_PORT,
+            idleCloseSeconds: 3,
+            // The default, spelled out because it is the point of this block.
+            audioFormat: "opus",
+        });
+    });
+
+    afterAll(async () => {
+        if (capsper) await waitForExit(capsper.proc);
+        for (const path of [capsper?.configFile, capsper?.logFile, speech]) {
+            if (path) try { unlinkSync(path); } catch {}
+        }
+        try { rmSync(sessionsDir, { recursive: true, force: true }); } catch {}
+    });
+
+    test("records a session as a playable Opus file", async () => {
+        const count = (needle: string) =>
+            readFileSync(capsper.logFile, "utf8").split(needle).length - 1;
+        const closedBefore = count("session closed");
+
+        const play = spawn(["pw-play", "--target", OPUS_SINK, speech], {
+            stdout: "ignore",
+            stderr: "ignore",
+        });
+        trackProc(play);
+        await play.exited;
+        await until("the session to close", () => count("session closed") === closedBefore + 1, {
+            timeoutSec: 30,
+        });
+
+        const audio = walkAudio(sessionsDir, ".opus").sort().pop()!;
+        expect(audio).toMatch(/\d{4}\/\d{2}\/\d{2}\/T\d{6}Z\/audio\.opus$/);
+
+        // Readable by something that is not us, which is the only test of a
+        // container format that means anything.
+        const probe = await $`ffprobe -v error -show_entries stream=codec_name,channels -show_entries format=duration -of default=noprint_wrappers=1 ${audio}`
+            .quiet()
+            .nothrow();
+        const info = probe.stdout.toString();
+        expect(info).toContain("codec_name=opus");
+        expect(info).toContain("channels=2");
+
+        // Granule positions are counted at 48 kHz whatever the encoder was
+        // given; get that wrong and the duration is out by a factor of three.
+        const seconds = parseFloat(info.match(/duration=([\d.]+)/)![1]);
+        expect(seconds).toBeGreaterThan(3);
+        expect(seconds).toBeLessThan(15);
+
+        // Far smaller than the WAV it came from, which is the reason for it.
+        expect(statSync(audio).size).toBeLessThan(seconds * 64_000 / 4);
+
+        // The transcript beside it shares the basename, so a player pairs them.
+        const vtt = readFileSync(audio.replace(/\.opus$/, ".vtt"), "utf8");
+        expect(vtt).toContain("audio.opus: near end");
+    }, 90_000);
+
+    test("serves the opus session with its duration and the right type", async () => {
+        const sessions = await (await fetch(`http://127.0.0.1:${OPUS_HTTP_PORT}/sessions.json`)).json();
+        expect(sessions.length).toBeGreaterThan(0);
+        expect(sessions[0].audio).toBe("audio.opus");
+        // Read back out of the last Ogg page's granule position.
+        expect(sessions[0].seconds).toBeGreaterThan(3);
+
+        const audio = await fetch(`http://127.0.0.1:${OPUS_HTTP_PORT}/s/${sessions[0].path}/audio.opus`);
+        expect(audio.status).toBe(200);
+        expect(audio.headers.get("content-type")).toBe("audio/ogg");
+    }, 30_000);
 });

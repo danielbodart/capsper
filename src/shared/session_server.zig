@@ -220,12 +220,17 @@ fn collect(arena: std.mem.Allocator, root: []const u8) ![]Session {
     return sessions;
 }
 
-/// Length from the WAV header, or zero for anything that is not one. Only ever
-/// used to label a row in the list, so an unknown length costs nothing.
+/// How long a session's audio runs. Only ever used to label a row in the list,
+/// so an unreadable file costs a blank cell rather than an error.
 fn durationSeconds(dir: std.fs.Dir, path: []const u8) f64 {
     var file = dir.openFile(path, .{}) catch return 0;
     defer file.close();
 
+    if (std.mem.endsWith(u8, path, ".opus")) return oggDurationSeconds(file);
+    return wavDurationSeconds(file);
+}
+
+fn wavDurationSeconds(file: std.fs.File) f64 {
     // Generously more than the 44 bytes capsper writes: a WAV from anything
     // else may carry LIST or fact chunks before the data chunk, and the header
     // parser has to reach the data chunk to find its size.
@@ -236,6 +241,35 @@ fn durationSeconds(dir: std.fs.Dir, path: []const u8) f64 {
     const bytes_per_second: f64 = @floatFromInt(16000 * 2 * @as(u32, parsed.channels));
     if (bytes_per_second == 0) return 0;
     return @as(f64, @floatFromInt(parsed.data_size)) / bytes_per_second;
+}
+
+/// The granule position on the last Ogg page, which for Opus is the number of
+/// 48 kHz samples the file decodes to.
+///
+/// Read by scanning backwards for the last page header rather than walking the
+/// file forwards, because an hour of audio is a lot of pages to walk to answer
+/// one question.
+fn oggDurationSeconds(file: std.fs.File) f64 {
+    const size = (file.stat() catch return 0).size;
+
+    // A page header is 27 bytes plus up to 255 segments plus the body, so the
+    // last one starts well inside the final 64 kB unless something is very
+    // wrong.
+    const window: u64 = @min(size, 64 * 1024);
+    var buf: [64 * 1024]u8 = undefined;
+    file.seekTo(size - window) catch return 0;
+    const n = file.readAll(buf[0..window]) catch return 0;
+
+    var i = n;
+    while (i >= 4) : (i -= 1) {
+        if (!std.mem.eql(u8, buf[i - 4 ..][0..4], "OggS")) continue;
+        const page = buf[i - 4 ..];
+        if (page.len < 14) return 0;
+        const granule = std.mem.readInt(i64, page[6..14], .little);
+        if (granule < 0) return 0;
+        return @as(f64, @floatFromInt(granule)) / 48000.0;
+    }
+    return 0;
 }
 
 // ─── Session files ───────────────────────────────────────────────────────────
