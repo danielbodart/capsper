@@ -363,6 +363,64 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         try { unlinkSync(speech); } catch {}
     }, 90_000);
 
+    test("keeps cue timestamps in step with the recording across a long silence", async () => {
+        // The trap this guards against does not exist yet, and that is the
+        // point of writing it now. Cue positions are counted as audio
+        // arrives, ahead of the encoder. Today everything that arrives is
+        // encoded, so the two agree and this passes trivially.
+        //
+        // The moment a VAD sits in front of the encoder to stop paying for
+        // silence, they diverge: a position derived from what the encoder
+        // consumed would skip the elided silence, so every cue after the
+        // first pause drifts earlier by the total silence skipped. On an
+        // hour-long meeting the end would be minutes out, and nothing about
+        // the file would look wrong.
+        await settle();
+
+        // Speech, then ten seconds of nothing, then the same speech again.
+        const gapped = tmpFile("capsper-sink-gapped", ".wav");
+        await $`ffmpeg -y -i test/jfk.wav -i test/jfk.wav -filter_complex ${"[0:a]apad=pad_dur=10[a];[a][1:a]concat=n=2:v=0:a=1"} -ar 48000 -ac 2 ${gapped}`
+            .quiet()
+            .nothrow();
+
+        const probe = await $`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${gapped}`
+            .quiet()
+            .nothrow();
+        const durationMs = parseFloat(probe.stdout.toString()) * 1000;
+
+        const play = spawn(["pw-play", "--target", SINK, gapped], {
+            stdout: "ignore",
+            stderr: "ignore",
+        });
+        trackProc(play);
+        await play.exited;
+        await Bun.sleep(5000);
+
+        const dir = sessionFiles().pop()!.replace(/audio\.wav$/, "");
+        const vtt = readFileSync(join(dir, "transcript.vtt"), "utf8");
+
+        const cues = [...vtt.matchAll(/^(\d{2}):(\d{2}):(\d{2})\.(\d{3}) --> (\d{2}):(\d{2}):(\d{2})\.(\d{3})$/gm)].map(
+            (m) => ({
+                start: ((+m[1] * 60 + +m[2]) * 60 + +m[3]) * 1000 + +m[4],
+                end: ((+m[5] * 60 + +m[6]) * 60 + +m[7]) * 1000 + +m[8],
+            }),
+        );
+        expect(cues.length).toBeGreaterThan(1);
+
+        const lastEnd = Math.max(...cues.map((c) => c.end));
+        console.error(`  played ${(durationMs / 1000).toFixed(1)}s, last cue ends at ${(lastEnd / 1000).toFixed(1)}s`);
+
+        // The second half of the speech has to be attributed after the
+        // silence, not folded back onto the first half.
+        const lastStart = Math.max(...cues.map((c) => c.start));
+        expect(lastStart).toBeGreaterThan(15_000);
+
+        // And the transcript must not run past the recording it describes.
+        expect(lastEnd).toBeLessThanOrEqual(durationMs + 2000);
+
+        try { unlinkSync(gapped); } catch {}
+    }, 120_000);
+
     test("is gone once capsper exits", async () => {
         try { server?.kill(); } catch {}
         await Bun.sleep(1500);
