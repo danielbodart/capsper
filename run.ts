@@ -155,7 +155,7 @@ export async function dev() {
     if (IS_MACOS) {
         await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/ca-stream.test.ts`;
     } else {
-        await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/pw-stream.test.ts`;
+        await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/pw-stream.test.ts test/pw-sink.test.ts`;
     }
 }
 

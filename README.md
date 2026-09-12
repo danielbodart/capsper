@@ -282,6 +282,37 @@ One-shot actions stay on the command line and have no field: `--version`,
 `--stream-wav` aliases likewise keep working as flags but have no second
 spelling in the file.
 
+## Meeting capture (Linux, in progress)
+
+A second capture mode: continuous, unattended, both sides of a call, one timed
+transcript. It is being built in phases and is not finished. What works today
+is the audio path.
+
+```zig
+.{
+    .meeting = .{
+        .enabled = true,
+        .sink_name = "capsper_call",
+    },
+}
+```
+
+With this on, capsper creates a virtual output device of that name. Select it
+as the output in the meeting app, and the far end of the call goes into it
+instead of your speakers. Capsper passes it straight on to whatever your
+default output is, so the call is still audible, and captures it from the
+sink's monitor.
+
+A dedicated sink rather than the default output's monitor, because selecting
+it *is* the declaration of intent: nothing else is ever in it, so there is no
+music or notification audio to filter out afterwards. The sink exists only
+while capsper runs, and sits suspended until an application plays into it.
+
+Not yet built: arming on the call starting and stopping, capturing the near
+end alongside it, the transcript, and the session files. See
+`docs/meeting-capture-plan.md`. macOS is not supported, because a program
+cannot create a virtual output device for itself there.
+
 ### Trigger keys
 
 The `--trigger` flag selects which key activates push-to-talk. CapsLock is the default.

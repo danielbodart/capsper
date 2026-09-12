@@ -18,6 +18,7 @@ const utils = @import("shared/utils.zig");
 const audio_detect = @import("platform/detect.zig");
 const Recorder = @import("shared/recorder.zig").Recorder;
 const config = @import("shared/config.zig");
+const VirtualSink = @import("platform/sink.zig").VirtualSink;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
@@ -110,11 +111,25 @@ pub fn main() !void {
     // Both can be active simultaneously.
     const want_local = cfg.audio.target != null or trigger_key != null;
     const want_tcp = cfg.tcp_server.port != null;
+    const want_meeting = cfg.meeting.enabled;
 
-    if (!want_local and !want_tcp and cli.stream == null and cli.transcribe == null and !cli.dry_run) {
+    if (!want_local and !want_tcp and !want_meeting and
+        cli.stream == null and cli.transcribe == null and !cli.dry_run)
+    {
         printUsage();
         return;
     }
+
+    // The sink goes up before the model loads, so it is in the output picker
+    // while the model is still being read rather than a minute later.
+    var sink: ?VirtualSink = null;
+    if (want_meeting and !cli.dry_run) {
+        sink = VirtualSink.init(cfg.meeting.sink_name, "Capsper Call") catch |err| {
+            std.debug.print("Failed to create virtual sink '{s}': {}\n", .{ cfg.meeting.sink_name, err });
+            return;
+        };
+    }
+    defer if (sink) |*s| s.deinit();
 
     // An unset model path means the copy shipped beside the binary, which is
     // what makes an unpacked dist tarball run without configuring anything.
@@ -374,6 +389,15 @@ pub fn main() !void {
         .recorder = recorder,
     });
     try server.run();
+
+    // The sink lives only as long as this process, so with nothing else
+    // enabled there has to be something to wait on. There is nothing to wait
+    // *for* yet -- arming on the graph and capturing the two tracks are the
+    // next phase -- so for now it simply holds the sink open.
+    if (want_meeting and !want_local and !want_tcp) {
+        std.debug.print("Meeting sink '{s}' is up; select it as your output. Nothing else to do yet.\n", .{cfg.meeting.sink_name});
+        while (true) std.Thread.sleep(std.time.ns_per_s);
+    }
 }
 
 /// Prime the pipeline on a short known file so the first real utterance does

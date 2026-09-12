@@ -119,3 +119,8 @@ pub const PW_KEY_MEDIA_CATEGORY = pw.PW_KEY_MEDIA_CATEGORY;
 pub const PW_KEY_MEDIA_ROLE = pw.PW_KEY_MEDIA_ROLE;
 pub const PW_KEY_TARGET_OBJECT = pw.PW_KEY_TARGET_OBJECT;
 pub const PW_KEY_NODE_NAME = pw.PW_KEY_NODE_NAME;
+
+// Virtual sink (the far end of a call, captured from its monitor)
+pub const pw_virtual_sink = opaque {};
+pub extern fn pw_virtual_sink_create(node_name: [*:0]const u8, description: [*:0]const u8) ?*pw_virtual_sink;
+pub extern fn pw_virtual_sink_destroy(s: *pw_virtual_sink) void;

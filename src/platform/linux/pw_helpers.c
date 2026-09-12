@@ -1,6 +1,7 @@
 #include <pipewire/pipewire.h>
 #include <pipewire/stream.h>
 #include <pipewire/core.h>
+#include <pipewire/impl-module.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/props.h>
 #include <spa/pod/builder.h>
@@ -464,4 +465,129 @@ pw_device_monitor_set_on_appeared(struct pw_device_monitor *m,
     if (!m) return;
     m->on_appeared = cb;
     m->on_appeared_data = data;
+}
+
+/* ─── Virtual sink ──────────────────────────────────────────────────────────
+
+   A sink capsper owns, so the far end of a call can be captured from
+   somewhere that contains only the call. The user selects it in the meeting
+   app, and that selection is the declaration of intent -- unlike the default
+   output's monitor, which would also catch music and notifications.
+
+   It is `libpipewire-module-loopback` loaded into our own context, which is
+   exactly what the `pw-loopback` tool does. One module gives all three things
+   the graph needs: the sink itself (the loopback's capture end, declared
+   Audio/Sink), a monitor on it to capture from, and a playback end that
+   carries the audio on to the real default output so the call is still
+   audible.
+
+   The playback end is `node.passive`, so the whole thing sits in `suspended`
+   when no application is holding the sink. That is what lets the graph answer
+   "is a call happening?" rather than being permanently busy. */
+
+struct pw_virtual_sink {
+    struct pw_thread_loop *thread_loop;
+    struct pw_context     *context;
+    struct pw_core        *core;
+    struct pw_impl_module *module;
+};
+
+struct pw_virtual_sink *
+pw_virtual_sink_create(const char *node_name, const char *description)
+{
+    if (!node_name || !node_name[0])
+        return NULL;
+
+    /* Refcounted, and the sink can be the first thing in the process to touch
+       PipeWire -- it goes up before the model loads. */
+    pw_init(NULL, NULL);
+
+    struct pw_virtual_sink *s = calloc(1, sizeof(*s));
+    if (!s) return NULL;
+
+    /* Stereo on both ends: the sink has to look like ordinary speakers to the
+       meeting app, and the monitor's two channels are what the far end is
+       eventually mixed down from. */
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{ "
+             "capture.props = { "
+                 "media.class = Audio/Sink "
+                 "node.name = \"%s\" "
+                 "node.description = \"%s\" "
+                 "audio.position = [ FL FR ] "
+             "} "
+             "playback.props = { "
+                 "node.name = \"%s.passthrough\" "
+                 "node.description = \"%s (pass-through)\" "
+                 "node.passive = true "
+                 "audio.position = [ FL FR ] "
+             "} "
+             "}",
+             node_name, description ? description : node_name,
+             node_name, description ? description : node_name);
+
+    s->thread_loop = pw_thread_loop_new("capsper-sink", NULL);
+    if (!s->thread_loop) { free(s); return NULL; }
+
+    s->context = pw_context_new(pw_thread_loop_get_loop(s->thread_loop), NULL, 0);
+    if (!s->context) {
+        pw_thread_loop_destroy(s->thread_loop);
+        free(s); return NULL;
+    }
+
+    pw_thread_loop_lock(s->thread_loop);
+
+    if (pw_thread_loop_start(s->thread_loop) < 0) {
+        pw_thread_loop_unlock(s->thread_loop);
+        pw_context_destroy(s->context);
+        pw_thread_loop_destroy(s->thread_loop);
+        free(s); return NULL;
+    }
+
+    s->core = pw_context_connect(s->context, NULL, 0);
+    if (!s->core) {
+        pw_thread_loop_unlock(s->thread_loop);
+        pw_thread_loop_stop(s->thread_loop);
+        pw_context_destroy(s->context);
+        pw_thread_loop_destroy(s->thread_loop);
+        free(s); return NULL;
+    }
+
+    /* The module creates its nodes on this loop, which is why the load
+       happens under the lock rather than before the loop is running. */
+    s->module = pw_context_load_module(s->context,
+                                       "libpipewire-module-loopback", args, NULL);
+    if (!s->module) {
+        fprintf(stderr, "[sink] Failed to load libpipewire-module-loopback\n");
+        pw_core_disconnect(s->core);
+        pw_thread_loop_unlock(s->thread_loop);
+        pw_thread_loop_stop(s->thread_loop);
+        pw_context_destroy(s->context);
+        pw_thread_loop_destroy(s->thread_loop);
+        free(s); return NULL;
+    }
+
+    pw_thread_loop_unlock(s->thread_loop);
+
+    fprintf(stderr, "[sink] Virtual sink '%s' ready\n", node_name);
+    return s;
+}
+
+void
+pw_virtual_sink_destroy(struct pw_virtual_sink *s)
+{
+    if (!s) return;
+
+    pw_thread_loop_lock(s->thread_loop);
+    /* Destroying the context unloads the module with it, which is what
+       removes the sink from the graph. */
+    if (s->core)
+        pw_core_disconnect(s->core);
+    pw_thread_loop_unlock(s->thread_loop);
+
+    pw_thread_loop_stop(s->thread_loop);
+    pw_context_destroy(s->context);
+    pw_thread_loop_destroy(s->thread_loop);
+    free(s);
 }
