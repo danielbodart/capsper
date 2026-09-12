@@ -493,7 +493,7 @@ test "LocalPttEventSource: multiplexes PTT and audio over real pipes" {
     try expectTag(try src.next(), .eof);
 }
 
-test "scripted PTT session writes a recording" {
+test "scripted PTT session writes a recording and its transcript" {
     const allocator = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -501,7 +501,7 @@ test "scripted PTT session writes a recording" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try tmp.dir.realpath(".", &path_buf);
 
-    var rec = try Recorder.init(allocator, dir_path, 10, "test");
+    var rec = try Recorder.init(allocator, dir_path, 10, "test", .debug);
     defer rec.deinit();
 
     // Two 320-byte chunks of non-zero S16 PCM (0x1111 samples).
@@ -517,6 +517,7 @@ test "scripted PTT session writes a recording" {
 
     var driver = SessionDriver.init(false);
     var saw_file_before_end = false;
+    var position_ms: u64 = 0;
 
     loop: while (true) {
         const ev = try src.next();
@@ -525,11 +526,19 @@ test "scripted PTT session writes a recording" {
             .start_recording => rec.startRecording(),
             .record => |bytes| rec.recordPcm(bytes),
             .end_recording => try rec.endRecording(),
-            .reset_segment, .transcribe => {}, // no pipeline in this test
+            .reset_segment => {},
+            // No pipeline here, so the text a real one would have produced is
+            // supplied directly. That is all the recorder ever sees of it.
+            .transcribe => rec.logEmit("hello"),
             .stop => break :loop,
         };
-        // Before release, nothing should be flushed to disk yet.
         if (ev == .audio) {
+            // One chunk of audio, loud, carrying whatever was just emitted.
+            const next_ms = position_ms + 10;
+            rec.markChunk(position_ms, next_ms, 0.5);
+            position_ms = next_ms;
+
+            // Before release, nothing should be flushed to disk yet.
             tmp.dir.access("000.wav", .{}) catch {
                 saw_file_before_end = false;
                 continue;
@@ -542,5 +551,14 @@ test "scripted PTT session writes a recording" {
     try testing.expect(!saw_file_before_end);
     const st = try tmp.dir.statFile("000.wav");
     try testing.expectEqual(@as(u64, 44 + 2 * 320), st.size); // 44-byte header + PCM
-    _ = try tmp.dir.statFile("000.log"); // sibling diagnostic log
+
+    // The transcript beside it is a real WebVTT file: a header note saying
+    // what wrote it, and a cue carrying the text against its audio position.
+    const vtt = try tmp.dir.readFileAlloc(allocator, "000.vtt", 64 * 1024);
+    defer allocator.free(vtt);
+
+    try testing.expect(std.mem.startsWith(u8, vtt, "WEBVTT\n"));
+    try testing.expect(std.mem.indexOf(u8, vtt, "NOTE capsper recording 000 (vtest)") != null);
+    try testing.expect(std.mem.indexOf(u8, vtt, "<v Near>hellohello") != null);
+    try testing.expect(std.mem.indexOf(u8, vtt, "00:00:00.000 --> 00:00:00.020") != null);
 }

@@ -8,6 +8,7 @@ const utils = @import("utils.zig");
 const recorder_mod = @import("recorder.zig");
 const Recorder = recorder_mod.Recorder;
 const session = @import("session.zig");
+const webvtt = @import("webvtt.zig");
 const Config = @import("config.zig").Config;
 const EventSource = session.EventSource;
 const Event = session.Event;
@@ -443,10 +444,21 @@ pub const Server = struct {
 
             // Audio bookkeeping + auto-gain live at the event level; the
             // pipeline/recording decisions are the driver's job (via Actions).
+            //
+            // `chunk` is the span of recording this event covers, carried past
+            // the action loop so the recorder can attribute whatever text the
+            // chunk produced to the audio that produced it.
+            var chunk: ?struct { start_ms: u64, end_ms: u64, rms: f64 } = null;
             if (ev == .audio) {
+                const chunk_start_bytes = total_audio_bytes;
                 total_audio_bytes += ev.audio.len;
                 if (driver.live) {
                     const rms = utils.channelRms(ev.audio, 1, 0);
+                    chunk = .{
+                        .start_ms = webvtt.msFromBytes(chunk_start_bytes),
+                        .end_ms = webvtt.msFromBytes(total_audio_bytes),
+                        .rms = rms,
+                    };
                     // Input-level telemetry: log only on a rolling-average
                     // audio↔silence transition (never per chunk).
                     if (level_mon.update(utils.rmsToDb(rms))) |t| switch (t) {
@@ -487,6 +499,12 @@ pub const Server = struct {
                     return;
                 },
             };
+
+            // After the actions, so any text this chunk produced has already
+            // reached the recorder and can be attributed to this audio.
+            if (chunk) |c| {
+                if (self.recorder) |rec| rec.markChunk(c.start_ms, c.end_ms, c.rms);
+            }
         }
     }
 

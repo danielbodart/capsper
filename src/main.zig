@@ -369,7 +369,10 @@ pub fn main() !void {
     var recorder_storage: Recorder = undefined;
     var recorder: ?*Recorder = null;
     if (cfg.debug_recording.dir) |rdir| {
-        recorder_storage = Recorder.init(allocator, rdir, cfg.debug_recording.keep, build_options.version) catch |err| {
+        recorder_storage = Recorder.init(allocator, rdir, cfg.debug_recording.keep, build_options.version, switch (cfg.debug_recording.detail) {
+            .minimal => .minimal,
+            .debug => .debug,
+        }) catch |err| {
             std.debug.print("Failed to open record directory '{s}': {}\n", .{ rdir, err });
             return;
         };
