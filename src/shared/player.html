@@ -369,11 +369,11 @@
 
   // ─── Where the audio came from ───────────────────────────────────────────
   //
-  // `audio.json` is whatever PipeWire and the process table said about the
-  // application on the other end, recorded verbatim and never interpreted by
-  // the thing that wrote it. This renders it just as literally: no field is
-  // singled out or renamed, because the point of keeping the raw pairs is
-  // that the useful one may not be the one anyone would have picked.
+  // `audio.json` is what PipeWire and the process table said about the
+  // application on the other end, and about the microphone it was recorded
+  // through. The writer has already decided what is worth keeping, so this
+  // renders whatever it finds rather than deciding again -- which means a
+  // property added to that allowlist appears here without touching this file.
   //
   // Sessions recorded before this existed have no file, and nothing is wrong
   // with that, so a missing one simply hides the panel.
@@ -395,21 +395,32 @@
     return table;
   }
 
+  const sentence = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+  const playing = (stream) => stream.role === "playing into the sink";
+
   function renderSource(doc) {
     const body = $("sourceBody");
     body.replaceChildren();
 
     for (const stream of doc.streams || []) {
-      body.appendChild(text("h3", stream.linked
-        ? "Playing into the sink"
-        : "Same process, capturing"));
-      body.appendChild(pairTable(Object.entries(stream.props || {})));
+      // The socket's own account of the process sits in the same table as
+      // the application's claims about itself. The key says which is which,
+      // and a heading for one row would cost more than it explained.
+      const suffix = stream.count > 1 ? " ×" + stream.count : "";
+      body.appendChild(text("h3", sentence(stream.role || "stream") + suffix));
+      body.appendChild(pairTable([
+        ...Object.entries(stream.props || {}),
+        ...Object.entries(stream.client || {}),
+      ]));
+    }
 
-      const client = Object.entries(stream.client || {});
-      if (client.length) {
-        body.appendChild(text("h3", "Its connection"));
-        body.appendChild(pairTable(client));
-      }
+    for (const device of doc.devices || []) {
+      body.appendChild(text("h3", sentence(device.role || "device")));
+      body.appendChild(pairTable([
+        ["requested", device.requested || "desktop default"],
+        ...Object.entries(device.props || {}),
+      ]));
     }
 
     for (const process of doc.processes || []) {
@@ -422,11 +433,12 @@
     }
 
     // A name to put on the summary line, so the common question is answered
-    // without opening anything. First linked stream wins; there is normally
-    // only one.
-    const name = (stream) => (stream.props || {})["application.name"]
-      || (stream.client || {})["application.name"];
-    const named = (doc.streams || []).filter((s) => s.linked).map(name).find(Boolean);
+    // without opening anything. The streams feeding the sink are the call;
+    // there is normally one application behind all of them.
+    const named = (doc.streams || [])
+      .filter(playing)
+      .map((stream) => (stream.props || {})["application.name"])
+      .find(Boolean);
     $("sourceSummary").textContent = named
       ? "Recorded from " + named
       : "Where this came from";

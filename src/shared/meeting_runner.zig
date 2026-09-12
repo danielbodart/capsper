@@ -420,7 +420,7 @@ const Session = struct {
         // Before anything else is set up, because what is being recorded is
         // the graph that opened the session and a browser will not hold it
         // still while a model loads.
-        writeSourceMetadata(gpa, file.dir, watch);
+        writeSourceMetadata(gpa, file.dir, watch, cfg);
 
         var near_asr = try TrackAsr.init(gpa, .near, factory, cfg);
         errdefer near_asr.deinit(gpa);
@@ -658,7 +658,12 @@ const proc_root = "/proc";
 /// Best effort from top to bottom. A recording with nothing beside it saying
 /// where it came from is worth enormously more than no recording, so every
 /// failure here is logged and stepped over rather than returned.
-fn writeSourceMetadata(gpa: std.mem.Allocator, dir: std.fs.Dir, watch: *const SinkWatch) void {
+fn writeSourceMetadata(
+    gpa: std.mem.Allocator,
+    dir: std.fs.Dir,
+    watch: *const SinkWatch,
+    cfg: *const config.Config,
+) void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -667,7 +672,11 @@ fn writeSourceMetadata(gpa: std.mem.Allocator, dir: std.fs.Dir, watch: *const Si
         log.warn("could not read who is playing into the sink: {}", .{err});
         return;
     };
-    const doc = source.capture(arena, streams, proc_root) catch |err| {
+    const wanted: source.Wanted = .{
+        .near = cfg.meetingNear(),
+        .output = cfg.meeting.output,
+    };
+    const doc = source.capture(arena, streams, wanted, proc_root) catch |err| {
         log.warn("could not read the processes behind the call: {}", .{err});
         return;
     };

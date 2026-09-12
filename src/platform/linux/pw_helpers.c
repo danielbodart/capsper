@@ -1036,6 +1036,11 @@ struct pw_sink_watch {
     uint32_t sink_id;   /* 0 until the sink shows up in the registry */
 
     struct watched_stream streams[SINK_WATCH_MAX];
+    /* The sources and sinks themselves, as against the streams using them.
+       Tracked so a recording can say which microphone it came off, which is
+       the question its own properties cannot answer: a stream names the
+       application, never the hardware. */
+    struct watched_stream devices[SINK_WATCH_MAX];
     struct watched_client clients[SINK_WATCH_MAX];
     struct watched_link   links[SINK_WATCH_MAX];
 
@@ -1051,6 +1056,7 @@ sink_watch_find_stream(struct pw_sink_watch *w, uint32_t node_id)
             return &w->streams[i];
     return NULL;
 }
+
 
 /* Recount from scratch rather than tracking deltas: the inputs are two small
    fixed arrays, and a count that can drift out of step with the graph is the
@@ -1084,14 +1090,18 @@ static const struct pw_node_events watched_stream_events = {
     .info = on_watched_stream_info,
 };
 
+/* Bind a node into one of the fixed arrays. Devices and streams differ only
+   in which array they land in and what the snapshot then does with them. */
 static void
-sink_watch_add_stream(struct pw_sink_watch *w, uint32_t id, uint32_t version,
-                      int is_input)
+sink_watch_bind_node(struct pw_sink_watch *w, struct watched_stream *slots,
+                     uint32_t id, uint32_t version, int is_input)
 {
-    if (sink_watch_find_stream(w, id))
-        return;
+    for (uint32_t i = 0; i < SINK_WATCH_MAX; i++)
+        if (slots[i].used && slots[i].node_id == id)
+            return;
+
     for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
-        struct watched_stream *s = &w->streams[i];
+        struct watched_stream *s = &slots[i];
         if (s->used)
             continue;
         struct pw_proxy *proxy = pw_registry_bind(w->registry, id,
@@ -1109,6 +1119,13 @@ sink_watch_add_stream(struct pw_sink_watch *w, uint32_t id, uint32_t version,
                              &watched_stream_events, s);
         return;
     }
+}
+
+static void
+sink_watch_add_stream(struct pw_sink_watch *w, uint32_t id, uint32_t version,
+                      int is_input)
+{
+    sink_watch_bind_node(w, w->streams, id, version, is_input);
 }
 
 static void
@@ -1199,16 +1216,21 @@ on_sink_watch_global(void *data, uint32_t id, uint32_t permissions,
         const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
         const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
 
-        if (media_class && name &&
-            strcmp(media_class, "Audio/Sink") == 0 &&
-            strcmp(name, w->sink_name) == 0) {
-            w->sink_id = id;
+        if (!media_class)
             return;
-        }
-        if (media_class && strcmp(media_class, "Stream/Output/Audio") == 0)
+
+        if (name && strcmp(media_class, "Audio/Sink") == 0 &&
+            strcmp(name, w->sink_name) == 0)
+            w->sink_id = id;
+
+        if (strcmp(media_class, "Stream/Output/Audio") == 0)
             sink_watch_add_stream(w, id, version, 0);
-        else if (media_class && strcmp(media_class, "Stream/Input/Audio") == 0)
+        else if (strcmp(media_class, "Stream/Input/Audio") == 0)
             sink_watch_add_stream(w, id, version, 1);
+        else if (strcmp(media_class, "Audio/Source") == 0)
+            sink_watch_bind_node(w, w->devices, id, version, 1);
+        else if (strcmp(media_class, "Audio/Sink") == 0)
+            sink_watch_bind_node(w, w->devices, id, version, 0);
         return;
     }
 
@@ -1249,6 +1271,14 @@ on_sink_watch_global_remove(void *data, uint32_t id)
             s->used = 0;
             s->proxy = NULL;
             changed = 1;
+        }
+        struct watched_stream *d = &w->devices[i];
+        if (d->used && d->node_id == id) {
+            spa_hook_remove(&d->listener);
+            pw_proxy_destroy(d->proxy);
+            watched_stream_free_props(d);
+            d->used = 0;
+            d->proxy = NULL;
         }
     }
     for (uint32_t i = 0; i < SINK_WATCH_MAX; i++) {
@@ -1342,6 +1372,12 @@ pw_sink_watch_destroy(struct pw_sink_watch *w)
             watched_stream_free_props(&w->streams[i]);
             w->streams[i].used = 0;
         }
+        if (w->devices[i].used) {
+            spa_hook_remove(&w->devices[i].listener);
+            pw_proxy_destroy(w->devices[i].proxy);
+            watched_stream_free_props(&w->devices[i]);
+            w->devices[i].used = 0;
+        }
         if (w->clients[i].used) {
             spa_hook_remove(&w->clients[i].listener);
             pw_proxy_destroy(w->clients[i].proxy);
@@ -1384,8 +1420,9 @@ pw_sink_watch_active_streams(struct pw_sink_watch *w)
    parsed or interpreted here; the values are what the client said about
    itself, verbatim, for something later to make sense of. */
 
+/* 0 playing into the sink, 1 another stream of the same process, 2 a device. */
 struct snap_stream {
-    int linked;
+    int kind;
     uint32_t n_props;
     struct prop_pair *props;
     /* What the client behind the stream declared, kept apart from the node's
@@ -1441,7 +1478,7 @@ pw_sink_watch_snapshot(struct pw_sink_watch *w)
 
     struct pw_stream_snapshot *snap = calloc(1, sizeof(*snap));
     if (!snap) return NULL;
-    snap->streams = calloc(SINK_WATCH_MAX, sizeof(*snap->streams));
+    snap->streams = calloc(SINK_WATCH_MAX * 2, sizeof(*snap->streams));
     if (!snap->streams) { free(snap); return NULL; }
 
     pw_thread_loop_lock(w->thread_loop);
@@ -1461,7 +1498,7 @@ pw_sink_watch_snapshot(struct pw_sink_watch *w)
                 break;          /* two links from one stream is one stream */
             linked_slot[j] = 1;
             struct snap_stream *dst = &snap->streams[snap->n];
-            dst->linked = 1;
+            dst->kind = 0;
             if (snap_copy(dst, w, s) == 0)
                 snap->n++;
             break;
@@ -1488,8 +1525,21 @@ pw_sink_watch_snapshot(struct pw_sink_watch *w)
             continue;
 
         struct snap_stream *dst = &snap->streams[snap->n];
-        dst->linked = 0;
+        dst->kind = 1;
         if (snap_copy(dst, w, s) == 0)
+            snap->n++;
+    }
+
+    /* Pass three: the hardware. Every source and sink goes in and the caller
+       picks out the ones it asked to record through, because only the caller
+       knows what it asked for. */
+    for (uint32_t i = 0; i < SINK_WATCH_MAX && snap->n < SINK_WATCH_MAX * 2; i++) {
+        struct watched_stream *d = &w->devices[i];
+        if (!d->used || d->n_props == 0)
+            continue;
+        struct snap_stream *dst = &snap->streams[snap->n];
+        dst->kind = 2;
+        if (snap_copy(dst, w, d) == 0)
             snap->n++;
     }
 
@@ -1525,9 +1575,9 @@ pw_stream_snapshot_count(const struct pw_stream_snapshot *snap)
 }
 
 int
-pw_stream_snapshot_linked(const struct pw_stream_snapshot *snap, uint32_t i)
+pw_stream_snapshot_kind(const struct pw_stream_snapshot *snap, uint32_t i)
 {
-    return (snap && i < snap->n) ? snap->streams[i].linked : 0;
+    return (snap && i < snap->n) ? snap->streams[i].kind : 0;
 }
 
 uint32_t

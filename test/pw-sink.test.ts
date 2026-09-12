@@ -517,21 +517,30 @@ describe.skipIf(!isLinux || !SLOW)("virtual sink: capture", () => {
         const dir = files[files.length - 1].replace(/\/audio\.wav$/, "");
         const meta = JSON.parse(readFileSync(join(dir, "audio.json"), "utf8"));
 
-        const linked = meta.streams.filter((s: any) => s.linked);
-        expect(linked.length).toBeGreaterThan(0);
+        const playing = meta.streams.filter((s: any) => s.role === "playing into the sink");
+        expect(playing.length).toBeGreaterThan(0);
 
         // Verbatim, so the assertion is on what the client actually said.
-        expect(linked.map((s: any) => s.props["application.name"])).toContain("pw-play");
+        expect(playing.map((s: any) => s.props["application.name"])).toContain("pw-play");
+
+        // The noise is gone: what survives says something about the source.
+        expect(Object.keys(playing[0].props).length).toBeLessThanOrEqual(10);
+        expect(playing[0].props["pulse.attr.maxlength"]).toBeUndefined();
 
         // `pw-play` speaks PipeWire directly and declares no process of its
         // own, so the only pid here is the one its socket proves -- which is
         // exactly the case that would be lost by trusting the node alone.
-        const pid = Number(linked[0].client["pipewire.sec.pid"]);
+        const pid = Number(playing[0].client["pipewire.sec.pid"]);
         expect(pid).toBeGreaterThan(0);
 
         const walked = meta.processes.find((p: any) => p.pid === pid);
         expect(walked).toBeDefined();
         expect(walked.cmdline).toContain("pw-play");
+
+        // And the hardware, which no stream property names.
+        const output = meta.devices.find((d: any) => d.role === "output");
+        expect(output.requested).toBe(OUTPUT_SINKS.capture);
+        expect(output.props["node.name"]).toBe(OUTPUT_SINKS.capture);
     });
 
     test("puts the call on the right channel and the microphone on the left", async () => {

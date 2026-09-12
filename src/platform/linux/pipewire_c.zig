@@ -169,7 +169,7 @@ pub const pw_stream_snapshot = opaque {};
 pub extern fn pw_sink_watch_snapshot(w: *pw_sink_watch) ?*pw_stream_snapshot;
 pub extern fn pw_stream_snapshot_destroy(s: *pw_stream_snapshot) void;
 pub extern fn pw_stream_snapshot_count(s: *const pw_stream_snapshot) u32;
-pub extern fn pw_stream_snapshot_linked(s: *const pw_stream_snapshot, i: u32) c_int;
+pub extern fn pw_stream_snapshot_kind(s: *const pw_stream_snapshot, i: u32) c_int;
 pub extern fn pw_stream_snapshot_prop_count(s: *const pw_stream_snapshot, i: u32) u32;
 pub extern fn pw_stream_snapshot_key(s: *const pw_stream_snapshot, i: u32, j: u32) ?[*:0]const u8;
 pub extern fn pw_stream_snapshot_value(s: *const pw_stream_snapshot, i: u32, j: u32) ?[*:0]const u8;

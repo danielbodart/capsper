@@ -172,7 +172,7 @@ pub const SinkWatch = struct {
             }
 
             stream.* = .{
-                .linked = pw.pw_stream_snapshot_linked(snap, si) != 0,
+                .kind = @enumFromInt(pw.pw_stream_snapshot_kind(snap, si)),
                 .props = props,
                 .client = client,
             };
