@@ -92,6 +92,14 @@ pub extern fn pw_set_source_volume(
     volume: f32,
 ) c_int;
 
+// C helper: the node name of the desktop.s default audio source. Not a
+// property of any node -- it lives in PipeWire.s `default` metadata, written
+// by the session manager. Returns 0 on success.
+pub extern fn pw_get_default_source(
+    out: [*]u8,
+    out_len: u32,
+) c_int;
+
 // C helper to connect a capture stream for multi-channel recording (channel detection).
 pub extern fn pw_connect_capture_multi(
     stream: *pw_stream,

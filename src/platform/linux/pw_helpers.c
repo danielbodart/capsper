@@ -2,6 +2,7 @@
 #include <pipewire/stream.h>
 #include <pipewire/core.h>
 #include <pipewire/impl-module.h>
+#include <pipewire/extensions/metadata.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/props.h>
 #include <spa/pod/builder.h>
@@ -1396,4 +1397,493 @@ out:
     if (loop) pw_main_loop_destroy(loop);
     pw_deinit();
     return rc;
+}
+
+/* ─── The desktop's default microphone ────────────────────────────────────────
+
+   Which source is "the default" is not a property of any node. It is an entry
+   in PipeWire's `default` metadata object, written by the session manager and
+   changed when the user picks a different input or unplugs the one they were
+   using. So it is read from there rather than looked for in the registry.
+
+   The value is JSON, `{"name":"vocaster_hostmic"}`, and only the name is
+   wanted. */
+
+struct default_source_data {
+    struct pw_main_loop *loop;
+    struct pw_registry *registry;
+    int pending_sync;
+
+    struct pw_proxy *metadata;
+    struct spa_hook metadata_listener;
+
+    char *out;
+    size_t out_len;
+    int found;
+};
+
+/* Pull the name out of `{"name":"..."}`.
+
+   A hand parse rather than spa_json, because the shape is fixed by the
+   session manager and one field is wanted from it. Returns 0 on success. */
+static int
+parse_default_name(const char *value, char *out, size_t out_len)
+{
+    if (!value) return -1;
+
+    const char *key = strstr(value, "\"name\"");
+    if (!key) return -1;
+
+    const char *colon = strchr(key + 6, ':');
+    if (!colon) return -1;
+
+    const char *open = strchr(colon, '"');
+    if (!open) return -1;
+    open++;
+
+    const char *close = strchr(open, '"');
+    if (!close || (size_t)(close - open) >= out_len) return -1;
+
+    memcpy(out, open, (size_t)(close - open));
+    out[close - open] = '\0';
+    return 0;
+}
+
+static int
+on_default_metadata_property(void *data, uint32_t subject, const char *key,
+                             const char *type, const char *value)
+{
+    struct default_source_data *d = data;
+    (void)subject;
+    (void)type;
+
+    if (!key || strcmp(key, "default.audio.source") != 0) return 0;
+    if (parse_default_name(value, d->out, d->out_len) == 0) d->found = 1;
+    return 0;
+}
+
+static const struct pw_metadata_events default_metadata_events = {
+    PW_VERSION_METADATA_EVENTS,
+    .property = on_default_metadata_property,
+};
+
+static void
+on_default_registry_global(void *data, uint32_t id, uint32_t permissions,
+                           const char *type, uint32_t version,
+                           const struct spa_dict *props)
+{
+    struct default_source_data *d = data;
+    (void)permissions;
+    (void)version;
+
+    if (d->metadata) return;
+    if (!props || !type || strcmp(type, PW_TYPE_INTERFACE_Metadata) != 0) return;
+
+    /* Several metadata objects exist -- settings, route-settings, and so on.
+       The defaults live in the one called `default`. */
+    const char *name = spa_dict_lookup(props, PW_KEY_METADATA_NAME);
+    if (!name || strcmp(name, "default") != 0) return;
+
+    struct pw_proxy *proxy = pw_registry_bind(d->registry, id, type,
+                                              PW_VERSION_METADATA, 0);
+    if (!proxy) return;
+
+    d->metadata = proxy;
+    pw_metadata_add_listener((struct pw_metadata *)proxy, &d->metadata_listener,
+                             &default_metadata_events, d);
+}
+
+static void
+on_default_core_done(void *data, uint32_t id, int seq)
+{
+    struct default_source_data *d = data;
+    if (id == PW_ID_CORE && seq == d->pending_sync)
+        pw_main_loop_quit(d->loop);
+}
+
+/* The node name of the desktop's default audio source, written into `out`.
+   Returns 0 on success, -1 if there is no default or it could not be read. */
+int
+pw_get_default_source(char *out, uint32_t out_len)
+{
+    if (!out || out_len == 0) return -1;
+    out[0] = '\0';
+
+    pw_init(NULL, NULL);
+
+    int rc = -1;
+    struct pw_main_loop *loop = NULL;
+    struct pw_context *context = NULL;
+    struct pw_core *core = NULL;
+    struct pw_registry *registry = NULL;
+
+    loop = pw_main_loop_new(NULL);
+    if (!loop) goto out;
+
+    context = pw_context_new(pw_main_loop_get_loop(loop), NULL, 0);
+    if (!context) goto out;
+
+    core = pw_context_connect(context, NULL, 0);
+    if (!core) goto out;
+
+    registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+    if (!registry) goto out;
+
+    struct default_source_data data = {
+        .loop = loop,
+        .registry = registry,
+        .out = out,
+        .out_len = out_len,
+        .found = 0,
+    };
+
+    static const struct pw_registry_events reg_events = {
+        PW_VERSION_REGISTRY_EVENTS,
+        .global = on_default_registry_global,
+    };
+    struct spa_hook reg_listener;
+    spa_zero(reg_listener);
+    pw_registry_add_listener(registry, &reg_listener, &reg_events, &data);
+
+    static const struct pw_core_events core_events = {
+        PW_VERSION_CORE_EVENTS,
+        .done = on_default_core_done,
+    };
+    struct spa_hook core_listener;
+    spa_zero(core_listener);
+    pw_core_add_listener(core, &core_listener, &core_events, &data);
+
+    /* First roundtrip binds the metadata object. */
+    data.pending_sync = pw_core_sync(core, PW_ID_CORE, 0);
+    pw_main_loop_run(loop);
+
+    if (data.metadata) {
+        /* Second lets it replay its properties, which is how the current
+           value arrives -- metadata announces what it holds on binding. */
+        data.pending_sync = pw_core_sync(core, PW_ID_CORE, 0);
+        pw_main_loop_run(loop);
+
+        spa_hook_remove(&data.metadata_listener);
+        pw_proxy_destroy(data.metadata);
+    }
+
+    spa_hook_remove(&reg_listener);
+    spa_hook_remove(&core_listener);
+    rc = data.found ? 0 : -1;
+
+out:
+    if (registry) pw_proxy_destroy((struct pw_proxy *)registry);
+    if (core) pw_core_disconnect(core);
+    if (context) pw_context_destroy(context);
+    if (loop) pw_main_loop_destroy(loop);
+    pw_deinit();
+    return rc;
+}
+
+/* ─── The microphone's level, held open ───────────────────────────────────────
+
+   One object that knows which node is the microphone and can set its level
+   cheaply, because the level controller adjusts it while audio is flowing and
+   a connection per adjustment would mean building a PipeWire context inside
+   the capture loop.
+
+   It also answers the question the controller cannot ask for itself: has the
+   microphone changed? The desktop's default source lives in metadata, and
+   metadata emits an event when it is rewritten, so switching from an
+   interface to a headset arrives as a change rather than as something that
+   has to be noticed by looking. Nothing here polls.
+
+   A named target pins the node and the metadata is ignored. Without one, the
+   microphone is whatever the desktop currently calls the default, which is the
+   same choice the user already made for every other application. */
+
+struct pw_mic_level {
+    struct pw_thread_loop *thread_loop;
+    struct pw_context     *context;
+    struct pw_core        *core;
+    struct pw_registry    *registry;
+    struct spa_hook        registry_listener;
+
+    /* Set when a target was named, in which case the default is irrelevant. */
+    int  pinned;
+    char node_name[256];
+
+    /* The node being levelled, once it has been seen in the registry. */
+    uint32_t     node_id;
+    struct pw_proxy *node;
+    struct spa_hook  node_listener;
+    uint32_t     channels;
+
+    struct pw_proxy *metadata;
+    struct spa_hook  metadata_listener;
+
+    /* Raised on the thread loop when the default moves, read and cleared by
+       whoever is levelling. */
+    _Atomic int changed;
+};
+
+static void mic_level_bind_node(struct pw_mic_level *m, uint32_t id);
+
+static void
+on_mic_node_info(void *data, const struct pw_node_info *info)
+{
+    struct pw_mic_level *m = data;
+    if (!info || !info->props) return;
+    const char *ch = spa_dict_lookup(info->props, "audio.channels");
+    if (ch) {
+        int n = atoi(ch);
+        if (n > 0 && n <= SPA_AUDIO_MAX_CHANNELS) m->channels = (uint32_t)n;
+    }
+}
+
+static const struct pw_node_events mic_node_events = {
+    PW_VERSION_NODE_EVENTS,
+    .info = on_mic_node_info,
+};
+
+/* Drop whatever node we were levelling, so a new name can be bound. */
+static void
+mic_level_release_node(struct pw_mic_level *m)
+{
+    if (!m->node) return;
+    spa_hook_remove(&m->node_listener);
+    pw_proxy_destroy(m->node);
+    m->node = NULL;
+    m->node_id = 0;
+    m->channels = 1;
+}
+
+static int
+on_mic_metadata_property(void *data, uint32_t subject, const char *key,
+                         const char *type, const char *value)
+{
+    struct pw_mic_level *m = data;
+    (void)subject;
+    (void)type;
+
+    if (m->pinned) return 0;
+    if (!key || strcmp(key, "default.audio.source") != 0) return 0;
+
+    char name[sizeof(m->node_name)];
+    if (parse_default_name(value, name, sizeof(name)) != 0) return 0;
+    if (strcmp(name, m->node_name) == 0) return 0;
+
+    snprintf(m->node_name, sizeof(m->node_name), "%s", name);
+    mic_level_release_node(m);
+    atomic_store(&m->changed, 1);
+
+    /* The node for the new name may already be in the registry, in which case
+       no further global event is coming and it has to be looked for now. */
+    return 0;
+}
+
+static const struct pw_metadata_events mic_metadata_events = {
+    PW_VERSION_METADATA_EVENTS,
+    .property = on_mic_metadata_property,
+};
+
+static void
+on_mic_registry_global(void *data, uint32_t id, uint32_t permissions,
+                       const char *type, uint32_t version,
+                       const struct spa_dict *props)
+{
+    struct pw_mic_level *m = data;
+    (void)permissions;
+    (void)version;
+
+    if (!props || !type) return;
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Metadata) == 0 && !m->metadata && !m->pinned) {
+        const char *name = spa_dict_lookup(props, PW_KEY_METADATA_NAME);
+        if (name && strcmp(name, "default") == 0) {
+            struct pw_proxy *proxy = pw_registry_bind(m->registry, id, type,
+                                                      PW_VERSION_METADATA, 0);
+            if (proxy) {
+                m->metadata = proxy;
+                pw_metadata_add_listener((struct pw_metadata *)proxy,
+                                         &m->metadata_listener,
+                                         &mic_metadata_events, m);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0) return;
+    if (m->node) return;
+    if (!m->node_name[0]) return;
+
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (!name || strcmp(name, m->node_name) != 0) return;
+
+    mic_level_bind_node(m, id);
+}
+
+static void
+on_mic_registry_global_remove(void *data, uint32_t id)
+{
+    struct pw_mic_level *m = data;
+    /* The microphone went away. Let go of it so the next name can bind, and
+       say so, because a controller carrying a level across a device change is
+       levelling for hardware that is no longer there. */
+    if (m->node && m->node_id == id) {
+        mic_level_release_node(m);
+        atomic_store(&m->changed, 1);
+    }
+}
+
+static void
+mic_level_bind_node(struct pw_mic_level *m, uint32_t id)
+{
+    struct pw_proxy *proxy = pw_registry_bind(m->registry, id,
+                                              PW_TYPE_INTERFACE_Node,
+                                              PW_VERSION_NODE, 0);
+    if (!proxy) return;
+    m->node = proxy;
+    m->node_id = id;
+    pw_node_add_listener((struct pw_node *)proxy, &m->node_listener,
+                         &mic_node_events, m);
+}
+
+/* `target` names the node to level, or is NULL to follow the desktop's
+   default input and keep following it. */
+struct pw_mic_level *
+pw_mic_level_create(const char *target)
+{
+    pw_init(NULL, NULL);
+
+    struct pw_mic_level *m = calloc(1, sizeof(*m));
+    if (!m) return NULL;
+    m->channels = 1;
+    if (target && target[0]) {
+        m->pinned = 1;
+        snprintf(m->node_name, sizeof(m->node_name), "%s", target);
+    }
+
+    m->thread_loop = pw_thread_loop_new("capsper-miclevel", NULL);
+    if (!m->thread_loop) { free(m); return NULL; }
+
+    m->context = pw_context_new(pw_thread_loop_get_loop(m->thread_loop), NULL, 0);
+    if (!m->context) {
+        pw_thread_loop_destroy(m->thread_loop);
+        free(m); return NULL;
+    }
+
+    pw_thread_loop_lock(m->thread_loop);
+
+    if (pw_thread_loop_start(m->thread_loop) < 0) {
+        pw_thread_loop_unlock(m->thread_loop);
+        pw_context_destroy(m->context);
+        pw_thread_loop_destroy(m->thread_loop);
+        free(m); return NULL;
+    }
+
+    m->core = pw_context_connect(m->context, NULL, 0);
+    if (!m->core) {
+        pw_thread_loop_unlock(m->thread_loop);
+        pw_thread_loop_stop(m->thread_loop);
+        pw_context_destroy(m->context);
+        pw_thread_loop_destroy(m->thread_loop);
+        free(m); return NULL;
+    }
+
+    m->registry = pw_core_get_registry(m->core, PW_VERSION_REGISTRY, 0);
+    if (!m->registry) {
+        pw_core_disconnect(m->core);
+        pw_thread_loop_unlock(m->thread_loop);
+        pw_thread_loop_stop(m->thread_loop);
+        pw_context_destroy(m->context);
+        pw_thread_loop_destroy(m->thread_loop);
+        free(m); return NULL;
+    }
+
+    static const struct pw_registry_events reg_events = {
+        PW_VERSION_REGISTRY_EVENTS,
+        .global = on_mic_registry_global,
+        .global_remove = on_mic_registry_global_remove,
+    };
+    spa_zero(m->registry_listener);
+    pw_registry_add_listener(m->registry, &m->registry_listener, &reg_events, m);
+
+    pw_thread_loop_unlock(m->thread_loop);
+    return m;
+}
+
+void
+pw_mic_level_destroy(struct pw_mic_level *m)
+{
+    if (!m) return;
+
+    pw_thread_loop_lock(m->thread_loop);
+    mic_level_release_node(m);
+    if (m->metadata) {
+        spa_hook_remove(&m->metadata_listener);
+        pw_proxy_destroy(m->metadata);
+    }
+    spa_hook_remove(&m->registry_listener);
+    pw_proxy_destroy((struct pw_proxy *)m->registry);
+    pw_core_disconnect(m->core);
+    pw_thread_loop_unlock(m->thread_loop);
+
+    pw_thread_loop_stop(m->thread_loop);
+    pw_context_destroy(m->context);
+    pw_thread_loop_destroy(m->thread_loop);
+    free(m);
+}
+
+/* Set the microphone's level. Linear, so 1.0 is unity; PipeWire clamps at 10x.
+   Returns 0 on success, -1 if there is no microphone bound yet. */
+int
+pw_mic_level_set(struct pw_mic_level *m, float volume)
+{
+    if (!m) return -1;
+
+    int rc = -1;
+    pw_thread_loop_lock(m->thread_loop);
+
+    /* A default that changed while nothing was bound, or a node that had not
+       reached the registry when it was first looked for. */
+    if (!m->node && m->node_name[0]) {
+        /* Nothing to do here: the registry listener binds it as it appears,
+           and until then there is no node to set a level on. */
+    }
+
+    if (m->node) {
+        float vols[SPA_AUDIO_MAX_CHANNELS];
+        for (uint32_t i = 0; i < m->channels; i++) vols[i] = volume;
+
+        uint8_t buf[1024];
+        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+        struct spa_pod *props_pod = spa_pod_builder_add_object(
+            &b,
+            SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+            SPA_PROP_channelVolumes,
+            SPA_POD_Array(sizeof(float), SPA_TYPE_Float, m->channels, vols));
+
+        if (props_pod) {
+            pw_node_set_param((struct pw_node *)m->node, SPA_PARAM_Props, 0,
+                              props_pod);
+            rc = 0;
+        }
+    }
+
+    pw_thread_loop_unlock(m->thread_loop);
+    return rc;
+}
+
+/* Whether the microphone has changed since this was last asked, and clears
+   the flag. A controller seeing 1 should start again from its configured
+   level rather than carrying the old device's across. */
+int
+pw_mic_level_take_changed(struct pw_mic_level *m)
+{
+    if (!m) return 0;
+    return atomic_exchange(&m->changed, 0);
+}
+
+/* The node currently being levelled, or an empty string if none is bound.
+   For logging: a meeting that switched microphones should say so. */
+const char *
+pw_mic_level_node_name(struct pw_mic_level *m)
+{
+    return m ? m->node_name : "";
 }
