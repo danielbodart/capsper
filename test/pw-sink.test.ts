@@ -421,6 +421,24 @@ describe.skipIf(!isLinux)("virtual sink", () => {
         try { unlinkSync(gapped); } catch {}
     }, 120_000);
 
+    test("writes a player beside the session that points at both siblings", () => {
+        const dir = sessionFiles().pop()!.replace(/audio\.wav$/, "");
+        const html = readFileSync(join(dir, "index.html"), "utf8");
+
+        // The bug this exists for: the placeholder appeared twice, once in a
+        // comment explaining it, so substituting the first occurrence filled
+        // in the comment and left the audio element pointing at the
+        // placeholder. The page rendered its transcript perfectly and played
+        // nothing.
+        expect(html).not.toContain("__AUDIO_FILE__");
+
+        expect(html).toContain('src="audio.wav"');
+        expect(html).toContain('src="transcript.vtt"');
+        // Hidden, so the native parser fires cue events without drawing
+        // subtitles over the audio element; the page renders them itself.
+        expect(html).toContain('mode = "hidden"');
+    });
+
     test("is gone once capsper exits", async () => {
         try { server?.kill(); } catch {}
         await Bun.sleep(1500);

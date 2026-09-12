@@ -1,0 +1,297 @@
+<!--
+  Written beside each session's transcript and audio, referencing both as
+  siblings. No build step, no dependencies, no network.
+
+  The page is a view, not the format. The transcript and the audio are
+  canonical and this is regenerable from them, so nothing may ever end up
+  recorded only here -- otherwise the player quietly becomes a thing that has
+  to stay backwards compatible.
+
+  It uses the browser's own WebVTT parser rather than a hand-written one. The
+  track is set to mode="hidden", so cue events fire without anything being
+  rendered, and cue.text arrives exactly as authored. That is the whole reason
+  the cues are readable text rather than JSON: the standard parser already
+  handles them, and the file still drops into mpv and works.
+
+  NOTE blocks are invisible here, which is correct -- the native parser
+  discards comments, so the debug detail costs the player nothing.
+
+  The audio element's src is a placeholder, filled in when the file is
+  written, because the container is a setting.
+-->
+<meta charset="utf-8">
+<title>Capsper session</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfaf8;
+    --panel: #ffffff;
+    --ink: #1c1b19;
+    --muted: #6b6862;
+    --line: #e4e1db;
+    --near: #2f6f4e;
+    --near-bg: #e8f3ec;
+    --far: #2b5d86;
+    --far-bg: #e6eef6;
+    --accent: #b4530a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161513;
+      --panel: #1e1d1b;
+      --ink: #eceae6;
+      --muted: #9b968d;
+      --line: #33312d;
+      --near: #7fc8a0;
+      --near-bg: #1c2b23;
+      --far: #8cbde4;
+      --far-bg: #1a2530;
+      --accent: #e08a3c;
+    }
+  }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 52rem; margin: 0 auto; padding: 1.5rem 1rem 6rem; }
+
+  h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 .25rem; }
+  .meta { color: var(--muted); font-size: .85rem; margin: 0 0 1.25rem; }
+
+  /* The audio element and the channel control sit together, and stay put
+     while the transcript scrolls past them. */
+  .bar {
+    position: sticky; top: 0; z-index: 2;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+    padding: .75rem 0 .85rem;
+    margin-bottom: 1rem;
+  }
+  audio { width: 100%; display: block; }
+
+  .routing { display: flex; align-items: center; gap: .5rem; margin-top: .6rem; flex-wrap: wrap; }
+  .routing span { color: var(--muted); font-size: .85rem; }
+  .routing button {
+    font: inherit; font-size: .85rem;
+    padding: .25rem .7rem;
+    border: 1px solid var(--line); border-radius: 999px;
+    background: var(--panel); color: var(--ink);
+    cursor: pointer;
+  }
+  .routing button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+
+  .warn {
+    display: none;
+    background: var(--far-bg); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    padding: .6rem .8rem; border-radius: 4px; font-size: .85rem; margin-bottom: 1rem;
+  }
+  .warn code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  /* Near on the left, far on the right, like a chat log. */
+  .line { display: flex; margin: .35rem 0; }
+  .line.far { justify-content: flex-end; }
+
+  .bubble {
+    max-width: min(38rem, 78%);
+    padding: .45rem .7rem;
+    border-radius: 10px;
+    background: var(--near-bg);
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: border-color .12s ease;
+  }
+  .line.far .bubble { background: var(--far-bg); }
+  .bubble.active { border-color: var(--accent); }
+
+  .who { display: block; font-size: .7rem; letter-spacing: .04em; text-transform: uppercase; color: var(--near); }
+  .line.far .who { color: var(--far); text-align: right; }
+  .at { color: var(--muted); font-variant-numeric: tabular-nums; font-weight: 400; }
+
+  .empty { color: var(--muted); font-style: italic; }
+</style>
+
+<main>
+  <h1>Capsper session</h1>
+  <p class="meta" id="meta">Near end on the left, far end on the right.</p>
+
+  <div class="warn" id="fileWarning">
+    Opened straight off the filesystem, so the channel control is disabled.
+    Browsers treat every <code>file://</code> page as its own origin, and reading
+    the audio would output silence rather than failing. Serve this directory over
+    HTTP instead, for example <code>python3 -m http.server</code>.
+  </div>
+
+  <div class="bar">
+    <audio id="audio" controls preload="metadata" crossorigin="anonymous" src="__AUDIO_FILE__">
+      <track id="track" kind="subtitles" srclang="en" label="Transcript" src="transcript.vtt" default>
+    </audio>
+    <div class="routing">
+      <span>Listen to</span>
+      <button type="button" data-route="both" aria-pressed="true">Both</button>
+      <button type="button" data-route="near" aria-pressed="false">Near only</button>
+      <button type="button" data-route="far" aria-pressed="false">Far only</button>
+    </div>
+  </div>
+
+  <div id="transcript"><p class="empty">Loading transcript…</p></div>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  const audio = document.getElementById("audio");
+  const track = document.getElementById("track");
+  const list = document.getElementById("transcript");
+
+  // Hidden rather than showing: cue events still fire, but nothing is drawn
+  // over the audio element, because this page draws the transcript itself.
+  track.track.mode = "hidden";
+
+  const timestamp = (seconds) => {
+    const s = Math.max(0, Math.floor(seconds));
+    const mm = String(Math.floor(s / 60)).padStart(2, "0");
+    const ss = String(s % 60).padStart(2, "0");
+    const hh = Math.floor(s / 3600);
+    return hh > 0 ? `${hh}:${mm.padStart(2, "0")}:${ss}` : `${mm}:${ss}`;
+  };
+
+  // `cue.text` is the payload as authored, so the voice span comes off with a
+  // regex and the rest is the line to show.
+  const voiceSpan = /^<v\s+([^>]*)>/;
+  const parse = (text) => {
+    const match = text.match(voiceSpan);
+    if (!match) return { who: "", body: text.trim() };
+    return { who: match[1].trim(), body: text.slice(match[0].length).trim() };
+  };
+
+  const rendered = new Map(); // cue -> element
+
+  function render() {
+    const cues = track.track.cues;
+    if (!cues || cues.length === 0) {
+      list.innerHTML = '<p class="empty">This session has no transcript.</p>';
+      return;
+    }
+
+    list.textContent = "";
+    rendered.clear();
+
+    for (const cue of cues) {
+      const { who, body } = parse(cue.text);
+      if (!body) continue;
+
+      const side = who.toLowerCase() === "far" ? "far" : "near";
+      const line = document.createElement("div");
+      line.className = `line ${side}`;
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      // Clicking a line plays from there, which is the whole point of having
+      // the transcript beside the audio.
+      bubble.addEventListener("click", () => {
+        audio.currentTime = cue.startTime;
+        audio.play().catch(() => {});
+      });
+
+      const label = document.createElement("strong");
+      label.className = "who";
+      label.textContent = `${who || side} `;
+      const at = document.createElement("span");
+      at.className = "at";
+      at.textContent = timestamp(cue.startTime);
+      label.appendChild(at);
+
+      const said = document.createElement("div");
+      said.textContent = body;
+
+      bubble.append(label, said);
+      line.appendChild(bubble);
+      list.appendChild(line);
+      rendered.set(cue, bubble);
+    }
+
+    if (!list.firstChild) {
+      list.innerHTML = '<p class="empty">This session has no transcript.</p>';
+    }
+  }
+
+  // Cues are only there once the track has loaded, and browsers differ on
+  // whether that has already happened by the time this runs.
+  if (track.track.cues && track.track.cues.length) render();
+  track.addEventListener("load", render);
+
+  let active = new Set();
+  track.track.addEventListener("cuechange", () => {
+    for (const cue of active) rendered.get(cue)?.classList.remove("active");
+    active = new Set(track.track.activeCues || []);
+    for (const cue of active) {
+      const el = rendered.get(cue);
+      if (!el) continue;
+      el.classList.add("active");
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  });
+
+  // ─── Channel routing ─────────────────────────────────────────────────────
+  //
+  // The file is hard-panned: near left, far right. That is the right way to
+  // store two tracks on one timeline and a tiring way to listen, so either
+  // channel can be sent to both ears.
+  //
+  // This needs a real origin. Both Chrome and Firefox treat every file:// URL
+  // as opaque, and createMediaElementSource on an audio element pointing at a
+  // sibling file outputs zeroes rather than throwing -- so it would look like
+  // it worked and be silent. Better to disable the control and say why.
+  const buttons = [...document.querySelectorAll("[data-route]")];
+
+  if (location.protocol === "file:") {
+    document.getElementById("fileWarning").style.display = "block";
+    for (const b of buttons) b.disabled = true;
+  } else {
+    let graph = null;
+
+    const build = () => {
+      if (graph) return graph;
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = ctx.createMediaElementSource(audio);
+      const splitter = ctx.createChannelSplitter(2);
+      const merger = ctx.createChannelMerger(2);
+      const left = ctx.createGain();
+      const right = ctx.createGain();
+
+      source.connect(splitter);
+      // Each channel feeds both ears, so soloing one is centred rather than
+      // stuck on one side.
+      splitter.connect(left, 0);
+      splitter.connect(right, 1);
+      left.connect(merger, 0, 0);
+      left.connect(merger, 0, 1);
+      right.connect(merger, 0, 0);
+      right.connect(merger, 0, 1);
+      merger.connect(ctx.destination);
+
+      graph = { ctx, left, right };
+      return graph;
+    };
+
+    const route = (which) => {
+      const { ctx, left, right } = build();
+      if (ctx.state === "suspended") ctx.resume();
+      left.gain.value = which === "far" ? 0 : 1;
+      right.gain.value = which === "near" ? 0 : 1;
+      for (const b of buttons) b.setAttribute("aria-pressed", String(b.dataset.route === which));
+    };
+
+    for (const b of buttons) b.addEventListener("click", () => route(b.dataset.route));
+  }
+
+  audio.addEventListener("loadedmetadata", () => {
+    const meta = document.getElementById("meta");
+    meta.textContent = `${timestamp(audio.duration)} · near end on the left, far end on the right.`;
+  });
+})();
+</script>

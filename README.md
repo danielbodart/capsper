@@ -313,19 +313,58 @@ session ends once nothing has played into it for `idle_close_seconds` — long
 enough that a mute or a screen-share renegotiation does not split one meeting
 into two files.
 
-Each session writes one file:
+Each session writes a directory:
 
 ```
-~/.local/share/capsper/sessions/2026/09/11/T143000Z/audio.wav
+~/.local/share/capsper/sessions/2026/09/11/T143000Z/
+  audio.wav         both sides, near left and far right
+  transcript.vtt    both sides, merged by time
+  index.html        plays the two together
 ```
 
 The path is a single ISO 8601 timestamp split across directories, in UTC. One
 stereo file rather than two mono ones, with the microphone on the left and the
 call on the right. Channel separation loses nothing — `ffmpeg` splits them
 apart again in one invocation — and what it buys is a single timeline, so the
-two sides cannot drift apart from each other.
+two sides cannot drift apart from each other or from the transcript.
 
-Not yet built: the transcript, the generated player, and Opus. See
+The transcript is [WebVTT](https://www.w3.org/TR/webvtt1/), which has speaker
+attribution in the spec:
+
+```
+1
+00:00:04.120 --> 00:00:07.880
+<v Near>so the thing I wanted to raise was the routing
+
+2
+00:00:08.020 --> 00:00:11.400
+<v Far>yeah, I looked at that yesterday
+```
+
+Two tracks means the speaker is known rather than guessed at by diarisation.
+The file drops into any player and shows the transcript against the audio, and
+converting it to SRT is a timestamp separator substitution.
+
+### Playing a session back
+
+`index.html` plays the audio with the transcript scrolling in step, near end on
+the left and far end on the right, and a control that sends either channel to
+both ears so the hard panning is a choice rather than something to endure.
+Clicking a line plays from there.
+
+It needs to be served over HTTP. Capsper ships no server — point any static
+file server at the sessions directory:
+
+```bash
+cd ~/.local/share/capsper/sessions && python3 -m http.server
+```
+
+Opening it straight off the filesystem will look like it works and the channel
+control will be silent, because browsers treat every `file://` URL as its own
+opaque origin and reading the audio returns zeroes rather than failing. The
+page says so itself when that happens.
+
+Not yet built: a voice activity gate for the near end, and Opus. See
 `docs/meeting-capture-plan.md`. macOS is not supported, because a program
 cannot create a virtual output device for itself there.
 

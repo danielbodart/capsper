@@ -55,6 +55,8 @@ const SessionFile = struct {
         const file = try dir.createFile("audio.wav", .{});
         errdefer file.close();
 
+        try writePlayer(dir, "audio.wav");
+
         // Placeholder sizes; a session's length is not known when it starts.
         var header: std.ArrayListUnmanaged(u8) = .{};
         defer header.deinit(std.heap.page_allocator);
@@ -87,6 +89,43 @@ const SessionFile = struct {
         return @as(f64, @floatFromInt(self.bytes_written)) / 64_000.0;
     }
 };
+
+/// The page that plays a session: the audio, the transcript scrolling in step
+/// with it, and a control that routes either hard-panned channel to both ears.
+///
+/// Embedded rather than built, so it stays an ordinary HTML file that can be
+/// opened and edited on its own, and so a session directory needs nothing
+/// fetched to be useful.
+const player_template = @embedFile("player.html");
+
+/// Written when the session is created rather than when it closes, so a
+/// session interrupted by a kill is still playable.
+///
+/// It assumes it is served over HTTP. Capsper ships no server -- point any
+/// static file server at the sessions directory. The page says so itself when
+/// opened from the filesystem, because that case fails silently rather than
+/// loudly: browsers treat every `file://` URL as its own opaque origin, so
+/// reading the audio for the channel control returns zeroes instead of an
+/// error.
+fn writePlayer(dir: std.fs.Dir, audio_name: []const u8) !void {
+    const marker = "__AUDIO_FILE__";
+    // Every occurrence, not the first. The first version of this substituted
+    // only once and silently filled in a mention of the marker in a comment,
+    // leaving the audio element pointing at the placeholder -- a page that
+    // rendered its transcript perfectly and played nothing.
+    if (std.mem.indexOf(u8, player_template, marker) == null) return error.PlayerTemplateBroken;
+
+    var file = try dir.createFile("index.html", .{});
+    defer file.close();
+
+    var rest: []const u8 = player_template;
+    while (std.mem.indexOf(u8, rest, marker)) |cut| {
+        try file.writeAll(rest[0..cut]);
+        try file.writeAll(audio_name);
+        rest = rest[cut + marker.len ..];
+    }
+    try file.writeAll(rest);
+}
 
 /// Run until the process is killed. Returns only on a failure that makes
 /// carrying on pointless.
