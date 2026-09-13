@@ -23,7 +23,7 @@ const sink_mod = @import("platform/sink.zig");
 const VirtualSink = sink_mod.VirtualSink;
 const SinkWatch = sink_mod.SinkWatch;
 const meeting_runner = @import("shared/meeting_runner.zig");
-const session_server = @import("shared/session_server.zig");
+const http_server = @import("shared/http_server.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
@@ -128,13 +128,32 @@ pub fn main() !void {
     const want_local = cfg.audio.target != null or trigger_key != null;
     const want_tcp = cfg.tcp_server.port != null;
     const want_meeting = cfg.meeting.enabled;
+    const want_http = cfg.http.port != null;
 
-    if (!want_local and !want_tcp and !want_meeting and
+    if (!want_local and !want_tcp and !want_meeting and !want_http and
         cli.stream == null and cli.transcribe == null and !cli.dry_run)
     {
         printUsage();
         return;
     }
+
+    // Before the model, the sink and the devices, because none of those are
+    // needed to answer and all of them take time. A minute of model reading
+    // is exactly when someone wants to be told that is what is happening.
+    //
+    // It fails loudly rather than quietly: this port was asked for by name,
+    // and something else already holding it is worth stopping over rather
+    // than discovering later by finding nothing at the address.
+    // Not for a one-shot: `--transcribe` and `--stream` read a file and
+    // leave, and a console that exists for the length of that is a port
+    // taken for nobody to look at.
+    const run_http = want_http and !cli.dry_run and
+        cli.stream == null and cli.transcribe == null;
+    if (run_http) try http_server.start(allocator, .{
+        .cfg = &cfg,
+        .port = cfg.http.port.?,
+        .bind = cfg.http.bind,
+    });
 
     // The sink goes up before the model loads, so it is in the output picker
     // while the model is still being read rather than a minute later.
@@ -417,13 +436,6 @@ pub fn main() !void {
     // Days of silence between two calls is the ordinary case, not a lapse.
     var meeting_thread: ?std.Thread = null;
     if (want_meeting and !cli.dry_run) {
-        if (cfg.meeting.http.port) |http_port| {
-            session_server.start(allocator, .{
-                .root = cfg.meeting.dir,
-                .port = http_port,
-                .bind = cfg.meeting.http.bind,
-            }) catch {};
-        }
         meeting_thread = std.Thread.spawn(.{}, runMeeting, .{
             allocator, &cfg, audio_channel, pipeline_factory,
         }) catch |err| blk: {
@@ -444,6 +456,14 @@ pub fn main() !void {
     try server.run();
 
     if (meeting_thread) |t| t.join();
+
+    // With the console the only thing asked for, `server.run()` has nothing
+    // to serve and returns at once, and there is no thread to join -- the
+    // accept loop is detached. Park here instead, because a capsper you
+    // turned on to look at its settings should still be there when you do.
+    if (run_http and !want_local and !want_tcp and !want_meeting) {
+        while (true) std.Thread.sleep(std.time.ns_per_hour);
+    }
 }
 
 /// `meeting_runner.run` with its error swallowed, because a thread entry point

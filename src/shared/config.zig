@@ -117,6 +117,20 @@ pub const TcpServer = struct {
     port: ?u16 = null,
 };
 
+pub const Http = struct {
+    /// Null means no server. Zero means an OS-assigned port, the same
+    /// convention `tcp_server.port` uses.
+    ///
+    /// Off unless asked for. It is the one part of capsper that opens a
+    /// socket onto what the machine is doing and what it has recorded, and
+    /// nothing else here turns itself on.
+    port: ?u16 = null,
+    /// Loopback only by default. This serves recordings of private
+    /// conversations and says what capsper is listening to right now;
+    /// reaching it from the network should take saying so.
+    bind: [:0]const u8 = "127.0.0.1",
+};
+
 pub const DebugRecording = struct {
     /// Null disables recording.
     dir: ?[:0]const u8 = null,
@@ -186,17 +200,6 @@ pub const Aec = struct {
     enabled: bool = true,
 };
 
-/// Browsing and playing back recorded sessions.
-pub const MeetingHttp = struct {
-    /// Null disables the server. Runs whenever meeting capture is on, because
-    /// a pile of session directories you have to find yourself is not much of
-    /// a feature.
-    port: ?u16 = 43008,
-    /// Loopback only by default. These are recordings of private
-    /// conversations; reaching them from the network should take saying so.
-    bind: [:0]const u8 = "127.0.0.1",
-};
-
 pub const Meeting = struct {
     /// Record and transcribe both sides of a call. Publishes a sink to select
     /// as the meeting app's output, and runs alongside dictation rather than
@@ -245,8 +248,6 @@ pub const Meeting = struct {
     /// How much each transcript says. `.minimal` here, because these are read
     /// as a record of the conversation rather than to debug the decoder.
     detail: Detail = .minimal,
-    /// The server that lists the recorded sessions and plays them back.
-    http: MeetingHttp = .{},
     /// The voice activity gate in front of the encoder.
     vad: Vad = .{},
     /// Echo cancellation on the near track.
@@ -269,8 +270,12 @@ pub const Config = struct {
     /// Push-to-talk: the key held to speak, and how the text is typed out.
     trigger: Trigger = .{},
     /// The server remote dictation clients connect to. Nothing to do with the
-    /// meeting one, which serves recordings over HTTP.
+    /// HTTP one, which serves a page rather than audio.
     tcp_server: TcpServer = .{},
+    /// The console: what capsper is doing right now, the settings behind it,
+    /// and whatever it has recorded. Runs on its own account rather than as
+    /// part of any capture mode.
+    http: Http = .{},
     /// Keeping the last few seconds of audio and its transcript on disk, for
     /// working out why a particular phrase came out wrong.
     debug_recording: DebugRecording = .{},

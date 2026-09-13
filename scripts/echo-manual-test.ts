@@ -116,7 +116,7 @@ async function runPass(label: string, aec: boolean, sessionsDir: string, farSeco
         `.{ .meeting = .{ .enabled = true, .sink_name = "${SINK}",` +
             ` .idle_close_seconds = 4, .dir = "${sessionsDir}/${label}",` +
             ` .audio_format = .wav, .aec = .{ .enabled = ${aec} },` +
-            ` .http = .{ .port = ${HTTP_PORT} } } }\n`,
+            ` }, .http = .{ .port = ${HTTP_PORT} } }\n`,
     );
 
     const logFile = join(sessionsDir, `capsper-${label}.log`);

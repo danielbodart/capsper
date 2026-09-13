@@ -166,7 +166,7 @@ async function startCapsper(opts: {
             ` .idle_close_seconds = ${opts.idleCloseSeconds}, .dir = "${opts.sessionsDir}",` +
             ` .audio_format = .${opts.audioFormat ?? "opus"},` +
             (opts.aec === undefined ? "" : ` .aec = .{ .enabled = ${opts.aec} },`) +
-            ` .http = .{ .port = ${opts.httpPort} } } }\n`,
+            ` }, .http = .{ .port = ${opts.httpPort} } }\n`,
     );
 
     const logFile = tmpFile("capsper-sink", ".log");
@@ -185,10 +185,18 @@ async function startCapsper(opts: {
     await until(`${opts.sink} to reach the graph`, async () =>
         nodes(await dump()).some((n) => n.name === `${opts.sink}.passthrough`));
 
-    // The server binds before the sink is announced, but wait for it rather
-    // than assume the ordering.
-    await until(`the session server on ${opts.httpPort}`, async () =>
-        (await fetch(`http://127.0.0.1:${opts.httpPort}/sessions.json`)).ok);
+    // Wait for meeting capture itself, not for the console.
+    //
+    // This used to poll the HTTP server, on the reasoning that it came up
+    // last. It no longer does: the console binds before the model loads, on
+    // purpose, so that it can say a model is loading. Waiting on it meant
+    // playing audio at a capsper that had not finished starting, and the
+    // opening words of the far track went missing with no test failing for
+    // the right reason.
+    //
+    // This line comes from the meeting runner's own loop, once it is watching
+    // the sink -- which is the condition these tests actually depend on.
+    await waitForLog(logFile, new RegExp(`Meeting sink '${opts.sink}' is up`), proc, 180);
 
     return { proc, configFile, logFile };
 }

@@ -144,7 +144,7 @@ async function startCapsper(opts: {
             (opts.near ? ` .near = "${opts.near}",` : "") +
             ` .idle_close_seconds = ${opts.idleCloseSeconds ?? 3}, .dir = "${opts.sessionsDir}",` +
             ` .audio_format = .wav, .aec = .{ .enabled = ${opts.aec} },` +
-            ` .http = .{ .port = ${opts.httpPort} } } }\n`,
+            ` }, .http = .{ .port = ${opts.httpPort} } }\n`,
     );
 
     const logFile = tmpFile("capsper-aec", ".log");
@@ -160,8 +160,11 @@ async function startCapsper(opts: {
         await waitForLog(logFile, new RegExp(`Virtual sink '${opts.sink}' ready`), proc, 180);
         await until(`${opts.sink} to reach the graph`, async () =>
             nodes(await dump()).some((n) => n.name === `${opts.sink}.passthrough`));
-        await until(`the session server on ${opts.httpPort}`, async () =>
-            (await fetch(`http://127.0.0.1:${opts.httpPort}/sessions.json`)).ok);
+        // Meeting capture itself, not the console. The console binds before
+        // the model loads so it can report one loading, which makes it a
+        // reply from a capsper that is not ready yet. See the longer note on
+        // the same wait in `pw-sink.test.ts`.
+        await waitForLog(logFile, new RegExp(`Meeting sink '${opts.sink}' is up`), proc, 180);
     } catch (e) {
         // Without this the failure is a bare timeout and capsper's own account
         // of what went wrong is deleted with the log file.

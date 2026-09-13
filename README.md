@@ -263,6 +263,11 @@ only what you want to change.
         .port = null,            // --port, -p; null means no server
     },
 
+    .http = .{
+        .port = null,            // null means no console; 0 takes any port
+        .bind = "127.0.0.1",
+    },
+
     .debug_recording = .{
         .dir = null,             // --record-dir; null disables
         .keep = 10,              // --record-keep
@@ -402,25 +407,25 @@ converting it to SRT is a timestamp separator substitution.
 
 ### Playing a session back
 
-With meeting capture on, capsper serves its sessions at
-[http://127.0.0.1:43008](http://127.0.0.1:43008). The page lists every
-recording newest first; picking one plays the audio with the transcript
-scrolling in step, near end on the left and far end on the right. Clicking a
-line plays from there, and a control sends either channel to both ears so the
-hard panning is a choice rather than something to endure.
-
-It binds to loopback, so the recordings are not reachable from the network.
-Both the port and the interface are configurable:
+Turn the console on and capsper serves its transcripts over HTTP. The page
+lists every recording newest first; picking one plays the audio with the
+transcript scrolling in step, near end on the left and far end on the right.
+Clicking a line plays from there, and a control sends either channel to both
+ears so the hard panning is a choice rather than something to endure.
 
 ```zig
-.meeting = .{
-    .enabled = true,
-    .http = .{
-        .port = 43008,        // null disables the server
-        .bind = "127.0.0.1",  // "0.0.0.0" to reach it from the network
-    },
+.http = .{
+    .port = 43008,        // null is no server; 0 takes whatever the OS gives
+    .bind = "127.0.0.1",  // "0.0.0.0" to reach it from the network
 },
 ```
+
+It is a setting of its own rather than part of meeting capture, because a
+capsper that only dictates has as much to show: it serves the same page
+whatever else is turned on. It is off until named, being the one part of
+capsper that opens a socket onto what the machine is doing.
+
+It binds to loopback, so the recordings are not reachable from the network.
 
 ### Not paying to transcribe silence
 

@@ -1,9 +1,14 @@
-// src/shared/session_server.zig — browsing and playing back recorded sessions.
+// src/shared/http_server.zig — the console: a way in to a running capsper.
 //
-// Runs whenever meeting capture is on, and serves one page: every session
-// listed newest first, and whichever one you pick playing against its
-// transcript. Sessions are directories of files and stay that way -- this
-// reads them, and writes nothing the recording does not already contain.
+// Runs whenever `http.port` is set, on its own account rather than as part of
+// any capture mode. A capsper that only dictates has as much to show here as
+// one recording meetings: what it is listening to, what it decided the
+// settings were, and whatever it has kept.
+//
+// Today it serves the transcripts. It starts before the model loads, so the
+// page answers while a minute of model reading is still going on, and it
+// holds the settings rather than a directory path because what it reports is
+// the whole of what this process was told.
 //
 // It binds to loopback unless told otherwise. These are recordings of private
 // conversations, and reaching them from the network should take saying so.
@@ -12,12 +17,13 @@ const std = @import("std");
 const net = std.net;
 const http = std.http;
 
+const config = @import("config.zig");
 const utils = @import("utils.zig");
 
-const log = std.log.scoped(.sessions);
+const log = std.log.scoped(.http);
 
 /// The page, embedded so a running capsper needs nothing fetched to serve it.
-const index_html = @embedFile("player.html");
+const index_html = @embedFile("console.html");
 
 /// Enough for any request line and headers a browser sends.
 const head_buffer_bytes = 16 * 1024;
@@ -31,8 +37,14 @@ const body_buffer_bytes = 64 * 1024;
 const max_range_bytes: u64 = 4 * 1024 * 1024;
 
 pub const Options = struct {
-    /// The sessions directory, already tilde-expanded.
-    root: []const u8,
+    /// Every setting this process is running on, paths already expanded.
+    ///
+    /// Borrowed rather than copied, and borrowed whole rather than picking
+    /// out the one directory this used to need. The settings are written once
+    /// in `main` and never again, and they outlive every thread, so reading
+    /// them from here is the same unsynchronised read of the same immutable
+    /// struct that `Server` and the meeting runner already do.
+    cfg: *const config.Config,
     port: u16,
     bind: []const u8,
 };
@@ -54,24 +66,25 @@ pub fn start(gpa: std.mem.Allocator, opts: Options) !void {
     state.* = .{
         .gpa = gpa,
         .listener = listener,
-        .root = try gpa.dupe(u8, opts.root),
+        .cfg = opts.cfg,
     };
 
     const thread = std.Thread.spawn(.{}, acceptLoop, .{state}) catch |err| {
         listener.deinit();
-        gpa.free(state.root);
         gpa.destroy(state);
         return err;
     };
     thread.detach();
 
-    std.debug.print("Sessions at http://{s}:{d}\n", .{ opts.bind, listener.listen_address.getPort() });
+    // The bound port rather than the requested one, because zero means
+    // whatever the OS picked and that is the number you need to type.
+    std.debug.print("Console at http://{s}:{d}\n", .{ opts.bind, listener.listen_address.getPort() });
 }
 
 const State = struct {
     gpa: std.mem.Allocator,
     listener: net.Server,
-    root: []const u8,
+    cfg: *const config.Config,
 };
 
 fn acceptLoop(state: *State) void {
@@ -152,8 +165,12 @@ fn sessionsJson(state: *State, request: *http.Server.Request) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const sessions = collect(arena, state.root) catch |err| {
-        log.warn("cannot read sessions from '{s}': {}", .{ state.root, err });
+    const root = state.cfg.meeting.dir;
+    const sessions = collect(arena, root) catch |err| {
+        // Ordinary when meeting capture has never run: the directory is made
+        // by the first session, so until then there is nothing to read and
+        // nothing wrong.
+        log.debug("cannot read sessions from '{s}': {}", .{ root, err });
         return request.respond("[]", .{
             .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
         });
@@ -290,7 +307,7 @@ fn oggDurationSeconds(file: std.fs.File) f64 {
 fn sessionFile(state: *State, request: *http.Server.Request, rel: []const u8) !void {
     if (!isSafe(rel)) return request.respond("no\n", .{ .status = .forbidden });
 
-    var dir = std.fs.cwd().openDir(state.root, .{}) catch
+    var dir = std.fs.cwd().openDir(state.cfg.meeting.dir, .{}) catch
         return request.respond("not found\n", .{ .status = .not_found });
     defer dir.close();
 

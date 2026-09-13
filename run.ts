@@ -154,9 +154,9 @@ export async function dev() {
     await $`zig build test`;
     console.log("Running integration smoke tests...");
     if (IS_MACOS) {
-        await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/ca-stream.test.ts`;
+        await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/console.test.ts test/ca-stream.test.ts`;
     } else {
-        await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/pw-stream.test.ts test/pw-sink.test.ts test/echo-cancel.test.ts`;
+        await $`bun test test/regression.test.ts test/concurrent-tcp.test.ts test/console.test.ts test/pw-stream.test.ts test/pw-sink.test.ts test/echo-cancel.test.ts`;
     }
 }
 
