@@ -20,7 +20,7 @@
   would have to re-parse the file by hand to read back.
 -->
 <meta charset="utf-8">
-<title>Capsper sessions</title>
+<title>Capsper transcripts</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -139,7 +139,7 @@
 </style>
 
 <main>
-  <h1 id="title">Capsper sessions</h1>
+  <h1 id="title">Capsper transcripts</h1>
   <p class="meta" id="meta">Recorded meetings, newest first.</p>
 
   <section id="listView">
@@ -489,7 +489,7 @@
     audio.pause();
     audio.removeAttribute("src");
     audio.load();
-    $("title").textContent = "Capsper sessions";
+    $("title").textContent = "Capsper transcripts";
     $("meta").textContent = "Recorded meetings, newest first.";
     playView.hidden = true;
     listView.hidden = false;
