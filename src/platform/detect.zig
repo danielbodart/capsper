@@ -5,3 +5,4 @@ else
     @import("linux/detect.zig");
 
 pub const detectChannel = impl.detectChannel;
+pub const listSources = impl.listSources;

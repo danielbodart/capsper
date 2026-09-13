@@ -54,8 +54,12 @@ pub fn main() !void {
     // always wins for one run. Finding --config therefore has to happen before
     // the general parse, which is why it gets its own scan.
     const explicit_config = config.configPathFromArgs(argv);
+    // Kept, because the console saves settings back to wherever they came
+    // from. Null only when there is no HOME and no XDG_CONFIG_HOME to build a
+    // default from, which the console then says rather than guessing.
+    const config_path = explicit_config orelse config.defaultPath(cfg_arena) catch null;
     var cfg = config.Config{};
-    if (explicit_config orelse config.defaultPath(cfg_arena) catch null) |path| {
+    if (config_path) |path| {
         if (config.load(cfg_arena, path)) |loaded| {
             if (loaded) |c| {
                 cfg = c;
@@ -83,6 +87,14 @@ pub fn main() !void {
         try out.interface.flush();
         return;
     }
+
+    // A copy taken before the expansion, and the console's settings form shows
+    // and saves this one. `expandPaths` reassigns each path field to a fresh
+    // absolute string, so this keeps the originals -- and a `~/` the user
+    // wrote stays a `~/` when it is written back rather than becoming one
+    // machine's home directory. It is the same reason `--write-config` runs
+    // above this line.
+    const cfg_as_written = cfg;
 
     try cfg.expandPaths(cfg_arena);
 
@@ -171,6 +183,9 @@ pub fn main() !void {
         cli.stream == null and cli.transcribe == null;
     if (run_http) try http_server.start(allocator, .{
         .cfg = &cfg,
+        .as_written = &cfg_as_written,
+        .config_path = config_path,
+        .list_devices = audio_detect.listSources,
         .port = cfg.http.port.?,
         .bind = cfg.http.bind,
         .version = build_options.version,

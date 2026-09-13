@@ -192,6 +192,24 @@ pub fn writeWavHeader(writer: anytype, data_size: u32, channels: u16) !void {
 /// starts in a file it wrote.
 pub const wav_header_bytes: u64 = 44;
 
+/// Write `text` with the five characters that change the meaning of markup
+/// replaced by their entities.
+///
+/// Everything the console puts on a page comes from somewhere capsper does not
+/// control: a PipeWire node name is whatever the device declared, a path is
+/// whatever the settings say, and a setting is whatever was last saved. None
+/// of it is trusted to be inert, so all of it goes through here.
+pub fn writeHtml(w: anytype, text: []const u8) !void {
+    for (text) |c| switch (c) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        '"' => try w.writeAll("&quot;"),
+        '\'' => try w.writeAll("&#39;"),
+        else => try w.writeByte(c),
+    };
+}
+
 // ============================================================
 // Tests
 // ============================================================

@@ -120,6 +120,7 @@ pub fn build(b: *std.Build) void {
         "src/shared/webvtt.zig",
         "src/shared/http_server.zig",
         "src/shared/status.zig",
+        "src/shared/settings_form.zig",
         "src/shared/source.zig",
         "src/shared/vad.zig",
         "src/shared/recorder.zig",

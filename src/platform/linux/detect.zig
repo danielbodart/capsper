@@ -11,6 +11,25 @@ const StreamData = struct {
     pipe_write_fd: posix.fd_t,
 };
 
+/// The capture devices in the graph, by node name.
+///
+/// The same enumeration the wizard below opens with, without the wizard: the
+/// console offers these as suggestions on the settings that name a device, and
+/// has nobody to ask questions of. The node name rather than the description,
+/// because the name is what a setting holds.
+pub fn listSources(arena: std.mem.Allocator) ![]const []const u8 {
+    var results: [64]pw.pw_source_info = undefined;
+    const count = pw.pw_enumerate_sources(&results, 64);
+    if (count < 0) return error.CannotEnumerateSources;
+
+    const n: usize = @intCast(count);
+    const out = try arena.alloc([]const u8, n);
+    for (results[0..n], 0..) |info, i| {
+        out[i] = try arena.dupe(u8, std.mem.sliceTo(&info.name, 0));
+    }
+    return out;
+}
+
 /// Full setup wizard: enumerate devices, let user pick, record silence,
 /// record speech, detect channel, calibrate gain — all in one interactive flow.
 /// If target is provided, skip device selection.

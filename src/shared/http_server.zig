@@ -17,7 +17,11 @@ const std = @import("std");
 const net = std.net;
 const http = std.http;
 
+const Allocator = std.mem.Allocator;
+
 const config = @import("config.zig");
+const config_docs = @import("config_docs.zig");
+const settings_form = @import("settings_form.zig");
 const status = @import("status.zig");
 const utils = @import("utils.zig");
 
@@ -63,6 +67,28 @@ pub const Options = struct {
     /// The model directory, as resolved. Reported while it is still being
     /// read, which is when naming it is most use.
     model: []const u8,
+
+    /// The settings as they were written, before `expandPaths` turned every
+    /// `~/` into one machine's absolute path.
+    ///
+    /// The form shows these and saves these. `cfg` above is what is running
+    /// and is right for reading a directory; this is what belongs in a file,
+    /// and saving the other one would quietly bake `/home/someone` into a
+    /// setting that said `~/`. `--write-config` avoids the same trap by
+    /// running before the expansion.
+    as_written: *const config.Config,
+
+    /// Where the settings came from, and so where they go back. Null when no
+    /// path could be worked out at all, which is its own answer on the page.
+    config_path: ?[]const u8 = null,
+
+    /// How to find the capture devices, or null where the platform cannot.
+    ///
+    /// A function rather than a list, so the form offers what is plugged in
+    /// now rather than what was plugged in at startup -- and injected rather
+    /// than imported, because reaching PipeWire from here would drag the whole
+    /// platform layer into a module that is built on its own as a test target.
+    list_devices: ?*const fn (Allocator) anyerror![]const []const u8 = null,
 };
 
 /// Start serving in the background. Returns once the socket is listening, so a
@@ -83,6 +109,9 @@ pub fn start(gpa: std.mem.Allocator, opts: Options) !void {
         .gpa = gpa,
         .listener = listener,
         .cfg = opts.cfg,
+        .as_written = opts.as_written,
+        .config_path = opts.config_path,
+        .list_devices = opts.list_devices,
         .build = .{ .version = opts.version, .backend = opts.backend, .model = opts.model },
     };
 
@@ -108,6 +137,9 @@ const State = struct {
     gpa: std.mem.Allocator,
     listener: net.Server,
     cfg: *const config.Config,
+    as_written: *const config.Config,
+    config_path: ?[]const u8,
+    list_devices: ?*const fn (Allocator) anyerror![]const []const u8,
     build: Build,
 };
 
@@ -194,6 +226,13 @@ fn route(state: *State, request: *http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/settings")) {
+        return switch (request.head.method) {
+            .POST => saveSettings(state, request),
+            else => settingsPage(state, request, null),
+        };
+    }
+
     if (std.mem.eql(u8, path, "/sessions.json")) return sessionsJson(state, request);
     if (std.mem.eql(u8, path, "/recordings.json")) return recordingsJson(state, request);
 
@@ -235,7 +274,7 @@ fn statusPage(state: *State, request: *http.Server.Request) !void {
         \\<title>Capsper</title>
         \\<link rel="stylesheet" href="/style.css">
         \\<main>
-        \\<nav><a href="/" aria-current="page">Status</a><a href="/transcripts">Transcripts</a><a href="/recordings">Recordings</a></nav>
+        \\<nav><a href="/" aria-current="page">Status</a><a href="/transcripts">Transcripts</a><a href="/recordings">Recordings</a><a href="/settings">Settings</a></nav>
         \\<h1>Capsper</h1>
         \\
     );
@@ -387,19 +426,9 @@ fn writeDuration(w: anytype, seconds: f64) !void {
 
 /// The five characters that change the meaning of markup.
 ///
-/// Everything written into this page comes from somewhere capsper does not
-/// control: a PipeWire node name is whatever the device declared, and a path
-/// is whatever the settings say. None of it is trusted to be inert.
-fn writeEscaped(w: anytype, text: []const u8) !void {
-    for (text) |c| switch (c) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        '"' => try w.writeAll("&quot;"),
-        '\'' => try w.writeAll("&#39;"),
-        else => try w.writeByte(c),
-    };
-}
+/// In `utils` because the settings form needs the same guarantee about the
+/// same untrusted values, and one of these is enough.
+const writeEscaped = utils.writeHtml;
 
 // ─── The session list ────────────────────────────────────────────────────────
 
@@ -550,6 +579,230 @@ fn oggDurationSeconds(file: std.fs.File) f64 {
         return @as(f64, @floatFromInt(granule)) / 48000.0;
     }
     return 0;
+}
+
+// ─── Settings ────────────────────────────────────────────────────────────────
+
+/// What happened to a save, and what to tell the person who asked for it.
+const Outcome = union(enum) {
+    /// A field could not be read. Nothing was written.
+    rejected: settings_form.Problem,
+    /// The document the form made would not parse. Nothing was written. This
+    /// should not happen -- every field is checked before it is written -- so
+    /// the diagnostic is shown rather than summarised.
+    invalid: []const u8,
+    /// Written, and the process is about to leave so the new settings take.
+    saved: []const u8,
+    /// Correct, complete, and nowhere to put it: the settings came from a path
+    /// that cannot be written, which on NixOS is every time. The ZON is handed
+    /// back for the person to put where it belongs.
+    unwritable: struct { path: ?[]const u8, zon: []const u8 },
+};
+
+fn settingsPage(state: *State, request: *http.Server.Request, outcome: ?Outcome) !void {
+    var arena_state = std.heap.ArenaAllocator.init(state.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Asked now rather than remembered from startup, so the list is what is
+    // plugged in while the page is being read.
+    const devices: []const []const u8 = if (state.list_devices) |list|
+        list(arena) catch &.{}
+    else
+        &.{};
+
+    var body: std.Io.Writer.Allocating = .init(arena);
+    const w = &body.writer;
+
+    try w.writeAll(
+        \\<!doctype html>
+        \\<meta charset="utf-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1">
+        \\<title>Capsper settings</title>
+        \\<link rel="stylesheet" href="/style.css">
+        \\<main>
+        \\<nav><a href="/">Status</a><a href="/transcripts">Transcripts</a><a href="/recordings">Recordings</a><a href="/settings" aria-current="page">Settings</a></nav>
+        \\<h1>Capsper settings</h1>
+        \\
+    );
+
+    if (outcome) |o| try writeOutcome(w, o);
+
+    try w.writeAll("<p class=\"meta\">Every setting capsper has, with what it means beside it. ");
+    if (state.config_path) |p| {
+        try w.writeAll("Saving writes <code>");
+        try utils.writeHtml(w, p);
+        try w.writeAll("</code> and restarts.");
+    } else {
+        try w.writeAll("There is nowhere to save to: no config path could be worked out.");
+    }
+    try w.writeAll("</p>\n<form method=\"post\" action=\"/settings\" class=\"settings\">\n");
+
+    try settings_form.writeForm(state.as_written, devices, w);
+
+    try w.writeAll(
+        \\<div class="actions"><button type="submit">Save and restart</button></div>
+        \\</form>
+        \\</main>
+        \\
+    );
+
+    return request.respond(body.written(), .{
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        },
+    });
+}
+
+fn writeOutcome(w: *std.Io.Writer, outcome: Outcome) !void {
+    switch (outcome) {
+        .rejected => |p| {
+            try w.writeAll("<p class=\"notice bad\">Nothing was saved: <code>");
+            try utils.writeHtml(w, p.path);
+            try w.writeAll("</code> ");
+            try utils.writeHtml(w, p.message);
+            try w.writeAll(".</p>\n");
+        },
+        .invalid => |text| {
+            try w.writeAll("<p class=\"notice bad\">Nothing was saved; the settings did not parse:</p><pre>");
+            try utils.writeHtml(w, text);
+            try w.writeAll("</pre>\n");
+        },
+        .saved => |path| {
+            try w.writeAll("<p class=\"notice good\">Saved to <code>");
+            try utils.writeHtml(w, path);
+            try w.writeAll("</code>. Capsper is restarting; reload in a moment.</p>\n");
+        },
+        .unwritable => |u| {
+            try w.writeAll("<p class=\"notice bad\">");
+            if (u.path) |p| {
+                try w.writeAll("<code>");
+                try utils.writeHtml(w, p);
+                try w.writeAll("</code> cannot be written");
+            } else {
+                try w.writeAll("There is nowhere to save these");
+            }
+            try w.writeAll(
+                \\ — on NixOS the settings are a read-only store path, built
+                \\ from your configuration. Nothing has changed here, and
+                \\ capsper is still running. Put this where that file comes
+                \\ from and rebuild:</p>
+                \\<pre class="zon">
+            );
+            try utils.writeHtml(w, u.zon);
+            try w.writeAll("</pre>\n");
+        },
+    }
+}
+
+/// Read the posted form, and act on it.
+///
+/// The reply is written before anything is torn down, and it is a whole page
+/// rather than a redirect, because in the case that matters most -- a config
+/// path that cannot be written -- the reply is the only copy of what the form
+/// produced. A redirect would lose it.
+fn saveSettings(state: *State, request: *http.Server.Request) !void {
+    var arena_state = std.heap.ArenaAllocator.init(state.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var read_buf: [8 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&read_buf);
+    // A form of a few dozen fields. Generous, and bounded, because this is
+    // reachable from wherever the server is bound.
+    const body = reader.allocRemaining(arena, .limited(256 * 1024)) catch
+        return request.respond("form too large\n", .{ .status = .payload_too_large });
+
+    var values = try settings_form.parseBody(arena, body);
+
+    var zon: std.Io.Writer.Allocating = .init(arena);
+    if (try settings_form.writeZon(&values, &zon.writer)) |problem| {
+        return settingsPage(state, request, .{ .rejected = problem });
+    }
+    const text = zon.written();
+
+    // Through the same parser a hand-written file goes through. Every value
+    // was already checked against its own field's type, so this should not
+    // fail -- and if it ever does, that is a bug in the walk above and the
+    // diagnostic is worth more than a tidy message.
+    const source = try arena.dupeZ(u8, text);
+    var diag: std.zon.parse.Diagnostics = .{};
+    const parsed = config.parse(arena, source, &diag) catch {
+        var report: std.Io.Writer.Allocating = .init(arena);
+        report.writer.print("{f}", .{diag}) catch {};
+        return settingsPage(state, request, .{ .invalid = report.written() });
+    };
+
+    // The text that reaches the file is written by `config_docs`, not by the
+    // form walk above. That is what a form submits every field it was given,
+    // ticked or not, and a file listing all of them would freeze today's
+    // defaults into it -- so a later change to one would reach new users and
+    // silently miss everyone who had ever pressed Save. The same writer
+    // `--write-config` uses names only what differs, and puts each setting's
+    // description above it.
+    var settled: std.Io.Writer.Allocating = .init(arena);
+    try config_docs.write(&parsed, &settled.writer);
+    const file_text = settled.written();
+
+    const path = state.config_path orelse
+        return settingsPage(state, request, .{ .unwritable = .{ .path = null, .zon = file_text } });
+
+    writeConfigFile(path, file_text) catch |err| {
+        log.warn("cannot write settings to '{s}': {}", .{ path, err });
+        return settingsPage(state, request, .{ .unwritable = .{ .path = path, .zon = file_text } });
+    };
+
+    try settingsPage(state, request, .{ .saved = path });
+
+    // Only once the page is on its way. Everything below this ends the
+    // process, and a browser that never received the confirmation would be
+    // left looking at a connection that died mid-save.
+    status.stop_requested.store(true, .release);
+    waitForMeetingToClose();
+    std.process.exit(0);
+}
+
+/// Replace the settings file's contents.
+///
+/// Written to a neighbour and renamed over the top, so a reader -- the next
+/// capsper, started by the service manager seconds from now -- never sees a
+/// half-written file. The directory is created if it is not there, which is
+/// the ordinary case the first time anyone saves.
+fn writeConfigFile(path: []const u8, text: []const u8) !void {
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    var dir = try std.fs.cwd().makeOpenPath(dir_path, .{});
+    defer dir.close();
+
+    const name = std.fs.path.basename(path);
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_name = try std.fmt.bufPrint(&tmp_buf, ".{s}.tmp", .{name});
+
+    {
+        var file = try dir.createFile(tmp_name, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(text);
+    }
+    errdefer dir.deleteFile(tmp_name) catch {};
+    try dir.rename(tmp_name, name);
+}
+
+/// Give a meeting in progress the chance to finish its file.
+///
+/// The flag is set; the meeting loop notices it between chunks, closes the
+/// session the way an idle timeout would, and says so. Waiting here means the
+/// recording of a call that happened to be running is a complete file rather
+/// than one that stops mid-word.
+///
+/// Bounded, because a save that never returns is worse than a recording that
+/// loses its last second: if the meeting thread is wedged, leaving is still
+/// the right answer.
+fn waitForMeetingToClose() void {
+    const deadline_ms = 15_000;
+    var waited: u64 = 0;
+    while (status.meeting.open.load(.acquire) and waited < deadline_ms) : (waited += 50) {
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
 }
 
 // ─── Debug recordings ────────────────────────────────────────────────────────

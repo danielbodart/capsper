@@ -42,7 +42,7 @@ pub const entries = buildEntries();
 
 /// The struct behind an optional, or null if the field is not one. Optional
 /// sections are not a shape the settings use; optional leaves are everywhere.
-fn sectionType(comptime T: type) ?type {
+pub fn sectionType(comptime T: type) ?type {
     return switch (@typeInfo(T)) {
         .@"struct" => T,
         else => null,
@@ -66,7 +66,7 @@ fn containerName(comptime T: type) []const u8 {
 /// analysed as a runtime loop whose `return` the compiler cannot prove is
 /// reached -- so it would fall through to the `@compileError` every time and
 /// report every setting as undocumented, however many doc comments there are.
-fn docFor(comptime T: type, comptime field_name: []const u8, comptime path: []const u8) []const u8 {
+pub fn docFor(comptime T: type, comptime field_name: []const u8, comptime path: []const u8) []const u8 {
     return comptime found: {
         // A linear scan of every harvested field, once per setting. Small
         // numbers either way, but their product is past the default quota.
@@ -153,13 +153,38 @@ pub fn write(cfg: *const Config, writer: *std.Io.Writer) !void {
 
 /// Whether any setting in `value` differs from `default`, so a section with
 /// nothing chosen in it costs no lines.
-///
-/// `std.meta.eql` compares strings by pointer, so two equal strings from
-/// separate allocations read as different. That errs towards writing a setting
-/// out, which is the harmless direction: the file says something true either
-/// way, just occasionally more than it had to.
 fn differs(comptime T: type, value: T, default: T) bool {
-    return !std.meta.eql(value, default);
+    return !equal(T, value, default);
+}
+
+/// Equality that reads a string as its characters.
+///
+/// `std.meta.eql` compares a slice by pointer, which was good enough while the
+/// only caller was `--write-config` on settings that had just been parsed
+/// straight from a file: a default that was never overwritten still pointed at
+/// the static default. It stopped being good enough when the console began
+/// saving a form, because every value there arrives from a fresh allocation --
+/// so every string setting looked changed, and a file would have been written
+/// naming all of them.
+///
+/// That is the failure this whole "only what differs" rule exists to prevent:
+/// a file listing every string setting freezes today's defaults into it, and a
+/// later change to one reaches new users while silently missing everyone who
+/// had ever pressed Save.
+fn equal(comptime T: type, a: T, b: T) bool {
+    return switch (@typeInfo(T)) {
+        .optional => |o| if (a) |av| {
+            if (b) |bv| return equal(o.child, av, bv) else return false;
+        } else b == null,
+        .pointer => |p| if (p.size == .slice and p.child == u8)
+            std.mem.eql(u8, a, b)
+        else
+            std.meta.eql(a, b),
+        .@"struct" => |s| inline for (s.fields) |f| {
+            if (!equal(f.type, @field(a, f.name), @field(b, f.name))) break false;
+        } else true,
+        else => a == b,
+    };
 }
 
 fn writeFields(
@@ -247,6 +272,24 @@ test "the table holds sections and the settings inside them" {
     }
     try testing.expect(saw_section);
     try testing.expect(saw_nested_leaf);
+}
+
+test "a string equal to its default is not a change" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The shape the console's save produces: every value a fresh allocation,
+    // none of them pointing at the static defaults. Nothing was changed, so
+    // nothing may be written -- a comparison by pointer would name every
+    // string setting here.
+    var cfg = Config{};
+    cfg.meeting.sink_name = try arena.dupeZ(u8, cfg.meeting.sink_name);
+    cfg.meeting.sink_description = try arena.dupeZ(u8, cfg.meeting.sink_description);
+    cfg.meeting.dir = try arena.dupeZ(u8, cfg.meeting.dir);
+    cfg.http.bind = try arena.dupeZ(u8, cfg.http.bind);
+
+    try testing.expectEqualStrings(".{\n}\n", try writeToString(arena, &cfg));
 }
 
 test "writing the defaults says nothing at all" {

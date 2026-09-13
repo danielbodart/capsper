@@ -154,6 +154,14 @@ pub fn run(
     std.debug.print("Meeting sink '{s}' is up; select it as your output.\n", .{cfg.meeting.sink_name});
 
     while (true) {
+        // Saving settings from the console ends the process, and a call being
+        // recorded at that moment should survive it as a finished file. The
+        // `defer` above closes the session; returning is what reaches it.
+        if (status.stop_requested.load(.acquire)) {
+            if (session != null) log.info("closing the session before restarting", .{});
+            return;
+        }
+
         const now: u64 = @intCast(std.time.nanoTimestamp());
         switch (gate.update(watch.activeStreams(), now)) {
             .none => {},

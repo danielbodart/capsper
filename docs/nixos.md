@@ -151,6 +151,22 @@ defaults, which transcribes straight into `settings`.
 `extraArgs` still appends flags to the command line. Flags are applied over the
 file, so anything there wins over `settings` for that one setting.
 
+### The console's settings page, here
+
+Capsper's console can edit the settings and save them, and on NixOS it cannot.
+The file it would write is the store path this module built, which is read-only
+by design and would be replaced by the next rebuild even if it were not.
+
+So it does not pretend. Pressing Save on a NixOS machine changes nothing,
+capsper keeps running, and the page hands back the ZON the form produced —
+naming only what differs from the defaults — for you to transcribe into
+`settings` here. The translation is mechanical: a ZON field becomes a Nix
+attribute, and a ZON enum literal becomes the plain string this module's
+renderer turns back into one.
+
+Everything else the console does works normally: it is reading, and reading is
+not the part the store path forbids.
+
 ## Models
 
 The models are **not** in the Nix store. They are ~900MB, versioned

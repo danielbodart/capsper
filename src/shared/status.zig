@@ -127,6 +127,16 @@ pub var sink_up: std.atomic.Value(bool) = .init(false);
 /// When the process started, for an uptime that does not need a second clock.
 pub var started_at_ns: std.atomic.Value(i64) = .init(0);
 
+/// Set when capsper is about to leave on purpose -- saving settings is the
+/// only thing that sets it -- so a capture loop can finish what it is doing
+/// first.
+///
+/// A flag rather than a signal or a join, because the only loop that needs to
+/// know already wakes several times a second and the process exits either way.
+/// What it buys is that a call being recorded when someone presses Save is a
+/// complete file afterwards rather than one that stops mid-word.
+pub var stop_requested: std.atomic.Value(bool) = .init(false);
+
 /// A meeting being recorded, if one is.
 pub const Meeting = struct {
     open: std.atomic.Value(bool) = .init(false),
