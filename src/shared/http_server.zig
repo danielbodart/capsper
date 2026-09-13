@@ -708,7 +708,15 @@ fn saveSettings(state: *State, request: *http.Server.Request) !void {
     const arena = arena_state.allocator();
 
     var read_buf: [8 * 1024]u8 = undefined;
-    const reader = request.readerExpectNone(&read_buf);
+    // `readerExpectContinue` and not `readerExpectNone`. The other one asserts
+    // the request carried no `Expect` header, and an assertion here is not a
+    // rejected request -- it is the whole process going down, dictation and a
+    // meeting in progress with it. A client is entitled to send
+    // `Expect: 100-continue`, and curl does so by default once a body passes a
+    // kilobyte, which this form does comfortably. So the handshake is answered
+    // rather than assumed away.
+    const reader = request.readerExpectContinue(&read_buf) catch
+        return request.respond("cannot read the form\n", .{ .status = .bad_request });
     // A form of a few dozen fields. Generous, and bounded, because this is
     // reachable from wherever the server is bound.
     const body = reader.allocRemaining(arena, .limited(256 * 1024)) catch
@@ -753,11 +761,20 @@ fn saveSettings(state: *State, request: *http.Server.Request) !void {
         return settingsPage(state, request, .{ .unwritable = .{ .path = path, .zon = file_text } });
     };
 
-    try settingsPage(state, request, .{ .saved = path });
+    // The confirmation goes first, because everything after it ends the
+    // process and a browser that never saw the reply would be left looking at
+    // a connection that died mid-save.
+    //
+    // Its failure is not allowed to cancel the restart, though. The file is
+    // already written; a client that closed the tab between the write and the
+    // reply would otherwise leave this process serving the old settings while
+    // the file on disk says something else, until some unrelated restart
+    // months later applied a change nobody remembers making. Whether anyone is
+    // still listening is not what decides this.
+    settingsPage(state, request, .{ .saved = path }) catch |err| {
+        log.warn("settings saved, but the reply did not reach the client: {}", .{err});
+    };
 
-    // Only once the page is on its way. Everything below this ends the
-    // process, and a browser that never received the confirmation would be
-    // left looking at a connection that died mid-save.
     status.stop_requested.store(true, .release);
     waitForMeetingToClose();
     std.process.exit(0);

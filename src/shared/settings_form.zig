@@ -32,10 +32,7 @@ const Config = config.Config;
 const Shape = enum { boolean, text, integer, number, choice };
 
 fn shapeOf(comptime T: type) Shape {
-    const Leaf = switch (@typeInfo(T)) {
-        .optional => |o| o.child,
-        else => T,
-    };
+    const Leaf = LeafType(T);
     return switch (@typeInfo(Leaf)) {
         .bool => .boolean,
         .int => .integer,
@@ -179,13 +176,15 @@ fn writeField(
     try w.writeAll("</p></div>\n");
 }
 
-/// The value inside an optional, or the value itself when there is no
-/// optional to look through.
+/// The value inside an optional, or the value itself when there is no optional
+/// to look through.
+///
+/// The identity function, and it earns its name rather than its body: an
+/// already-optional value passes through, and a concrete one coerces into the
+/// optional return type. What it buys is that the callers above can ask "is
+/// there a value here" the same way whether or not the field can be null.
 fn unwrap(comptime T: type, value: T) ?LeafType(T) {
-    return switch (@typeInfo(T)) {
-        .optional => value,
-        else => value,
-    };
+    return value;
 }
 
 // ─── Reading it back ─────────────────────────────────────────────────────────
@@ -348,6 +347,12 @@ fn writeZonValue(
         .number => {
             const n = std.fmt.parseFloat(Leaf, trimmed) catch
                 return .{ .path = path, .message = "must be a number" };
+            // `inf` and `nan` parse, print, and parse back as ZON, so the
+            // round trip would accept them all the way to the file -- where a
+            // gain of infinity or a voice-activity threshold of nan is not a
+            // setting anyone can have meant. A number input in a browser
+            // refuses to type them; nothing else was refusing them.
+            if (!std.math.isFinite(n)) return .{ .path = path, .message = "must be a finite number" };
             try w.print("{d}", .{n});
         },
         // The one value that is written from what arrived, and the one that is

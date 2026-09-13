@@ -189,6 +189,21 @@ describe.skipIf(!gpu)("console", () => {
         expect(html).toContain(server.recordingsDir);
     });
 
+    test("survives a POST that asks to continue", async () => {
+        // `Expect: 100-continue` used to kill the process outright, not the
+        // request: the reader asserted the header was absent, and an assertion
+        // in a release build takes dictation and any meeting down with it.
+        // curl sends this by default once a body passes a kilobyte, which the
+        // real settings form does comfortably.
+        const res = await fetch(`${server.base}/settings`, {
+            method: "POST",
+            headers: { "Expect": "100-continue" },
+            body: new URLSearchParams({ "audio.channel": "SIDEWAYS" }),
+        });
+        expect(res.status).toBeLessThan(500);
+        expect(server.proc.exitCode).toBeNull();
+    });
+
     test("refuses a value that is not of its field's type, and writes nothing", async () => {
         const before = readFileSync(server.configFile, "utf8");
 

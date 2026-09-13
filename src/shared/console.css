@@ -75,7 +75,7 @@ a.back:hover { color: var(--accent); }
 .card dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: .3rem .9rem; }
 .card dt { color: var(--muted); font-size: .85rem; }
 .card dd { margin: 0; font-size: .85rem; overflow-wrap: anywhere; }
-.card dd.num { font-variant-numeric: tabular-nums; }
+.card .num { font-variant-numeric: tabular-nums; }
 
 /* A live thing, said in colour as well as in words, because the word is the
    only difference between the two states and it is one letter long. */

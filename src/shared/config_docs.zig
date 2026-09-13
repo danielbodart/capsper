@@ -11,10 +11,18 @@
 // a compile error naming the field, which is what stops the descriptions
 // rotting quietly behind the type as fields are added.
 //
-// The one consumer today is `--write-config`, which writes the settings out as
-// ZON with each one's description above it as a comment. The table is shaped
-// for the others that want the same three things -- path, type and description
-// -- with usage text the obvious next one.
+// What it offers is a walk rather than a table: `sectionType` says whether a
+// field groups other settings, and `docFor` hands back the prose beside it.
+// `write` below uses both to put the settings out as ZON with each
+// description above it, which is what `--write-config` prints and what the
+// console writes when it saves a form. `settings_form.zig` uses the same two
+// to build that form.
+//
+// It was a table once -- every setting flattened to a dotted path, built at
+// comptime. Both consumers turned out to want the real types rather than a
+// description of them: one to compare a value against its default, the other
+// to know that a field holds an enum and which tags it has. So the table went
+// and the two functions behind it stayed.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -22,23 +30,7 @@ const generated = @import("config_field_docs");
 
 const Config = config.Config;
 
-/// One setting, addressed the way the config file and a dotted flag would.
-pub const Entry = struct {
-    /// Dotted path from the root of the settings: "meeting.vad.onset".
-    path: []const u8,
-    /// What the field holds. A section is a struct; everything else is a leaf.
-    type_name: []const u8,
-    doc: []const u8,
-    /// Sections are the structs that group the settings. They take no value
-    /// themselves, and their description heads the group.
-    is_section: bool,
-};
-
-/// Every setting, depth first, in declaration order. A section comes
-/// immediately before the settings it contains.
-pub const entries = buildEntries();
-
-// ─── Building the table ──────────────────────────────────────────────────────
+// ─── Reading the tree ────────────────────────────────────────────────────────
 
 /// The struct behind an optional, or null if the field is not one. Optional
 /// sections are not a shape the settings use; optional leaves are everywhere.
@@ -81,46 +73,6 @@ pub fn docFor(comptime T: type, comptime field_name: []const u8, comptime path: 
         @compileError("setting '" ++ path ++ "' has no doc comment in config.zig. " ++
             "Every setting needs one: it is what --write-config puts beside it.");
     };
-}
-
-fn countEntries(comptime T: type, comptime prefix: []const u8) usize {
-    comptime var n: usize = 0;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        n += 1;
-        const path = if (prefix.len == 0) f.name else prefix ++ "." ++ f.name;
-        if (sectionType(f.type)) |S| n += countEntries(S, path);
-    }
-    return n;
-}
-
-fn fillEntries(
-    comptime T: type,
-    comptime prefix: []const u8,
-    comptime out: []Entry,
-    comptime at: usize,
-) usize {
-    comptime var i = at;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        const path = if (prefix.len == 0) f.name else prefix ++ "." ++ f.name;
-        const section = sectionType(f.type);
-        out[i] = .{
-            .path = path,
-            .type_name = @typeName(f.type),
-            .doc = docFor(T, f.name, path),
-            .is_section = section != null,
-        };
-        i += 1;
-        if (section) |S| i = fillEntries(S, path, out, i);
-    }
-    return i;
-}
-
-fn buildEntries() [countEntries(Config, "")]Entry {
-    @setEvalBranchQuota(100_000);
-    comptime var out: [countEntries(Config, "")]Entry = undefined;
-    _ = comptime fillEntries(Config, "", &out, 0);
-    const frozen = out;
-    return frozen;
 }
 
 // ─── Writing ─────────────────────────────────────────────────────────────────
@@ -248,30 +200,6 @@ fn writeToString(arena: std.mem.Allocator, cfg: *const Config) ![]const u8 {
     var buf: std.Io.Writer.Allocating = .init(arena);
     try write(cfg, &buf.writer);
     return buf.written();
-}
-
-test "every setting has a description" {
-    // The table cannot be built at all if one is missing, so reaching here is
-    // the assertion. This names it so a failure reads as what it is.
-    try testing.expect(entries.len > 0);
-}
-
-test "the table holds sections and the settings inside them" {
-    var saw_section = false;
-    var saw_nested_leaf = false;
-    for (entries) |e| {
-        if (std.mem.eql(u8, e.path, "meeting")) {
-            saw_section = true;
-            try testing.expect(e.is_section);
-        }
-        if (std.mem.eql(u8, e.path, "meeting.vad.onset")) {
-            saw_nested_leaf = true;
-            try testing.expect(!e.is_section);
-        }
-        try testing.expect(e.doc.len > 0);
-    }
-    try testing.expect(saw_section);
-    try testing.expect(saw_nested_leaf);
 }
 
 test "a string equal to its default is not a change" {
