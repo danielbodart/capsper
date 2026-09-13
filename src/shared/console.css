@@ -61,8 +61,12 @@ a.back {
 }
 a.back:hover { color: var(--accent); }
 
-/* ── Status ── */
-.cards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+/* ── Status ──
+   One card per row rather than side by side. Three columns fit, but what goes
+   in them does not: a model path is most of a line on its own, and a device
+   name is a PipeWire node name. Side by side they wrap into narrow ribbons of
+   text; full width they read. */
+.cards { display: grid; gap: 1rem; }
 .card {
   border: 1px solid var(--line); border-radius: 8px;
   background: var(--panel); padding: .85rem 1rem 1rem;
