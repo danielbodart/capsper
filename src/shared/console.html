@@ -21,51 +21,10 @@
 -->
 <meta charset="utf-8">
 <title>Capsper transcripts</title>
+<link rel="stylesheet" href="/style.css">
 <style>
-  :root {
-    color-scheme: light dark;
-    --bg: #fbfaf8;
-    --panel: #ffffff;
-    --ink: #1c1b19;
-    --muted: #6b6862;
-    --line: #e4e1db;
-    --near: #2f6f4e;
-    --near-bg: #e8f3ec;
-    --far: #2b5d86;
-    --far-bg: #e6eef6;
-    --accent: #b4530a;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #161513;
-      --panel: #1e1d1b;
-      --ink: #eceae6;
-      --muted: #9b968d;
-      --line: #33312d;
-      --near: #7fc8a0;
-      --near-bg: #1c2b23;
-      --far: #8cbde4;
-      --far-bg: #1a2530;
-      --accent: #e08a3c;
-    }
-  }
-
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--ink);
-    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  }
-  main { max-width: 52rem; margin: 0 auto; padding: 1.5rem 1rem 6rem; }
-
-  h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 .25rem; }
-  .meta { color: var(--muted); font-size: .85rem; margin: 0 0 1.25rem; }
-
-  a.back {
-    display: inline-block; margin-bottom: .75rem;
-    color: var(--muted); text-decoration: none; font-size: .85rem;
-  }
-  a.back:hover { color: var(--accent); }
+  /* The palette and the page furniture are in `console.css`, shared with the
+     status page. What is left here is the player, which is this page alone. */
 
   /* ── Session list ── */
   .sessions { border-top: 1px solid var(--line); }
@@ -134,11 +93,14 @@
   .source td:first-child { color: var(--muted); white-space: nowrap; }
   .source code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
 
-  .empty { color: var(--muted); font-style: italic; }
-  [hidden] { display: none !important; }
 </style>
 
 <main>
+  <nav>
+    <a href="/">Status</a>
+    <a href="/transcripts" aria-current="page">Transcripts</a>
+  </nav>
+
   <h1 id="title">Capsper transcripts</h1>
   <p class="meta" id="meta">Recorded meetings, newest first.</p>
 

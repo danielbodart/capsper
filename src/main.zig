@@ -23,9 +23,14 @@ const sink_mod = @import("platform/sink.zig");
 const VirtualSink = sink_mod.VirtualSink;
 const SinkWatch = sink_mod.SinkWatch;
 const meeting_runner = @import("shared/meeting_runner.zig");
+const status = @import("shared/status.zig");
 const http_server = @import("shared/http_server.zig");
 
 pub fn main() !void {
+    // First, so an uptime counts from the process rather than from whenever
+    // the last slow thing finished starting.
+    status.started_at_ns.store(@intCast(std.time.nanoTimestamp()), .monotonic);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
     defer _ = gpa.deinit();
     var ts_allocator = std.heap.ThreadSafeAllocator{ .child_allocator = gpa.allocator() };
@@ -137,6 +142,20 @@ pub fn main() !void {
         return;
     }
 
+    // An unset model path means the copy shipped beside the binary, which is
+    // what makes an unpacked dist tarball run without configuring anything.
+    //
+    // Resolved up here rather than beside the load it feeds, because it is
+    // path arithmetic and the console reports it: naming the model capsper is
+    // reading is most useful while it is still reading it.
+    const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch null;
+    defer if (exe_dir) |d| allocator.free(d);
+
+    const resolved_model_path: [:0]const u8 = cfg.model orelse blk: {
+        const d = exe_dir orelse break :blk "../models/nemotron";
+        break :blk std.fs.path.joinZ(cfg_arena, &.{ d, "../models/nemotron" }) catch "../models/nemotron";
+    };
+
     // Before the model, the sink and the devices, because none of those are
     // needed to answer and all of them take time. A minute of model reading
     // is exactly when someone wants to be told that is what is happening.
@@ -144,6 +163,7 @@ pub fn main() !void {
     // It fails loudly rather than quietly: this port was asked for by name,
     // and something else already holding it is worth stopping over rather
     // than discovering later by finding nothing at the address.
+    //
     // Not for a one-shot: `--transcribe` and `--stream` read a file and
     // leave, and a console that exists for the length of that is a port
     // taken for nobody to look at.
@@ -153,6 +173,9 @@ pub fn main() !void {
         .cfg = &cfg,
         .port = cfg.http.port.?,
         .bind = cfg.http.bind,
+        .version = build_options.version,
+        .backend = @tagName(build_options.backend),
+        .model = resolved_model_path,
     });
 
     // The sink goes up before the model loads, so it is in the output picker
@@ -163,18 +186,9 @@ pub fn main() !void {
             std.debug.print("Failed to create virtual sink '{s}': {}\n", .{ cfg.meeting.sink_name, err });
             return;
         };
+        status.sink_up.store(true, .monotonic);
     }
     defer if (sink) |*s| s.deinit();
-
-    // An unset model path means the copy shipped beside the binary, which is
-    // what makes an unpacked dist tarball run without configuring anything.
-    const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch null;
-    defer if (exe_dir) |d| allocator.free(d);
-
-    const resolved_model_path: [:0]const u8 = cfg.model orelse blk: {
-        const d = exe_dir orelse break :blk "../models/nemotron";
-        break :blk std.fs.path.joinZ(cfg_arena, &.{ d, "../models/nemotron" }) catch "../models/nemotron";
-    };
 
     // Load Nemotron model
     std.debug.print("Loading Nemotron model from: {s}\n", .{resolved_model_path});

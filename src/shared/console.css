@@ -1,0 +1,86 @@
+/* src/shared/console.css — what every page of the console has in common.
+ *
+ * The palette and the page furniture, and nothing that belongs to one view.
+ * It is a separate file because the console is not one page any more: the
+ * status page is plain HTML written by Zig, the transcripts are a script that
+ * syncs a subtitle track to an audio element, and two copies of a colour
+ * scheme that have to agree is a worse problem than one request.
+ */
+
+:root {
+  color-scheme: light dark;
+  --bg: #fbfaf8;
+  --panel: #ffffff;
+  --ink: #1c1b19;
+  --muted: #6b6862;
+  --line: #e4e1db;
+  --near: #2f6f4e;
+  --near-bg: #e8f3ec;
+  --far: #2b5d86;
+  --far-bg: #e6eef6;
+  --accent: #b4530a;
+  --live: #2f6f4e;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161513;
+    --panel: #1e1d1b;
+    --ink: #eceae6;
+    --muted: #9b968d;
+    --line: #33312d;
+    --near: #7fc8a0;
+    --near-bg: #1c2b23;
+    --far: #8cbde4;
+    --far-bg: #1a2530;
+    --accent: #e08a3c;
+    --live: #7fc8a0;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main { max-width: 52rem; margin: 0 auto; padding: 1.5rem 1rem 6rem; }
+
+h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 .25rem; }
+.meta { color: var(--muted); font-size: .85rem; margin: 0 0 1.25rem; }
+
+nav { display: flex; gap: 1rem; margin: 0 0 1.25rem; font-size: .85rem; }
+nav a { color: var(--muted); text-decoration: none; }
+nav a:hover { color: var(--accent); }
+nav a[aria-current="page"] { color: var(--accent); font-weight: 600; }
+
+a.back {
+  display: inline-block; margin-bottom: .75rem;
+  color: var(--muted); text-decoration: none; font-size: .85rem;
+}
+a.back:hover { color: var(--accent); }
+
+/* ── Status ── */
+.cards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+.card {
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel); padding: .85rem 1rem 1rem;
+}
+.card h2 {
+  margin: 0 0 .6rem;
+  font-size: .8rem; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--accent); font-weight: 600;
+}
+.card dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: .3rem .9rem; }
+.card dt { color: var(--muted); font-size: .85rem; }
+.card dd { margin: 0; font-size: .85rem; overflow-wrap: anywhere; }
+.card dd.num { font-variant-numeric: tabular-nums; }
+
+/* A live thing, said in colour as well as in words, because the word is the
+   only difference between the two states and it is one letter long. */
+.on { color: var(--live); font-weight: 600; }
+.off { color: var(--muted); }
+
+.empty { color: var(--muted); font-style: italic; }
+[hidden] { display: none !important; }

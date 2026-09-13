@@ -18,12 +18,18 @@ const net = std.net;
 const http = std.http;
 
 const config = @import("config.zig");
+const status = @import("status.zig");
 const utils = @import("utils.zig");
 
 const log = std.log.scoped(.http);
 
-/// The page, embedded so a running capsper needs nothing fetched to serve it.
+/// The transcripts page, embedded so a running capsper needs nothing fetched
+/// to serve it.
 const index_html = @embedFile("console.html");
+
+/// What both pages look like. One file rather than a copy in each, because a
+/// palette that has to agree in two places eventually does not.
+const style_css = @embedFile("console.css");
 
 /// Enough for any request line and headers a browser sends.
 const head_buffer_bytes = 16 * 1024;
@@ -47,6 +53,16 @@ pub const Options = struct {
     cfg: *const config.Config,
     port: u16,
     bind: []const u8,
+
+    /// What this binary is, passed in rather than imported. `build_options`
+    /// belongs to the executable, and this module is built on its own as a
+    /// test target with none of the executable's dependencies -- so the three
+    /// facts it wants arrive as three strings instead.
+    version: []const u8,
+    backend: []const u8,
+    /// The model directory, as resolved. Reported while it is still being
+    /// read, which is when naming it is most use.
+    model: []const u8,
 };
 
 /// Start serving in the background. Returns once the socket is listening, so a
@@ -67,6 +83,7 @@ pub fn start(gpa: std.mem.Allocator, opts: Options) !void {
         .gpa = gpa,
         .listener = listener,
         .cfg = opts.cfg,
+        .build = .{ .version = opts.version, .backend = opts.backend, .model = opts.model },
     };
 
     const thread = std.Thread.spawn(.{}, acceptLoop, .{state}) catch |err| {
@@ -81,10 +98,17 @@ pub fn start(gpa: std.mem.Allocator, opts: Options) !void {
     std.debug.print("Console at http://{s}:{d}\n", .{ opts.bind, listener.listen_address.getPort() });
 }
 
+const Build = struct {
+    version: []const u8,
+    backend: []const u8,
+    model: []const u8,
+};
+
 const State = struct {
     gpa: std.mem.Allocator,
     listener: net.Server,
     cfg: *const config.Config,
+    build: Build,
 };
 
 fn acceptLoop(state: *State) void {
@@ -135,10 +159,27 @@ fn route(state: *State, request: *http.Server.Request) !void {
     const target = request.head.target;
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 
-    if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
+    if (std.mem.eql(u8, path, "/")) return statusPage(state, request);
+
+    // The transcripts are an application rather than a document -- the player
+    // syncs a WebVTT track to an audio element and re-reads it while a meeting
+    // is still being written -- so this one page is handed out for its own
+    // path and everything under it, and the script reads the address to know
+    // which recording is wanted. The status page next door has no such need
+    // and is plain HTML, which is the whole reason they are not one mechanism.
+    if (std.mem.eql(u8, path, "/transcripts") or std.mem.startsWith(u8, path, "/transcripts/")) {
         return request.respond(index_html, .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+                .{ .name = "cache-control", .value = "no-cache" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/style.css")) {
+        return request.respond(style_css, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/css; charset=utf-8" },
                 .{ .name = "cache-control", .value = "no-cache" },
             },
         });
@@ -149,6 +190,204 @@ fn route(state: *State, request: *http.Server.Request) !void {
     if (std.mem.startsWith(u8, path, "/s/")) return sessionFile(state, request, path[3..]);
 
     return request.respond("not found\n", .{ .status = .not_found });
+}
+
+// ─── Status ──────────────────────────────────────────────────────────────────
+
+/// Written here rather than fetched as JSON and assembled in the browser.
+///
+/// There is nothing live on this page beyond the reload: no seeking, no audio
+/// graph, no track that changes while it is open. A renderer in JavaScript
+/// would exist only to turn values this function already holds into the markup
+/// this function already knows how to write. The transcripts next door are the
+/// other case and keep their script for the reason it was written.
+///
+/// It refreshes on a meta tag for the same reason: five seconds of staleness
+/// on a level meter costs nothing, and the alternative is a polling loop and a
+/// second representation of every field.
+fn statusPage(state: *State, request: *http.Server.Request) !void {
+    var arena_state = std.heap.ArenaAllocator.init(state.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const cfg = state.cfg;
+
+    var body: std.ArrayListUnmanaged(u8) = .{};
+    const w = body.writer(arena);
+
+    try w.writeAll(
+        \\<!doctype html>
+        \\<meta charset="utf-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1">
+        \\<meta http-equiv="refresh" content="5">
+        \\<title>Capsper</title>
+        \\<link rel="stylesheet" href="/style.css">
+        \\<main>
+        \\<nav><a href="/" aria-current="page">Status</a><a href="/transcripts">Transcripts</a></nav>
+        \\<h1>Capsper</h1>
+        \\
+    );
+
+    // ── What it is doing ──
+    try w.writeAll("<p class=\"meta\">");
+    if (status.meeting.runningFor(now)) |secs| {
+        try w.writeAll("Recording a meeting, ");
+        try writeDuration(w, secs);
+        try w.writeAll(" in.");
+    } else if (status.live.load(.monotonic)) {
+        try w.writeAll("Listening.");
+    } else {
+        try w.writeAll("Idle.");
+    }
+    try w.writeAll("</p>\n<div class=\"cards\">\n");
+
+    // ── Capture ──
+    try w.writeAll("<section class=\"card\"><h2>Capture</h2><dl>");
+    try writeFlag(w, "Push to talk", status.live.load(.monotonic), "held", "not held");
+    try w.print("<dt>Remote clients</dt><dd class=\"num\">{d}</dd>", .{status.tcp_clients.load(.monotonic)});
+    if (status.meeting.runningFor(now)) |secs| {
+        var path_buf: [64]u8 = undefined;
+        const rel = status.meeting.path.get(&path_buf);
+        try w.writeAll("<dt>Meeting</dt><dd>recording ");
+        try writeDuration(w, secs);
+        if (rel.len > 0) {
+            try w.writeAll(" — <a href=\"/transcripts/");
+            try writeEscaped(w, rel);
+            try w.writeAll("\">");
+            try writeEscaped(w, rel);
+            try w.writeAll("</a>");
+        }
+        try w.writeAll("</dd>");
+    } else {
+        try w.print("<dt>Meeting</dt><dd class=\"off\">{s}</dd>", .{
+            if (cfg.meeting.enabled) "waiting for a call" else "off",
+        });
+    }
+    try w.writeAll("</dl></section>\n");
+
+    // ── Audio ──
+    //
+    // Only the microphones something is actually listening to. A TCP-only
+    // capsper has no microphone of its own -- the audio arrives down the
+    // socket already captured -- and a row naming "the default input" there
+    // would describe a device this process never opens.
+    const captures_locally = cfg.audio.target != null or cfg.trigger.key != null;
+    try w.writeAll("<section class=\"card\"><h2>Audio</h2><dl>");
+    if (captures_locally) try writeInput(w, "Dictation mic", &status.dictation, cfg.audio.target);
+    if (cfg.meeting.enabled) {
+        try writeInput(w, "Meeting mic", &status.meeting_near, cfg.meetingNear());
+        try writeFlag(w, "Sink", status.sink_up.load(.monotonic), "in the graph", "not created");
+        try w.writeAll("<dt>Passing through to</dt><dd>");
+        try writeEscaped(w, cfg.meeting.output orelse "the default output");
+        try w.writeAll("</dd>");
+    }
+    if (!captures_locally and !cfg.meeting.enabled) {
+        try w.writeAll("<dt>Microphone</dt><dd class=\"off\">nothing is captured here</dd>");
+    }
+    try w.writeAll("</dl></section>\n");
+
+    // ── Build ──
+    try w.writeAll("<section class=\"card\"><h2>Build</h2><dl>");
+    try w.writeAll("<dt>Version</dt><dd>");
+    try writeEscaped(w, state.build.version);
+    try w.writeAll("</dd><dt>Backend</dt><dd>");
+    try writeEscaped(w, state.build.backend);
+    try w.writeAll("</dd><dt>Model</dt><dd>");
+    try writeEscaped(w, state.build.model);
+    try w.writeAll("</dd>");
+    if (status.uptimeSeconds(now)) |secs| {
+        try w.writeAll("<dt>Up for</dt><dd class=\"num\">");
+        try writeDuration(w, secs);
+        try w.writeAll("</dd>");
+    }
+    try w.writeAll("</dl></section>\n</div>\n</main>\n");
+
+    return request.respond(body.items, .{
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        },
+    });
+}
+
+/// One microphone: the node it settled on, and what is arriving on it.
+///
+/// `configured` is what the settings asked for, which is null when capsper was
+/// told to follow the desktop's default. Saying which of those happened is the
+/// point: "the default" and "this particular node" look identical on a status
+/// page that only prints a name.
+fn writeInput(
+    w: anytype,
+    label: []const u8,
+    input: *status.Input,
+    configured: ?[]const u8,
+) !void {
+    try w.writeAll("<dt>");
+    try writeEscaped(w, label);
+    try w.writeAll("</dt><dd>");
+
+    var name_buf: [128]u8 = undefined;
+    const device = input.device.get(&name_buf);
+    if (device.len > 0) {
+        try writeEscaped(w, device);
+        if (configured == null) try w.writeAll(" <span class=\"off\">(following the default)</span>");
+    } else if (configured) |c| {
+        try writeEscaped(w, c);
+        try w.writeAll(" <span class=\"off\">(not open yet)</span>");
+    } else {
+        try w.writeAll("<span class=\"off\">the default input</span>");
+    }
+
+    if (input.heard.load(.monotonic)) {
+        try w.print(
+            "<br><span class=\"num\">{d:.0} dBFS at {d:.2}×</span>",
+            .{ input.level_db.load(), input.gain.load() },
+        );
+    } else {
+        try w.print("<br><span class=\"off num\">nothing heard yet, at {d:.2}×</span>", .{input.gain.load()});
+    }
+    try w.writeAll("</dd>");
+}
+
+fn writeFlag(w: anytype, label: []const u8, on: bool, yes: []const u8, no: []const u8) !void {
+    try w.writeAll("<dt>");
+    try writeEscaped(w, label);
+    try w.print("</dt><dd class=\"{s}\">", .{if (on) "on" else "off"});
+    try writeEscaped(w, if (on) yes else no);
+    try w.writeAll("</dd>");
+}
+
+/// A length of time as a person would say it, which is not the same as a
+/// number of seconds once it passes a minute.
+fn writeDuration(w: anytype, seconds: f64) !void {
+    const total: u64 = @intFromFloat(@max(0, seconds));
+    const h = total / 3600;
+    const m = (total % 3600) / 60;
+    const s = total % 60;
+    if (h > 0) {
+        try w.print("{d}h {d}m", .{ h, m });
+    } else if (m > 0) {
+        try w.print("{d}m {d}s", .{ m, s });
+    } else {
+        try w.print("{d}s", .{s});
+    }
+}
+
+/// The five characters that change the meaning of markup.
+///
+/// Everything written into this page comes from somewhere capsper does not
+/// control: a PipeWire node name is whatever the device declared, and a path
+/// is whatever the settings say. None of it is trusted to be inert.
+fn writeEscaped(w: anytype, text: []const u8) !void {
+    for (text) |c| switch (c) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        '"' => try w.writeAll("&quot;"),
+        '\'' => try w.writeAll("&#39;"),
+        else => try w.writeByte(c),
+    };
 }
 
 // ─── The session list ────────────────────────────────────────────────────────
@@ -426,6 +665,60 @@ fn parseRangeValue(value: []const u8) ?Range {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+fn escaped(gpa: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    try writeEscaped(buf.writer(gpa), text);
+    return buf.toOwnedSlice(gpa);
+}
+
+test "a device name cannot close the tag it is written into" {
+    // A PipeWire node name is whatever the device said it was, and it lands in
+    // the middle of this page's markup. Nothing here is trusted to be inert.
+    const out = try escaped(testing.allocator, "<script>alert('x')</script>");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;",
+        out,
+    );
+}
+
+test "an ampersand is escaped once, not twice" {
+    const out = try escaped(testing.allocator, "a&b");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a&amp;b", out);
+}
+
+test "an ordinary node name comes through untouched" {
+    const name = "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source";
+    const out = try escaped(testing.allocator, name);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(name, out);
+}
+
+fn duration(gpa: std.mem.Allocator, seconds: f64) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    try writeDuration(buf.writer(gpa), seconds);
+    return buf.toOwnedSlice(gpa);
+}
+
+test "a length of time is said the way a person would say it" {
+    const cases = [_]struct { secs: f64, want: []const u8 }{
+        .{ .secs = 0, .want = "0s" },
+        .{ .secs = 42.7, .want = "42s" },
+        .{ .secs = 60, .want = "1m 0s" },
+        .{ .secs = 154, .want = "2m 34s" },
+        .{ .secs = 3600, .want = "1h 0m" },
+        .{ .secs = 7_845, .want = "2h 10m" },
+        // A clock that went backwards is not a negative duration.
+        .{ .secs = -5, .want = "0s" },
+    };
+    for (cases) |c| {
+        const out = try duration(testing.allocator, c.secs);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
 
 test "a path that climbs out of the sessions directory is refused" {
     try testing.expect(!isSafe("../../etc/passwd"));

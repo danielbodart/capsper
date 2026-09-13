@@ -28,6 +28,7 @@ const EchoCanceller = sink_mod.EchoCanceller;
 const vad_backend = @import("../backend/vad.zig");
 const AutoGain = @import("auto_gain.zig").AutoGain;
 const MicLevel = @import("../platform/mic_level.zig").MicLevel;
+const status = @import("status.zig");
 
 const log = std.log.scoped(.meeting);
 
@@ -489,6 +490,8 @@ const Session = struct {
         // the near track sits at whatever the microphone was left at, which
         // measured 20 dB below the same voice dictating.
         if (level) |*l| {
+            status.meeting_near.reportDevice(l.nodeName());
+            status.meeting_near.reportGain(cfg.audio.gain);
             if (cfg.audio.gain > 1.01) _ = l.set(cfg.audio.gain);
         }
 
@@ -513,6 +516,7 @@ const Session = struct {
         errdefer far.deinit();
         far.setActive(true);
 
+        status.meeting.opened(rel, @intCast(std.time.nanoTimestamp()));
         std.debug.print("[meeting] session opened: {s}\n", .{rel});
         return .{
             .near = near,
@@ -605,6 +609,8 @@ const Session = struct {
         if (level.tookChange()) {
             gain.* = .{ .current_gain = self.configured_gain };
             _ = level.set(self.configured_gain);
+            status.meeting_near.reportDevice(level.nodeName());
+            status.meeting_near.reportGain(self.configured_gain);
             log.info("microphone changed to '{s}', levelling from {d:.1}x again", .{
                 level.nodeName(), self.configured_gain,
             });
@@ -614,7 +620,11 @@ const Session = struct {
 
         const rms = self.near_asr.speech_rms orelse return;
         self.near_asr.speech_rms = null;
-        if (gain.update(rms)) |new_gain| _ = level.set(new_gain);
+        status.meeting_near.reportLevel(@floatCast(utils.rmsToDb(rms)));
+        if (gain.update(rms)) |new_gain| {
+            _ = level.set(new_gain);
+            status.meeting_near.reportGain(new_gain);
+        }
     }
 
     fn close(self: *Session, gpa: std.mem.Allocator) void {
@@ -643,6 +653,7 @@ const Session = struct {
 
         const seconds = self.file.durationSeconds();
         self.file.finish(gpa);
+        status.meeting.closed();
         std.debug.print("[meeting] session closed ({d:.1}s of audio)\n", .{seconds});
     }
 };

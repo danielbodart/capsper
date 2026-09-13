@@ -77,11 +77,33 @@ describe.skipIf(!gpu)("console", () => {
         }
     });
 
-    test("serves the page with meeting capture switched off", async () => {
-        const page = await fetch(`${server.base}/`);
+    test("serves the transcripts page with meeting capture switched off", async () => {
+        const page = await fetch(`${server.base}/transcripts`);
         expect(page.ok).toBe(true);
         expect(page.headers.get("content-type")).toContain("text/html");
         expect(await page.text()).toContain("Capsper transcripts");
+    });
+
+    test("says what the running service is, at the root", async () => {
+        const page = await fetch(`${server.base}/`);
+        expect(page.ok).toBe(true);
+        const html = await page.text();
+
+        // What it is: this binary, and the model it was pointed at.
+        expect(html).toContain("Backend");
+        expect(html).toContain("nemotron");
+        // What it is doing: a TCP port is open and nobody is on it, meeting
+        // capture is off, and nothing is being dictated.
+        expect(html).toContain("Remote clients");
+        expect(html).toMatch(/Meeting<\/dt><dd[^>]*>off/);
+        expect(html).toContain("not held");
+    });
+
+    test("shares one stylesheet between the pages", async () => {
+        const css = await fetch(`${server.base}/style.css`);
+        expect(css.ok).toBe(true);
+        expect(css.headers.get("content-type")).toContain("text/css");
+        expect(await css.text()).toContain("--accent");
     });
 
     test("lists no transcripts rather than failing when none were ever recorded", async () => {

@@ -10,6 +10,7 @@ const recorder_mod = @import("recorder.zig");
 const Recorder = recorder_mod.Recorder;
 const session = @import("session.zig");
 const webvtt = @import("webvtt.zig");
+const status = @import("status.zig");
 const Config = @import("config.zig").Config;
 const EventSource = session.EventSource;
 const Event = session.Event;
@@ -58,6 +59,9 @@ fn nanoTimestampI64() i64 {
 pub fn setLive(live: bool) void {
     if (live) ptt_press_ns.store(nanoTimestampI64(), .monotonic);
     is_live.store(live, .monotonic);
+    // The same fact, somewhere the console can read it without importing the
+    // audio path to get at it.
+    status.live.store(live, .monotonic);
     // Deliver the transition to the local session loop (survives cork).
     const pfd = ptt_event_write_fd.load(.monotonic);
     if (pfd >= 0) {
@@ -329,6 +333,8 @@ pub const Server = struct {
             posix.close(args.conn_fd);
             args.server.allocator.destroy(args);
         }
+        _ = status.tcp_clients.fetchAdd(1, .monotonic);
+        defer _ = status.tcp_clients.fetchSub(1, .monotonic);
         std.debug.print("Client connected\n", .{});
         // TCP is always-live and data-driven: audio/eof only, no PTT events.
         var evsrc = TcpEventSource.init(args.conn_fd, STREAMING_CHUNK_BYTES);
@@ -378,6 +384,8 @@ pub const Server = struct {
         defer if (level) |*l| l.deinit();
 
         if (level) |*l| {
+            status.dictation.reportDevice(l.nodeName());
+            status.dictation.reportGain(self.cfg.audio.gain);
             if (self.cfg.audio.gain > 1.01) {
                 _ = l.set(self.cfg.audio.gain);
                 std.debug.print("Auto-gain starting at {d:.1}x\n", .{self.cfg.audio.gain});
@@ -480,6 +488,9 @@ pub const Server = struct {
                         .end_ms = webvtt.msFromBytes(total_audio_bytes),
                         .rms = rms,
                     };
+                    // One atomic store per chunk, on the same figure the log
+                    // line below is computed from.
+                    status.dictation.reportLevel(@floatCast(utils.rmsToDb(rms)));
                     // Input-level telemetry: log only on a rolling-average
                     // audio↔silence transition (never per chunk).
                     if (level_mon.update(utils.rmsToDb(rms))) |t| switch (t) {
@@ -496,11 +507,14 @@ pub const Server = struct {
                             if (l.tookChange()) {
                                 auto_gain = .{ .current_gain = self.cfg.audio.gain };
                                 _ = l.set(self.cfg.audio.gain);
+                                status.dictation.reportDevice(l.nodeName());
+                                status.dictation.reportGain(self.cfg.audio.gain);
                                 log.info("microphone changed to '{s}', levelling from {d:.1}x again", .{
                                     l.nodeName(), self.cfg.audio.gain,
                                 });
                             } else if (auto_gain.update(rms)) |new_gain| {
                                 _ = l.set(new_gain);
+                                status.dictation.reportGain(new_gain);
                                 if (self.cfg.verbose) std.debug.print("  auto-gain: {d:.2}x\n", .{new_gain});
                             }
                         }
