@@ -6,13 +6,13 @@
 // that way is a test that would have been impossible to write before.
 
 import { describe, test, expect, afterAll, beforeAll } from "bun:test";
-import { writeFileSync, mkdtempSync } from "fs";
+import { writeFileSync, mkdtempSync, mkdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { spawn } from "bun";
 import {
     BINARY, hasGpu, ensureBinary, tmpFile, trackProc,
-    waitForLog, saveLog,
+    waitForLog, saveLog, writeWav, silence,
 } from "./helpers";
 
 const gpu = await hasGpu();
@@ -29,12 +29,32 @@ const extraArgs: string[] = [
 /// Left at its default it is the developer's own `~/.local/share/capsper`,
 /// and a test that reads whatever real meetings happen to be on the machine
 /// passes or fails by what its author did last week.
-async function startConsole(): Promise<{ base: string; logFile: string; kill: () => void }> {
+async function startConsole(): Promise<{ base: string; recordingsDir: string; logFile: string; kill: () => void }> {
     const root = mkdtempSync(join(tmpdir(), "capsper-console-"));
+
+    // Debug recordings written before capsper starts, deliberately out of
+    // numeric order: the ring numbers files `seq % keep`, so after it wraps
+    // the newest has the lowest number. `009` is written first and must
+    // therefore come last.
+    const recordingsDir = join(root, "recordings");
+    mkdirSync(recordingsDir);
+    for (const id of ["009", "000", "004"]) {
+        writeWav(join(recordingsDir, `${id}.wav`), silence(500));
+        writeFileSync(
+            join(recordingsDir, `${id}.vtt`),
+            `WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\n<v Near>recording ${id}\n`,
+        );
+        // A whole second apart, so the ordering cannot turn on timestamp
+        // resolution.
+        await Bun.sleep(1100);
+    }
+
     const configFile = tmpFile("capsper-console", ".zon");
     writeFileSync(
         configFile,
-        `.{ .http = .{ .port = 0 }, .meeting = .{ .dir = "${join(root, "sessions")}" } }\n`,
+        `.{ .http = .{ .port = 0 },` +
+            ` .meeting = .{ .dir = "${join(root, "sessions")}" },` +
+            ` .debug_recording = .{ .dir = "${recordingsDir}" } }\n`,
     );
 
     const logFile = tmpFile("capsper-console", ".log");
@@ -55,7 +75,7 @@ async function startConsole(): Promise<{ base: string; logFile: string; kill: ()
         // the log line it is waited for arrives on the same startup path.
         const line = await waitForLog(logFile, /Console at http:\/\/[\d.]+:(\d+)/, proc, 180);
         const port = parseInt(line.match(/:(\d+)/)![1]);
-        return { base: `http://127.0.0.1:${port}`, logFile, kill };
+        return { base: `http://127.0.0.1:${port}`, recordingsDir, logFile, kill };
     } catch (e) {
         kill();
         throw e;
@@ -113,5 +133,43 @@ describe.skipIf(!gpu)("console", () => {
         const res = await fetch(`${server.base}/sessions.json`);
         expect(res.ok).toBe(true);
         expect(await res.json()).toEqual([]);
+    });
+
+    test("lists debug recordings newest first, by when they were written", async () => {
+        // The whole point of ordering these by modification time: the ring
+        // numbers files `seq % keep`, so `000` is newer than `009` here and
+        // sorting by name would put it in the wrong place entirely.
+        const body = await (await fetch(`${server.base}/recordings.json`)).json();
+        expect(body.enabled).toBe(true);
+        expect(body.items.map((r: { id: string }) => r.id)).toEqual(["004", "000", "009"]);
+        // The transcript beside each one is not listed as a thing to play.
+        expect(body.items.every((r: { audio: string }) => r.audio.endsWith(".wav"))).toBe(true);
+    });
+
+    test("serves a debug recording's audio and transcript", async () => {
+        const wav = await fetch(`${server.base}/d/004.wav`);
+        expect(wav.ok).toBe(true);
+        expect(wav.headers.get("content-type")).toBe("audio/wav");
+
+        const vtt = await fetch(`${server.base}/d/004.vtt`);
+        expect(vtt.ok).toBe(true);
+        expect(vtt.headers.get("content-type")).toBe("text/vtt");
+        expect(await vtt.text()).toContain("recording 004");
+    });
+
+    test("will not be walked out of the recordings directory", async () => {
+        // The same guard the sessions route has, on a route that reaches a
+        // different tree. Neither prefix may be used to read the other's
+        // files, or anything else on the machine.
+        for (const path of ["/d/../../../../etc/passwd", "/d/../sessions"]) {
+            const res = await fetch(`${server.base}${path}`);
+            expect(res.status).toBeGreaterThanOrEqual(400);
+        }
+    });
+
+    test("serves the recordings page at its own address", async () => {
+        const page = await fetch(`${server.base}/recordings/004`);
+        expect(page.ok).toBe(true);
+        expect(page.headers.get("content-type")).toContain("text/html");
     });
 });

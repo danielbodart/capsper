@@ -185,9 +185,20 @@ fn route(state: *State, request: *http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/recordings") or std.mem.startsWith(u8, path, "/recordings/")) {
+        return request.respond(index_html, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+                .{ .name = "cache-control", .value = "no-cache" },
+            },
+        });
+    }
+
     if (std.mem.eql(u8, path, "/sessions.json")) return sessionsJson(state, request);
+    if (std.mem.eql(u8, path, "/recordings.json")) return recordingsJson(state, request);
 
     if (std.mem.startsWith(u8, path, "/s/")) return sessionFile(state, request, path[3..]);
+    if (std.mem.startsWith(u8, path, "/d/")) return debugFile(state, request, path[3..]);
 
     return request.respond("not found\n", .{ .status = .not_found });
 }
@@ -224,7 +235,7 @@ fn statusPage(state: *State, request: *http.Server.Request) !void {
         \\<title>Capsper</title>
         \\<link rel="stylesheet" href="/style.css">
         \\<main>
-        \\<nav><a href="/" aria-current="page">Status</a><a href="/transcripts">Transcripts</a></nav>
+        \\<nav><a href="/" aria-current="page">Status</a><a href="/transcripts">Transcripts</a><a href="/recordings">Recordings</a></nav>
         \\<h1>Capsper</h1>
         \\
     );
@@ -541,12 +552,138 @@ fn oggDurationSeconds(file: std.fs.File) f64 {
     return 0;
 }
 
-// ─── Session files ───────────────────────────────────────────────────────────
+// ─── Debug recordings ────────────────────────────────────────────────────────
+
+/// One of the last few dictated utterances kept on disk, which is a different
+/// shape of thing from a meeting: no dated directory, one flat name, and no
+/// far end -- there was only ever a microphone.
+const Recording = struct {
+    /// The number the ring gave it, which is also its filename stem.
+    id: []const u8,
+    audio: []const u8,
+    seconds: f64,
+    /// When it was written, in seconds. The page shows it because the number
+    /// says nothing about when: the ring reuses the low ones first.
+    modified: i64,
+};
+
+fn recordingsJson(state: *State, request: *http.Server.Request) !void {
+    var arena_state = std.heap.ArenaAllocator.init(state.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var body: std.ArrayListUnmanaged(u8) = .{};
+    const w = body.writer(arena);
+
+    // Whether debug recording is configured at all, so the page can say "it
+    // is off" rather than "there are none" -- which are different answers to
+    // different questions and look identical in an empty list.
+    const root = state.cfg.debug_recording.dir;
+    try w.print("{{\"enabled\":{s},\"items\":[", .{if (root != null) "true" else "false"});
+
+    if (root) |dir_path| {
+        const found = collectDebug(arena, dir_path) catch &[_]Recording{};
+        for (found, 0..) |r, i| {
+            if (i > 0) try w.writeByte(',');
+            // Every field is this walk's own: a stem of digits, a name from a
+            // fixed list, and two numbers.
+            try w.print(
+                "{{\"id\":\"{s}\",\"audio\":\"{s}\",\"seconds\":{d:.2},\"modified\":{d}}}",
+                .{ r.id, r.audio, r.seconds, r.modified },
+            );
+        }
+    }
+    try w.writeAll("]}");
+
+    return request.respond(body.items, .{
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        },
+    });
+}
+
+/// Whether a name is one the recorder wrote: three digits and an extension it
+/// records in. Named exactly, for the same reason the session walk names its
+/// audio file exactly -- a debug directory is a directory like any other and
+/// may have anything else in it.
+fn isDebugRecording(name: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const stem = name[0..dot];
+    if (stem.len != 3) return false;
+    for (stem) |c| if (!std.ascii.isDigit(c)) return false;
+
+    const ext = name[dot..];
+    for ([_][]const u8{ ".wav", ".opus" }) |known| {
+        if (std.mem.eql(u8, ext, known)) return true;
+    }
+    return false;
+}
+
+/// Every debug recording, most recently written first.
+///
+/// By modification time, and this is the one thing about them worth knowing:
+/// the recorder numbers them `seq % keep`, so the ring wraps and `003.wav` is
+/// routinely newer than `009.wav`. The name sorts a session directory
+/// correctly because a session's name is a timestamp. Here it means nothing.
+fn collectDebug(arena: std.mem.Allocator, root: []const u8) ![]Recording {
+    var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
+    defer dir.close();
+
+    const Timed = struct { rec: Recording, mtime: i128 };
+    var found: std.ArrayListUnmanaged(Timed) = .{};
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isDebugRecording(entry.name)) continue;
+
+        const st = dir.statFile(entry.name) catch continue;
+        const name = try arena.dupe(u8, entry.name);
+        try found.append(arena, .{
+            .rec = .{
+                .id = name[0..3],
+                .audio = name,
+                .seconds = durationSeconds(dir, name),
+                .modified = @intCast(@divTrunc(st.mtime, std.time.ns_per_s)),
+            },
+            .mtime = st.mtime,
+        });
+    }
+
+    std.mem.sort(Timed, found.items, {}, struct {
+        fn newestFirst(_: void, a: Timed, b: Timed) bool {
+            return a.mtime > b.mtime;
+        }
+    }.newestFirst);
+
+    const out = try arena.alloc(Recording, found.items.len);
+    for (found.items, 0..) |t, i| out[i] = t.rec;
+    return out;
+}
+
+// ─── Serving a recording's files ─────────────────────────────────────────────
 
 fn sessionFile(state: *State, request: *http.Server.Request, rel: []const u8) !void {
+    return serveFile(request, state.cfg.meeting.dir, rel);
+}
+
+/// A debug recording's audio or transcript.
+///
+/// A different root and otherwise the same job, so it is the same function.
+/// The prefix in the request picks the root before anything opens a directory,
+/// and `isSafe` refuses to leave whichever one was picked -- so `/d/` cannot
+/// be walked into the sessions tree, or the other way about, by any path.
+fn debugFile(state: *State, request: *http.Server.Request, rel: []const u8) !void {
+    const root = state.cfg.debug_recording.dir orelse
+        return request.respond("not found\n", .{ .status = .not_found });
+    return serveFile(request, root, rel);
+}
+
+fn serveFile(request: *http.Server.Request, root: []const u8, rel: []const u8) !void {
     if (!isSafe(rel)) return request.respond("no\n", .{ .status = .forbidden });
 
-    var dir = std.fs.cwd().openDir(state.cfg.meeting.dir, .{}) catch
+    var dir = std.fs.cwd().openDir(root, .{}) catch
         return request.respond("not found\n", .{ .status = .not_found });
     defer dir.close();
 
@@ -718,6 +855,57 @@ test "a length of time is said the way a person would say it" {
         defer testing.allocator.free(out);
         try testing.expectEqualStrings(c.want, out);
     }
+}
+
+test "a debug recording is three digits and an extension the recorder writes" {
+    try testing.expect(isDebugRecording("003.wav"));
+    try testing.expect(isDebugRecording("000.wav"));
+    try testing.expect(isDebugRecording("009.opus"));
+
+    // The transcript beside it is not the thing to play, same as a session's.
+    try testing.expect(!isDebugRecording("003.vtt"));
+    // Nor is anything else that happens to be in the directory.
+    try testing.expect(!isDebugRecording("3.wav"));
+    try testing.expect(!isDebugRecording("0003.wav"));
+    try testing.expect(!isDebugRecording("notes.wav"));
+    try testing.expect(!isDebugRecording("00a.wav"));
+    try testing.expect(!isDebugRecording("003"));
+    try testing.expect(!isDebugRecording(".wav"));
+}
+
+test "debug recordings are ordered by when they were written, not by their number" {
+    // The regression this exists for. The recorder numbers by `seq % keep`, so
+    // after the ring wraps the newest file has the lowest number -- and the
+    // lexicographic order that is correct for a dated session directory puts
+    // it last. Real files with real timestamps, because the ordering is a
+    // property of the filesystem rather than of a struct.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Written oldest first, deliberately out of numeric order.
+    for ([_][]const u8{ "009.wav", "000.wav", "004.wav" }) |name| {
+        var f = try tmp.dir.createFile(name, .{});
+        f.close();
+        // A whole second apart, so the comparison cannot turn on timer
+        // resolution. Slow for a unit test and the only way to be sure.
+        std.Thread.sleep(std.time.ns_per_s + std.time.ns_per_ms * 50);
+    }
+    // Something else in the directory, to prove the walk is an allowlist.
+    var vtt = try tmp.dir.createFile("004.vtt", .{});
+    vtt.close();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const path = try tmp.dir.realpathAlloc(arena, ".");
+    const found = try collectDebug(arena, path);
+
+    try testing.expectEqual(@as(usize, 3), found.len);
+    try testing.expectEqualStrings("004", found[0].id);
+    try testing.expectEqualStrings("000", found[1].id);
+    try testing.expectEqualStrings("009", found[2].id);
+    try testing.expectEqualStrings("004.wav", found[0].audio);
 }
 
 test "a path that climbs out of the sessions directory is refused" {

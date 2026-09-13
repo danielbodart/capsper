@@ -26,14 +26,16 @@
   /* The palette and the page furniture are in `console.css`, shared with the
      status page. What is left here is the player, which is this page alone. */
 
-  /* ── Session list ── */
+  /* ── The list of recordings ──
+     A real link rather than a button, so middle-click and ctrl-click open one
+     in a tab the way they do everywhere else. */
   .sessions { border-top: 1px solid var(--line); }
   .session {
     display: flex; align-items: baseline; gap: .75rem;
     width: 100%; text-align: left;
     padding: .7rem .25rem;
     background: none; border: 0; border-bottom: 1px solid var(--line);
-    color: inherit; font: inherit; cursor: pointer;
+    color: inherit; font: inherit; text-decoration: none; cursor: pointer;
   }
   .session:hover { background: var(--panel); }
   .session .when { font-weight: 600; }
@@ -98,7 +100,8 @@
 <main>
   <nav>
     <a href="/">Status</a>
-    <a href="/transcripts" aria-current="page">Transcripts</a>
+    <a href="/transcripts" id="navTranscripts">Transcripts</a>
+    <a href="/recordings" id="navRecordings">Recordings</a>
   </nav>
 
   <h1 id="title">Capsper transcripts</h1>
@@ -109,12 +112,14 @@
   </section>
 
   <section id="playView" hidden>
-    <a class="back" href="#" id="back">← All sessions</a>
+    <a class="back" href="/transcripts" id="back">← All transcripts</a>
     <div class="bar">
       <audio id="audio" controls preload="metadata" crossorigin="anonymous">
         <track id="track" kind="subtitles" srclang="en" label="Transcript" default>
       </audio>
-      <div class="routing">
+      <!-- Hidden for a debug recording, which is one microphone: there is no
+           near and far to choose between, only the one voice. -->
+      <div class="routing" id="routing">
         <span>Listen to</span>
         <button type="button" data-route="both" aria-pressed="true">Both</button>
         <button type="button" data-route="near" aria-pressed="false">Near only</button>
@@ -164,40 +169,120 @@
     };
   };
 
+  // ─── The two kinds of recording ──────────────────────────────────────────
+  //
+  // A meeting and a dictated utterance are the same thing to play -- audio
+  // beside a WebVTT file of the same name -- and different in every detail
+  // around it. A meeting is two voices hard-panned into a dated directory; a
+  // debug recording is one microphone in a flat ring of numbered files. So the
+  // differences are named once, here, and the player below reads them rather
+  // than asking which it is at every turn.
+
+  const KINDS = {
+    transcripts: {
+      path: "/transcripts",
+      nav: "navTranscripts",
+      title: "Capsper transcripts",
+      blurb: "Recorded meetings, newest first.",
+      back: "← All transcripts",
+      playing: "Near end on the left, far end on the right.",
+      empty: "No meetings recorded yet.",
+      // Two voices on one timeline, so the channel control means something.
+      stereo: true,
+      // A meeting knows where it came from; an utterance typed into a window
+      // does not, and has no `audio.json` to ask.
+      hasSource: true,
+      list: async () => (await (await fetch("/sessions.json")).json()).map((s) => ({
+        id: s.path, audio: s.audio, seconds: s.seconds, ...when(s.path),
+      })),
+      base: (id) => "/s/" + id + "/",
+      heading: (item) => (item.time ? `${item.time} · ${item.day}` : item.id),
+    },
+    recordings: {
+      path: "/recordings",
+      nav: "navRecordings",
+      title: "Capsper recordings",
+      blurb: "The last few dictated utterances, newest first.",
+      back: "← All recordings",
+      playing: "One microphone, as capsper heard it.",
+      empty: "No recordings kept yet.",
+      stereo: false,
+      hasSource: false,
+      list: async () => {
+        const body = await (await fetch("/recordings.json")).json();
+        if (!body.enabled) return null;
+        return body.items.map((r) => {
+          // The ring reuses low numbers first, so the number says nothing
+          // about when. The modification time is the only ordering there is,
+          // and it is what the row shows.
+          const d = new Date(r.modified * 1000);
+          return {
+            id: r.id, audio: r.audio, seconds: r.seconds,
+            date: d,
+            day: d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }),
+            time: d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }),
+          };
+        });
+      },
+      base: () => "/d/",
+      heading: (item) => `Recording ${item.id} · ${item.time}`,
+    },
+  };
+
+  // Which kind is on screen, and what it is showing. Set by `show()` from the
+  // address, and read by everything else rather than passed around.
+  let kind = KINDS.transcripts;
+  let items = [];
+
   // ─── The list ────────────────────────────────────────────────────────────
 
-  let sessions = [];
-
   async function loadList() {
+    let loaded;
     try {
-      sessions = await (await fetch("sessions.json")).json();
+      loaded = await kind.list();
     } catch {
-      sessions = [];
+      loaded = [];
     }
+
     const host = $("sessions");
     host.textContent = "";
 
-    if (sessions.length === 0) {
-      host.innerHTML = '<p class="empty">No sessions recorded yet.</p>';
+    // Null means the feature is switched off, which is a different answer
+    // from "there are none" and deserves different words.
+    if (loaded === null) {
+      items = [];
+      host.innerHTML = '<p class="empty">Debug recording is off. Set <code>debug_recording.dir</code> to keep the last few utterances.</p>';
       return;
     }
 
-    for (const s of sessions) {
-      const { day, time } = when(s.path);
-      const row = document.createElement("button");
+    items = loaded;
+    if (items.length === 0) {
+      host.innerHTML = `<p class="empty">${kind.empty}</p>`;
+      return;
+    }
+
+    for (const item of items) {
+      const row = document.createElement("a");
       row.className = "session";
-      row.type = "button";
-      row.addEventListener("click", () => { location.hash = "#/" + s.path; });
+      row.href = kind.path + "/" + item.id;
+      row.addEventListener("click", (e) => {
+        // Left click only, and not when a modifier says "open it elsewhere":
+        // the href is real, so letting the browser have those costs nothing
+        // and keeps middle-click and ctrl-click working.
+        if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        e.preventDefault();
+        go(row.href);
+      });
 
       const at = document.createElement("span");
       at.className = "when";
-      at.textContent = time || s.path;
+      at.textContent = kind === KINDS.recordings ? item.id : (item.time || item.id);
       const on = document.createElement("span");
       on.className = "day";
-      on.textContent = day;
+      on.textContent = kind === KINDS.recordings ? `${item.day} ${item.time}` : item.day;
       const len = document.createElement("span");
       len.className = "len";
-      len.textContent = s.seconds ? clock(s.seconds) : "";
+      len.textContent = item.seconds ? clock(item.seconds) : "";
 
       row.append(at, on, len);
       host.appendChild(row);
@@ -242,7 +327,11 @@
 
       const label = document.createElement("strong");
       label.className = "who";
-      label.textContent = `${who || side} `;
+      // The name only where there is a choice of names. A debug recording is
+      // one microphone, and the writer labels every cue `Near` because the
+      // format has nowhere else to put a voice -- so repeating "Near" down a
+      // transcript of one speaker says nothing. The time still does.
+      label.textContent = kind.stereo ? `${who || side} ` : "";
       const at = document.createElement("span");
       at.className = "at";
       at.textContent = clock(cue.startTime);
@@ -420,15 +509,19 @@
     }
   }
 
-  function open(path) {
-    const session = sessions.find((s) => s.path === path);
-    const audioName = session ? session.audio : "audio.wav";
-    const base = "s/" + path + "/";
+  function open(id) {
+    const item = items.find((i) => i.id === id);
+    // A recording that is not in the list yet -- a meeting still being written
+    // when the page was loaded, linked to from the status page -- still plays.
+    // Guess the name the recorder would have used and let the audio element
+    // report it if that is wrong.
+    const audioName = item ? item.audio : (kind === KINDS.recordings ? id + ".wav" : "audio.opus");
+    const base = kind.base(id);
 
     list.innerHTML = '<p class="empty">Loading transcript…</p>';
     audio.src = base + audioName;
     audio.load();
-    loadSource(base);
+    if (kind.hasSource) loadSource(base); else $("source").hidden = true;
 
     vttUrl = base + audioName.replace(/\.[^.]+$/, "") + ".vtt";
     lastVtt = null;
@@ -436,9 +529,11 @@
     clearInterval(poller);
     poller = setInterval(refreshTranscript, poll_ms);
 
-    const { day, time } = when(path);
-    $("title").textContent = time ? `${time} · ${day}` : path;
-    $("meta").textContent = "Near end on the left, far end on the right.";
+    $("title").textContent = item ? kind.heading(item) : id;
+    $("meta").textContent = kind.playing;
+    $("back").textContent = kind.back;
+    $("back").href = kind.path;
+    $("routing").hidden = !kind.stereo;
 
     listView.hidden = true;
     playView.hidden = false;
@@ -451,8 +546,8 @@
     audio.pause();
     audio.removeAttribute("src");
     audio.load();
-    $("title").textContent = "Capsper transcripts";
-    $("meta").textContent = "Recorded meetings, newest first.";
+    $("title").textContent = kind.title;
+    $("meta").textContent = kind.blurb;
     playView.hidden = true;
     listView.hidden = false;
   }
@@ -499,16 +594,55 @@
 
   for (const b of buttons) b.addEventListener("click", () => route(b.dataset.route));
 
-  // ─── Routing by URL, so a session can be linked to ───────────────────────
+  // ─── Routing by URL, so a recording can be linked to ─────────────────────
+  //
+  // Real paths rather than a fragment, because the server already hands this
+  // page out for every address under both prefixes and the status page next
+  // door links straight at a meeting in progress. A fragment would have been
+  // a second address scheme for no gain.
 
-  function show() {
-    const path = location.hash.replace(/^#\/?/, "");
-    if (path) open(path); else showList();
+  function parse() {
+    const [, head, ...rest] = location.pathname.split("/");
+    return { kind: KINDS[head] || KINDS.transcripts, id: rest.join("/") };
   }
 
-  window.addEventListener("hashchange", show);
-  $("back").addEventListener("click", (e) => { e.preventDefault(); location.hash = ""; });
+  async function show() {
+    const here = parse();
+    const changed = here.kind !== kind;
+    kind = here.kind;
 
-  loadList().then(show);
+    for (const k of Object.values(KINDS)) {
+      const link = $(k.nav);
+      if (k === kind) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    }
+
+    // Only when the kind changed: moving between the list and one recording
+    // of the same kind reuses what is already loaded.
+    if (changed || items.length === 0) await loadList();
+
+    if (here.id) open(here.id); else showList();
+  }
+
+  function go(href) {
+    history.pushState(null, "", href);
+    show();
+  }
+
+  window.addEventListener("popstate", show);
+  for (const k of Object.values(KINDS)) {
+    $(k.nav).addEventListener("click", (e) => {
+      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      e.preventDefault();
+      go(k.path);
+    });
+  }
+  $("back").addEventListener("click", (e) => {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    go(kind.path);
+  });
+
+  show();
 })();
 </script>
