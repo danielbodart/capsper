@@ -628,11 +628,25 @@ fn settingsPage(state: *State, request: *http.Server.Request, outcome: ?Outcome)
 
     if (outcome) |o| try writeOutcome(w, o);
 
+    // Said before the button is pressed rather than after. On NixOS the
+    // settings are a read-only store path and saving cannot write them, and a
+    // page promising to write and restart would be a page that lies to
+    // everyone running capsper the way its own documentation recommends.
+    const writable = if (state.config_path) |p| canWrite(p) else false;
+
     try w.writeAll("<p class=\"meta\">Every setting capsper has, with what it means beside it. ");
     if (state.config_path) |p| {
-        try w.writeAll("Saving writes <code>");
-        try utils.writeHtml(w, p);
-        try w.writeAll("</code> and restarts.");
+        if (writable) {
+            try w.writeAll("Saving writes <code>");
+            try utils.writeHtml(w, p);
+            try w.writeAll("</code> and restarts.");
+        } else {
+            try w.writeAll("<code>");
+            try utils.writeHtml(w, p);
+            try w.writeAll("</code> cannot be written — on NixOS it is built from your " ++
+                "configuration and belongs to the store. Saving changes nothing here and " ++
+                "hands back the settings to put where that file comes from.");
+        }
     } else {
         try w.writeAll("There is nowhere to save to: no config path could be worked out.");
     }
@@ -640,11 +654,9 @@ fn settingsPage(state: *State, request: *http.Server.Request, outcome: ?Outcome)
 
     try settings_form.writeForm(state.as_written, devices, w);
 
-    try w.writeAll(
-        \\<div class="actions"><button type="submit">Save and restart</button></div>
-        \\</form>
-        \\</main>
-        \\
+    try w.print(
+        "<div class=\"actions\"><button type=\"submit\">{s}</button></div>\n</form>\n</main>\n",
+        .{if (writable) "Save and restart" else "Show me the settings to copy"},
     );
 
     return request.respond(body.written(), .{
@@ -778,6 +790,29 @@ fn saveSettings(state: *State, request: *http.Server.Request) !void {
     status.stop_requested.store(true, .release);
     waitForMeetingToClose();
     std.process.exit(0);
+}
+
+/// Whether a save to `path` could land, asked before offering to do it.
+///
+/// The directory decides it, not the file: saving writes a neighbour and
+/// renames it over the top, so what matters is whether the directory will take
+/// a new entry. A `/nix/store` path fails here, which is the case this exists
+/// for.
+///
+/// The directory need not exist yet -- nobody has a `~/.config/capsper` before
+/// their first save -- so the walk climbs to the first ancestor that does and
+/// asks about that one. `makeOpenPath` would create the rest.
+fn canWrite(path: []const u8) bool {
+    var dir = std.fs.path.dirname(path) orelse ".";
+    while (true) {
+        if (std.fs.cwd().access(dir, .{ .mode = .write_only })) {
+            return true;
+        } else |err| switch (err) {
+            // Not there yet: ask about whatever contains it.
+            error.FileNotFound => dir = std.fs.path.dirname(dir) orelse return false,
+            else => return false,
+        }
+    }
 }
 
 /// Replace the settings file's contents.
@@ -1125,6 +1160,43 @@ test "a length of time is said the way a person would say it" {
         defer testing.allocator.free(out);
         try testing.expectEqualStrings(c.want, out);
     }
+}
+
+test "a settings file in a directory that will not take a write is known to be unsaveable" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(root);
+
+    const in_place = try std.fs.path.join(testing.allocator, &.{ root, "config.zon" });
+    defer testing.allocator.free(in_place);
+    try testing.expect(canWrite(in_place));
+
+    // A directory that does not exist yet is still saveable: nobody has a
+    // `~/.config/capsper` before their first save, and the write creates it.
+    const nested = try std.fs.path.join(testing.allocator, &.{ root, "a", "b", "config.zon" });
+    defer testing.allocator.free(nested);
+    try testing.expect(canWrite(nested));
+
+    // The case this exists for: on NixOS the settings are a store path, and a
+    // page offering to write one would be promising what it cannot do.
+    //
+    // Root is not subject to the permission bits this asks about, so there is
+    // nothing here to observe when the tests run as it. Said out loud rather
+    // than left as a test that quietly proves nothing.
+    if (std.posix.geteuid() == 0) return;
+
+    try tmp.dir.makeDir("readonly");
+    // `Dir.chmod` opens the directory as a file and fchmods it, which the
+    // handle a tmpDir hands out does not allow. The path-relative call does
+    // the same job from the parent.
+    try std.posix.fchmodat(tmp.dir.fd, "readonly", 0o555, 0);
+    defer std.posix.fchmodat(tmp.dir.fd, "readonly", 0o755, 0) catch {};
+
+    const locked = try std.fs.path.join(testing.allocator, &.{ root, "readonly", "config.zon" });
+    defer testing.allocator.free(locked);
+    try testing.expect(!canWrite(locked));
 }
 
 test "a debug recording is three digits and an extension the recorder writes" {
