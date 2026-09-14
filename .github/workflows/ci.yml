@@ -16,12 +16,17 @@ jobs:
           submodules: recursive
       # The LFS objects themselves, keyed on the pointer files -- which are
       # content-addressed, so the key changes exactly when the libraries do.
-      # `./run ci` pulls them if this misses.
+      # `./run ci` pulls them if this misses, which costs one 24MB download.
+      #
+      # No restore-keys: a near-miss would hand this key the *previous*
+      # object store, and saving it back would carry every superseded library
+      # forward for as long as the chain is unbroken. That is how the cache
+      # stayed at 184MB after the 368MB CUDA provider was deleted -- it was
+      # still in there, being copied from key to key.
       - uses: actions/cache@v4
         with:
           path: .git/lfs
           key: lfs-${{ hashFiles('dist/linux/lib/*.so') }}
-          restore-keys: lfs-
       # zig, bun, shellcheck and cosign, at the versions .mise.toml pins.
       # Installs and caches them; the tools it installs land on PATH for the
       # steps below.
