@@ -171,15 +171,33 @@ fn writeFields(
 }
 
 /// A description as wrapped `//` lines at the current indent.
+fn writeComment(doc: []const u8, comptime pad: []const u8, writer: *std.Io.Writer) !void {
+    try writeWrapped(doc, pad ++ "// ", true, writer);
+}
+
+/// Text wrapped to `wrap_columns`, with `prefix` before every line.
 ///
 /// Breaks only between words, and lets a word longer than the line stand off
 /// the right margin rather than splitting it: the long ones here are node
 /// names and paths, and a broken path is worse than a ragged edge.
-fn writeComment(doc: []const u8, comptime pad: []const u8, writer: *std.Io.Writer) !void {
-    const width = wrap_columns - pad.len - 3;
+///
+/// `prefix_first` is false where the caller has already put the cursor past
+/// the prefix, which is how a flag's first line of description sits beside
+/// its name rather than under it.
+fn writeWrapped(
+    text: []const u8,
+    prefix: []const u8,
+    prefix_first: bool,
+    writer: *std.Io.Writer,
+) !void {
+    const width = wrap_columns - prefix.len;
 
-    var rest = std.mem.trim(u8, doc, " ");
+    var rest = std.mem.trim(u8, text, " ");
+    var first = true;
     while (rest.len > 0) {
+        if (!first or prefix_first) try writer.writeAll(prefix);
+        first = false;
+
         var take = rest.len;
         if (take > width) {
             take = if (std.mem.lastIndexOfScalar(u8, rest[0 .. width + 1], ' ')) |space|
@@ -187,8 +205,206 @@ fn writeComment(doc: []const u8, comptime pad: []const u8, writer: *std.Io.Write
             else
                 std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
         }
-        try writer.print("{s}// {s}\n", .{ pad, std.mem.trimRight(u8, rest[0..take], " ") });
+        try writer.print("{s}\n", .{std.mem.trimRight(u8, rest[0..take], " ")});
         rest = std.mem.trimLeft(u8, rest[take..], " ");
+    }
+}
+
+// ─── The usage message ───────────────────────────────────────────────────────
+
+/// Where a flag's description starts, so the descriptions stand in a column of
+/// their own. A flag whose name and placeholder reach past this takes the line
+/// to itself and its description starts on the next one.
+const description_column = 32;
+const description_pad = " " ** description_column;
+
+/// The part of the usage that belongs to no particular flag. Everything else
+/// is read out of `config.flags` and the doc comments in `config.zig`.
+const preamble =
+    \\Usage: capsper [options]
+    \\
+    \\Push-to-talk dictation and meeting capture. It needs something to do: a
+    \\trigger key, a capture device, a TCP port, the console, or meeting capture.
+    \\
+    \\Settings are read from the config file first -- $XDG_CONFIG_HOME/capsper/
+    \\config.zon, or wherever --config names -- and the flags below are applied
+    \\over it, so a flag wins for one run. The file holds settings that have no
+    \\flag, meeting capture and the console among them, and --write-config prints
+    \\what a run would use, ready to save as that file.
+    \\
+;
+
+const examples =
+    \\
+    \\Examples:
+    \\  capsper --trigger capslock --audio-target my-mic
+    \\  capsper --trigger capslock --audio-target my-mic --port 43007
+    \\  capsper --port 0
+    \\  capsper --stream recording.wav
+    \\  capsper --trigger capslock --write-config > ~/.config/capsper/config.zon
+    \\
+;
+
+/// Every flag capsper accepts: what it does, the setting it writes, and what
+/// that setting is when nobody says otherwise.
+///
+/// There is no list of flags in this file. `config.flags` is the list, the
+/// prose is the doc comment on the setting each flag writes, and the default
+/// is read off the settings type -- so this cannot describe a flag that does
+/// not exist, miss one that does, or quote a default that has since changed.
+/// It was a hand-written block of text in `main.zig` until it had drifted
+/// from all three.
+pub fn writeUsage(w: *std.Io.Writer) !void {
+    try w.writeAll(preamble);
+
+    try w.writeAll("\nCommands (each does its one thing and exits):\n");
+    inline for (config.flags) |f| {
+        if (f.root == .cli) try writeFlag(f, w);
+    }
+
+    try w.writeAll("\nSettings:\n");
+    inline for (config.flags, 0..) |f, i| {
+        if (f.root == .config) {
+            const section = comptime sectionOf(f.path);
+            if (comptime !std.mem.eql(u8, section, sectionBefore(i))) try writeSection(section, w);
+            try writeFlag(f, w);
+        }
+    }
+
+    try w.writeAll(examples);
+}
+
+/// The group a setting belongs to: `audio` for `audio.channel`, and the empty
+/// string for one that sits at the top of the file.
+fn sectionOf(comptime path: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, path, '.') orelse return "";
+    return path[0..dot];
+}
+
+/// The section of the last setting printed before flag `i`, so a heading is
+/// written where the group changes and nowhere else. `"\x00"` before the
+/// first one, which no real section can equal.
+fn sectionBefore(comptime i: usize) []const u8 {
+    comptime {
+        var j = i;
+        while (j > 0) {
+            j -= 1;
+            if (config.flags[j].root == .config) return sectionOf(config.flags[j].path);
+        }
+        return "\x00";
+    }
+}
+
+/// A group's heading, which is the group's own name and the doc comment
+/// beside it. Wrapped as one piece, name included, so a long description does
+/// not run the first line off the terminal.
+fn writeSection(comptime section: []const u8, w: *std.Io.Writer) !void {
+    if (section.len == 0) return;
+    try w.writeAll("\n");
+    try writeWrapped(
+        comptime section ++ " -- " ++ firstSentence(docFor(Config, section, section)),
+        "  ",
+        true,
+        w,
+    );
+}
+
+/// One flag: its name, what the setting behind it means, where that setting
+/// lives in the file, its default, and any older spellings still accepted.
+fn writeFlag(comptime f: config.Flag, w: *std.Io.Writer) !void {
+    const head = comptime "    " ++ f.name ++ (if (f.takesValue()) " " ++ f.placeholder() else "");
+
+    try w.writeAll(head);
+    if (head.len + 2 > description_column) {
+        try w.writeAll("\n");
+        try w.writeAll(description_pad);
+    } else {
+        try w.splatByteAll(' ', description_column - head.len);
+    }
+
+    try writeWrapped(comptime flagDescription(f), description_pad, false, w);
+
+    try writeWrapped(comptime meta(f), description_pad, true, w);
+}
+
+/// What a flag's line should say it does.
+///
+/// Normally the prose beside the setting, which is where descriptions live so
+/// that there is exactly one per setting. A flag that turns a setting off
+/// cannot borrow it: that prose argues for the behaviour, so printing it under
+/// `--no-...` describes the opposite of what the flag does, and the only thing
+/// correcting it is the `= false` on the line below. Negated flags say what
+/// they do themselves, and must — one without a `describes` is a compile error
+/// naming it, so the next `--no-` flag cannot quietly inherit the same
+/// contradiction.
+fn flagDescription(comptime f: config.Flag) []const u8 {
+    comptime {
+        if (f.describes) |d| return d;
+        if (!f.takesValue() and !f.value) @compileError(
+            "the flag " ++ f.name ++ " turns " ++ f.path ++ " off, so it needs a `describes`:" ++
+                " the prose beside that setting describes turning it on",
+        );
+        const Holder = config.Holder(f.RootType(), f.path);
+        return firstSentence(docFor(Holder, config.leafName(f.path), f.path));
+    }
+}
+
+/// The line under a flag's description: the setting it writes, what that
+/// setting is by default, and any older spellings of the flag.
+///
+/// The setting is named because moving a service file full of flags into a
+/// config file is otherwise a translation exercise. A command writes no
+/// setting, so it has only its aliases to declare -- and an alias nobody can
+/// discover is a trap for whoever inherits a service file full of them.
+fn meta(comptime f: config.Flag) []const u8 {
+    comptime {
+        var parts: []const u8 = "";
+        if (f.root == .config) {
+            // A switch says the value it sets rather than a default, because
+            // its default is the state it exists to leave.
+            parts = if (f.Type() == bool)
+                f.path ++ " = " ++ (if (f.value) "true" else "false")
+            else
+                f.path ++ ", default " ++ defaultText(f);
+        }
+        for (f.aliases, 0..) |a, i| {
+            parts = parts ++ (if (parts.len == 0) "also " else if (i == 0) ", also " else ", ") ++ a;
+        }
+        return parts;
+    }
+}
+
+/// What a setting is when nobody says otherwise, as the usage should show it.
+/// Read off the settings type, so it cannot quote a default that has changed.
+fn defaultText(comptime f: config.Flag) []const u8 {
+    comptime {
+        const T = f.Type();
+        const defaults = config.Holder(f.RootType(), f.path){};
+        const value = @field(defaults, config.leafName(f.path));
+        const v = if (@typeInfo(T) == .optional) (value orelse return "unset") else value;
+
+        return switch (@typeInfo(@TypeOf(v))) {
+            .@"enum" => @tagName(v),
+            .pointer => "\"" ++ v ++ "\"",
+            else => std.fmt.comptimePrint("{d}", .{v}),
+        };
+    }
+}
+
+/// The first sentence of a description, which is what a terminal has room
+/// for. The rest of the prose stays in the config file, beside the setting.
+///
+/// A sentence ends at a full stop followed by a space and a capital, so
+/// `../models/nemotron` and `0.3` do not end one.
+fn firstSentence(comptime doc: []const u8) []const u8 {
+    comptime {
+        var i: usize = 0;
+        while (i + 2 < doc.len) : (i += 1) {
+            if (doc[i] == '.' and doc[i + 1] == ' ' and std.ascii.isUpper(doc[i + 2])) {
+                return doc[0 .. i + 1];
+            }
+        }
+        return doc;
     }
 }
 
@@ -240,7 +456,7 @@ test "writing names the settings that differ and nothing else" {
     // The section carrying it appears; the ones left alone do not.
     try testing.expect(std.mem.indexOf(u8, text, ".audio = .{") != null);
     try testing.expect(std.mem.indexOf(u8, text, ".meeting") == null);
-    try testing.expect(std.mem.indexOf(u8, text, ".tcp_server") == null);
+    try testing.expect(std.mem.indexOf(u8, text, ".tcp") == null);
     // Nor do that section's own untouched fields.
     try testing.expect(std.mem.indexOf(u8, text, ".detect_duration") == null);
 }
@@ -315,7 +531,7 @@ test "flags written out and read back give the same settings" {
     try testing.expectEqual(config.Channel.FR, reparsed.audio.channel);
     try testing.expectEqual(@as(f32, 10.0), reparsed.audio.gain);
     try testing.expect(!reparsed.audio.auto_gain);
-    try testing.expectEqual(@as(u16, 43007), reparsed.tcp_server.port.?);
+    try testing.expectEqual(@as(u16, 43007), reparsed.tcp.port.?);
     try testing.expectEqual(@as(usize, 3), reparsed.debug_recording.keep);
     try testing.expect(reparsed.meeting.enabled);
     try testing.expectEqual(@as(f32, 0.45), reparsed.meeting.vad.onset);
@@ -328,4 +544,76 @@ test "writing keeps a tilde, because expandPaths has not run yet" {
     const cfg = Config{ .model = "~/models/nemotron" };
     const text = try writeToString(arena_state.allocator(), &cfg);
     try testing.expect(std.mem.indexOf(u8, text, "~/models/nemotron") != null);
+}
+
+test "the usage names every flag, with its setting and its older spellings" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var buf: std.Io.Writer.Allocating = .init(arena_state.allocator());
+    try writeUsage(&buf.writer);
+    const text = buf.written();
+
+    inline for (config.flags) |f| {
+        try testing.expect(std.mem.indexOf(u8, text, f.name) != null);
+        if (f.root == .config) try testing.expect(std.mem.indexOf(u8, text, f.path) != null);
+        inline for (f.aliases) |a| try testing.expect(std.mem.indexOf(u8, text, a) != null);
+    }
+}
+
+test "the usage quotes the defaults off the settings type" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var buf: std.Io.Writer.Allocating = .init(arena_state.allocator());
+    try writeUsage(&buf.writer);
+    const text = buf.written();
+
+    try testing.expect(std.mem.indexOf(u8, text, "audio.channel, default FL") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "trigger.type_delay_us, default 12000") != null);
+    // A setting that is off unless asked for says so rather than naming a
+    // value it does not have.
+    try testing.expect(std.mem.indexOf(u8, text, "tcp.port, default unset") != null);
+    // A switch says what it sets, because its default is the state it exists
+    // to leave.
+    try testing.expect(std.mem.indexOf(u8, text, "audio.auto_gain = false") != null);
+}
+
+test "a negated flag says what it does, not what it undoes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var buf: std.Io.Writer.Allocating = .init(arena_state.allocator());
+    try writeUsage(&buf.writer);
+    const text = buf.written();
+
+    // `--no-auto-gain` turns auto-gain off, so it must not be described by the
+    // prose beside `Audio.auto_gain`, which argues for having it on.
+    try testing.expect(std.mem.indexOf(u8, text, "Leave the gain where") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Track the speaking level") == null);
+
+    // The setting keeps that prose where it belongs: above the field in a
+    // written config file.
+    var cfg_buf: std.Io.Writer.Allocating = .init(arena_state.allocator());
+    var cfg = config.Config{};
+    cfg.audio.auto_gain = false;
+    try write(&cfg, &cfg_buf.writer);
+    try testing.expect(std.mem.indexOf(u8, cfg_buf.written(), "Track the speaking level") != null);
+}
+
+test "the usage describes each flag with the prose beside its setting" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var buf: std.Io.Writer.Allocating = .init(arena_state.allocator());
+    try writeUsage(&buf.writer);
+    const text = buf.written();
+
+    // The first sentence of the doc comment on `Audio.gain`, wrapped.
+    try testing.expect(std.mem.indexOf(u8, text, "Multiplier applied to the incoming samples") != null);
+    // The group headings are the doc comments on the groups themselves.
+    try testing.expect(std.mem.indexOf(u8, text, "audio -- Where the audio comes from") != null);
+    // Nothing runs off an eighty column terminal.
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| try testing.expect(line.len <= wrap_columns);
 }

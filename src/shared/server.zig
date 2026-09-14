@@ -273,7 +273,7 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server) !void {
-        if (self.want_local and self.cfg.tcp_server.port != null) {
+        if (self.want_local and self.cfg.tcp.port != null) {
             // Both modes: spawn local capture in background, run TCP in calling thread.
             const t = std.Thread.spawn(.{}, runLocalCaptureThread, .{self});
             if (t) |thread| {
@@ -283,7 +283,7 @@ pub const Server = struct {
                 return err;
             }
             try self.runTcp();
-        } else if (self.cfg.tcp_server.port != null) {
+        } else if (self.cfg.tcp.port != null) {
             try self.runTcp();
         } else if (self.want_local) {
             try self.runLocalCapture();
@@ -291,7 +291,7 @@ pub const Server = struct {
     }
 
     fn runTcp(self: *Server) !void {
-        const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.cfg.tcp_server.port.?);
+        const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.cfg.tcp.port.?);
         const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
         defer posix.close(listener);
 
@@ -300,7 +300,7 @@ pub const Server = struct {
         try posix.bind(listener, &address.any, address.getOsSockLen());
         try posix.listen(listener, 8);
 
-        // Query actual port (needed when self.cfg.tcp_server.port == 0 for OS-assigned port)
+        // Query actual port (needed when self.cfg.tcp.port == 0 for OS-assigned port)
         var bound: net.Address = undefined;
         var addr_len: posix.socklen_t = @sizeOf(@TypeOf(bound.any));
         try posix.getsockname(listener, &bound.any, &addr_len);

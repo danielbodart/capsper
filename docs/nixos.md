@@ -106,7 +106,7 @@ services.capsper = {
       channel = "FL";
       gain = 10.0;
     };
-    # meeting.enabled, tcp_server.port, debug_recording.dir ...
+    # meeting.enabled, tcp.port, debug_recording.dir ...
   };
 };
 ```

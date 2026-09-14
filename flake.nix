@@ -104,7 +104,7 @@
                 auto_gain = false;
               };
               trigger.key = "capslock";
-              tcp_server.port = 43007;
+              tcp.port = 43007;
               meeting = {
                 enabled = true;
                 output = null;
@@ -129,7 +129,7 @@
                       },
                   },
                   .model = "~/models/nemotron",
-                  .tcp_server = .{
+                  .tcp = .{
                       .port = 43007,
                   },
                   .trigger = .{

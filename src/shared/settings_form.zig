@@ -417,7 +417,7 @@ test "a section the form did not carry costs no lines" {
     try testing.expectEqual(@as(?Problem, null), out.problem);
     try testing.expect(std.mem.indexOf(u8, out.text, ".audio = .{") != null);
     try testing.expect(std.mem.indexOf(u8, out.text, ".meeting") == null);
-    try testing.expect(std.mem.indexOf(u8, out.text, ".tcp_server") == null);
+    try testing.expect(std.mem.indexOf(u8, out.text, ".tcp") == null);
 }
 
 test "an empty box on an optional setting means unset" {

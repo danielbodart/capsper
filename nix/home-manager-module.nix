@@ -169,11 +169,11 @@ in
         assertion =
           (cfg.settings.trigger.key or null) != null
           || (cfg.settings.audio.target or null) != null
-          || (cfg.settings.tcp_server.port or null) != null
+          || (cfg.settings.tcp.port or null) != null
           || (cfg.settings.meeting.enabled or false);
         message = ''
           services.capsper.settings gives capsper nothing to do. Set one of
-          trigger.key, audio.target, tcp_server.port or meeting.enabled.
+          trigger.key, audio.target, tcp.port or meeting.enabled.
         '';
       }
     ];

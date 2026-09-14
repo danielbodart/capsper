@@ -77,6 +77,15 @@ pub fn main() !void {
         config.reportArgError(arg_err);
         std.process.exit(1);
     }
+    // Asked for outright, or asked for by saying nothing at all. Before
+    // anything that can fail on the settings themselves: someone reaching for
+    // the usage is the last person to be handed an error about a trigger key
+    // their platform does not have.
+    if (cli.show_help or args.len == 1) {
+        try printUsage();
+        return;
+    }
+
     // Before expandPaths, so a `~/` the user wrote is still a `~/` when it is
     // written back out. Nothing else has run yet either, so this reports the
     // settings and not the state of a half-started service.
@@ -126,12 +135,6 @@ pub fn main() !void {
     else
         null;
 
-    // No arguments: show usage
-    if (args.len == 1) {
-        printUsage();
-        return;
-    }
-
     // Audio detect utility command (early exit, no model loading needed)
     if (cli.audio_detect) {
         audio_detect.detectChannel(allocator, cfg.audio.target, cfg.audio.detect_duration);
@@ -143,14 +146,14 @@ pub fn main() !void {
     // --port → TCP server
     // Both can be active simultaneously.
     const want_local = cfg.audio.target != null or trigger_key != null;
-    const want_tcp = cfg.tcp_server.port != null;
+    const want_tcp = cfg.tcp.port != null;
     const want_meeting = cfg.meeting.enabled;
     const want_http = cfg.http.port != null;
 
     if (!want_local and !want_tcp and !want_meeting and !want_http and
         cli.stream == null and cli.transcribe == null and !cli.dry_run)
     {
-        printUsage();
+        try printUsage();
         return;
     }
 
@@ -319,7 +322,7 @@ pub fn main() !void {
         // Reading a file is not capturing audio, so the settings that only
         // describe a live microphone are forced off rather than inherited.
         var stream_cfg = cfg;
-        stream_cfg.tcp_server.port = null;
+        stream_cfg.tcp.port = null;
         stream_cfg.audio.gain = 1.0;
         stream_cfg.audio.auto_gain = false;
         stream_cfg.trigger.low_latency = false;
@@ -544,43 +547,13 @@ fn warmup(allocator: std.mem.Allocator, factory: PipelineFactory) void {
     std.debug.print("Warmup complete ({d}.{d:0>1}s)\n", .{ ms / 1000, (ms % 1000) / 100 });
 }
 
-fn printUsage() void {
-    std.debug.print(
-        \\Usage: capsper <mode> [options]
-        \\
-        \\Modes (at least one required):
-        \\  --audio-target NODE      Local audio capture (always-live without --trigger)
-        \\  --trigger KEY             Enable push-to-talk (implies local capture)
-        \\  --port PORT              Start TCP server (multiple concurrent clients)
-        \\  --stream FILE            Stream WAV file through pipeline, output to stdout
-        \\  --transcribe FILE        Transcribe WAV file in one shot, output to stdout
-        \\  --audio-detect           Detect audio devices and channels, then exit
-        \\
-        \\Options:
-        \\  --config PATH            Config file (default: $XDG_CONFIG_HOME/capsper/config.zon)
-        \\  --model PATH             Model directory (default: ../models/nemotron)
-        \\  --audio-channel CHANNEL  Audio channel: MONO, FL, FR, AUX0-AUX63
-        \\  --audio-gain FACTOR      Initial gain multiplier
-        \\  --no-auto-gain           Disable automatic gain adjustment
-        \\  --on-device-lost MODE    exit or wait (default: wait)
-        \\  --low-latency            Use cork/uncork instead of connect/disconnect
-        \\  --trigger-passthrough    Pass trigger key through to applications
-        \\  --type-delay MICROSECONDS Delay between injected keystrokes (default: 12000)
-        \\  --drop-terms FILE        Filler words to suppress (one per line)
-        \\  --record-dir DIR         Save audio recordings to directory
-        \\  --record-keep N          Keep last N recordings (default: 10)
-        \\  --detect-duration SECS   Audio detection duration (default: 5)
-        \\  --verbose, -v            Verbose logging
-        \\  --dry-run                Load model and exit (verify setup)
-        \\  --write-config           Print these settings as ZON, then exit
-        \\  --version                Show version
-        \\
-        \\Examples:
-        \\  capsper --trigger capslock --audio-target my-mic
-        \\  capsper --trigger capslock --audio-target my-mic --port 43007
-        \\  capsper --port 0
-        \\  capsper --stream recording.wav
-        \\  capsper --trigger capslock --write-config > ~/.config/capsper/config.zon
-        \\
-    , .{});
+/// The usage, which is not written here: `config_docs.writeUsage` builds it
+/// out of the flag table and the doc comments beside the settings those flags
+/// write. A hand-written copy lived here once and had drifted from the flags
+/// it described.
+fn printUsage() !void {
+    var buf: [4096]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&buf);
+    try config_docs.writeUsage(&out.interface);
+    try out.interface.flush();
 }

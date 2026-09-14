@@ -103,6 +103,8 @@ pub const Trigger = struct {
     /// Let the trigger key reach the focused window as well as capsper, so
     /// holding it still does whatever it normally does.
     passthrough: bool = false,
+    /// How long to wait between the keystrokes capsper types, which is what
+    /// keeps a window that drops fast input from losing characters.
     /// Named for its unit, because a bare number in a file has no usage text
     /// beside it to say what the number means.
     type_delay_us: u64 = 12_000,
@@ -112,14 +114,15 @@ pub const Trigger = struct {
     low_latency: bool = false,
 };
 
-pub const TcpServer = struct {
-    /// Null means no server. Zero means an OS-assigned port.
+pub const Tcp = struct {
+    /// The port to listen on. Null means no server; zero takes an
+    /// OS-assigned one.
     port: ?u16 = null,
 };
 
 pub const Http = struct {
     /// Null means no server. Zero means an OS-assigned port, the same
-    /// convention `tcp_server.port` uses.
+    /// convention `tcp.port` uses.
     ///
     /// Off unless asked for. It is the one part of capsper that opens a
     /// socket onto what the machine is doing and what it has recorded, and
@@ -132,7 +135,8 @@ pub const Http = struct {
 };
 
 pub const DebugRecording = struct {
-    /// Null disables recording.
+    /// Where the recordings and their transcripts are written. Null disables
+    /// recording.
     dir: ?[:0]const u8 = null,
     /// Ring size: recordings are numbered `seq % keep`, so the last `keep`
     /// survive and older ones are overwritten.
@@ -255,8 +259,9 @@ pub const Meeting = struct {
 };
 
 pub const Config = struct {
-    /// Null resolves to `../models/nemotron` relative to the binary, which is
-    /// what makes an unpacked dist tarball run without configuring anything.
+    /// The directory the model is loaded from. Null resolves to
+    /// `../models/nemotron` relative to the binary, which is what makes an
+    /// unpacked dist tarball run without configuring anything.
     model: ?[:0]const u8 = null,
     /// Log what the decoder is doing as it does it, which is a great deal of
     /// output and belongs to troubleshooting rather than to running.
@@ -271,7 +276,7 @@ pub const Config = struct {
     trigger: Trigger = .{},
     /// The server remote dictation clients connect to. Nothing to do with the
     /// HTTP one, which serves a page rather than audio.
-    tcp_server: TcpServer = .{},
+    tcp: Tcp = .{},
     /// The console: what capsper is doing right now, the settings behind it,
     /// and whatever it has recorded. Runs on its own account rather than as
     /// part of any capture mode.
@@ -309,11 +314,22 @@ pub const Config = struct {
 /// One-shot actions and the config location. None of these are settings, so
 /// none of them appear in the file.
 pub const Cli = struct {
+    /// Read settings from this file instead of the default location.
     config_path: ?[:0]const u8 = null,
+    /// Print the version and exit.
     show_version: bool = false,
+    /// Print what every flag does and exit.
+    show_help: bool = false,
+    /// Load the model, report that it loaded, and exit without capturing
+    /// anything. What a fresh install runs to find out whether it would work.
     dry_run: bool = false,
+    /// Listen to the capture device, report which channel carries a voice and
+    /// how much gain it wants, and exit.
     audio_detect: bool = false,
+    /// Transcribe a WAV file by feeding it through the streaming pipeline as
+    /// if it were arriving live, and write the result to stdout.
     stream: ?[:0]const u8 = null,
+    /// Transcribe a WAV file in one pass and write the result to stdout.
     transcribe: ?[:0]const u8 = null,
     /// Print the settings this run would use as ZON, then exit. The point is
     /// migrating a service file full of flags into a config file without
@@ -321,21 +337,188 @@ pub const Cli = struct {
     write_config: bool = false,
 };
 
+// ─── Flags ───────────────────────────────────────────────────────────────────
+
+/// One command line flag, as data.
+///
+/// This table is the only place a flag name is written. `parseArgs` applies
+/// it and `config_docs.writeUsage` prints it, so a flag cannot exist without
+/// appearing in the usage, and what it is printed with is the doc comment on
+/// the setting it writes. There is no second description to fall out of date,
+/// which is the whole reason the parser is a table rather than the if-chain
+/// it used to be -- that chain had a hand-written usage message beside it,
+/// and the two had already drifted.
+pub const Flag = struct {
+    /// The flag as typed, dashes included.
+    name: []const u8,
+    /// Older spellings still accepted. Printed in the usage too: an alias
+    /// nobody can discover is a trap for whoever inherits a service file full
+    /// of them.
+    aliases: []const []const u8 = &.{},
+    /// Dotted path to what this writes: `audio.channel`.
+    path: []const u8,
+    /// Which struct that path is rooted in.
+    root: Root = .config,
+    /// What a flag over a `bool` sets it to. Every other kind takes the next
+    /// argument as its value instead.
+    value: bool = true,
+    /// The argument placeholder for the usage. Null takes one from the type.
+    arg: ?[]const u8 = null,
+    /// What to say was expected when a value does not parse. Null lists the
+    /// enum's tags, which is the right answer until there are 67 of them.
+    choices: ?[]const u8 = null,
+    /// What this flag does, for when the prose beside its setting would say
+    /// the opposite.
+    ///
+    /// Descriptions live beside the setting so there is one of them per
+    /// setting, and a flag that turns a setting on can borrow it as it
+    /// stands. One that turns a setting off cannot: the prose argues for the
+    /// behaviour, so printing it under `--no-...` recommends the reverse of
+    /// what the flag does. Negated flags carry their own line instead, and
+    /// `config_docs` refuses to compile one that does not.
+    describes: ?[]const u8 = null,
+
+    pub const Root = enum { config, cli };
+
+    /// Whether this flag consumes the argument after it.
+    pub fn takesValue(comptime self: Flag) bool {
+        return Leaf(self.Type()) != bool;
+    }
+
+    /// The type of the field this writes.
+    pub fn Type(comptime self: Flag) type {
+        return FieldType(self.RootType(), self.path);
+    }
+
+    pub fn RootType(comptime self: Flag) type {
+        return switch (self.root) {
+            .config => Config,
+            .cli => Cli,
+        };
+    }
+
+    /// `CHANNEL`, `PATH`, `N`: what stands in for the value in the usage.
+    pub fn placeholder(comptime self: Flag) []const u8 {
+        if (self.arg) |a| return a;
+        return switch (@typeInfo(Leaf(self.Type()))) {
+            .int => "N",
+            .float => "FACTOR",
+            else => "VALUE",
+        };
+    }
+
+    /// What the flag would have accepted, for the message when it did not.
+    pub fn expected(comptime self: Flag) []const u8 {
+        if (self.choices) |c| return c;
+        const T = Leaf(self.Type());
+        return switch (@typeInfo(T)) {
+            .int, .float => "a number",
+            .@"enum" => comptime tagList(T),
+            else => "any text",
+        };
+    }
+};
+
+/// Every flag capsper accepts, in the order the usage prints them: the
+/// one-shot commands first, then the settings, grouped the way `Config`
+/// groups them.
+pub const flags = [_]Flag{
+    .{ .name = "--help", .aliases = &.{"-h"}, .path = "show_help", .root = .cli },
+    .{ .name = "--version", .path = "show_version", .root = .cli },
+    .{ .name = "--config", .path = "config_path", .root = .cli, .arg = "PATH" },
+    .{ .name = "--write-config", .path = "write_config", .root = .cli },
+    .{ .name = "--dry-run", .path = "dry_run", .root = .cli },
+    .{ .name = "--audio-detect", .aliases = &.{"--pw-detect"}, .path = "audio_detect", .root = .cli },
+    .{ .name = "--stream", .aliases = &.{"--stream-wav"}, .path = "stream", .root = .cli, .arg = "FILE" },
+    .{ .name = "--transcribe", .path = "transcribe", .root = .cli, .arg = "FILE" },
+
+    .{ .name = "--model", .aliases = &.{"-m"}, .path = "model", .arg = "PATH" },
+    .{ .name = "--drop-terms", .path = "drop_terms", .arg = "FILE" },
+    .{ .name = "--verbose", .aliases = &.{"-v"}, .path = "verbose" },
+
+    .{ .name = "--audio-target", .aliases = &.{"--pw-target"}, .path = "audio.target", .arg = "NODE" },
+    .{
+        .name = "--audio-channel",
+        .aliases = &.{"--pw-channel"},
+        .path = "audio.channel",
+        .arg = "CHANNEL",
+        // Spelled out rather than listed: the 64 AUX positions are a range to
+        // anyone reading, and 67 tags is not a message.
+        .choices = "MONO, FL, FR, AUX0-AUX63",
+    },
+    .{ .name = "--audio-gain", .aliases = &.{"--pw-gain"}, .path = "audio.gain", .arg = "FACTOR" },
+    .{
+        .name = "--no-auto-gain",
+        .path = "audio.auto_gain",
+        .value = false,
+        .describes = "Leave the gain where `--audio-gain` put it, rather than tracking the speaking level and adjusting it as it drifts.",
+    },
+    .{ .name = "--on-device-lost", .path = "audio.on_device_lost", .arg = "MODE" },
+    .{ .name = "--detect-duration", .path = "audio.detect_duration", .arg = "SECONDS" },
+
+    .{ .name = "--trigger", .path = "trigger.key", .arg = "KEY" },
+    .{ .name = "--trigger-passthrough", .path = "trigger.passthrough" },
+    .{ .name = "--type-delay", .path = "trigger.type_delay_us", .arg = "MICROSECONDS" },
+    .{ .name = "--low-latency", .path = "trigger.low_latency" },
+
+    .{ .name = "--port", .aliases = &.{"-p"}, .path = "tcp.port", .arg = "PORT" },
+
+    .{ .name = "--record-dir", .path = "debug_recording.dir", .arg = "DIR" },
+    .{ .name = "--record-keep", .path = "debug_recording.keep", .arg = "N" },
+};
+
+// ─── Walking a dotted path ───────────────────────────────────────────────────
+
+/// The type behind an optional, or the type itself. A flag writes the value
+/// rather than the optionality, so `?u16` and `u16` parse identically.
+pub fn Leaf(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
+}
+
+/// The type of the field `path` names, starting from `T`.
+pub fn FieldType(comptime T: type, comptime path: []const u8) type {
+    if (std.mem.indexOfScalar(u8, path, '.')) |dot| {
+        return FieldType(@FieldType(T, path[0..dot]), path[dot + 1 ..]);
+    }
+    return @FieldType(T, path);
+}
+
+/// The struct that directly holds the field `path` names -- `config.Audio`
+/// for `audio.channel`. Which is the container its doc comment was harvested
+/// under, so it is what `config_docs.docFor` needs.
+pub fn Holder(comptime T: type, comptime path: []const u8) type {
+    if (std.mem.indexOfScalar(u8, path, '.')) |dot| {
+        return Holder(@FieldType(T, path[0..dot]), path[dot + 1 ..]);
+    }
+    return T;
+}
+
+/// The last segment of a dotted path: `channel` for `audio.channel`.
+pub fn leafName(comptime path: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return path;
+    return path[dot + 1 ..];
+}
+
+/// A pointer to the field `path` names inside `root`.
+fn fieldPtr(comptime path: []const u8, root: anytype) *FieldType(@TypeOf(root.*), path) {
+    if (comptime std.mem.indexOfScalar(u8, path, '.')) |dot| {
+        return fieldPtr(path[dot + 1 ..], &@field(root, path[0..dot]));
+    }
+    return &@field(root, path);
+}
+
 // ─── Argument parsing ────────────────────────────────────────────────────────
 
 /// A flag that could not be understood. Returned rather than printed so the
 /// parser stays quiet in tests; `reportArgError` does the formatting.
 pub const ArgError = struct {
-    kind: Kind,
     flag: []const u8,
     value: []const u8,
-
-    pub const Kind = enum {
-        invalid_channel,
-        invalid_trigger_key,
-        invalid_on_device_lost,
-        invalid_number,
-    };
+    /// What would have been accepted, from the flag's own table entry.
+    expected: []const u8,
 };
 
 /// Find `--config PATH` and nothing else.
@@ -360,145 +543,104 @@ pub fn configPathFromArgs(args: []const [:0]const u8) ?[:0]const u8 {
 /// worse answer than ignoring them.
 pub fn parseArgs(cfg: *Config, cli: *Cli, args: []const [:0]const u8) ?ArgError {
     var i: usize = 1;
-    while (i < args.len) : (i += 1) {
+    args: while (i < args.len) : (i += 1) {
         const arg = args[i];
 
-        // Flags taking a value. `value` is null at the end of the argument
-        // list, in which case the flag is ignored rather than misreading the
-        // next flag as its argument.
+        // Null at the end of the argument list, in which case a flag wanting
+        // a value is ignored rather than misreading the next flag as one.
         const value: ?[:0]const u8 = if (i + 1 < args.len) args[i + 1] else null;
 
-        if (eql(arg, "--version")) {
-            cli.show_version = true;
-        } else if (eql(arg, "--verbose") or eql(arg, "-v")) {
-            cfg.verbose = true;
-        } else if (eql(arg, "--dry-run")) {
-            cli.dry_run = true;
-        } else if (eql(arg, "--write-config")) {
-            cli.write_config = true;
-        } else if (eql(arg, "--audio-detect") or eql(arg, "--pw-detect")) {
-            cli.audio_detect = true;
-        } else if (eql(arg, "--trigger-passthrough")) {
-            cfg.trigger.passthrough = true;
-        } else if (eql(arg, "--low-latency")) {
-            cfg.trigger.low_latency = true;
-        } else if (eql(arg, "--no-auto-gain")) {
-            cfg.audio.auto_gain = false;
-        } else if (eql(arg, "--config")) {
-            if (value) |v| cli.config_path = v;
-            i += 1;
-        } else if (eql(arg, "--model") or eql(arg, "-m")) {
-            if (value) |v| cfg.model = v;
-            i += 1;
-        } else if (eql(arg, "--drop-terms")) {
-            if (value) |v| cfg.drop_terms = v;
-            i += 1;
-        } else if (eql(arg, "--stream") or eql(arg, "--stream-wav")) {
-            if (value) |v| cli.stream = v;
-            i += 1;
-        } else if (eql(arg, "--transcribe")) {
-            if (value) |v| cli.transcribe = v;
-            i += 1;
-        } else if (eql(arg, "--audio-target") or eql(arg, "--pw-target")) {
-            if (value) |v| cfg.audio.target = v;
-            i += 1;
-        } else if (eql(arg, "--record-dir")) {
-            if (value) |v| cfg.debug_recording.dir = v;
-            i += 1;
-        } else if (eql(arg, "--port") or eql(arg, "-p")) {
-            if (value) |v| cfg.tcp_server.port = parseNum(u16, v) orelse
-                return .{ .kind = .invalid_number, .flag = arg, .value = v };
-            i += 1;
-        } else if (eql(arg, "--type-delay")) {
-            if (value) |v| cfg.trigger.type_delay_us = parseNum(u64, v) orelse
-                return .{ .kind = .invalid_number, .flag = arg, .value = v };
-            i += 1;
-        } else if (eql(arg, "--detect-duration")) {
-            if (value) |v| cfg.audio.detect_duration = parseNum(u32, v) orelse
-                return .{ .kind = .invalid_number, .flag = arg, .value = v };
-            i += 1;
-        } else if (eql(arg, "--record-keep")) {
-            if (value) |v| cfg.debug_recording.keep = parseNum(usize, v) orelse
-                return .{ .kind = .invalid_number, .flag = arg, .value = v };
-            i += 1;
-        } else if (eql(arg, "--audio-gain") or eql(arg, "--pw-gain")) {
-            if (value) |v| cfg.audio.gain = std.fmt.parseFloat(f32, v) catch
-                return .{ .kind = .invalid_number, .flag = arg, .value = v };
-            i += 1;
-        } else if (eql(arg, "--audio-channel") or eql(arg, "--pw-channel")) {
-            if (value) |v| cfg.audio.channel = parseChannel(v) orelse
-                return .{ .kind = .invalid_channel, .flag = arg, .value = v };
-            i += 1;
-        } else if (eql(arg, "--trigger")) {
-            if (value) |v| cfg.trigger.key = parseTriggerKey(v) orelse
-                return .{ .kind = .invalid_trigger_key, .flag = arg, .value = v };
-            i += 1;
-        } else if (eql(arg, "--on-device-lost")) {
-            if (value) |v| cfg.audio.on_device_lost = parseOnDeviceLost(v) orelse
-                return .{ .kind = .invalid_on_device_lost, .flag = arg, .value = v };
-            i += 1;
-        } else {
-            std.debug.print("Warning: unknown option '{s}' will be ignored\n", .{arg});
-            // Skip what looks like this flag's argument, so an unrecognised
-            // `--foo bar` does not then warn about `bar` as well.
-            if (value) |v| {
-                if (v.len > 0 and v[0] != '-') i += 1;
+        inline for (flags) |f| {
+            if (matches(f, arg)) {
+                if (comptime f.takesValue()) {
+                    if (value) |v| {
+                        if (comptime f.root == .cli)
+                            assign(f, cli, v) orelse return argError(f, v)
+                        else
+                            assign(f, cfg, v) orelse return argError(f, v);
+                    }
+                    i += 1;
+                } else if (comptime f.root == .cli) {
+                    fieldPtr(f.path, cli).* = f.value;
+                } else {
+                    fieldPtr(f.path, cfg).* = f.value;
+                }
+                continue :args;
             }
+        }
+
+        std.debug.print("Warning: unknown option '{s}' will be ignored\n", .{arg});
+        // Skip what looks like this flag's argument, so an unrecognised
+        // `--foo bar` does not then warn about `bar` as well.
+        if (value) |v| {
+            if (v.len > 0 and v[0] != '-') i += 1;
         }
     }
     return null;
 }
 
-/// Print an unparseable flag the way the old inline checks did, including the
-/// list of what would have been accepted.
-pub fn reportArgError(err: ArgError) void {
-    switch (err.kind) {
-        .invalid_channel => {
-            std.debug.print("Invalid channel value '{s}'\n", .{err.value});
-            std.debug.print("Expected: MONO, FL, FR, AUX0-AUX63\n", .{});
-        },
-        .invalid_trigger_key => {
-            std.debug.print("Unknown trigger key '{s}'\n", .{err.value});
-            std.debug.print("Supported: capslock, scrolllock, numlock, pause, f13-f24\n", .{});
-        },
-        .invalid_on_device_lost => {
-            std.debug.print("Invalid --on-device-lost value '{s}', expected 'exit' or 'wait'\n", .{err.value});
-        },
-        .invalid_number => {
-            std.debug.print("Invalid {s} value '{s}': expected a number\n", .{ err.flag, err.value });
-        },
+fn matches(comptime f: Flag, arg: []const u8) bool {
+    if (eql(arg, f.name)) return true;
+    inline for (f.aliases) |a| {
+        if (eql(arg, a)) return true;
     }
+    return false;
+}
+
+fn argError(comptime f: Flag, value: []const u8) ArgError {
+    return .{ .flag = f.name, .value = value, .expected = comptime f.expected() };
+}
+
+/// Write `text` into the field `f` names, or null if it does not parse as
+/// that field's type. The `orelse` at the call site turns that into the error.
+fn assign(comptime f: Flag, root: anytype, text: [:0]const u8) ?void {
+    const ptr = fieldPtr(f.path, root);
+    ptr.* = parseValue(Leaf(@TypeOf(ptr.*)), text) orelse return null;
+}
+
+/// One value, read as whatever type the setting holds. Strings arrive as
+/// themselves, which is why the argv slices are sentinel-terminated all the
+/// way down: a `[:0]const u8` setting can point straight at one.
+fn parseValue(comptime T: type, text: [:0]const u8) ?T {
+    return switch (@typeInfo(T)) {
+        .int => std.fmt.parseInt(T, text, 10) catch null,
+        .float => std.fmt.parseFloat(T, text) catch null,
+        .@"enum" => parseEnum(T, text),
+        .pointer => text,
+        else => @compileError("no flag parser for " ++ @typeName(T)),
+    };
+}
+
+/// Print an unparseable flag, including what would have been accepted.
+pub fn reportArgError(e: ArgError) void {
+    std.debug.print("Invalid {s} value '{s}'\n", .{ e.flag, e.value });
+    std.debug.print("Expected: {s}\n", .{e.expected});
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-fn parseNum(comptime T: type, text: []const u8) ?T {
-    return std.fmt.parseInt(T, text, 10) catch null;
-}
-
-/// Case-insensitive so `--audio-channel fl` keeps working; the enum tag itself
-/// is upper case because that is how channels are written everywhere else.
-pub fn parseChannel(name: []const u8) ?Channel {
-    inline for (@typeInfo(Channel).@"enum".fields) |f| {
+/// Match an enum tag by name, ignoring case, so `--audio-channel fl` keeps
+/// working against a `FL` tag and `--trigger CapsLock` against `capslock`.
+pub fn parseEnum(comptime T: type, name: []const u8) ?T {
+    inline for (@typeInfo(T).@"enum".fields) |f| {
         if (std.ascii.eqlIgnoreCase(name, f.name)) return @enumFromInt(f.value);
     }
     return null;
 }
 
-pub fn parseTriggerKey(name: []const u8) ?TriggerKey {
-    inline for (@typeInfo(TriggerKey).@"enum".fields) |f| {
-        if (std.ascii.eqlIgnoreCase(name, f.name)) return @enumFromInt(f.value);
+/// An enum's tags as `wait, exit`, for a message saying what was expected.
+fn tagList(comptime T: type) []const u8 {
+    comptime {
+        var list: []const u8 = "";
+        for (@typeInfo(T).@"enum".fields, 0..) |f, i| {
+            list = list ++ (if (i == 0) "" else ", ") ++ f.name;
+        }
+        return list;
     }
-    return null;
 }
 
-fn parseOnDeviceLost(name: []const u8) ?OnDeviceLost {
-    if (eql(name, "wait")) return .wait;
-    if (eql(name, "exit")) return .exit;
-    return null;
-}
 
 // ─── Loading ─────────────────────────────────────────────────────────────────
 
@@ -598,7 +740,7 @@ test "defaults match the documented schema" {
     try testing.expectEqual(OnDeviceLost.wait, cfg.audio.on_device_lost);
     try testing.expect(cfg.trigger.key == null);
     try testing.expectEqual(@as(u64, 12_000), cfg.trigger.type_delay_us);
-    try testing.expect(cfg.tcp_server.port == null);
+    try testing.expect(cfg.tcp.port == null);
     try testing.expectEqual(AudioFormat.wav, cfg.debug_recording.audio_format);
     try testing.expectEqual(AudioFormat.opus, cfg.meeting.audio_format);
     try testing.expect(!cfg.meeting.enabled);
@@ -625,7 +767,7 @@ test "nested groups and enum literals parse" {
         \\    // Comments are the reason this is ZON and not JSON.
         \\    .audio = .{ .channel = .FR, .gain = 2.5, .on_device_lost = .exit },
         \\    .trigger = .{ .key = .f13, .low_latency = true },
-        \\    .tcp_server = .{ .port = 43007 },
+        \\    .tcp = .{ .port = 43007 },
         \\}
     ;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -637,7 +779,7 @@ test "nested groups and enum literals parse" {
     try testing.expectEqual(OnDeviceLost.exit, cfg.audio.on_device_lost);
     try testing.expectEqual(TriggerKey.f13, cfg.trigger.key.?);
     try testing.expect(cfg.trigger.low_latency);
-    try testing.expectEqual(@as(u16, 43007), cfg.tcp_server.port.?);
+    try testing.expectEqual(@as(u16, 43007), cfg.tcp.port.?);
 }
 
 test "strings parse and keep their sentinel" {
@@ -685,17 +827,17 @@ test "a parse error reports a line and column" {
 }
 
 test "AUX channels exist across the full range" {
-    try testing.expectEqual(Channel.AUX0, parseChannel("AUX0").?);
-    try testing.expectEqual(Channel.AUX63, parseChannel("aux63").?);
-    try testing.expect(parseChannel("AUX64") == null);
+    try testing.expectEqual(Channel.AUX0, parseEnum(Channel, "AUX0").?);
+    try testing.expectEqual(Channel.AUX63, parseEnum(Channel, "aux63").?);
+    try testing.expect(parseEnum(Channel, "AUX64") == null);
     try testing.expectEqualStrings("AUX7", @tagName(Channel.AUX7));
 }
 
 test "channel and trigger names parse case-insensitively" {
-    try testing.expectEqual(Channel.FL, parseChannel("fl").?);
-    try testing.expectEqual(Channel.MONO, parseChannel("Mono").?);
-    try testing.expectEqual(TriggerKey.capslock, parseTriggerKey("CapsLock").?);
-    try testing.expect(parseTriggerKey("shift") == null);
+    try testing.expectEqual(Channel.FL, parseEnum(Channel, "fl").?);
+    try testing.expectEqual(Channel.MONO, parseEnum(Channel, "Mono").?);
+    try testing.expectEqual(TriggerKey.capslock, parseEnum(TriggerKey, "CapsLock").?);
+    try testing.expect(parseEnum(TriggerKey, "shift") == null);
 }
 
 test "flags set every setting they name" {
@@ -728,7 +870,7 @@ test "flags set every setting they name" {
     try testing.expectEqual(@as(f32, 2.0), cfg.audio.gain);
     try testing.expect(!cfg.audio.auto_gain);
     try testing.expectEqual(OnDeviceLost.exit, cfg.audio.on_device_lost);
-    try testing.expectEqual(@as(u16, 43007), cfg.tcp_server.port.?);
+    try testing.expectEqual(@as(u16, 43007), cfg.tcp.port.?);
     try testing.expectEqual(@as(u64, 5000), cfg.trigger.type_delay_us);
     try testing.expectEqualStrings("/tmp/rec", cfg.debug_recording.dir.?);
     try testing.expectEqual(@as(usize, 3), cfg.debug_recording.keep);
@@ -802,23 +944,31 @@ test "--stream-wav is still a spelling of --stream" {
     try testing.expectEqualStrings("x.wav", cli.stream.?);
 }
 
-test "an unparseable value names the flag that carried it" {
+test "an unparseable value names the flag that carried it, and what it wanted" {
     var cfg = Config{};
     var cli = Cli{};
 
     const bad_channel = parseArgs(&cfg, &cli, argv(&.{ "capsper", "--audio-channel", "SIDEWAYS" })).?;
-    try testing.expectEqual(ArgError.Kind.invalid_channel, bad_channel.kind);
+    try testing.expectEqualStrings("--audio-channel", bad_channel.flag);
     try testing.expectEqualStrings("SIDEWAYS", bad_channel.value);
+    // The 64 AUX positions as a range rather than as 64 tags.
+    try testing.expectEqualStrings("MONO, FL, FR, AUX0-AUX63", bad_channel.expected);
 
+    // No override on this one, so the list comes from the enum itself.
     const bad_key = parseArgs(&cfg, &cli, argv(&.{ "capsper", "--trigger", "escape" })).?;
-    try testing.expectEqual(ArgError.Kind.invalid_trigger_key, bad_key.kind);
+    try testing.expect(std.mem.startsWith(u8, bad_key.expected, "capslock, scrolllock"));
 
     const bad_port = parseArgs(&cfg, &cli, argv(&.{ "capsper", "--port", "http" })).?;
-    try testing.expectEqual(ArgError.Kind.invalid_number, bad_port.kind);
     try testing.expectEqualStrings("--port", bad_port.flag);
+    try testing.expectEqualStrings("a number", bad_port.expected);
 
     const bad_mode = parseArgs(&cfg, &cli, argv(&.{ "capsper", "--on-device-lost", "panic" })).?;
-    try testing.expectEqual(ArgError.Kind.invalid_on_device_lost, bad_mode.kind);
+    try testing.expectEqualStrings("wait, exit", bad_mode.expected);
+
+    // An alias reports the flag it stands for, which is the one to go and read
+    // about.
+    const bad_alias = parseArgs(&cfg, &cli, argv(&.{ "capsper", "--pw-channel", "SIDEWAYS" })).?;
+    try testing.expectEqualStrings("--audio-channel", bad_alias.flag);
 }
 
 test "a value-taking flag at the end of the line is ignored, not misread" {

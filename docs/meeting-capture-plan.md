@@ -423,7 +423,7 @@ same idea.
         .low_latency = false,    // --low-latency
     },
 
-    .tcp_server = .{
+    .tcp = .{
         .port = null,            // --port, -p; null means no server
     },
 

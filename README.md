@@ -185,45 +185,26 @@ The model runs through different backends depending on platform:
 
 A single Zig binary handles everything: keyboard interception, audio capture, mel spectrogram computation, model inference, SentencePiece detokenization, and text injection. No Python, no runtime dependencies beyond the platform's audio system and GPU drivers.
 
-## Server options
+## Command line
 
-Running `capsper` with no arguments prints usage and exits.
+`capsper --help` prints every flag, what it does, the setting in the config
+file it writes, and what that setting is by default. Running with no arguments
+prints the same thing and exits.
 
-```
-capsper [OPTIONS]
-
-  --config PATH             Config file (default: $XDG_CONFIG_HOME/capsper/config.zon)
-  --model, -m PATH          Model directory path (default: ../models/nemotron relative to binary)
-  --port, -p PORT           TCP port (use 0 for OS-assigned; omit for no server)
-  --stream FILE             Stream a WAV file through the pipeline and exit
-  --trigger KEY             Trigger key for push-to-talk (see Trigger keys below)
-  --trigger-passthrough     Forward trigger key to OS after interception
-  --type-delay US           Delay between injected keystrokes in microseconds (default: 12000)
-  --low-latency             Keep audio stream open (mic indicator always visible, ~300ms faster)
-  --audio-target NODE       Audio capture target device name
-  --audio-channel CHANNEL   Audio channel: MONO, FL, FR, AUX0-AUX63 (default: FL)
-  --audio-gain FACTOR       Software gain multiplier (default: 1.0, max: 10.0)
-  --audio-detect            Interactive audio setup wizard (device selection, channel detection, gain calibration)
-  --detect-duration SECS    Duration per detection phase (default: 5)
-  --drop-terms FILE         Text file of phrases to suppress (one per line, exact match)
-  --record-dir DIR          Record each utterance to DIR (WAV + diagnostic log)
-  --record-keep N           Number of recording pairs to keep (default: 10, ring buffer)
-  --transcribe FILE         Batch-transcribe a WAV file (non-streaming) and exit
-  --no-auto-gain            Disable automatic gain adjustment
-  --on-device-lost MODE     exit or wait when the capture device disappears (default: wait)
-  --verbose, -v             Enable verbose logging
-  --dry-run                 Load models, run warmup, then exit (validates setup)
-  --version                 Print version and exit
-```
+That usage message is not written anywhere: it is built from the flag table in
+`src/shared/config.zig` and the doc comment beside each setting, so a flag
+cannot exist without appearing in it. Older spellings -- `--pw-target`,
+`--pw-channel`, `--pw-gain`, `--pw-detect`, `--stream-wav` -- are in the same
+table and are printed beside the flag they alias.
 
 An unrecognised flag is a warning, not an error, so a service file carrying a
 flag from an older version still starts.
 
 ## Config file
 
-Every option above except the one-shot commands can also be set in a config
-file, which is where the settings that do not fit comfortably on a command line
-live. Flags are applied over the file, so a flag always wins for one run.
+Every setting a flag writes can also be set in a config file, which is also
+where the settings that have no flag live -- meeting capture and the console
+among them. Flags are applied over the file, so a flag always wins for one run.
 
 Capsper reads `$XDG_CONFIG_HOME/capsper/config.zon`, falling back to
 `~/.config/capsper/config.zon`, unless `--config` names another path. A missing
@@ -259,7 +240,7 @@ only what you want to change.
         .low_latency = false,    // --low-latency
     },
 
-    .tcp_server = .{
+    .tcp = .{
         .port = null,            // --port, -p; null means no server
     },
 
