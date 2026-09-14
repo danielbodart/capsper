@@ -229,6 +229,33 @@ The one pinned artefact is the onnxruntime build used by `capsper-cuda` (see
 below); its URL and hash live in `nix/package.nix` and only change when the ORT
 version does.
 
+### Which version you end up running
+
+`capsper --version` reports `0.<commits>.<build>`, the same shape the release
+binaries carry, so a Nix build and a tarball build can be compared directly.
+Nix takes the commit count from the flake input and uses the commit date as
+the build stamp, where a release uses the CI run number:
+
+```
+0.392.20260914141256   # nix, at commit 392, committed 14 Sep 14:12:56
+0.392.481              # the release built from that same commit by CI
+```
+
+The commit count only reaches the build if the input is a **git** ref.
+`github:danielbodart/capsper` fetches a tarball through GitHub's API, which
+carries the revision but not the count, and lands on `0.0.<date>`. If you want
+the number, ask for git:
+
+```nix
+capsper = {
+  url = "git+https://github.com/danielbodart/capsper";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+That clones the history rather than fetching a tarball — a little slower to
+fetch and to update, which is the whole of the trade.
+
 ## Why the CUDA variant fetches onnxruntime
 
 `capsper-cpu` links nixpkgs' own `onnxruntime`, which is in `cache.nixos.org`

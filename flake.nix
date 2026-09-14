@@ -21,8 +21,19 @@
       # that changes on every rebuild would need re-approving each time.
       system = "x86_64-linux";
 
-      # Built from source, so the exact revision is the version.
-      version = "0.0.0-git.${self.shortRev or self.dirtyShortRev or "dirty"}";
+      # The same shape `./run.ts version` stamps into the release binaries --
+      # 0.<commits>.<build> -- so `capsper --version` means the same thing
+      # however it was built. `revCount` is the number run.ts gets from
+      # `git rev-list --count`, and `lastModifiedDate` is the same
+      # YYYYMMDDHHMMSS stamp it falls back to off CI, taken from the commit
+      # rather than the clock so the build stays reproducible.
+      #
+      # Only a git ref carries revCount: `github:owner/repo` fetches a tarball
+      # through the API and arrives without one, as does a bare path. Those
+      # land on 0.0.<date> -- still ordered, still exact about the source.
+      # Reference the flake as `git+https://github.com/danielbodart/capsper`
+      # to get the commit count.
+      version = "0.${toString (self.revCount or 0)}.${self.lastModifiedDate}";
 
       pkgs = import nixpkgs {
         inherit system;
