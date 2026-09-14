@@ -90,11 +90,25 @@ const UI_SET_KEYBIT = _ioc(IOC_WRITE, 'U', 101, @sizeOf(c_int));
 const UI_SET_LEDBIT = _ioc(IOC_WRITE, 'U', 104, @sizeOf(c_int));
 const UI_DEV_SETUP = _ioc(IOC_WRITE, 'U', 3, @sizeOf(UinputSetup));
 const UI_DEV_CREATE = _ioc(IOC_NONE, 'U', 1, 0);
+const InotifyEvent = extern struct {
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    len: u32,
+};
+
 const UI_DEV_DESTROY = _ioc(IOC_NONE, 'U', 2, 0);
+
+// inotify constants
+const IN_CREATE: u32 = 0x100;
+const IN_NONBLOCK: c_int = 0x800;
+const IN_CLOEXEC: c_int = 0x80000;
 
 // ──── ioctl wrapper ────
 
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+extern "c" fn inotify_init1(flags: c_int) c_int;
+extern "c" fn inotify_add_watch(fd: c_int, pathname: [*:0]const u8, mask: u32) c_int;
 
 fn doIoctl(fd: posix.fd_t, request: u32, arg: usize) !void {
     if (ioctl(@intCast(fd), @as(c_ulong, request), arg) < 0) {
@@ -352,33 +366,24 @@ pub fn isKeyboardBitmask(keymask: []const u8) bool {
     return true;
 }
 
-/// Fill `out` from a sysfs bitmask: 64-bit hex words, most significant first,
-/// so the last word holds bits 0-63. Bits past the end of `out` are dropped.
-pub fn parseSysfsBitmask(text: []const u8, out: []u8) void {
-    @memset(out, 0);
-
-    var counter = std.mem.tokenizeAny(u8, text, " \t\n");
-    var words: usize = 0;
-    while (counter.next()) |_| words += 1;
-
-    var iter = std.mem.tokenizeAny(u8, text, " \t\n");
-    var i: usize = 0;
-    while (iter.next()) |word| : (i += 1) {
-        const value = std.fmt.parseInt(u64, word, 16) catch continue;
-        const base = (words - 1 - i) * 8;
-        for (0..8) |byte| {
-            if (base + byte >= out.len) break;
-            out[base + byte] = @truncate(value >> @intCast(byte * 8));
-        }
-    }
-}
-
 // ──── Grabbed device tracking ────
 
 const MAX_DEVICES = 32;
 
-/// How often the event loop retries keyboards it does not currently hold.
-const RESCAN_INTERVAL_MS = 2000;
+/// A node inotify has announced, and the moment it is worth opening.
+///
+/// udev applies permissions to a node after creating it, so a grab attempted
+/// the instant it appears gets EACCES. The wait is real. It just cannot be a
+/// sleep, because the thread that would do the sleeping is the one carrying
+/// your keystrokes to the screen.
+const PendingGrab = struct {
+    path: [64]u8,
+    path_len: usize,
+    due_ms: i64,
+};
+
+/// How long to let udev finish with a node before opening it.
+const SETTLE_MS = 200;
 
 const GrabbedDevice = struct {
     fd: posix.fd_t,
@@ -404,6 +409,8 @@ fn findDeviceByPath(devices: []const ?GrabbedDevice, path: []const u8) ?usize {
 pub const InputHandler = struct {
     devices: [MAX_DEVICES]?GrabbedDevice = .{null} ** MAX_DEVICES,
     uinput_fd: posix.fd_t = -1,
+    inotify_fd: posix.fd_t = -1,
+    pending: [MAX_DEVICES]?PendingGrab = .{null} ** MAX_DEVICES,
     trigger_key: u16,
     trigger_passthrough: bool,
     type_delay_us: u64,
@@ -415,7 +422,6 @@ pub const InputHandler = struct {
     panic: PanicDetector = .{},
     trigger: TriggerState = .{},
     typing_cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    last_rescan_ms: i64 = 0,
 
     pub const Config = struct {
         trigger_key: u16 = ev.KEY_CAPSLOCK,
@@ -441,6 +447,14 @@ pub const InputHandler = struct {
 
         // Scan and grab keyboards
         try self.scanDevices();
+
+        // Hotplug: a node created later is announced rather than polled for.
+        const inot_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (inot_fd < 0) return error.InotifyFailed;
+        self.inotify_fd = inot_fd;
+        if (inotify_add_watch(inot_fd, "/dev/input/", IN_CREATE) < 0) {
+            return error.InotifyFailed;
+        }
 
         return self;
     }
@@ -508,8 +522,8 @@ pub const InputHandler = struct {
         }
 
         while (!self.shutdown.load(.monotonic)) {
-            // Build poll fd list from the devices we hold.
-            var fds: [MAX_DEVICES]posix.pollfd = undefined;
+            // Build poll fd list: all grabbed devices + inotify
+            var fds: [MAX_DEVICES + 1]posix.pollfd = undefined;
             var fd_map: [MAX_DEVICES]usize = undefined; // maps poll index → device index
             var nfds: usize = 0;
 
@@ -520,6 +534,10 @@ pub const InputHandler = struct {
                     nfds += 1;
                 }
             }
+
+            // inotify fd last
+            fds[nfds] = .{ .fd = self.inotify_fd, .events = posix.POLL.IN, .revents = 0 };
+            nfds += 1;
 
             const ready = posix.poll(fds[0..nfds], 200) catch |err| {
                 if (err == error.Interrupted) continue;
@@ -536,22 +554,17 @@ pub const InputHandler = struct {
                 log.warn("trigger key not physically held — forcing release", .{});
             }
 
-            // Pick up every keyboard we do not hold: one plugged in since the
-            // last pass, and one whose grab lost a race — the previous capsper
-            // still holding the device across a `systemctl restart` is the one
-            // that bites. Silently running without your keyboard is the worst
-            // failure this file has, and the scan costs half a millisecond, so
-            // there is no reason to wait for anyone to tell us.
-            const now_ms = std.time.milliTimestamp();
-            if (now_ms - self.last_rescan_ms >= RESCAN_INTERVAL_MS) {
-                self.last_rescan_ms = now_ms;
-                self.grabAvailable();
-            }
+            self.grabSettled();
 
             if (ready == 0) continue;
 
+            // Check inotify (last fd)
+            if (fds[nfds - 1].revents & posix.POLL.IN != 0) {
+                self.queueHotplug();
+            }
+
             // Check device events
-            for (0..nfds) |fi| {
+            for (0..nfds - 1) |fi| {
                 if (fds[fi].revents == 0) continue;
                 const dev_idx = fd_map[fi];
 
@@ -632,7 +645,23 @@ pub const InputHandler = struct {
     // ──── Device management ────
 
     fn scanDevices(self: *InputHandler) !void {
-        self.grabAvailable();
+        var dir = std.fs.openDirAbsolute("/dev/input", .{ .iterate = true }) catch |err| {
+            log.err("cannot open /dev/input: {} — is user in 'input' group?", .{err});
+            return err;
+        };
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "event")) continue;
+
+            var path_buf: [64]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&path_buf, "/dev/input/{s}", .{entry.name}) catch continue;
+
+            self.tryGrabDevice(path) catch |err| {
+                log.debug("skipping {s}: {}", .{ path, err });
+            };
+        }
 
         var count: usize = 0;
         for (self.devices) |d| {
@@ -643,32 +672,6 @@ pub const InputHandler = struct {
             return error.NoKeyboards;
         }
         log.info("grabbed {d} keyboard(s)", .{count});
-    }
-
-    /// Try to grab every keyboard in /dev/input that we do not already hold.
-    /// Cheap enough for the event loop to call on a timer: a device we already
-    /// hold costs a path comparison, and the rest an open and two ioctls.
-    fn grabAvailable(self: *InputHandler) void {
-        var dir = std.fs.openDirAbsolute("/dev/input", .{ .iterate = true }) catch |err| {
-            log.err("cannot open /dev/input: {} — is user in 'input' group?", .{err});
-            return;
-        };
-        defer dir.close();
-
-        var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (!std.mem.startsWith(u8, entry.name, "event")) continue;
-
-            var path_buf: [64]u8 = undefined;
-            const path = std.fmt.bufPrintZ(&path_buf, "/dev/input/{s}", .{entry.name}) catch continue;
-
-            if (findDeviceByPath(&self.devices, path) != null) continue;
-            if (!worthOpening(entry.name)) continue;
-
-            self.tryGrabDevice(path) catch |err| {
-                log.debug("skipping {s}: {}", .{ path, err });
-            };
-        }
     }
 
     fn tryGrabDevice(self: *InputHandler, path: [:0]const u8) !void {
@@ -762,6 +765,65 @@ pub const InputHandler = struct {
 
         self.writeEvent(InputEvent.syn());
         log.info("released {d} key(s) held while grabbing {s}", .{ released, name });
+    }
+
+    /// Read what inotify has to say and queue each new node for grabbing once
+    /// udev has had `SETTLE_MS` with it.
+    fn queueHotplug(self: *InputHandler) void {
+        var buf: [4096]u8 = undefined;
+        const n = posix.read(self.inotify_fd, &buf) catch return;
+
+        var offset: usize = 0;
+        while (offset + @sizeOf(InotifyEvent) <= n) {
+            const inot: *const InotifyEvent = @ptrCast(@alignCast(buf[offset..].ptr));
+            const name_start = offset + @sizeOf(InotifyEvent);
+            offset += @sizeOf(InotifyEvent) + inot.len;
+
+            if (inot.len == 0) continue;
+            const name_bytes = buf[name_start .. name_start + inot.len];
+            // Find null terminator
+            var name_end: usize = 0;
+            for (name_bytes) |ch| {
+                if (ch == 0) break;
+                name_end += 1;
+            }
+            const name = name_bytes[0..name_end];
+
+            if (!std.mem.startsWith(u8, name, "event")) continue;
+
+            var path_buf: [64]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&path_buf, "/dev/input/{s}", .{name}) catch continue;
+
+            for (&self.pending) |*slot| {
+                if (slot.* != null) continue;
+                var entry = PendingGrab{
+                    .path = std.mem.zeroes([64]u8),
+                    .path_len = path.len,
+                    .due_ms = std.time.milliTimestamp() + SETTLE_MS,
+                };
+                @memcpy(entry.path[0..path.len], path);
+                slot.* = entry;
+                break;
+            } else {
+                log.warn("no room to queue {s} for grabbing", .{path});
+            }
+        }
+    }
+
+    /// Grab every queued node whose settle time has passed.
+    fn grabSettled(self: *InputHandler) void {
+        const now_ms = std.time.milliTimestamp();
+        for (&self.pending) |*slot| {
+            const entry = slot.* orelse continue;
+            if (now_ms < entry.due_ms) continue;
+            slot.* = null;
+
+            var path_buf: [64]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&path_buf, "{s}", .{entry.path[0..entry.path_len]}) catch continue;
+            self.tryGrabDevice(path) catch |err| {
+                log.debug("skipping {s}: {}", .{ path, err });
+            };
+        }
     }
 
     fn removeDevice(self: *InputHandler, idx: usize) void {
@@ -859,39 +921,6 @@ fn isKeyboard(fd: posix.fd_t) bool {
     var keymask: [bitmask_size]u8 = std.mem.zeroes([bitmask_size]u8);
     doIoctl(fd, EVIOCGBIT(EV_KEY, bitmask_size), @intFromPtr(&keymask)) catch return false;
     return isKeyboardBitmask(&keymask);
-}
-
-/// Read a sysfs attribute into `buf`. Null when the answer cannot be trusted:
-/// no such file, or more of one than `buf` holds.
-fn readSysfs(buf: []u8, comptime path_fmt: []const u8, node: []const u8) ?[]const u8 {
-    var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, path_fmt, .{node}) catch return null;
-    const text = std.fs.cwd().readFile(path, buf) catch return null;
-    if (text.len == buf.len) return null;
-    return std.mem.trim(u8, text, " \n");
-}
-
-/// Whether the scan should open `node` (an `eventN` name) at all.
-///
-/// Opening an evdev node is not free: closing one again costs an RCU grace
-/// period, around ten milliseconds a device, and the thread paying it is the
-/// one forwarding your keystrokes. Twenty-odd devices reopened every couple of
-/// seconds put a third of a second of that between key and screen. sysfs
-/// answers the same two questions from bitmaps the kernel already holds, so
-/// the scan only opens a device it might actually grab. A question sysfs
-/// cannot answer is answered yes, because losing a keyboard costs more than
-/// an open.
-fn worthOpening(node: []const u8) bool {
-    var caps_buf: [1024]u8 = undefined;
-    const caps = readSysfs(&caps_buf, "/sys/class/input/{s}/device/capabilities/key", node) orelse return true;
-
-    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
-    parseSysfsBitmask(caps, &keymask);
-    if (!isKeyboardBitmask(&keymask)) return false;
-
-    var vendor_buf: [32]u8 = undefined;
-    const vendor = readSysfs(&vendor_buf, "/sys/class/input/{s}/device/id/vendor", node) orelse return true;
-    return (std.fmt.parseInt(u16, vendor, 16) catch return true) != VIRTUAL_VENDOR;
 }
 
 /// Parse a trigger key name to a Linux keycode
@@ -1323,64 +1352,3 @@ test "ioctl constants: UI_DEV_CREATE and UI_DEV_DESTROY" {
     try std.testing.expectEqual(@as(u32, 0x00005502), UI_DEV_DESTROY);
 }
 
-// ──── parseSysfsBitmask tests ────
-//
-// The strings are what /sys/class/input/eventN/device/capabilities/key holds
-// for the named devices: 64-bit hex words, most significant first.
-
-test "parseSysfsBitmask: a keyboard's capabilities say keyboard" {
-    // Wooting 80HE.
-    const caps = "1000000000007 ff980000000007ff febeffdfffefffff fffffffffffffffe";
-    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
-    parseSysfsBitmask(caps, &keymask);
-    try std.testing.expect(isKeyboardBitmask(&keymask));
-}
-
-test "parseSysfsBitmask: a mouse's capabilities do not" {
-    // SteelSeries Aerox 5 — buttons, no letters.
-    const caps = "ff0000 0 0 0 0";
-    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
-    parseSysfsBitmask(caps, &keymask);
-    try std.testing.expect(!isKeyboardBitmask(&keymask));
-}
-
-test "parseSysfsBitmask: an RGB controller reporting no keys at all" {
-    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
-    parseSysfsBitmask("0", &keymask);
-    try std.testing.expect(!isKeyboardBitmask(&keymask));
-    for (keymask) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
-}
-
-test "parseSysfsBitmask: the rightmost word holds bits 0-63" {
-    // KEY_1 is 2 and KEY_Y is 21, both inside the low word; a single word must
-    // land there rather than at the front of the mask.
-    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
-    parseSysfsBitmask("8000000000000001", &keymask);
-    try std.testing.expect(hasKeyBit(&keymask, 0));
-    try std.testing.expect(hasKeyBit(&keymask, 63));
-    try std.testing.expect(!hasKeyBit(&keymask, 64));
-}
-
-test "parseSysfsBitmask: leading words carry the high bits" {
-    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
-    parseSysfsBitmask("1 0 0", &keymask);
-    try std.testing.expect(hasKeyBit(&keymask, 128));
-    try std.testing.expect(!hasKeyBit(&keymask, 0));
-}
-
-test "parseSysfsBitmask: bits past the end of the mask are dropped" {
-    // A device reporting more words than KEY_MAX covers must not write past
-    // the buffer, and must still place the low bits correctly.
-    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
-    parseSysfsBitmask("ffffffffffffffff " ** 20 ++ "3", &keymask);
-    try std.testing.expect(hasKeyBit(&keymask, 0));
-    try std.testing.expect(hasKeyBit(&keymask, 1));
-    try std.testing.expect(!hasKeyBit(&keymask, 2));
-}
-
-test "parseSysfsBitmask: a trailing newline is not a word" {
-    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
-    parseSysfsBitmask("3\n", &keymask);
-    try std.testing.expect(hasKeyBit(&keymask, 0));
-    try std.testing.expect(hasKeyBit(&keymask, 1));
-}
