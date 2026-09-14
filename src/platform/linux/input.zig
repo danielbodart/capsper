@@ -51,13 +51,6 @@ const UinputSetup = extern struct {
     ff_effects_max: u32,
 };
 
-const InotifyEvent = extern struct {
-    wd: i32,
-    mask: u32,
-    cookie: u32,
-    len: u32,
-};
-
 // ──── Event type / key constants ────
 
 const EV_SYN: u16 = 0x00;
@@ -99,16 +92,9 @@ const UI_DEV_SETUP = _ioc(IOC_WRITE, 'U', 3, @sizeOf(UinputSetup));
 const UI_DEV_CREATE = _ioc(IOC_NONE, 'U', 1, 0);
 const UI_DEV_DESTROY = _ioc(IOC_NONE, 'U', 2, 0);
 
-// inotify constants
-const IN_CREATE: u32 = 0x100;
-const IN_NONBLOCK: c_int = 0x800;
-const IN_CLOEXEC: c_int = 0x80000;
-
 // ──── ioctl wrapper ────
 
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
-extern "c" fn inotify_init1(flags: c_int) c_int;
-extern "c" fn inotify_add_watch(fd: c_int, pathname: [*:0]const u8, mask: u32) c_int;
 
 fn doIoctl(fd: posix.fd_t, request: u32, arg: usize) !void {
     if (ioctl(@intCast(fd), @as(c_ulong, request), arg) < 0) {
@@ -418,7 +404,6 @@ fn findDeviceByPath(devices: []const ?GrabbedDevice, path: []const u8) ?usize {
 pub const InputHandler = struct {
     devices: [MAX_DEVICES]?GrabbedDevice = .{null} ** MAX_DEVICES,
     uinput_fd: posix.fd_t = -1,
-    inotify_fd: posix.fd_t = -1,
     trigger_key: u16,
     trigger_passthrough: bool,
     type_delay_us: u64,
@@ -457,14 +442,6 @@ pub const InputHandler = struct {
         // Scan and grab keyboards
         try self.scanDevices();
 
-        // Set up inotify for hotplug
-        const inot_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-        if (inot_fd < 0) return error.InotifyFailed;
-        self.inotify_fd = inot_fd;
-        if (inotify_add_watch(inot_fd, "/dev/input/", IN_CREATE) < 0) {
-            return error.InotifyFailed;
-        }
-
         return self;
     }
 
@@ -474,7 +451,6 @@ pub const InputHandler = struct {
 
         self.ungrabAll();
 
-        if (self.inotify_fd >= 0) posix.close(self.inotify_fd);
 
         if (self.uinput_fd >= 0) {
             doIoctl(self.uinput_fd, UI_DEV_DESTROY, 0) catch {};
@@ -489,18 +465,26 @@ pub const InputHandler = struct {
     /// Inject text as keystrokes via uinput. Thread-safe.
     /// Checks typing_cancel per character — if PTT is released mid-injection,
     /// stops immediately instead of typing remaining characters.
+    ///
+    /// The lock is taken per character, never across the delay between them.
+    /// Held for the whole injection it blocks `forwardEvent`, so every key the
+    /// user presses while a transcript is going in waits for the transcript to
+    /// finish — a second of frozen keyboard for a sentence. A character is the
+    /// unit that has to stay whole; between two of them a real keystroke is
+    /// welcome to go first.
     pub fn typeText(self: *InputHandler, text: []const u8) void {
-        self.uinput_mutex.lock();
-        defer self.uinput_mutex.unlock();
-
         for (text, 0..) |ch, i| {
             if (self.typing_cancel.load(.monotonic)) {
                 log.info("typing cancelled ({d} chars remaining)", .{text.len - i});
                 break;
             }
             const char_ev = eventsForChar(ch);
-            for (char_ev.slice()) |event| {
-                self.writeEvent(event);
+            {
+                self.uinput_mutex.lock();
+                defer self.uinput_mutex.unlock();
+                for (char_ev.slice()) |event| {
+                    self.writeEvent(event);
+                }
             }
             if (char_ev.len > 0 and self.type_delay_us > 0) {
                 std.Thread.sleep(self.type_delay_us * std.time.ns_per_us);
@@ -524,8 +508,8 @@ pub const InputHandler = struct {
         }
 
         while (!self.shutdown.load(.monotonic)) {
-            // Build poll fd list: all grabbed devices + inotify
-            var fds: [MAX_DEVICES + 1]posix.pollfd = undefined;
+            // Build poll fd list from the devices we hold.
+            var fds: [MAX_DEVICES]posix.pollfd = undefined;
             var fd_map: [MAX_DEVICES]usize = undefined; // maps poll index → device index
             var nfds: usize = 0;
 
@@ -536,10 +520,6 @@ pub const InputHandler = struct {
                     nfds += 1;
                 }
             }
-
-            // inotify fd last
-            fds[nfds] = .{ .fd = self.inotify_fd, .events = posix.POLL.IN, .revents = 0 };
-            nfds += 1;
 
             const ready = posix.poll(fds[0..nfds], 200) catch |err| {
                 if (err == error.Interrupted) continue;
@@ -556,13 +536,12 @@ pub const InputHandler = struct {
                 log.warn("trigger key not physically held — forcing release", .{});
             }
 
-            // Retry keyboards we do not hold. A grab that loses a race — the
-            // previous capsper still holding the device across a `systemctl
-            // restart` is the one that bites — otherwise loses that keyboard
-            // for the lifetime of the process, because inotify only fires for
-            // newly created nodes and never for one that was there all along.
-            // Silently running without your keyboard is the worst failure this
-            // file has, so pay a scan every couple of seconds to avoid it.
+            // Pick up every keyboard we do not hold: one plugged in since the
+            // last pass, and one whose grab lost a race — the previous capsper
+            // still holding the device across a `systemctl restart` is the one
+            // that bites. Silently running without your keyboard is the worst
+            // failure this file has, and the scan costs half a millisecond, so
+            // there is no reason to wait for anyone to tell us.
             const now_ms = std.time.milliTimestamp();
             if (now_ms - self.last_rescan_ms >= RESCAN_INTERVAL_MS) {
                 self.last_rescan_ms = now_ms;
@@ -571,13 +550,8 @@ pub const InputHandler = struct {
 
             if (ready == 0) continue;
 
-            // Check inotify (last fd)
-            if (fds[nfds - 1].revents & posix.POLL.IN != 0) {
-                self.handleHotplug();
-            }
-
             // Check device events
-            for (0..nfds - 1) |fi| {
+            for (0..nfds) |fi| {
                 if (fds[fi].revents == 0) continue;
                 const dev_idx = fd_map[fi];
 
@@ -772,6 +746,12 @@ pub const InputHandler = struct {
         var state: [state_size]u8 = std.mem.zeroes([state_size]u8);
         doIoctl(fd, EVIOCGKEY(state_size), @intFromPtr(&state)) catch return;
 
+        // These go to the same virtual keyboard a transcript is typed on, so
+        // they take the same lock: half a released modifier in the middle of an
+        // injected character is its own bug.
+        self.uinput_mutex.lock();
+        defer self.uinput_mutex.unlock();
+
         var released: usize = 0;
         for (0..KEY_MAX + 1) |code| {
             if (!hasKeyBit(&state, @intCast(code))) continue;
@@ -827,36 +807,6 @@ pub const InputHandler = struct {
         }
     }
 
-    fn handleHotplug(self: *InputHandler) void {
-        var buf: [4096]u8 = undefined;
-        const n = posix.read(self.inotify_fd, &buf) catch return;
-
-        var offset: usize = 0;
-        while (offset + @sizeOf(InotifyEvent) <= n) {
-            const inot: *const InotifyEvent = @ptrCast(@alignCast(buf[offset..].ptr));
-            const name_start = offset + @sizeOf(InotifyEvent);
-            offset += @sizeOf(InotifyEvent) + inot.len;
-
-            if (inot.len == 0) continue;
-            const name_bytes = buf[name_start .. name_start + inot.len];
-            // Find null terminator
-            var name_end: usize = 0;
-            for (name_bytes) |ch| {
-                if (ch == 0) break;
-                name_end += 1;
-            }
-            const name = name_bytes[0..name_end];
-
-            if (!std.mem.startsWith(u8, name, "event")) continue;
-
-            // Short delay for device to initialize
-            std.Thread.sleep(200 * std.time.ns_per_ms);
-
-            var path_buf: [64]u8 = undefined;
-            const path = std.fmt.bufPrintZ(&path_buf, "/dev/input/{s}", .{name}) catch continue;
-            self.tryGrabDevice(path) catch {};
-        }
-    }
 };
 
 // ──── Standalone helpers ────
