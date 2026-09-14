@@ -466,6 +466,8 @@ pub const Server = struct {
         var auto_gain = AutoGain{ .current_gain = self.cfg.audio.gain };
         var driver = session.SessionDriver.init(live_at_start);
         var level_mon = session.InputLevelMonitor{};
+        var capture_report = session.CaptureReport{};
+        var window_start_ms: i64 = 0;
         var total_audio_bytes: usize = 0;
 
         while (true) {
@@ -482,6 +484,7 @@ pub const Server = struct {
                 const chunk_start_bytes = total_audio_bytes;
                 total_audio_bytes += ev.audio.len;
                 if (driver.live) {
+                    capture_report.feed(ev.audio);
                     const rms = utils.channelRms(ev.audio, 1, 0);
                     chunk = .{
                         .start_ms = webvtt.msFromBytes(chunk_start_bytes),
@@ -527,6 +530,8 @@ pub const Server = struct {
                 .reset_segment => asr.resetSegment(),
                 .start_recording => {
                     level_mon.reset();
+                    capture_report.start();
+                    window_start_ms = std.time.milliTimestamp();
                     if (self.recorder) |rec| rec.startRecording();
                     if (self.cfg.verbose) {
                         var ts_buf: [32]u8 = undefined;
@@ -539,6 +544,7 @@ pub const Server = struct {
                 .transcribe => |t| try self.runTranscribe(asr, t.audio, t.flush, output_fd, type_cb, total_audio_bytes),
                 .end_recording => {
                     if (self.recorder) |rec| rec.endRecording() catch {};
+                    reportCapture(&capture_report, window_start_ms);
                 },
                 .stop => {
                     std.debug.print("session ended (eof)\n", .{});
@@ -613,6 +619,38 @@ pub const Server = struct {
         if (self.recorder) |rec| rec.logEmit(delta);
     }
 };
+
+/// Say so when a capture window produced nothing usable.
+///
+/// Worth the noise it costs. A microphone that stops delivering is invisible
+/// from the desktop — the recording is written, the transcript is empty, and
+/// every log line still reads like success — so the failure presents as
+/// capsper being broken and sends the user to restart capsper, which cannot
+/// fix it. One line naming the input device saves that whole detour.
+fn reportCapture(report: *const session.CaptureReport, window_start_ms: i64) void {
+    const window_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - window_start_ms));
+    const verdict = report.verdict(window_ms) orelse return;
+
+    const window_s = asSeconds(window_ms);
+    switch (verdict) {
+        .no_audio => log.warn(
+            "no audio arrived in {d:.1}s of capture — the input device has stopped delivering; check it is powered and unmuted",
+            .{window_s},
+        ),
+        .digital_silence => log.warn(
+            "{d:.1}s of capture was pure digital silence — the input device is still streaming but producing nothing",
+            .{window_s},
+        ),
+        .starved => |captured_ms| log.warn(
+            "only {d:.1}s of audio arrived in {d:.1}s of capture — the input device is dropping it",
+            .{ asSeconds(captured_ms), window_s },
+        ),
+    }
+}
+
+fn asSeconds(ms: u64) f64 {
+    return @as(f64, @floatFromInt(ms)) / 1000.0;
+}
 
 /// Format audio-position timestamp as "{s}.{tenths}" into buf.
 /// Uses total audio bytes received (at 32000 bytes/sec) instead of wall-clock,

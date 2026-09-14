@@ -370,12 +370,27 @@ pub fn isKeyboardBitmask(keymask: []const u8) bool {
 
 const MAX_DEVICES = 32;
 
+/// How often the event loop retries keyboards it does not currently hold.
+const RESCAN_INTERVAL_MS = 2000;
+
 const GrabbedDevice = struct {
     fd: posix.fd_t,
     grabbed: bool,
     name: [64]u8,
     name_len: usize,
+    path: [64]u8,
+    path_len: usize,
 };
+
+/// Index of the device we hold for `path`, or null if we do not hold it.
+fn findDeviceByPath(devices: []const ?GrabbedDevice, path: []const u8) ?usize {
+    for (devices, 0..) |maybe_dev, i| {
+        if (maybe_dev) |dev| {
+            if (std.mem.eql(u8, dev.path[0..dev.path_len], path)) return i;
+        }
+    }
+    return null;
+}
 
 // ──── InputHandler ────
 
@@ -394,6 +409,7 @@ pub const InputHandler = struct {
     panic: PanicDetector = .{},
     trigger: TriggerState = .{},
     typing_cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    last_rescan_ms: i64 = 0,
 
     pub const Config = struct {
         trigger_key: u16 = ev.KEY_CAPSLOCK,
@@ -519,6 +535,19 @@ pub const InputHandler = struct {
                 log.warn("trigger key not physically held — forcing release", .{});
             }
 
+            // Retry keyboards we do not hold. A grab that loses a race — the
+            // previous capsper still holding the device across a `systemctl
+            // restart` is the one that bites — otherwise loses that keyboard
+            // for the lifetime of the process, because inotify only fires for
+            // newly created nodes and never for one that was there all along.
+            // Silently running without your keyboard is the worst failure this
+            // file has, so pay a scan every couple of seconds to avoid it.
+            const now_ms = std.time.milliTimestamp();
+            if (now_ms - self.last_rescan_ms >= RESCAN_INTERVAL_MS) {
+                self.last_rescan_ms = now_ms;
+                self.grabAvailable();
+            }
+
             if (ready == 0) continue;
 
             // Check inotify (last fd)
@@ -608,23 +637,7 @@ pub const InputHandler = struct {
     // ──── Device management ────
 
     fn scanDevices(self: *InputHandler) !void {
-        var dir = std.fs.openDirAbsolute("/dev/input", .{ .iterate = true }) catch |err| {
-            log.err("cannot open /dev/input: {} — is user in 'input' group?", .{err});
-            return err;
-        };
-        defer dir.close();
-
-        var iter = dir.iterate();
-        while (try iter.next()) |entry| {
-            if (!std.mem.startsWith(u8, entry.name, "event")) continue;
-
-            var path_buf: [64]u8 = undefined;
-            const path = std.fmt.bufPrintZ(&path_buf, "/dev/input/{s}", .{entry.name}) catch continue;
-
-            self.tryGrabDevice(path) catch |err| {
-                log.debug("skipping {s}: {}", .{ path, err });
-            };
-        }
+        self.grabAvailable();
 
         var count: usize = 0;
         for (self.devices) |d| {
@@ -637,8 +650,33 @@ pub const InputHandler = struct {
         log.info("grabbed {d} keyboard(s)", .{count});
     }
 
-    fn tryGrabDevice(self: *InputHandler, path: [*:0]const u8) !void {
-        const fd = posix.openZ(path, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0) catch {
+    /// Try to grab every keyboard in /dev/input that we do not already hold.
+    /// Cheap enough for the event loop to call on a timer: a device we already
+    /// hold costs a path comparison, and the rest an open and two ioctls.
+    fn grabAvailable(self: *InputHandler) void {
+        var dir = std.fs.openDirAbsolute("/dev/input", .{ .iterate = true }) catch |err| {
+            log.err("cannot open /dev/input: {} — is user in 'input' group?", .{err});
+            return;
+        };
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "event")) continue;
+
+            var path_buf: [64]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&path_buf, "/dev/input/{s}", .{entry.name}) catch continue;
+
+            self.tryGrabDevice(path) catch |err| {
+                if (err != error.AlreadyHeld) log.debug("skipping {s}: {}", .{ path, err });
+            };
+        }
+    }
+
+    fn tryGrabDevice(self: *InputHandler, path: [:0]const u8) !void {
+        if (findDeviceByPath(&self.devices, path) != null) return error.AlreadyHeld;
+
+        const fd = posix.openZ(path.ptr, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0) catch {
             return error.OpenFailed;
         };
         errdefer posix.close(fd);
@@ -661,10 +699,9 @@ pub const InputHandler = struct {
             name_len += 1;
         }
 
-        // Wait for neutral key state before grabbing
-        try waitNeutral(fd);
-
-        // Grab
+        // Grab whatever the keys are doing. Declining a keyboard because
+        // someone is leaning on it loses that keyboard for good, which is a
+        // far worse outcome than the latched key `releaseHeldKeys` repairs.
         doIoctl(fd, EVIOCGRAB, 1) catch return error.GrabFailed;
 
         // Drain pending events
@@ -673,10 +710,22 @@ pub const InputHandler = struct {
             _ = posix.read(fd, std.mem.asBytes(&drain_buf)) catch break;
         }
 
+        self.releaseHeldKeys(fd, name[0..name_len]);
+
+        var path_store: [64]u8 = std.mem.zeroes([64]u8);
+        @memcpy(path_store[0..path.len], path);
+
         // Store in first available slot
         for (&self.devices) |*slot| {
             if (slot.* == null) {
-                slot.* = .{ .fd = fd, .grabbed = true, .name = name, .name_len = name_len };
+                slot.* = .{
+                    .fd = fd,
+                    .grabbed = true,
+                    .name = name,
+                    .name_len = name_len,
+                    .path = path_store,
+                    .path_len = path.len,
+                };
                 log.info("grabbed: {s}", .{name[0..name_len]});
                 return;
             }
@@ -684,6 +733,31 @@ pub const InputHandler = struct {
         // No slots available
         doIoctl(fd, EVIOCGRAB, 0) catch {};
         posix.close(fd);
+    }
+
+    /// Say, on the virtual keyboard, that every key the device reports as held
+    /// has come up.
+    ///
+    /// Grabbing mid-press splits a keypress in two: the press reached the
+    /// desktop from the real device, and everything after the grab arrives
+    /// from ours instead — with the trigger key's release swallowed outright
+    /// when passthrough is off. Left alone that is a modifier stuck down until
+    /// the user works out to tap it again, so send the releases ourselves.
+    fn releaseHeldKeys(self: *InputHandler, fd: posix.fd_t, name: []const u8) void {
+        const state_size = (KEY_MAX + 7) / 8 + 1;
+        var state: [state_size]u8 = std.mem.zeroes([state_size]u8);
+        doIoctl(fd, EVIOCGKEY(state_size), @intFromPtr(&state)) catch return;
+
+        var released: usize = 0;
+        for (0..KEY_MAX + 1) |code| {
+            if (!hasKeyBit(&state, @intCast(code))) continue;
+            self.writeEvent(InputEvent.key(@intCast(code), 0));
+            released += 1;
+        }
+        if (released == 0) return;
+
+        self.writeEvent(InputEvent.syn());
+        log.info("released {d} key(s) held while grabbing {s}", .{ released, name });
     }
 
     fn removeDevice(self: *InputHandler, idx: usize) void {
@@ -811,26 +885,6 @@ fn isKeyboard(fd: posix.fd_t) bool {
     var keymask: [bitmask_size]u8 = std.mem.zeroes([bitmask_size]u8);
     doIoctl(fd, EVIOCGBIT(EV_KEY, bitmask_size), @intFromPtr(&keymask)) catch return false;
     return isKeyboardBitmask(&keymask);
-}
-
-fn waitNeutral(fd: posix.fd_t) !void {
-    const state_size = (KEY_MAX + 7) / 8 + 1;
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        var state: [state_size]u8 = std.mem.zeroes([state_size]u8);
-        doIoctl(fd, EVIOCGKEY(state_size), @intFromPtr(&state)) catch |err| return err;
-
-        var any_pressed = false;
-        for (state) |byte| {
-            if (byte != 0) {
-                any_pressed = true;
-                break;
-            }
-        }
-        if (!any_pressed) return;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-    }
-    return error.KeysStillPressed;
 }
 
 /// Parse a trigger key name to a Linux keycode
@@ -1179,6 +1233,43 @@ test "isKeyboardBitmask: short mask fails gracefully" {
 
 // ──── ioctl constant verification ────
 // Computed values verified against linux/input.h and linux/uinput.h kernel headers.
+
+// ──── findDeviceByPath tests ────
+
+fn testDevice(path: []const u8) GrabbedDevice {
+    var dev = GrabbedDevice{
+        .fd = -1,
+        .grabbed = true,
+        .name = std.mem.zeroes([64]u8),
+        .name_len = 0,
+        .path = std.mem.zeroes([64]u8),
+        .path_len = path.len,
+    };
+    @memcpy(dev.path[0..path.len], path);
+    return dev;
+}
+
+test "findDeviceByPath: finds a held device" {
+    const devices = [_]?GrabbedDevice{ null, testDevice("/dev/input/event23"), null };
+    try std.testing.expectEqual(@as(?usize, 1), findDeviceByPath(&devices, "/dev/input/event23"));
+}
+
+test "findDeviceByPath: a device we skipped is not held" {
+    const devices = [_]?GrabbedDevice{ testDevice("/dev/input/event22"), null };
+    try std.testing.expectEqual(@as(?usize, null), findDeviceByPath(&devices, "/dev/input/event23"));
+}
+
+test "findDeviceByPath: does not match on a path prefix" {
+    // event2 must not shadow event23 — a stale prefix match would leave the
+    // real keyboard ungrabbed forever.
+    const devices = [_]?GrabbedDevice{testDevice("/dev/input/event2")};
+    try std.testing.expectEqual(@as(?usize, null), findDeviceByPath(&devices, "/dev/input/event23"));
+}
+
+test "findDeviceByPath: empty device table holds nothing" {
+    const devices = [_]?GrabbedDevice{ null, null };
+    try std.testing.expectEqual(@as(?usize, null), findDeviceByPath(&devices, "/dev/input/event23"));
+}
 
 test "ioctl constants: EVIOCGRAB" {
     try std.testing.expectEqual(@as(u32, 0x40044590), EVIOCGRAB);

@@ -106,6 +106,83 @@ pub const InputLevelMonitor = struct {
     }
 };
 
+/// What the microphone actually delivered across one capture window.
+///
+/// `InputLevelMonitor` answers "is this quiet?" while audio flows, which leaves
+/// the worse failure unreported: when the device stops delivering there are no
+/// chunks, so nothing reaches a per-chunk detector and the window ends with
+/// nothing said about it. That is what a USB interface that has dropped out
+/// looks like from in here, and to the user it reads as capsper being broken —
+/// they restart capsper, which cannot help, rather than the interface, which
+/// would.
+///
+/// Deliberately narrow: every verdict below is one a working microphone cannot
+/// produce. A warning that cries wolf on a press where nobody got round to
+/// speaking is worse than no warning at all, so "quiet" is left to the monitor
+/// above and this reports only "nothing at all".
+pub const CaptureReport = struct {
+    bytes: usize = 0,
+    peak: u16 = 0,
+
+    /// 16 kHz mono S16 — the only format that reaches here.
+    const bytes_per_ms: u64 = 32;
+
+    /// Audio missing from the head of a window that the device is not to blame
+    /// for: outside low-latency mode the PipeWire stream is connected per press
+    /// and takes roughly this long to hand over its first buffer.
+    const connect_allowance_ms: u64 = 1500;
+
+    /// Shorter than this and there is nothing to judge — a quick tap ends
+    /// before the stream has produced anything, which is ordinary.
+    const min_window_ms: u64 = 2000;
+
+    pub const Verdict = union(enum) {
+        /// Not one byte arrived.
+        no_audio,
+        /// Audio arrived and every sample of it was exactly zero. A live
+        /// converter always dithers; only a stopped or muted one reads as
+        /// true digital zero.
+        digital_silence,
+        /// Far less audio than the window lasted, in milliseconds captured.
+        starved: u64,
+    };
+
+    /// Begin a fresh window (call on PTT press).
+    pub fn start(self: *CaptureReport) void {
+        self.* = .{};
+    }
+
+    /// Feed one chunk of captured PCM.
+    pub fn feed(self: *CaptureReport, pcm: []const u8) void {
+        self.bytes += pcm.len;
+
+        var i: usize = 0;
+        while (i + 1 < pcm.len) : (i += 2) {
+            const sample = std.mem.readInt(i16, pcm[i..][0..2], .little);
+            // Negated as i32: -32768 has no positive i16 counterpart.
+            const magnitude: u16 = @intCast(@abs(@as(i32, sample)));
+            if (magnitude > self.peak) self.peak = magnitude;
+        }
+    }
+
+    /// What to say about the window just ended, or null if there is nothing
+    /// wrong with it worth saying.
+    pub fn verdict(self: *const CaptureReport, window_ms: u64) ?Verdict {
+        if (window_ms < min_window_ms) return null;
+        if (self.bytes == 0) return .no_audio;
+        if (self.peak == 0) return .digital_silence;
+
+        const captured_ms = self.bytes / bytes_per_ms;
+        const owed_ms = window_ms - connect_allowance_ms;
+        // Half, not all: the allowance above is a typical connect time rather
+        // than a bound, and this should fire on a device that has stopped, not
+        // on one that was slow to start.
+        if (captured_ms * 2 < owed_ms) return .{ .starved = captured_ms };
+
+        return null;
+    }
+};
+
 /// Pure PTT/segmentation/recording state machine. `live` tracks whether an
 /// utterance is in progress. Every transition that ends an utterance
 /// (release/timeout/eof) flushes the pipeline AND ends the recording — the two
@@ -461,6 +538,81 @@ fn expectTag(e: Event, tag: std.meta.Tag(Event)) !void {
 // LocalPttEventSource multiplexes a PTT pipe and an audio pipe with real fds
 // (no hardware). Proves a release is delivered even though audio is present,
 // full chunks are yielded, and audio-pipe EOF surfaces as `.eof`.
+// ──── CaptureReport ────
+//
+// The numbers below are the ones from the morning a Vocaster stopped
+// delivering mid-session: capsper wrote three recordings, reported success for
+// all three, and said nothing at all about the microphone having died.
+
+/// `ms` of 16 kHz mono S16 at a constant amplitude.
+fn tone(buf: []u8, amplitude: i16) []u8 {
+    var i: usize = 0;
+    while (i + 1 < buf.len) : (i += 2) {
+        std.mem.writeInt(i16, buf[i..][0..2], amplitude, .little);
+    }
+    return buf;
+}
+
+test "capture report: a healthy press says nothing" {
+    var buf: [3000 * 32]u8 = undefined;
+    var r = CaptureReport{};
+    r.feed(tone(&buf, 8000));
+    try std.testing.expectEqual(@as(?CaptureReport.Verdict, null), r.verdict(3800));
+}
+
+test "capture report: 008.wav — a long press that captured nothing at all" {
+    var r = CaptureReport{};
+    try std.testing.expectEqual(CaptureReport.Verdict.no_audio, r.verdict(2400).?);
+}
+
+test "capture report: a quick tap is too short to judge" {
+    // 008 itself was a 0.2s tap; ending before the stream produces anything is
+    // ordinary and must not warn.
+    var r = CaptureReport{};
+    try std.testing.expectEqual(@as(?CaptureReport.Verdict, null), r.verdict(200));
+}
+
+test "capture report: a device streaming pure zeros is not a quiet room" {
+    var buf: [3000 * 32]u8 = undefined;
+    var r = CaptureReport{};
+    r.feed(tone(&buf, 0));
+    try std.testing.expectEqual(CaptureReport.Verdict.digital_silence, r.verdict(3800).?);
+}
+
+test "capture report: 007.wav — 0.56s of audio in a 3.8s press" {
+    var buf: [560 * 32]u8 = undefined;
+    var r = CaptureReport{};
+    r.feed(tone(&buf, 102)); // the measured peak: noise floor, but not zero
+    try std.testing.expectEqual(CaptureReport.Verdict{ .starved = 560 }, r.verdict(3800).?);
+}
+
+test "capture report: a slow stream start is not starvation" {
+    // 2.0s of audio in a 3.8s press — the head lost to connecting the stream.
+    var buf: [2000 * 32]u8 = undefined;
+    var r = CaptureReport{};
+    r.feed(tone(&buf, 8000));
+    try std.testing.expectEqual(@as(?CaptureReport.Verdict, null), r.verdict(3800));
+}
+
+test "capture report: peak survives a quiet chunk after a loud one" {
+    var loud: [100 * 32]u8 = undefined;
+    var quiet: [2900 * 32]u8 = undefined;
+    var r = CaptureReport{};
+    r.feed(tone(&loud, -32768)); // the sample with no positive counterpart
+    r.feed(tone(&quiet, 0));
+    try std.testing.expectEqual(@as(u16, 32768), r.peak);
+    try std.testing.expectEqual(@as(?CaptureReport.Verdict, null), r.verdict(3000));
+}
+
+test "capture report: start clears the previous window" {
+    var buf: [3000 * 32]u8 = undefined;
+    var r = CaptureReport{};
+    r.feed(tone(&buf, 8000));
+    r.start();
+    try std.testing.expectEqual(@as(usize, 0), r.bytes);
+    try std.testing.expectEqual(CaptureReport.Verdict.no_audio, r.verdict(2400).?);
+}
+
 test "LocalPttEventSource: multiplexes PTT and audio over real pipes" {
     const audio = try posix.pipe();
     defer posix.close(audio[0]);
