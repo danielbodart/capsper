@@ -364,10 +364,18 @@ describe.skipIf(!isLinux)("echo cancellation: a far end coming back off the spea
 
         // A microphone capsper can be pointed at. Same bridge the streaming
         // regressions use, at 16 kHz so the graph does not resample twice.
+        //
+        // `priority.session = 0` keeps it out of the desktop's reach. An
+        // Audio/Source appearing in the graph looks to a session manager
+        // exactly like a microphone being plugged in, so WirePlumber can make
+        // it the default input and write that choice to
+        // ~/.local/state/wireplumber/default-nodes -- which outlives the test,
+        // the test run, and the reboot after it, naming a node that will never
+        // exist again. Lowest priority means a real microphone always wins.
         loopback = spawn([
             "pw-loopback",
-            `--capture-props={"media.class":"Audio/Sink", "node.name":"${MIC_SINK}", "audio.rate":16000}`,
-            `--playback-props={"media.class":"Audio/Source", "node.name":"${MIC_SOURCE}", "audio.rate":16000}`,
+            `--capture-props={"media.class":"Audio/Sink", "node.name":"${MIC_SINK}", "audio.rate":16000, "priority.session":0}`,
+            `--playback-props={"media.class":"Audio/Source", "node.name":"${MIC_SOURCE}", "audio.rate":16000, "priority.session":0}`,
             "-C", "1", "-m", "MONO",
         ], { stdout: "ignore", stderr: "ignore" });
         trackProc(loopback);
