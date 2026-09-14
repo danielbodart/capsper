@@ -3,15 +3,13 @@ import { $, spawn, file } from "bun";
 import { readdirSync, readFileSync, statSync, existsSync } from "fs";
 import { basename, join } from "path";
 import {
-    hasGpu, ensureBinary, ensureFile,
+    ensureBinary, ensureFile,
     startServer, startLocalServer, readPcm,
     streamPcmFast, streamPcm, streamWavDirect,
     assertTranscript, printScorecard, saveLog, saveScoring,
     wavDuration, trackProc, waitForLog, until,
     type Thresholds, type TranscriptResult,
 } from "./helpers";
-
-const gpu = await hasGpu();
 
 // --- Test mode: tcp (default), tcp-realtime, pipewire, stream-wav ---
 type TestMode = "tcp" | "tcp-realtime" | "pipewire" | "stream-wav";
@@ -199,7 +197,7 @@ async function streamPcmPipeWire(
 const groups = buildGroups();
 
 for (const g of groups) {
-    describe.skipIf(!gpu)(`${g.name} regressions (${testMode})`, () => {
+    describe(`${g.name} regressions (${testMode})`, () => {
         let tcpServer: Awaited<ReturnType<typeof startServer>> | null = null;
         const results: TranscriptResult[] = [];
         const serverArgs = [

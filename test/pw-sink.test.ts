@@ -176,8 +176,8 @@ async function startCapsper(opts: {
     });
     trackProc(proc);
 
-    // 180s: the model still loads before the process settles, and a first CUDA
-    // run compiles PTX.
+    // 180s: the model still loads and runs a warmup pass before the process
+    // settles.
     await waitForLog(logFile, new RegExp(`Virtual sink '${opts.sink}' ready`), proc, 180);
 
     // "Ready" and "visible in the graph" are not the same instant: the module

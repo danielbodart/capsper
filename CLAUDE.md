@@ -34,20 +34,19 @@ Zig and Bun are installed automatically via `bootstrap.sh` + mise.
 
 ### Build Variants
 
-The build produces separate binaries per platform via `-Dbackend=`:
+One binary, named `capsper`, with the ASR backend chosen at compile time from the target OS:
 
-| Binary | Platform | Backend | Build Option |
-|--------|----------|---------|-------------|
-| `capsper` | macOS | CoreML (ANE + CPU) | `-Dbackend=coreml` (default on macOS) |
-| `capsper-cuda` | Linux | ORT + CUDA | `-Dbackend=ort_cuda` (default on Linux) |
-| `capsper-cpu` | Linux | ORT CPU only | `-Dbackend=ort_cpu` |
+| Platform | Backend |
+|----------|---------|
+| macOS | CoreML (ANE + CPU) |
+| Linux | ONNX Runtime, CPU execution provider |
 
-On macOS, `./run.ts build` produces one binary. On Linux, it builds both `capsper-cuda` and `capsper-cpu`, plus a `bin/capsper` launcher script that detects GPU and exec's the right one.
+There is no build option to select it and no second variant to choose between at install time.
 
 ### Testing
 
 ```bash
-# Unit + property tests (fast, no GPU required)
+# Unit + property tests (fast, no model required)
 ./run.ts test
 
 # Regression test groups (requires built binary)
@@ -86,10 +85,10 @@ src/
   backend/
     pipeline.zig                   — Comptime switch → concrete Pipeline type
     init.zig                       — Comptime switch → backend-specific init
-    ort/                           — ONNX Runtime (Linux CUDA + CPU)
+    ort/                           — ONNX Runtime (Linux, CPU)
       pipeline.zig                   Nemotron RNNT streaming pipeline
       ort_c.zig                      ORT C API bindings
-      init.zig                       ORT model loading, CUDA EP setup
+      init.zig                       ORT model loading, session setup
     coreml/                        — CoreML (macOS)
       pipeline.zig                   CoreML streaming pipeline
       helpers.m                      Obj-C bridge (model load, predict, cache)
@@ -115,8 +114,8 @@ src/
 
 ### Scripts & Task Runner
 
-- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `dev` (default), `build`, `clean`, `setup`, `test`, `slow-test`, `dist`, `ci`. On Linux, builds both CUDA and CPU variants.
-- **`install.sh`** — Self-contained bash installer. Ships in dist tarball. On macOS: downloads CoreML models from HuggingFace. On Linux: downloads ONNX models (int8-static for GPU, int8-dynamic for CPU).
+- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `dev` (default), `build`, `clean`, `setup`, `test`, `slow-test`, `dist`, `ci`.
+- **`install.sh`** — Self-contained bash installer. Ships in dist tarball. On macOS: downloads CoreML models from HuggingFace. On Linux: downloads the int8 ONNX model.
 
 ### Build System & `dist/` Layout
 
@@ -125,7 +124,7 @@ Platform-specific files are separated into `dist/linux/` and `dist/macos/`, mirr
 ```
 dist/
 ├── linux/
-│   ├── bin/                     (build output: capsper-cuda, capsper-cpu, capsper symlink)
+│   ├── bin/                     (build output: capsper)
 │   ├── lib/                     (pre-built ORT .so files via LFS)
 │   ├── include/onnxruntime/     (ORT C API headers — build-time only)
 │   ├── install.sh               (Linux installer)
@@ -142,12 +141,11 @@ dist/
 
 ### Nix / NixOS
 
-`nix/` plus the root `flake.nix` package capsper for NixOS. Both variants are **built from source** — nothing is patchelf'd, because Zig links the executable and sets its own interpreter and RPATH. Things to know:
+`nix/` plus the root `flake.nix` package capsper for NixOS. It is **built from source** — nothing is patchelf'd, because Zig links the executable and sets its own interpreter and RPATH. Things to know:
 
-- The flake tracks the repository, not releases. There are no binary hashes to bump.
-- `capsper-cpu` links nixpkgs' `onnxruntime` (1.24.4, cached). `capsper-cuda` links the ORT that capsper's CI publishes, because `onnxruntime` with `cudaSupport` is in **no** binary cache and would be a multi-hour compile per nixpkgs bump. That one URL + hash in `nix/package.nix` is the only pinned artefact.
-- ORT 1.24.4 vs the tarball's 1.23.2 is verified equivalent — the long regression group produces identical coverage and WER on both.
-- `./run.ts nix` runs `nix flake check` (including a NixOS VM test of the module) and builds both packages. Wired into CI as its own job; it is a no-op where `nix` is absent, including macOS.
+- The flake tracks the repository, not releases. There are no binary hashes to bump, and no pinned artefacts at all.
+- It links nixpkgs' `onnxruntime` (1.24.4, cached), rather than the 1.23.2 in `dist/linux/lib`. The two are verified equivalent — the long regression group produces identical coverage and WER on both.
+- `./run.ts nix` runs `nix flake check` (including a NixOS VM test of the module) and builds the package. Wired into CI as its own job; it is a no-op where `nix` is absent, including macOS.
 - The Nix build relies on three `build.zig` options — `-Dort-include`/`-Dort-lib` (external onnxruntime), `-Drpath` (RPATH entries for absolute store paths), and `-Dprop-tests=false` (drops the only external Zig dependency, so the sandboxed build needs no network). All default to the previous behaviour, so the tarball build is unchanged.
 - `dist/linux/lib/*.so` are Git LFS objects and arrive as pointer files when the flake is fetched from GitHub. The source filter excludes that directory; nothing in the Nix build reads it.
 
@@ -181,12 +179,11 @@ Do NOT manually download CI artifacts or stage releases by hand — the update s
 
 **Never change test thresholds without human approval.** Regression test thresholds (coverage, WER, gap, repetition limits) in `.test.json` files are carefully tuned. If a code change causes tests to fail, fix the code — don't relax the thresholds. If thresholds genuinely need updating, present the before/after results and get explicit human sign-off.
 
-**Do not attribute test result differences to CUDA non-determinism.** When results differ between test modes or runs, the cause is almost always a real discrepancy in the test methodology or a real code bug — not GPU randomness. Investigate the actual root cause instead of dismissing differences as non-determinism.
+**Do not attribute test result differences to non-determinism.** When results differ between test modes or runs, the cause is almost always a real discrepancy in the test methodology or a real code bug. Investigate the actual root cause instead of dismissing differences as noise.
 
 ## Conventions
 
 - Zig 0.15 API: `b.createModule(...)` for executables, `file.reader(&buf)` takes a buffer arg, use `readToEndAlloc` instead of `readBytesNoEof`
-- Build: `-Dbackend=coreml|ort_cuda|ort_cpu` selects ASR backend at compile time
 - Models: CoreML from `danielbodart/nemotron-speech-600m-coreml`, ONNX from `danielbodart/nemotron-speech-600m-onnx` on HuggingFace
 - Conversion scripts: [nemotron-speech-600m-coreml](https://github.com/danielbodart/nemotron-speech-600m-coreml) (CoreML), [nemotron-speech-600m-onnx](https://github.com/danielbodart/nemotron-speech-600m-onnx) (ONNX)
 - Audio format: 16kHz mono S16_LE PCM (32000 bytes/sec)

@@ -8,10 +8,9 @@ process.env.FORCE_COLOR = "1";
 
 const IS_MACOS = process.platform === "darwin";
 const PLATFORM_DIR = IS_MACOS ? "dist/macos" : "dist/linux";
-const BINARY = IS_MACOS ? `./${PLATFORM_DIR}/bin/capsper` : `./${PLATFORM_DIR}/bin/capsper-cuda`;
+const BINARY = `./${PLATFORM_DIR}/bin/capsper`;
 const SCRIPT_DIR = import.meta.dir;
 const TARBALL = IS_MACOS ? "capsper-macos-arm64.tar.gz" : "capsper-linux-x86_64.tar.gz";
-const DEPS_TARBALL = "capsper-linux-x86_64-deps.tar.gz";
 const LIB_DIR = "dist/linux/lib"; // Linux only — macOS uses system CoreML frameworks
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -72,18 +71,10 @@ async function ensureDepsLinux() {
 }
 
 function ensureBinary() {
-    if (IS_MACOS) {
-        if (!existsSync(`./${PLATFORM_DIR}/bin/capsper`)) {
-            console.error(`Binary not found: ./${PLATFORM_DIR}/bin/capsper`);
-            console.error("Run: ./run.ts build");
-            process.exit(1);
-        }
-    } else {
-        if (!existsSync(`./${PLATFORM_DIR}/bin/capsper-cuda`) && !existsSync(`./${PLATFORM_DIR}/bin/capsper-cpu`)) {
-            console.error(`No binaries found in ${PLATFORM_DIR}/bin/`);
-            console.error("Run: ./run.ts build");
-            process.exit(1);
-        }
+    if (!existsSync(BINARY)) {
+        console.error(`Binary not found: ${BINARY}`);
+        console.error("Run: ./run.ts build");
+        process.exit(1);
     }
 }
 
@@ -103,28 +94,20 @@ async function version(): Promise<string> {
 export async function build() {
     await ensureDeps();
     const ver = await version();
+    console.log(`Building v${ver} (${IS_MACOS ? "coreml" : "ort"})...`);
+    // -Dcpu on Linux only: the dist build targets x86_64_v3, while macOS is
+    // Apple Silicon, where Zig's native default is already right.
     if (IS_MACOS) {
-        console.log(`Building v${ver} (coreml)...`);
         await $`zig build --prefix ${PLATFORM_DIR} -Dversion=${ver} -Doptimize=ReleaseSafe`;
-        // Symlink installed models so the binary finds them at ../models/ relative to bin/
-        const modelsLink = `${PLATFORM_DIR}/models`;
-        const modelsTarget = join(process.env.HOME!, ".local/share/capsper/models");
-        if (!existsSync(modelsLink) && existsSync(modelsTarget)) {
-            await $`ln -s ${modelsTarget} ${modelsLink}`;
-        }
     } else {
-        console.log(`Building v${ver} (ort-cuda)...`);
-        await $`zig build --prefix ${PLATFORM_DIR} -Dbackend=ort_cuda -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
-        console.log(`Building v${ver} (ort-cpu)...`);
-        await $`zig build --prefix ${PLATFORM_DIR} -Dbackend=ort_cpu -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
-        // Symlink capsper → capsper-cuda for dev (dist creates a proper launcher script)
-        await $`ln -sf capsper-cuda ${PLATFORM_DIR}/bin/capsper`;
-        // Symlink installed models so the binary finds them at ../models/ relative to bin/
-        const modelsLink = `${PLATFORM_DIR}/models`;
-        const modelsTarget = join(process.env.HOME!, ".local/share/capsper/models");
-        if (!existsSync(modelsLink) && existsSync(modelsTarget)) {
-            await $`ln -s ${modelsTarget} ${modelsLink}`;
-        }
+        await $`zig build --prefix ${PLATFORM_DIR} -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
+    }
+
+    // Symlink installed models so the binary finds them at ../models/ relative to bin/
+    const modelsLink = `${PLATFORM_DIR}/models`;
+    const modelsTarget = join(process.env.HOME!, ".local/share/capsper/models");
+    if (!existsSync(modelsLink) && existsSync(modelsTarget)) {
+        await $`ln -s ${modelsTarget} ${modelsLink}`;
     }
 }
 
@@ -208,46 +191,38 @@ async function distLinux() {
         process.exit(1);
     }
 
-    // Validate both binaries exist and contain no AVX-512
-    for (const bin of [`${PLATFORM_DIR}/bin/capsper-cuda`, `${PLATFORM_DIR}/bin/capsper-cpu`]) {
-        if (!existsSync(bin)) {
-            console.error(`ERROR: ${bin} not found — did build() run?`);
-            process.exit(1);
-        }
-        const { stdout: objdumpOut } = await $`objdump -d ${bin} | grep -c 'zmm\\|%k[0-7],'`.quiet().nothrow();
-        const avx512Count = parseInt(objdumpOut.toString().trim()) || 0;
-        if (avx512Count > 0) {
-            console.error(`ERROR: ${bin} contains ${avx512Count} AVX-512 instructions`);
-            process.exit(1);
-        }
+    // Validate the binary exists and contains no AVX-512
+    const bin = `${PLATFORM_DIR}/bin/capsper`;
+    if (!existsSync(bin)) {
+        console.error(`ERROR: ${bin} not found — did build() run?`);
+        process.exit(1);
     }
-
-    // Replace dev symlink with a default capsper → capsper-cpu for the tarball.
-    // The installer/apply-update overrides this with the correct variant (cuda or cpu)
-    // based on GPU detection. The default ensures compatibility with older update
-    // scripts that validate bin/capsper exists.
-    await $`ln -sf capsper-cpu ${PLATFORM_DIR}/bin/capsper`;
+    const { stdout: objdumpOut } = await $`objdump -d ${bin} | grep -c 'zmm\\|%k[0-7],'`.quiet().nothrow();
+    const avx512Count = parseInt(objdumpOut.toString().trim()) || 0;
+    if (avx512Count > 0) {
+        console.error(`ERROR: ${bin} contains ${avx512Count} AVX-512 instructions`);
+        process.exit(1);
+    }
 
     const ver = await version();
     await Bun.write(`${PLATFORM_DIR}/VERSION`, ver);
 
-    // Generate DEPS_VERSION from sha256 of real ORT libs (skip symlinks)
-    const { stdout: depsHash } = await $`find ${LIB_DIR} -name '*.so' -not -type l | sort | xargs sha256sum | sha256sum | cut -d' ' -f1`.quiet();
-    const depsVersion = depsHash.toString().trim();
-
-    // Binary tarball: binaries + scripts + lib/DEPS_VERSION marker
-    // lib/ dir with just DEPS_VERSION satisfies old update scripts that check [ -d lib ]
+    // One tarball: binary, scripts, and the ONNX Runtime libraries. They were
+    // split into a second "deps" asset when the CUDA execution provider made
+    // them 390MB and worth not re-downloading per update; CPU-only ORT is
+    // 24MB, which is smaller than the binary it sits next to. The installed
+    // update script already handles a tarball carrying real .so files -- that
+    // is the "old-style tarball" branch in ensure_ort_libs.
     const staging = "/tmp/capsper-dist-linux";
     await $`rm -rf ${staging}`;
     await $`mkdir -p ${staging}`;
     await $`cp -a ${PLATFORM_DIR}/bin ${staging}/`;
+    await $`cp -a ${LIB_DIR} ${staging}/`;
     // The voice activity model ships rather than being downloaded: it is two
     // megabytes, it never changes, and a meeting should not be the first thing
     // to discover it is missing.
     await $`mkdir -p ${staging}/models`;
     await $`cp models/silero_vad.onnx ${staging}/models/`;
-    await $`mkdir -p ${staging}/lib`;
-    await Bun.write(`${staging}/lib/DEPS_VERSION`, depsVersion);
     for (const script of ["install.sh", "capsper-update.sh", "capsper-apply-update.sh", "capsper-rollback.sh"]) {
         await $`cp ${PLATFORM_DIR}/${script} ${staging}/`;
     }
@@ -257,16 +232,6 @@ async function distLinux() {
     await $`sha256sum ${TARBALL} > ${TARBALL}.sha256`;
     await $`rm -rf ${staging}`;
     console.log(`Tarball: ${TARBALL} (v${ver})`);
-
-    // Deps tarball: ORT shared libs + DEPS_VERSION
-    const depsStaging = "/tmp/capsper-dist-deps";
-    await $`mkdir -p ${depsStaging}/lib`;
-    await $`cp -a ${LIB_DIR}/libonnxruntime* ${depsStaging}/lib/`;
-    await Bun.write(`${depsStaging}/lib/DEPS_VERSION`, depsVersion);
-    await $`tar -czf ${DEPS_TARBALL} -C ${depsStaging} .`;
-    await $`sha256sum ${DEPS_TARBALL} > ${DEPS_TARBALL}.sha256`;
-    await $`rm -rf ${depsStaging}`;
-    console.log(`Deps tarball: ${DEPS_TARBALL} (${depsVersion.slice(0, 12)})`);
 }
 
 async function distMacOS() {
@@ -308,10 +273,6 @@ export async function sign() {
     if (hasOidc) {
         console.log(`Signing ${TARBALL} with cosign...`);
         await $`cosign sign-blob ${TARBALL} --bundle ${TARBALL}.sigstore.json --yes`;
-        if (!IS_MACOS && existsSync(DEPS_TARBALL)) {
-            console.log(`Signing ${DEPS_TARBALL} with cosign...`);
-            await $`cosign sign-blob ${DEPS_TARBALL} --bundle ${DEPS_TARBALL}.sigstore.json --yes`;
-        }
     } else {
         console.log("Skipping cosign blob signing (no OIDC token — not in CI)");
     }
@@ -333,16 +294,9 @@ export async function ci() {
     await sign();
     if (process.env.GH_TOKEN) {
         const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
-        // Collect all release assets (deps tarball only exists for Linux)
         const assets = [TARBALL, `${TARBALL}.sha256`];
         if (existsSync(`${TARBALL}.sigstore.json`)) {
             assets.push(`${TARBALL}.sigstore.json`);
-        }
-        if (!IS_MACOS && existsSync(DEPS_TARBALL)) {
-            assets.push(DEPS_TARBALL, `${DEPS_TARBALL}.sha256`);
-            if (existsSync(`${DEPS_TARBALL}.sigstore.json`)) {
-                assets.push(`${DEPS_TARBALL}.sigstore.json`);
-            }
         }
         if (noCreateRelease) {
             console.log(`Uploading assets to release v${ver}...`);
@@ -371,7 +325,7 @@ async function printVersion() {
 }
 
 
-/** Verify the Nix flake: both packages build from source, and the NixOS module
+/** Verify the Nix flake: the package builds from source, and the NixOS module
  *  actually grants the permissions it claims (checked in a real NixOS VM).
  *  Skipped where nix is unavailable, which includes the macOS CI runner. */
 export async function nix() {
@@ -384,10 +338,9 @@ export async function nix() {
         return;
     }
     // Evaluates every output and builds the checks, including the NixOS VM
-    // test. Both packages are cheap: capsper itself is a zig build, and the
-    // CUDA execution provider is fetched rather than compiled.
+    // test. Cheap: capsper is a zig build and onnxruntime comes from the cache.
     await $`nix flake check --print-build-logs`;
-    await $`nix build --no-link .#capsper-cpu .#capsper-cuda`;
+    await $`nix build --no-link .#capsper`;
 }
 const commands: Record<string, Function> = {
     dev, build, clean, setup, test, lint, dist, sign, ci, nix, version: printVersion,

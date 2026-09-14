@@ -9,7 +9,7 @@ const IS_MACOS = process.platform === "darwin";
 export const BINARY = IS_MACOS ? "./dist/macos/bin/capsper" : "./dist/linux/bin/capsper";
 
 // Track all spawned child processes so we can kill them on exit/signal.
-// Prevents orphaned capsper processes holding GPU memory after Ctrl+C.
+// Prevents orphaned capsper processes outliving the test run after Ctrl+C.
 const childProcs = new Set<ReturnType<typeof spawn>>();
 
 function killAllChildren() {
@@ -27,16 +27,6 @@ process.on("SIGTERM", () => { killAllChildren(); process.exit(1); });
 export function trackProc(proc: ReturnType<typeof spawn>): void {
     childProcs.add(proc);
     proc.exited.then(() => childProcs.delete(proc));
-}
-
-export async function hasGpu(): Promise<boolean> {
-    if (process.platform === "darwin") {
-        // macOS: check for Metal GPU via system_profiler
-        const { exitCode } = await $`system_profiler SPDisplaysDataType 2>/dev/null | grep -q Metal`.quiet().nothrow();
-        return exitCode === 0;
-    }
-    const { exitCode } = await $`nvidia-smi`.quiet().nothrow();
-    return exitCode === 0;
 }
 
 export function tmpFile(prefix: string, ext: string): string {
@@ -156,7 +146,8 @@ export async function startServer(args: string[]): Promise<{ proc: ReturnType<ty
     };
 
     try {
-        // 180s timeout: first-time CUDA PTX compilation during warmup can take minutes
+        // 180s timeout: the warmup pass loads and runs the model before the
+        // server is ready, which on a cold page cache is not quick.
         const line = await waitForLog(logFile, /Listening on port (\d+)/, proc, 180);
         const port = parseInt(line.match(/\d+/)![0]);
         console.error(`Server ready on port ${port} (PID ${proc.pid})`);
@@ -185,7 +176,8 @@ export async function startLocalServer(args: string[]): Promise<{ proc: ReturnTy
     };
 
     try {
-        // 180s timeout: first-time CUDA PTX compilation during warmup can take minutes
+        // 180s timeout: the warmup pass loads and runs the model before the
+        // server is ready, which on a cold page cache is not quick.
         await waitForLog(logFile, /Capturing audio/, proc, 180);
         console.error(`Server capturing audio (PID ${proc.pid})`);
         return { proc, outputFile, logFile, kill };

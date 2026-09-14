@@ -21,7 +21,7 @@ Pre-built onnxruntime shared libraries are committed in `dist/linux/lib/` via Gi
 
 ## CPU Target
 
-- **Linux dist builds target `x86_64_v3`** (AVX2+FMA+BMI) — matches our GPU support floor (GTX 1650+). Both `build()` and `ci()` pass `-Dcpu=x86_64_v3` to zig build.
+- **Linux dist builds target `x86_64_v3`** (AVX2+FMA+BMI) — inference runs on the CPU, so the vector instructions are the point, and everything from ~2015 onwards has them. Both `build()` and `ci()` pass `-Dcpu=x86_64_v3` to zig build.
 - The `dist()` target validates no AVX-512 instructions are present in the binary.
 - **macOS builds target Apple Silicon (arm64)** — no `-Dcpu` flag needed, Zig defaults to the native target.
 

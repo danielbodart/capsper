@@ -155,8 +155,8 @@ async function startCapsper(opts: {
     trackProc(proc);
 
     try {
-        // 180s: the model loads before the process settles, and a first CUDA
-        // run compiles PTX.
+        // 180s: the model loads and runs a warmup pass before the process
+        // settles.
         await waitForLog(logFile, new RegExp(`Virtual sink '${opts.sink}' ready`), proc, 180);
         await until(`${opts.sink} to reach the graph`, async () =>
             nodes(await dump()).some((n) => n.name === `${opts.sink}.passthrough`));

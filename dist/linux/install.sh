@@ -242,9 +242,7 @@ run_dry_run_linux() {
 # ─── Main Install ─────────────────────────────────────────────────────────────
 
 cmd_install() {
-    [ -f "$SCRIPT_DIR/bin/capsper-cuda" ] || [ -f "$SCRIPT_DIR/bin/capsper-cpu" ] \
-        || [ -f "$SCRIPT_DIR/bin/capsper" ] \
-        || die "capsper binaries not found in $SCRIPT_DIR/bin"
+    [ -f "$SCRIPT_DIR/bin/capsper" ] || die "capsper binary not found in $SCRIPT_DIR/bin"
 
     local service_file="$HOME/.config/systemd/user/capsper.service"
     local is_upgrade=false
@@ -276,7 +274,6 @@ cmd_install() {
         project_dir="$(cd "$SCRIPT_DIR/.." && pwd)"
 
         check_permissions
-        ensure_cudnn
 
         if ! $is_upgrade || $update_config; then
             local channel="FL"
@@ -337,7 +334,6 @@ cmd_install() {
         install_files
         download_models "$INSTALL_DIR/models"
         check_permissions
-        ensure_cudnn
 
         if ! $is_upgrade || $update_config; then
             local channel="FL"

@@ -1,11 +1,10 @@
 import { describe, test, expect, beforeAll } from "bun:test";
-import { hasGpu, ensureBinary, ensureFile, startServer, readPcm, streamPcmFast, saveLog } from "./helpers";
+import { ensureBinary, ensureFile, startServer, readPcm, streamPcmFast, saveLog } from "./helpers";
 
-const gpu = await hasGpu();
 const vadBackend = process.env.VAD_BACKEND;
 const extraServerArgs: string[] = vadBackend ? ["--vad", vadBackend] : [];
 
-describe.skipIf(!gpu)("long-stream", () => {
+describe("long-stream", () => {
     beforeAll(() => {
         ensureBinary();
         ensureFile("test/jfk.wav");

@@ -4,7 +4,7 @@
 
 Does CapsLock annoy you? Ever wished it actually did something useful instead of SHOUTING AT PEOPLE BY ACCIDENT?
 
-Ever wished you could just whisper to a friendly ghost and have your words appear on screen? Well now you can. Capsper is your friendly neighbourhood ghost writer — hold CapsLock, speak, and he types it out for you. No cloud, no subscription, no latency worth complaining about. Just a local GPU (or CPU), a haunted key, and a little ~~whisper~~ nemo magic.
+Ever wished you could just whisper to a friendly ghost and have your words appear on screen? Well now you can. Capsper is your friendly neighbourhood ghost writer — hold CapsLock, speak, and he types it out for you. No cloud, no subscription, no latency worth complaining about. Just your own CPU, a haunted key, and a little ~~whisper~~ nemo magic.
 
 Push-to-talk voice dictation for Linux and macOS. Uses NVIDIA's [Nemotron Speech 600M](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) model (FastConformer RNNT) for streaming speech-to-text. Single self-contained binary per platform.
 
@@ -19,7 +19,7 @@ Push-to-talk voice dictation for Linux and macOS. Uses NVIDIA's [Nemotron Speech
 |---|---|---|
 | **Keyboard** | evdev grab + uinput virtual keyboard | CGEventTap + CGEventPost |
 | **Audio** | PipeWire capture | CoreAudio (AUHAL) |
-| **Inference** | ONNX Runtime (CUDA or CPU) | CoreML (93% Apple Neural Engine) |
+| **Inference** | ONNX Runtime (CPU) | CoreML (93% Apple Neural Engine) |
 | **Display server** | X11 and Wayland | native |
 
 ## Requirements
@@ -28,8 +28,8 @@ Push-to-talk voice dictation for Linux and macOS. Uses NVIDIA's [Nemotron Speech
 
 - Debian/Ubuntu/NixOS (or similar)
 - PipeWire (default audio server on modern Ubuntu/Fedora)
-- **GPU (recommended):** NVIDIA GPU with ~4 GB VRAM (Turing or newer: GTX 16xx, RTX 20xx/30xx/40xx/50xx), NVIDIA drivers, and cuDNN — near-zero CPU impact during inference
-- **CPU-only:** works without a GPU at similar speed, but uses significant CPU while speaking
+- An x86-64 CPU with AVX2 (anything from 2015 onwards). Inference runs about 8x faster than real time and costs ~1.4 cores while you are actually speaking — nothing at all the rest of the time
+- No GPU, no CUDA, no cuDNN
 
 ### macOS
 
@@ -66,8 +66,6 @@ curl -fSL https://github.com/danielbodart/capsper/releases/latest/download/capsp
 ```
 
 The installer walks you through everything interactively — downloading models, setting up permissions, detecting your microphone, and installing a background service.
-
-On Linux, a launcher script automatically detects whether you have an NVIDIA GPU and runs the appropriate binary (`capsper-cuda` or `capsper-cpu`).
 
 ## Usage
 
@@ -177,13 +175,12 @@ This loads the model, transcribes the entire file in one shot, prints the result
 
 Capsper uses NVIDIA's Nemotron Speech 600M model — a FastConformer-based RNNT (Recurrent Neural Network Transducer) that's inherently incremental. Unlike the previous whisper.cpp approach which needed separate voice activity detection and cross-attention tricks for streaming, the RNNT model naturally processes audio as it arrives and emits tokens incrementally. Push-to-talk is the sole gate — no VAD needed.
 
-The model runs through different backends depending on platform:
+The model runs through a different backend on each platform:
 
-- **Linux (NVIDIA GPU):** ONNX Runtime with CUDA execution provider — int8-static quantization
-- **Linux (CPU):** ONNX Runtime CPU — int8-dynamic quantization
+- **Linux:** ONNX Runtime, CPU execution provider — int8 quantization
 - **macOS (Apple Silicon):** CoreML — FP16, runs 93% on the Apple Neural Engine
 
-A single Zig binary handles everything: keyboard interception, audio capture, mel spectrogram computation, model inference, SentencePiece detokenization, and text injection. No Python, no runtime dependencies beyond the platform's audio system and GPU drivers.
+A single Zig binary handles everything: keyboard interception, audio capture, mel spectrogram computation, model inference, SentencePiece detokenization, and text injection. No Python, and no runtime dependencies beyond the platform's audio system.
 
 ## Command line
 
@@ -516,12 +513,10 @@ cd capsper
 This auto-detects your platform and handles everything:
 - Installs toolchain (mise, Zig 0.15, Bun) on first run via `bootstrap.sh`
 - Installs system packages (`libpipewire-0.3-dev` on Linux; `shellcheck` on macOS)
-- On NixOS, where there is no apt, `bootstrap.sh` re-runs the command inside the flake's `devShell`, which supplies that same set plus the CUDA libraries the dev binary loads. The toolchain still comes from mise either way, so a local build uses the versions CI uses
+- On NixOS, where there is no apt, `bootstrap.sh` re-runs the command inside the flake's `devShell`, which supplies that same set. The toolchain still comes from mise either way, so a local build uses the versions CI uses
 - Downloads models if missing (~250 MB for ONNX, ~150 MB for CoreML)
 - Compiles the Zig binary (pre-built ONNX Runtime shared libs committed via Git LFS on Linux)
 - Runs unit tests, property tests, and short integration smoke tests
-
-On Linux, `./run.ts build` produces two binaries (`capsper-cuda` + `capsper-cpu`) plus a launcher script. On macOS, it produces a single `capsper` binary using CoreML.
 
 Every step is incremental — re-running `./run.ts` is fast if everything is already set up.
 
@@ -533,7 +528,7 @@ All commands go through the Bun-based task runner (`run.ts`):
 # Build (default command)
 ./run.ts build
 
-# Unit + property tests (no GPU required)
+# Unit + property tests (no model required)
 ./run.ts test
 
 # Regression test groups (requires built binary + model)
@@ -548,8 +543,6 @@ All commands go through the Bun-based task runner (`run.ts`):
 ## Troubleshooting
 
 ### Linux
-
-**"No CUDA GPU detected"** — the CUDA binary requires an NVIDIA GPU with cuDNN. Ensure NVIDIA drivers are installed (`sudo ubuntu-drivers autoinstall`), that `nvidia-smi` shows your GPU, and that cuDNN is installed. Alternatively, the CPU binary works without a GPU (the launcher script auto-detects this).
 
 **Cannot open /dev/input** — ensure your user is in the `input` group (`groups` to check, `sudo usermod -aG input $USER` then log out/in).
 

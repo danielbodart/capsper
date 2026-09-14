@@ -511,7 +511,7 @@ fn runMeeting(
 
 
 /// Prime the pipeline on a short known file so the first real utterance does
-/// not pay for CoreML ANE warm-up or CUDA kernel compilation. The file ships
+/// not pay for CoreML ANE warm-up or the first ORT session's setup. The file ships
 /// beside the binary; if it is missing there is nothing to warm up and nothing
 /// to say about it, so every failure here is silent by design.
 fn warmup(allocator: std.mem.Allocator, factory: PipelineFactory) void {

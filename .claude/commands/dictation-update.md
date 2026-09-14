@@ -58,7 +58,7 @@ forward and rebuilding. The commit must be **pushed** for the flake to see it.
    systemctl --user show capsper.service -p ExecStart --no-pager
    systemctl --user is-active capsper.service
    ```
-   The store path must contain the new short revision (`capsper-cpu-0.0.0-git.<rev>`). home-manager may leave the old process running; if the path is stale, run `systemctl --user restart capsper.service`.
+   The store path must contain the new short revision (`capsper-0.0.0-git.<rev>`). home-manager may leave the old process running; if the path is stale, run `systemctl --user restart capsper.service`.
 
 8. **Rebuild or restart failed?** Show `journalctl --user -u capsper.service -n 30 --no-pager`. Roll back with `sudo nixos-rebuild switch --rollback`.
 

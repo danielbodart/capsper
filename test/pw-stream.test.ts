@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll } from "bun:test";
 import { $, spawn, file } from "bun";
-import { hasGpu, ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, trackProc, saveLog, until } from "./helpers";
+import { ensureBinary, ensureFile, wavDuration, waitForLog, startLocalServer, trackProc, saveLog, until } from "./helpers";
 
 const isLinux = process.platform === "linux";
 

@@ -1,12 +1,11 @@
 import { describe, test, expect, afterAll } from "bun:test";
 import { file } from "bun";
 import {
-    hasGpu, ensureBinary, ensureFile,
+    ensureBinary, ensureFile,
     startServer, readPcm, streamPcmFast,
     normalize, saveLog,
 } from "./helpers";
 
-const gpu = await hasGpu();
 
 const dropTerms = process.env.DROP_TERMS ?? "test/drop-terms-nemotron.txt";
 const extraServerArgs: string[] = [
@@ -14,7 +13,7 @@ const extraServerArgs: string[] = [
     "--drop-terms", dropTerms,
 ];
 
-describe.skipIf(!gpu)("concurrent TCP", () => {
+describe("concurrent TCP", () => {
     let server: Awaited<ReturnType<typeof startServer>> | null = null;
 
     afterAll(() => {

@@ -11,11 +11,10 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { spawn } from "bun";
 import {
-    BINARY, hasGpu, ensureBinary, tmpFile, trackProc,
+    BINARY, ensureBinary, tmpFile, trackProc,
     waitForLog, saveLog, writeWav, silence, until,
 } from "./helpers";
 
-const gpu = await hasGpu();
 
 const extraArgs: string[] = [
     ...(process.env.ASR_MODEL ? ["--model", process.env.ASR_MODEL] : []),
@@ -70,9 +69,9 @@ async function startConsole(): Promise<{ base: string; recordingsDir: string; co
     };
 
     try {
-        // The same 180s the TCP helper allows: a first CUDA run compiles PTX
-        // during warmup and the console is up long before that finishes, but
-        // the log line it is waited for arrives on the same startup path.
+        // The same 180s the TCP helper allows: the console is up long before
+        // the warmup pass finishes, but the log line waited for here arrives
+        // on the same startup path.
         const line = await waitForLog(logFile, /Console at http:\/\/[\d.]+:(\d+)/, proc, 180);
         const port = parseInt(line.match(/:(\d+)/)![1]);
         return { base: `http://127.0.0.1:${port}`, recordingsDir, configFile, proc, logFile, kill };
@@ -82,7 +81,7 @@ async function startConsole(): Promise<{ base: string; recordingsDir: string; co
     }
 }
 
-describe.skipIf(!gpu)("console", () => {
+describe("console", () => {
     let server: Awaited<ReturnType<typeof startConsole>>;
 
     beforeAll(async () => {

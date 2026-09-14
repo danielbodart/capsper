@@ -10,6 +10,9 @@ SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pw
 
 HF_ONNX_REPO="danielbodart/nemotron-speech-600m-onnx"
 HF_ONNX_BASE="https://huggingface.co/${HF_ONNX_REPO}/resolve/main"
+# The int8 export the CPU execution provider runs. Named for the quantisation
+# it was produced with; there is one Linux build and so one model to fetch.
+ONNX_VARIANT="int8-dynamic"
 HF_COREML_REPO="danielbodart/nemotron-speech-600m-coreml"
 HF_COREML_BASE="https://huggingface.co/${HF_COREML_REPO}/resolve/main"
 
@@ -51,125 +54,15 @@ is_dev_mode() {
     [ -d "$SCRIPT_DIR/../.git" ] || [ -d "$SCRIPT_DIR/../../.git" ]
 }
 
-# ─── Hardware Detection ──────────────────────────────────────────────────────
-
-has_nvidia_gpu() {
-    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
-}
-
-detect_model_variant() {
-    if [ "$(uname -s)" = "Darwin" ]; then
-        echo "coreml"
-        return
-    fi
-    if has_nvidia_gpu; then
-        echo "int8-static"
-        return
-    fi
-    echo "int8-dynamic"
-}
-
-# Create bin/capsper symlink pointing to the right binary for this machine.
-# On macOS, capsper is already the real binary — no symlink needed.
-# On Linux, symlinks to capsper-cuda (NVIDIA GPU) or capsper-cpu (no GPU).
-create_capsper_symlink() {
-    local bin_dir="$1"
-    [ "$(uname -s)" = "Darwin" ] && return 0
-
-    local target
-    if has_nvidia_gpu; then
-        target="capsper-cuda"
-    else
-        target="capsper-cpu"
-    fi
-
-    ln -sf "$target" "$bin_dir/capsper"
-    echo "Selected binary: $target (symlinked as capsper)"
-}
-
-# ─── cuDNN Detection & Install (Linux NVIDIA only) ──────────────────────────
-
-# Check if cuDNN is installed. Returns 0 if found, 1 if missing.
-has_cudnn() {
-    # Check ldconfig cache first (fastest)
-    if ldconfig -p 2>/dev/null | grep -q libcudnn; then
-        return 0
-    fi
-    # Check common paths
-    for path in /usr/lib/x86_64-linux-gnu/libcudnn*.so* /usr/local/cuda/lib64/libcudnn*.so*; do
-        [ -e "$path" ] && return 0
-    done
-    return 1
-}
-
-# Try to install cuDNN via apt. Tries multiple package names across distros.
-install_cudnn() {
-    echo ""
-    echo "=== cuDNN Required ==="
-    echo "The NVIDIA CUDA binary requires cuDNN for inference."
-    echo "Attempting to install via apt..."
-
-    # Try package names in order of preference:
-    # 1. libcudnn9-cuda-12 — NVIDIA's official repo (Ubuntu 22.04+)
-    # 2. libcudnn8        — older NVIDIA repo / Ubuntu 20.04
-    # 3. nvidia-cudnn      — some Ubuntu 24.04+ configurations
-    local pkg=""
-    for candidate in libcudnn9-cuda-12 libcudnn8 nvidia-cudnn; do
-        if apt-cache show "$candidate" >/dev/null 2>&1; then
-            pkg="$candidate"
-            break
-        fi
-    done
-
-    if [ -n "$pkg" ]; then
-        echo "Found package: $pkg"
-        if confirm "Install $pkg? (requires sudo)"; then
-            if sudo apt install -y "$pkg"; then
-                echo "cuDNN installed successfully."
-                return 0
-            else
-                echo "WARNING: apt install failed."
-            fi
-        fi
-    else
-        echo "No cuDNN package found in apt repositories."
-        echo ""
-        echo "To add NVIDIA's apt repository, follow:"
-        echo "  https://developer.nvidia.com/cudnn-downloads"
-        echo ""
-        echo "Or install manually:"
-        echo "  sudo apt install libcudnn9-cuda-12"
-    fi
-
-    echo ""
-    echo "WARNING: cuDNN not installed. The CUDA binary may fail at runtime."
-    echo "If CUDA fails, re-run the installer to switch to the CPU binary."
-    return 1
-}
-
-# Check cuDNN and offer to install if missing. Only runs on Linux with NVIDIA GPU.
-ensure_cudnn() {
-    [ "$(uname -s)" = "Linux" ] || return 0
-    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1 || return 0
-
-    if has_cudnn; then
-        return 0
-    fi
-
-    install_cudnn
-}
-
 # ─── Model Download ──────────────────────────────────────────────────────────
 
 download_models() {
     local model_dir="$1"
-    local variant
-    variant=$(detect_model_variant)
 
-    if [ "$variant" = "coreml" ]; then
+    if [ "$(uname -s)" = "Darwin" ]; then
         download_coreml_models "$model_dir"
     else
-        download_onnx_models "$model_dir" "$variant"
+        download_onnx_models "$model_dir"
     fi
 }
 
@@ -223,7 +116,6 @@ download_coreml_models() {
 
 download_onnx_models() {
     local model_dir="$1"
-    local variant="$2"
     local target_dir="$model_dir/nemotron"
     mkdir -p "$target_dir"
 
@@ -233,8 +125,7 @@ download_onnx_models() {
         return
     fi
 
-    echo "Detected hardware: $variant precision"
-    echo "Model: Nemotron Speech 600M ONNX ($variant)"
+    echo "Model: Nemotron Speech 600M ONNX (int8)"
 
     if ! confirm "Download now?"; then
         echo ""
@@ -244,16 +135,16 @@ download_onnx_models() {
     fi
 
     require_cmd curl "Install curl to download models."
-    echo "Downloading ONNX model ($variant)..."
+    echo "Downloading ONNX model..."
 
     curl -L --progress-bar -o "$target_dir/encoder_model.onnx" \
-        "$HF_ONNX_BASE/$variant/encoder_model.onnx"
+        "$HF_ONNX_BASE/$ONNX_VARIANT/encoder_model.onnx"
     curl -L --progress-bar -o "$target_dir/encoder_model.onnx.data" \
-        "$HF_ONNX_BASE/$variant/encoder_model.onnx.data"
+        "$HF_ONNX_BASE/$ONNX_VARIANT/encoder_model.onnx.data"
     curl -L --progress-bar -o "$target_dir/decoder_model.onnx" \
-        "$HF_ONNX_BASE/$variant/decoder_model.onnx"
+        "$HF_ONNX_BASE/$ONNX_VARIANT/decoder_model.onnx"
     curl -L --progress-bar -o "$target_dir/decoder_model.onnx.data" \
-        "$HF_ONNX_BASE/$variant/decoder_model.onnx.data"
+        "$HF_ONNX_BASE/$ONNX_VARIANT/decoder_model.onnx.data"
     curl -L --progress-bar -o "$target_dir/filterbank.bin" \
         "$HF_ONNX_BASE/shared/filterbank.bin"
     curl -L --progress-bar -o "$target_dir/tokens.txt" \
@@ -261,46 +152,7 @@ download_onnx_models() {
     curl -L --progress-bar -o "$target_dir/config.json" \
         "$HF_ONNX_BASE/config.json"
 
-    echo "ONNX model downloaded ($variant)."
-}
-
-# ─── ORT Runtime Libraries ────────────────────────────────────────────────
-
-download_ort_libs() {
-    local target_dir="$1"
-    local release_tag="$2"
-    local repo="danielbodart/capsper"
-    local asset="capsper-linux-x86_64-deps.tar.gz"
-    local url="https://github.com/$repo/releases/download/$release_tag/$asset"
-
-    echo "Downloading ORT runtime libraries..."
-    require_cmd curl "Install curl to download dependencies."
-
-    local tmp
-    tmp=$(mktemp -d)
-
-    curl -fSL -o "$tmp/$asset" "$url" || {
-        echo "WARNING: Failed to download deps from $url"
-        echo "ORT libs may need to be installed manually."
-        rm -rf "$tmp"
-        return 1
-    }
-
-    # Verify SHA256 if available
-    if curl -fSL -o "$tmp/$asset.sha256" "${url}.sha256" 2>/dev/null; then
-        (cd "$tmp" && sha256sum -c "$asset.sha256") || {
-            echo "ERROR: Deps SHA256 verification failed" >&2
-            rm -rf "$tmp"
-            return 1
-        }
-        echo "Deps SHA256 verified."
-    fi
-
-    mkdir -p "$target_dir" "$tmp/deps"
-    tar -xzf "$tmp/$asset" -C "$tmp/deps"
-    cp -a "$tmp/deps/lib/"* "$target_dir/"
-    rm -rf "$tmp"
-    echo "ORT runtime libraries installed."
+    echo "ONNX model downloaded."
 }
 
 # ─── Install Files ────────────────────────────────────────────────────────────
@@ -327,27 +179,15 @@ install_files() {
         cp -a "$SCRIPT_DIR/models/." "$release_dir/models/"
     fi
 
-    # On Linux, create bin/capsper symlink to the right variant for this machine
-    create_capsper_symlink "$release_dir/bin"
-
-    # Set up shared ORT libs
+    # The ONNX Runtime libraries ship in the tarball. They live in one shared
+    # directory rather than once per release: every release so far has used the
+    # same build, and each copy is 24MB.
     local shared_lib="$INSTALL_DIR/lib"
-    if [ -d "$SCRIPT_DIR/lib" ] && [ -f "$SCRIPT_DIR/lib/libonnxruntime.so" ]; then
-        # Old-style tarball with bundled libs — copy to shared
+    if [ -f "$SCRIPT_DIR/lib/libonnxruntime.so" ]; then
         mkdir -p "$shared_lib"
         cp -a "$SCRIPT_DIR/lib/"* "$shared_lib/"
-    elif [ -d "$SCRIPT_DIR/lib" ] && [ -f "$SCRIPT_DIR/lib/DEPS_VERSION" ]; then
-        # New-style tarball — download deps if shared libs missing or outdated
-        local needed_version
-        needed_version=$(cat "$SCRIPT_DIR/lib/DEPS_VERSION")
-        local have_version=""
-        [ -f "$shared_lib/DEPS_VERSION" ] && have_version=$(cat "$shared_lib/DEPS_VERSION")
-        if [ ! -f "$shared_lib/libonnxruntime.so" ] || [ "$have_version" != "$needed_version" ]; then
-            download_ort_libs "$shared_lib" "v$ver"
-        fi
     fi
-    # Symlink shared libs into release
-    if [ -d "$shared_lib" ] && [ -f "$shared_lib/libonnxruntime.so" ]; then
+    if [ -f "$shared_lib/libonnxruntime.so" ]; then
         ln -sfn "$shared_lib" "$release_dir/lib"
     fi
 

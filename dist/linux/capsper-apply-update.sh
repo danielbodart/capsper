@@ -41,7 +41,6 @@ main() {
     if [ -d "$release_lib_dir" ] && [ -f "$release_lib_dir/libonnxruntime.so" ]; then
         mkdir -p "$shared_lib_dir"
         cp -a "$release_lib_dir/"*.so "$release_lib_dir/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
-        [ -f "$release_lib_dir/DEPS_VERSION" ] && cp "$release_lib_dir/DEPS_VERSION" "$shared_lib_dir/"
     fi
     if [ ! -f "$shared_lib_dir/libonnxruntime.so" ] && [ -n "$current_target" ]; then
         local prev_lib="$INSTALL_DIR/$current_target/lib"
@@ -49,13 +48,20 @@ main() {
             echo "Migrating ORT libs from previous release to shared directory..."
             mkdir -p "$shared_lib_dir"
             cp -a "$prev_lib/"*.so "$prev_lib/"*.so.* "$shared_lib_dir/" 2>/dev/null || true
-            [ -f "$prev_lib/DEPS_VERSION" ] && cp "$prev_lib/DEPS_VERSION" "$shared_lib_dir/"
         fi
     fi
     if [ -d "$shared_lib_dir" ] && [ -f "$shared_lib_dir/libonnxruntime.so" ]; then
         rm -rf "$release_lib_dir"
         ln -sfn "$shared_lib_dir" "$release_lib_dir"
     fi
+
+    # Left by installs that predate the CUDA build's removal: the execution
+    # provider (368MB) and the marker for the separate deps tarball that
+    # carried it. Nothing loads either now -- ORT only dlopens a provider it is
+    # asked for -- so this is reclaiming the space, not fixing a fault.
+    rm -f "$shared_lib_dir/libonnxruntime_providers_cuda.so" \
+          "$shared_lib_dir/libonnxruntime_providers_shared.so" \
+          "$shared_lib_dir/DEPS_VERSION"
 
     # Symlink shared models into the new release so the binary can find them
     # via its default relative path (bin/../models/).
@@ -84,25 +90,15 @@ main() {
     # Migrate systemd service file: update model path, strip removed flags
     migrate_service_config
 
-    # Create bin/capsper symlink to the right variant for this machine.
-    local target="capsper-cpu"
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-        target="capsper-cuda"
-    fi
-    ln -sf "$target" "$release_dir/bin/capsper"
-    echo "Selected binary: $target"
-
     # Atomic symlink swap (for models, scripts, VERSION, etc.)
     ln -sfn "releases/$pending" "$INSTALL_DIR/current.tmp"
     rm -f "$INSTALL_DIR/current"
     mv "$INSTALL_DIR/current.tmp" "$INSTALL_DIR/current"
 
-    # Copy the selected variant to a stable path for service configs.
+    # Copy the binary to a stable path for service configs.
     # Uses cp + mv for atomic replacement (mv is atomic on same filesystem).
     mkdir -p "$INSTALL_DIR/bin"
-    local selected
-    selected=$(readlink "$release_dir/bin/capsper" 2>/dev/null || echo "capsper")
-    cp "$release_dir/bin/$selected" "$INSTALL_DIR/bin/capsper.tmp"
+    cp "$release_dir/bin/capsper" "$INSTALL_DIR/bin/capsper.tmp"
     mv "$INSTALL_DIR/bin/capsper.tmp" "$INSTALL_DIR/bin/capsper"
 
     rm -f "$pending_file"

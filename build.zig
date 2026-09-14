@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Backend = enum { coreml, ort_cuda, ort_cpu };
+pub const Backend = enum { coreml, ort };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -9,8 +9,10 @@ pub fn build(b: *std.Build) void {
 
     // --- Build options ---
     const version_str = b.option([]const u8, "version", "Version string") orelse "0.0.0";
-    const default_backend: Backend = if (is_macos) .coreml else .ort_cuda;
-    const backend = b.option(Backend, "backend", "ASR backend") orelse default_backend;
+    // One backend per platform: CoreML on macOS, ONNX Runtime everywhere else.
+    // Not an option, because there has never been a second choice on either --
+    // it is a comptime switch so the inactive backend's code is never compiled.
+    const backend: Backend = if (is_macos) .coreml else .ort;
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version_str);
@@ -60,16 +62,9 @@ pub fn build(b: *std.Build) void {
         break :blk run.addOutputFileArg("config_field_docs.zig");
     };
 
-    // --- Binary name ---
-    const exe_name: []const u8 = switch (backend) {
-        .coreml => "capsper",
-        .ort_cuda => "capsper-cuda",
-        .ort_cpu => "capsper-cpu",
-    };
-
     // --- Zig executable ---
     const exe = b.addExecutable(.{
-        .name = exe_name,
+        .name = "capsper",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -258,7 +253,7 @@ fn addBackendDeps(b: *std.Build, exe: *Exe, backend: Backend, ort_include: ?[]co
                 .flags = &.{"-fobjc-arc"},
             });
         },
-        .ort_cuda, .ort_cpu => {
+        .ort => {
             if (ort_include) |dir| {
                 exe.root_module.addIncludePath(.{ .cwd_relative = dir });
             } else {

@@ -10,8 +10,9 @@ REPO="danielbodart/capsper"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/capsper"
 HF_ONNX_REPO="danielbodart/nemotron-speech-600m-onnx"
 HF_ONNX_BASE="https://huggingface.co/${HF_ONNX_REPO}/resolve/main"
+# The int8 export the CPU execution provider runs -- see install-common.sh.
+ONNX_VARIANT="int8-dynamic"
 ASSET="capsper-linux-x86_64.tar.gz"
-DEPS_ASSET="capsper-linux-x86_64-deps.tar.gz"
 TMP_DIR=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -36,14 +37,6 @@ current_version() {
     cat "$INSTALL_DIR/current/VERSION" 2>/dev/null || echo "unknown"
 }
 
-detect_model_variant() {
-    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-        echo "int8-static"
-    else
-        echo "int8-dynamic"
-    fi
-}
-
 ensure_nemotron_model() {
     local model_dir="$INSTALL_DIR/models/nemotron"
     if [ ! -f "$model_dir/encoder_model.onnx" ] || [ ! -f "$model_dir/decoder_model.onnx" ] \
@@ -56,82 +49,30 @@ download_nemotron_model() {
     local target_dir="$1"
     mkdir -p "$target_dir"
 
-    local variant
-    variant=$(detect_model_variant)
-    echo "Downloading Nemotron model ($variant)..."
+    echo "Downloading Nemotron model..."
 
-    curl -fsSL -o "$target_dir/encoder_model.onnx" "$HF_ONNX_BASE/$variant/encoder_model.onnx" || return 1
-    curl -fsSL -o "$target_dir/encoder_model.onnx.data" "$HF_ONNX_BASE/$variant/encoder_model.onnx.data" || return 1
-    curl -fsSL -o "$target_dir/decoder_model.onnx" "$HF_ONNX_BASE/$variant/decoder_model.onnx" || return 1
-    curl -fsSL -o "$target_dir/decoder_model.onnx.data" "$HF_ONNX_BASE/$variant/decoder_model.onnx.data" || return 1
+    curl -fsSL -o "$target_dir/encoder_model.onnx" "$HF_ONNX_BASE/$ONNX_VARIANT/encoder_model.onnx" || return 1
+    curl -fsSL -o "$target_dir/encoder_model.onnx.data" "$HF_ONNX_BASE/$ONNX_VARIANT/encoder_model.onnx.data" || return 1
+    curl -fsSL -o "$target_dir/decoder_model.onnx" "$HF_ONNX_BASE/$ONNX_VARIANT/decoder_model.onnx" || return 1
+    curl -fsSL -o "$target_dir/decoder_model.onnx.data" "$HF_ONNX_BASE/$ONNX_VARIANT/decoder_model.onnx.data" || return 1
     curl -fsSL -o "$target_dir/filterbank.bin" "$HF_ONNX_BASE/shared/filterbank.bin" || return 1
     curl -fsSL -o "$target_dir/tokens.txt" "$HF_ONNX_BASE/shared/tokens.txt" || return 1
     curl -fsSL -o "$target_dir/config.json" "$HF_ONNX_BASE/config.json" || return 1
 
-    echo "Nemotron model downloaded ($variant)."
+    echo "Nemotron model downloaded."
 }
 
 ensure_ort_libs() {
     local release_dir="$1"
-    local release_tag="$2"
     local shared_lib="$INSTALL_DIR/lib"
-    local needed_version=""
 
-    # Read required deps version from staged release
-    if [ -f "$release_dir/lib/DEPS_VERSION" ]; then
-        needed_version=$(cat "$release_dir/lib/DEPS_VERSION")
-    fi
+    # The libraries ship inside the release tarball. One shared copy, not one
+    # per release: atomic_copy_libs replaces them by rename so a running
+    # capsper keeps reading the inode it mapped.
+    [ -f "$release_dir/lib/libonnxruntime.so" ] || return 0
 
-    # If the release has real .so files (old-style tarball), move them to shared
-    if [ -f "$release_dir/lib/libonnxruntime.so" ]; then
-        echo "Migrating bundled ORT libs to shared directory..."
-        mkdir -p "$shared_lib"
-        atomic_copy_libs "$release_dir/lib" "$shared_lib"
-        [ -n "$needed_version" ] && cp "$release_dir/lib/DEPS_VERSION" "$shared_lib/"
-        return 0
-    fi
-
-    # Check if shared libs already match the needed version
-    if [ -n "$needed_version" ] && [ -f "$shared_lib/DEPS_VERSION" ]; then
-        local current_version
-        current_version=$(cat "$shared_lib/DEPS_VERSION")
-        if [ "$current_version" = "$needed_version" ]; then
-            return 0
-        fi
-    fi
-
-    # Shared libs exist but no version tracking yet (transition from old-style).
-    # Accept them — the next ORT upgrade will set DEPS_VERSION properly.
-    if [ -f "$shared_lib/libonnxruntime.so" ] && [ ! -f "$shared_lib/DEPS_VERSION" ]; then
-        return 0
-    fi
-
-    # Download deps tarball from the same GitHub release
-    echo "Downloading ORT runtime libraries..."
-    local deps_url="https://github.com/$REPO/releases/download/$release_tag/$DEPS_ASSET"
-    curl -fSL -o "$TMP_DIR/$DEPS_ASSET" "$deps_url" || {
-        echo "WARNING: Failed to download deps tarball from $deps_url"
-        echo "ORT libs may need to be installed manually."
-        return 1
-    }
-
-    # Verify SHA256 if available
-    if curl -fSL -o "$TMP_DIR/$DEPS_ASSET.sha256" \
-        "https://github.com/$REPO/releases/download/$release_tag/$DEPS_ASSET.sha256" 2>/dev/null; then
-        (cd "$TMP_DIR" && sha256sum -c "$DEPS_ASSET.sha256") || die "Deps SHA256 verification failed"
-        echo "Deps SHA256 verified."
-    fi
-
-    mkdir -p "$shared_lib" "$TMP_DIR/deps"
-    tar -xzf "$TMP_DIR/$DEPS_ASSET" -C "$TMP_DIR/deps"
-    atomic_copy_libs "$TMP_DIR/deps/lib" "$shared_lib"
-    # Copy non-.so files (DEPS_VERSION, etc.) normally
-    for f in "$TMP_DIR/deps/lib/"*; do
-        case "$f" in *.so|*.so.*) continue ;; esac
-        [ -e "$f" ] || continue
-        cp -a "$f" "$shared_lib/"
-    done
-    echo "ORT runtime libraries installed."
+    mkdir -p "$shared_lib"
+    atomic_copy_libs "$release_dir/lib" "$shared_lib"
 }
 
 main() {
@@ -188,9 +129,7 @@ main() {
     tar -xzf "$TMP_DIR/$ASSET" -C "$release_dir"
 
     # Validate critical files exist
-    [ -f "$release_dir/bin/capsper-cuda" ] || [ -f "$release_dir/bin/capsper-cpu" ] \
-        || [ -f "$release_dir/bin/capsper" ] \
-        || die "Extracted release is missing capsper binaries"
+    [ -f "$release_dir/bin/capsper" ] || die "Extracted release is missing the capsper binary"
 
     # Update top-level scripts from staged release.
     # Use cp-to-temp + mv (rename) so the running script keeps its old inode —
@@ -203,8 +142,8 @@ main() {
         fi
     done
 
-    # Ensure ORT shared libs are present (downloads deps tarball if needed)
-    ensure_ort_libs "$release_dir" "$latest_tag"
+    # Ensure ORT shared libs are present (they ship inside the tarball)
+    ensure_ort_libs "$release_dir"
 
     # Download models if not present or incomplete
     ensure_nemotron_model

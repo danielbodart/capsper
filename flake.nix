@@ -35,32 +35,12 @@
       # to get the commit count.
       version = "0.${toString (self.revCount or 0)}.${self.lastModifiedDate}";
 
-      pkgs = import nixpkgs {
-        inherit system;
-        # cudnn and the CUDA runtime libraries are unfree. Setting this on our
-        # own instance keeps the flake self-contained rather than making every
-        # consumer opt in globally.
-        config.allowUnfree = true;
-      };
-
-      # The same list nix/package.nix bakes into the packaged wrapper. Bound
-      # here so the devShell below exports exactly what the packaged build
-      # loads.
-      runtimeLibs = import ./nix/runtime-libs.nix { inherit (pkgs) lib stdenv cudaPackages; };
+      pkgs = nixpkgs.legacyPackages.${system};
     in
     {
       packages.${system} = {
-        capsper-cpu = pkgs.callPackage ./nix/package.nix { inherit version; };
-        capsper-cuda = pkgs.callPackage ./nix/package.nix {
-          inherit version;
-          cudaSupport = true;
-        };
-
-        # CPU by default: free software end to end, every dependency served
-        # from cache.nixos.org, and no CPU-baseline restriction. Anyone with an
-        # NVIDIA GPU wants `.#capsper-cuda` explicitly -- it adds a 240MB
-        # onnxruntime fetch and the CUDA runtime on top.
-        default = self.packages.${system}.capsper-cpu;
+        capsper = pkgs.callPackage ./nix/package.nix { inherit version; };
+        default = self.packages.${system}.capsper;
       };
 
       # What `./run` installs with apt everywhere else. bootstrap.sh enters
@@ -72,7 +52,7 @@
       # versions CI does rather than whatever nixpkgs happens to carry. This
       # supplies only the system half -- the packages the Ubuntu job installs
       # in .github/workflows/ci.yml, plus the two binaries `dist` shells out
-      # to.
+      # to, plus the C++ runtime below.
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = with pkgs; [
           pkg-config
@@ -85,15 +65,12 @@
         # PipeWire that way and no other.
         buildInputs = [ pkgs.pipewire ];
 
-        # `./run build` symlinks bin/capsper to the CUDA variant and the
-        # integration tests start that, so the dev binary needs the same
-        # libraries the packaged one gets from its wrapper. Both read the
-        # single list in nix/runtime-libs.nix, which is the point of that
-        # file: these two cannot drift apart.
-        #
-        # No ORT entry here. This binary finds it in dist/linux/lib through an
-        # $ORIGIN-relative RPATH that build.zig sets.
-        LD_LIBRARY_PATH = pkgs.lib.concatStringsSep ":" runtimeLibs;
+        # The binary `./run build` produces links the onnxruntime in
+        # dist/linux/lib, which it finds through an $ORIGIN-relative RPATH that
+        # build.zig sets -- but that library is a C++ one built elsewhere, and
+        # nothing gives it a path to a libstdc++. The packaged build needs no
+        # equivalent: it links nixpkgs' onnxruntime, so Zig's RPATH covers it.
+        LD_LIBRARY_PATH = "${pkgs.lib.getLib pkgs.stdenv.cc.cc}/lib";
       };
 
       checks.${system} = {
@@ -152,7 +129,7 @@
           pkgs.runCommand "capsper-zon-renderer" { } ''
             diff -u ${pkgs.writeText "expected.zon" expected} \
                     ${pkgs.writeText "rendered.zon" rendered}
-            ${pkgs.lib.getExe self.packages.${system}.capsper-cpu} \
+            ${pkgs.lib.getExe self.packages.${system}.capsper} \
               --config ${pkgs.writeText "rendered.zon" rendered} --write-config > /dev/null
             touch $out
           '';

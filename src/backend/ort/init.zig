@@ -1,7 +1,6 @@
-/// ONNX Runtime backend loading (Linux CUDA + CPU).
+/// ONNX Runtime backend loading (Linux, CPU execution provider).
 /// Loads encoder + decoder ONNX models via onnxruntime C API.
 const std = @import("std");
-const build_options = @import("build_options");
 const tokenizer = @import("../../shared/tokenizer.zig");
 const ContextGraph = @import("../../shared/context_graph.zig").ContextGraph;
 const ort_c = @import("ort_c.zig");
@@ -88,24 +87,6 @@ pub fn load(
     ort_c.check(api, api.AddSessionConfigEntry.?(opts.?, "session.intra_op.allow_spinning", "0")) catch {
         std.debug.print("Warning: could not disable ORT intra-op spinning\n", .{});
     };
-
-    // CUDA configuration based on build variant
-    const backend = build_options.backend;
-    if (backend == .ort_cuda) {
-        var cuda_opts: ort_c.OrtCUDAProviderOptions = std.mem.zeroes(ort_c.OrtCUDAProviderOptions);
-        const cuda_status = api.SessionOptionsAppendExecutionProvider_CUDA.?(opts.?, &cuda_opts);
-        if (cuda_status) |s| {
-            api.ReleaseStatus.?(s);
-            std.debug.print("Nemotron: CUDA not available. This binary requires a CUDA-capable GPU.\n", .{});
-            api.ReleaseSessionOptions.?(opts.?);
-            api.ReleaseEnv.?(env.?);
-            allocator.destroy(state);
-            return null;
-        }
-        std.debug.print("Nemotron: using CUDA\n", .{});
-    } else {
-        std.debug.print("Nemotron: using CPU\n", .{});
-    }
 
     const enc_path = std.fs.path.joinZ(allocator, &.{ model_path, "encoder_model.onnx" }) catch {
         std.debug.print("Failed to build encoder path\n", .{});
