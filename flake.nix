@@ -43,16 +43,17 @@
         default = self.packages.${system}.capsper;
       };
 
-      # What `./run` installs with apt everywhere else. bootstrap.sh enters
-      # this shell automatically on NixOS, where there is no apt to call, so
-      # the same `./run dev` works on both.
+      # What `./run` installs with apt everywhere else. On NixOS there is no
+      # apt to call, so this supplies it instead: direnv loads this shell on
+      # entering the directory (.envrc), and `./run` re-runs itself inside it
+      # when something non-interactive did not.
       #
       # Deliberately not the toolchain: zig, bun and shellcheck still come
       # from mise, pinned in .mise.toml, so a local build uses the identical
       # versions CI does rather than whatever nixpkgs happens to carry. This
-      # supplies only the system half -- the packages the Ubuntu job installs
-      # in .github/workflows/ci.yml, plus the two binaries `dist` shells out
-      # to, plus the C++ runtime below.
+      # supplies only the system half -- the same packages `ensureDeps` in
+      # run.ts installs with apt, plus the two binaries `dist` shells out to,
+      # plus the C++ runtime below.
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = with pkgs; [
           pkg-config

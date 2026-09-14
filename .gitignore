@@ -6,7 +6,7 @@ dist/linux/models
 zig-out/
 dist/*/VERSION
 .zig-cache/
-tools/
+.direnv/
 .idea/
 CLAUDE.local.md
 .claude/worktrees/

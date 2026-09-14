@@ -1,4 +1,4 @@
-#!/usr/bin/env ./bootstrap.sh
+#!/usr/bin/env -S mise exec -- bun
 import { $ } from "bun";
 import { existsSync } from "fs";
 import { join } from "path";
@@ -57,17 +57,37 @@ async function ensureDepsLinux() {
 
     if (missing.length === 0) return;
 
-    // On NixOS these arrive from the flake's devShell, which bootstrap.sh
-    // enters before we get here -- so anything still missing means that did
-    // not happen, and apt is not the answer.
+    // On NixOS these come from the flake's devShell, which enterDevShell()
+    // below re-runs us inside -- so anything still missing here means neither
+    // that nor apt is the answer.
     if (!await which("apt")) {
         console.error(`Missing packages: ${missing.join(", ")}`);
-        console.error("No apt here. On NixOS run through the flake: nix develop --command ./run");
+        console.error("No apt here. Enter the flake's devShell: nix develop --command ./run");
         process.exit(1);
     }
 
     console.log(`Installing missing packages: ${missing.join(", ")}`);
     await $`sudo apt install -y ${missing}`;
+}
+
+/** Submodules and Git LFS objects: present after a clone, but not from it. */
+async function ensureCheckout() {
+    // libopus is a submodule, compiled into the binary on both platforms.
+    // A no-op once initialised, so it costs a stat rather than a fetch.
+    await $`git -C ${SCRIPT_DIR} submodule update --init --recursive --quiet`;
+
+    // dist/linux/lib/libonnxruntime.so is a Git LFS object, and a clone
+    // without the LFS filters leaves a ~130-byte text pointer in its place.
+    // Linking against that fails with an error that mentions neither LFS nor
+    // the file, so check the size rather than wait to be confused by it.
+    // macOS never reads this library: it links the system CoreML framework.
+    if (IS_MACOS) return;
+    const ort = Bun.file(`${LIB_DIR}/libonnxruntime.so`);
+    if (await ort.exists() && ort.size < 4096) {
+        console.log("Fetching Git LFS objects...");
+        await $`git -C ${SCRIPT_DIR} lfs install --local`;
+        await $`git -C ${SCRIPT_DIR} lfs pull`;
+    }
 }
 
 function ensureBinary() {
@@ -92,6 +112,7 @@ async function version(): Promise<string> {
 // ─── Commands ──────────────────────────────────────────────────────────────
 
 export async function build() {
+    await ensureCheckout();
     await ensureDeps();
     const ver = await version();
     console.log(`Building v${ver} (${IS_MACOS ? "coreml" : "ort"})...`);
@@ -132,7 +153,7 @@ export async function setup() {
 export async function dev() {
     await build();
     console.log("Running lint...");
-    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh bootstrap.sh`;
+    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh`;
     console.log("Running unit + property tests...");
     await $`zig build test`;
     console.log("Running integration smoke tests...");
@@ -279,14 +300,15 @@ export async function sign() {
 }
 
 export async function lint() {
-    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh bootstrap.sh scripts/*.sh`;
+    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh`;
 }
 
 export async function ci() {
+    await ensureCheckout();
     await ensureDeps();
     const ver = await version();
     console.log("Running lint...");
-    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh bootstrap.sh`;
+    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh`;
     console.log("Running tests...");
     await $`zig build test`;
     await build();
@@ -354,8 +376,32 @@ const commands: Record<string, Function> = {
     "manual-echo-test": manualEchoTest,
 };
 
+/**
+ * On NixOS the system half of the build comes from the flake's devShell,
+ * because there is no apt to install it with. An interactive shell is
+ * normally already inside that shell -- direnv loads it on entering the
+ * directory, see .envrc -- but a script, an editor or a CI runner is not, and
+ * would otherwise fail on a missing pkg-config, or link a binary that cannot
+ * find libstdc++. So re-run the command inside it.
+ *
+ * Nothing happens anywhere else: on any other distro these come from apt, and
+ * on a NixOS machine that already entered the shell pkg-config is on PATH and
+ * this returns immediately.
+ */
+async function enterDevShell(): Promise<boolean> {
+    if (IS_MACOS || process.env.CAPSPER_DEV_SHELL) return false;
+    if (!existsSync("/etc/NIXOS") || await which("pkg-config")) return false;
+
+    const { exitCode } = await $`nix develop ${SCRIPT_DIR} --command bun ${SCRIPT_DIR}/run.ts ${process.argv.slice(2)}`
+        .env({ ...process.env, CAPSPER_DEV_SHELL: "1" })
+        .nothrow();
+    process.exit(exitCode);
+}
+
 const command = process.argv[2] || "dev";
 const args = process.argv.slice(3);
+
+await enterDevShell();
 
 const fn = commands[command];
 if (fn) {

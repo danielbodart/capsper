@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run
 
-Zig and Bun are installed automatically via `bootstrap.sh` + mise.
+Zig, Bun, shellcheck and cosign come from [mise](https://mise.jdx.dev), at the versions `.mise.toml` pins — install mise and activate it in your shell, and `./run.ts` works. The system-level build dependencies come from apt (Linux), brew (macOS), or the flake's devShell (NixOS, loaded by direnv on entering the directory — see `.envrc`).
 
 ```bash
 # Default: build + unit tests + short regressions + platform plumbing
@@ -114,7 +114,7 @@ src/
 
 ### Scripts & Task Runner
 
-- **`run.ts`** — Bun task runner (bootstrapped via `bootstrap.sh` + mise). Commands: `dev` (default), `build`, `clean`, `setup`, `test`, `slow-test`, `dist`, `ci`.
+- **`run.ts`** — Bun task runner, run directly (`./run.ts`); its shebang resolves the pinned Bun through mise. Commands: `dev` (default), `build`, `clean`, `setup`, `test`, `slow-test`, `dist`, `ci`.
 - **`install.sh`** — Self-contained bash installer. Ships in dist tarball. On macOS: downloads CoreML models from HuggingFace. On Linux: downloads the int8 ONNX model.
 
 ### Build System & `dist/` Layout

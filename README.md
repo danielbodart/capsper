@@ -502,7 +502,7 @@ Function keys F13–F20 are the safest choice for a non-default trigger — they
 
 ## Development
 
-Want to hack on Capsper? You'll need the [requirements](#requirements) for your platform.
+Want to hack on Capsper? You'll need the [requirements](#requirements) for your platform, plus [mise](https://mise.jdx.dev), which supplies the toolchain.
 
 ```bash
 git clone https://github.com/danielbodart/capsper.git
@@ -510,15 +510,18 @@ cd capsper
 ./run.ts
 ```
 
-This auto-detects your platform and handles everything:
-- Installs toolchain (mise, Zig 0.15, Bun) on first run via `bootstrap.sh`
+mise installs Zig, Bun, shellcheck and cosign at the versions `.mise.toml` pins — the same versions CI uses — into its own data directory. `run.ts` finds the pinned Bun through mise whether or not your shell has mise activated.
+
+From there `./run.ts` handles the rest:
+- Initialises the libopus submodule and fetches the Git LFS objects (the ONNX Runtime libraries on Linux)
 - Installs system packages (`libpipewire-0.3-dev` on Linux; `shellcheck` on macOS)
-- On NixOS, where there is no apt, `bootstrap.sh` re-runs the command inside the flake's `devShell`, which supplies that same set. The toolchain still comes from mise either way, so a local build uses the versions CI uses
 - Downloads models if missing (~250 MB for ONNX, ~150 MB for CoreML)
-- Compiles the Zig binary (pre-built ONNX Runtime shared libs committed via Git LFS on Linux)
+- Compiles the Zig binary
 - Runs unit tests, property tests, and short integration smoke tests
 
 Every step is incremental — re-running `./run.ts` is fast if everything is already set up.
+
+**On NixOS** there is no apt, so the system packages come from the flake's `devShell` instead. Install [direnv](https://direnv.net) (with [nix-direnv](https://github.com/nix-community/nix-direnv), which caches the evaluation) and `direnv allow` once: entering the directory then loads that shell. `./run.ts` also re-runs itself inside it when something non-interactive — a script, an editor, CI — has not. The toolchain still comes from mise either way.
 
 ### Building & testing
 

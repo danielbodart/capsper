@@ -9,26 +9,30 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libpipewire-0.3-dev
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           # libopus is a submodule, compiled into the binary.
           submodules: recursive
+      # The LFS objects themselves, keyed on the pointer files -- which are
+      # content-addressed, so the key changes exactly when the libraries do.
+      # `./run ci` pulls them if this misses.
       - uses: actions/cache@v4
         with:
           path: .git/lfs
           key: lfs-${{ hashFiles('dist/linux/lib/*.so') }}
           restore-keys: lfs-
-      - run: git lfs pull
+      # zig, bun, shellcheck and cosign, at the versions .mise.toml pins.
+      # Installs and caches them; the tools it installs land on PATH for the
+      # steps below.
+      - uses: jdx/mise-action@v4
+      # Zig's global cache: the compiled standard library and the build's own
+      # dependencies, which is most of a cold build.
       - uses: actions/cache@v4
         with:
-          path: tools
-          key: mise-tools-linux-${{ hashFiles('.mise.toml') }}
-          restore-keys: mise-tools-linux-
+          path: ~/.cache/zig
+          key: zig-linux-${{ hashFiles('build.zig.zon', '.mise.toml') }}
+          restore-keys: zig-linux-
       - name: CI
         run: ./run ci
         env:
@@ -48,11 +52,12 @@ jobs:
           fetch-depth: 0
           # libopus is a submodule, compiled into the binary.
           submodules: recursive
+      - uses: jdx/mise-action@v4
       - uses: actions/cache@v4
         with:
-          path: tools
-          key: mise-tools-macos-${{ hashFiles('.mise.toml') }}
-          restore-keys: mise-tools-macos-
+          path: ~/.cache/zig
+          key: zig-macos-${{ hashFiles('build.zig.zon', '.mise.toml') }}
+          restore-keys: zig-macos-
       - name: CI
         run: ./run ci
         env:
@@ -67,18 +72,20 @@ jobs:
 
   # NixOS support. There is no NixOS runner image, but a Nix derivation builds
   # identically on any host, so Nix on ubuntu is a real verification of the
-  # packages. The NixOS module needs an actual NixOS system, which the flake's
-  # check boots in a VM — KVM is available on Linux runners and the Determinate
-  # installer enables it.
+  # package. The NixOS module needs an actual NixOS system, which the flake's
+  # check boots in a VM — KVM is available on Linux runners and the installer
+  # enables it.
   nix:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
-        with:
-          path: tools
-          key: mise-tools-linux-${{ hashFiles('.mise.toml') }}
-          restore-keys: mise-tools-linux-
+      # Only for bun, which runs run.ts. The flake supplies everything else.
+      - uses: jdx/mise-action@v4
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # Upstream Nix rather than Determinate Nix, whose FlakeHub login
+          # this repository has no account for: it fails after a 15s timeout
+          # and warns. KVM is configured either way, and the VM test needs it.
+          determinate: false
       - name: Nix
         run: ./run nix
