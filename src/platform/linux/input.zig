@@ -366,6 +366,27 @@ pub fn isKeyboardBitmask(keymask: []const u8) bool {
     return true;
 }
 
+/// Fill `out` from a sysfs bitmask: 64-bit hex words, most significant first,
+/// so the last word holds bits 0-63. Bits past the end of `out` are dropped.
+pub fn parseSysfsBitmask(text: []const u8, out: []u8) void {
+    @memset(out, 0);
+
+    var counter = std.mem.tokenizeAny(u8, text, " \t\n");
+    var words: usize = 0;
+    while (counter.next()) |_| words += 1;
+
+    var iter = std.mem.tokenizeAny(u8, text, " \t\n");
+    var i: usize = 0;
+    while (iter.next()) |word| : (i += 1) {
+        const value = std.fmt.parseInt(u64, word, 16) catch continue;
+        const base = (words - 1 - i) * 8;
+        for (0..8) |byte| {
+            if (base + byte >= out.len) break;
+            out[base + byte] = @truncate(value >> @intCast(byte * 8));
+        }
+    }
+}
+
 // ──── Grabbed device tracking ────
 
 const MAX_DEVICES = 32;
@@ -667,8 +688,11 @@ pub const InputHandler = struct {
             var path_buf: [64]u8 = undefined;
             const path = std.fmt.bufPrintZ(&path_buf, "/dev/input/{s}", .{entry.name}) catch continue;
 
+            if (findDeviceByPath(&self.devices, path) != null) continue;
+            if (!worthOpening(entry.name)) continue;
+
             self.tryGrabDevice(path) catch |err| {
-                if (err != error.AlreadyHeld) log.debug("skipping {s}: {}", .{ path, err });
+                log.debug("skipping {s}: {}", .{ path, err });
             };
         }
     }
@@ -885,6 +909,39 @@ fn isKeyboard(fd: posix.fd_t) bool {
     var keymask: [bitmask_size]u8 = std.mem.zeroes([bitmask_size]u8);
     doIoctl(fd, EVIOCGBIT(EV_KEY, bitmask_size), @intFromPtr(&keymask)) catch return false;
     return isKeyboardBitmask(&keymask);
+}
+
+/// Read a sysfs attribute into `buf`. Null when the answer cannot be trusted:
+/// no such file, or more of one than `buf` holds.
+fn readSysfs(buf: []u8, comptime path_fmt: []const u8, node: []const u8) ?[]const u8 {
+    var path_buf: [128]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, path_fmt, .{node}) catch return null;
+    const text = std.fs.cwd().readFile(path, buf) catch return null;
+    if (text.len == buf.len) return null;
+    return std.mem.trim(u8, text, " \n");
+}
+
+/// Whether the scan should open `node` (an `eventN` name) at all.
+///
+/// Opening an evdev node is not free: closing one again costs an RCU grace
+/// period, around ten milliseconds a device, and the thread paying it is the
+/// one forwarding your keystrokes. Twenty-odd devices reopened every couple of
+/// seconds put a third of a second of that between key and screen. sysfs
+/// answers the same two questions from bitmaps the kernel already holds, so
+/// the scan only opens a device it might actually grab. A question sysfs
+/// cannot answer is answered yes, because losing a keyboard costs more than
+/// an open.
+fn worthOpening(node: []const u8) bool {
+    var caps_buf: [1024]u8 = undefined;
+    const caps = readSysfs(&caps_buf, "/sys/class/input/{s}/device/capabilities/key", node) orelse return true;
+
+    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
+    parseSysfsBitmask(caps, &keymask);
+    if (!isKeyboardBitmask(&keymask)) return false;
+
+    var vendor_buf: [32]u8 = undefined;
+    const vendor = readSysfs(&vendor_buf, "/sys/class/input/{s}/device/id/vendor", node) orelse return true;
+    return (std.fmt.parseInt(u16, vendor, 16) catch return true) != VIRTUAL_VENDOR;
 }
 
 /// Parse a trigger key name to a Linux keycode
@@ -1314,4 +1371,66 @@ test "ioctl constants: UI_DEV_SETUP" {
 test "ioctl constants: UI_DEV_CREATE and UI_DEV_DESTROY" {
     try std.testing.expectEqual(@as(u32, 0x00005501), UI_DEV_CREATE);
     try std.testing.expectEqual(@as(u32, 0x00005502), UI_DEV_DESTROY);
+}
+
+// ──── parseSysfsBitmask tests ────
+//
+// The strings are what /sys/class/input/eventN/device/capabilities/key holds
+// for the named devices: 64-bit hex words, most significant first.
+
+test "parseSysfsBitmask: a keyboard's capabilities say keyboard" {
+    // Wooting 80HE.
+    const caps = "1000000000007 ff980000000007ff febeffdfffefffff fffffffffffffffe";
+    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
+    parseSysfsBitmask(caps, &keymask);
+    try std.testing.expect(isKeyboardBitmask(&keymask));
+}
+
+test "parseSysfsBitmask: a mouse's capabilities do not" {
+    // SteelSeries Aerox 5 — buttons, no letters.
+    const caps = "ff0000 0 0 0 0";
+    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
+    parseSysfsBitmask(caps, &keymask);
+    try std.testing.expect(!isKeyboardBitmask(&keymask));
+}
+
+test "parseSysfsBitmask: an RGB controller reporting no keys at all" {
+    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
+    parseSysfsBitmask("0", &keymask);
+    try std.testing.expect(!isKeyboardBitmask(&keymask));
+    for (keymask) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "parseSysfsBitmask: the rightmost word holds bits 0-63" {
+    // KEY_1 is 2 and KEY_Y is 21, both inside the low word; a single word must
+    // land there rather than at the front of the mask.
+    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
+    parseSysfsBitmask("8000000000000001", &keymask);
+    try std.testing.expect(hasKeyBit(&keymask, 0));
+    try std.testing.expect(hasKeyBit(&keymask, 63));
+    try std.testing.expect(!hasKeyBit(&keymask, 64));
+}
+
+test "parseSysfsBitmask: leading words carry the high bits" {
+    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
+    parseSysfsBitmask("1 0 0", &keymask);
+    try std.testing.expect(hasKeyBit(&keymask, 128));
+    try std.testing.expect(!hasKeyBit(&keymask, 0));
+}
+
+test "parseSysfsBitmask: bits past the end of the mask are dropped" {
+    // A device reporting more words than KEY_MAX covers must not write past
+    // the buffer, and must still place the low bits correctly.
+    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
+    parseSysfsBitmask("ffffffffffffffff " ** 20 ++ "3", &keymask);
+    try std.testing.expect(hasKeyBit(&keymask, 0));
+    try std.testing.expect(hasKeyBit(&keymask, 1));
+    try std.testing.expect(!hasKeyBit(&keymask, 2));
+}
+
+test "parseSysfsBitmask: a trailing newline is not a word" {
+    var keymask: [(KEY_MAX + 7) / 8 + 1]u8 = undefined;
+    parseSysfsBitmask("3\n", &keymask);
+    try std.testing.expect(hasKeyBit(&keymask, 0));
+    try std.testing.expect(hasKeyBit(&keymask, 1));
 }
