@@ -44,9 +44,13 @@ const bytes_per_second: usize = 32_000;
 /// One session's audio file, written as it is captured rather than held in
 /// memory: an hour of stereo is 230 MB, and a session that is lost because
 /// capsper was killed is a session that never happened.
-const SessionFile = struct {
+pub const SessionFile = struct {
     dir: std.fs.Dir,
     file: std.fs.File,
+
+    /// Two for a call, one for a room. Kept because the WAV header is
+    /// rewritten at close and the duration is bytes divided by this.
+    channels: u8,
 
     /// Opus for a meeting, which is hours kept indefinitely; WAV when the
     /// setting asks for it. Either way the audio is never gated -- it has to
@@ -56,7 +60,13 @@ const SessionFile = struct {
         opus: opus.Writer,
     },
 
-    fn create(root: []const u8, rel_path: []const u8, gpa: std.mem.Allocator, format: config.AudioFormat) !SessionFile {
+    pub fn create(
+        root: []const u8,
+        rel_path: []const u8,
+        gpa: std.mem.Allocator,
+        format: config.AudioFormat,
+        channels: u8,
+    ) !SessionFile {
         var root_dir = try std.fs.cwd().makeOpenPath(root, .{});
         defer root_dir.close();
 
@@ -87,28 +97,29 @@ const SessionFile = struct {
                 // starts, so the header is rewritten on close.
                 var header: std.ArrayListUnmanaged(u8) = .{};
                 defer header.deinit(gpa);
-                try utils.writeWavHeader(header.writer(gpa), 0, 2);
+                try utils.writeWavHeader(header.writer(gpa), 0, channels);
                 try file.writeAll(header.items);
-                return .{ .dir = dir, .file = file, .encoder = .{ .wav = .{} } };
+                return .{ .dir = dir, .file = file, .channels = channels, .encoder = .{ .wav = .{} } };
             },
             .opus => return .{
                 .dir = dir,
                 .file = file,
-                .encoder = .{ .opus = try opus.Writer.create(gpa, file, 2, opus.default_bitrate) },
+                .channels = channels,
+                .encoder = .{ .opus = try opus.Writer.create(gpa, file, channels, opus.default_bitrate) },
             },
         }
     }
 
     /// The audio file's name, which the transcript beside it shares: media
     /// players pair a subtitle file with a media file by matching basenames.
-    fn audioName(format: config.AudioFormat) [:0]const u8 {
+    pub fn audioName(format: config.AudioFormat) [:0]const u8 {
         return switch (format) {
             .wav => "audio.wav",
             .opus => "audio.opus",
         };
     }
 
-    fn append(self: *SessionFile, bytes: []const u8) !void {
+    pub fn append(self: *SessionFile, bytes: []const u8) !void {
         if (bytes.len == 0) return;
         switch (self.encoder) {
             .wav => |*w| {
@@ -119,12 +130,12 @@ const SessionFile = struct {
         }
     }
 
-    fn finish(self: *SessionFile, gpa: std.mem.Allocator) void {
+    pub fn finish(self: *SessionFile, gpa: std.mem.Allocator) void {
         switch (self.encoder) {
             .wav => |w| {
                 var header: std.ArrayListUnmanaged(u8) = .{};
                 defer header.deinit(gpa);
-                if (utils.writeWavHeader(header.writer(gpa), w.bytes, 2)) {
+                if (utils.writeWavHeader(header.writer(gpa), w.bytes, self.channels)) {
                     self.file.seekTo(0) catch {};
                     self.file.writeAll(header.items) catch {};
                 } else |_| {}
@@ -135,10 +146,11 @@ const SessionFile = struct {
         self.dir.close();
     }
 
-    fn durationSeconds(self: *const SessionFile) f64 {
+    pub fn durationSeconds(self: *const SessionFile) f64 {
         return switch (self.encoder) {
-            // 16 kHz, two channels, two bytes a sample.
-            .wav => |w| @as(f64, @floatFromInt(w.bytes)) / 64_000.0,
+            // 16 kHz, two bytes a sample, and however many channels this is.
+            .wav => |w| @as(f64, @floatFromInt(w.bytes)) /
+                (32_000.0 * @as(f64, @floatFromInt(self.channels))),
             .opus => |w| w.durationSeconds(),
         };
     }
@@ -267,7 +279,7 @@ pub fn run(
 /// Load the voice activity model from the models directory, beside the ASR
 /// model it gates. Null when it is missing or the backend has no gate; that is a
 /// cost, not a failure, so nothing here reports it as one.
-fn loadVad(gpa: std.mem.Allocator, cfg: *const config.Config) ?*vad_backend.Vad {
+pub fn loadVad(gpa: std.mem.Allocator, cfg: *const config.Config) ?*vad_backend.Vad {
     const bin_dir = std.fs.selfExeDirPathAlloc(gpa) catch return null;
     defer gpa.free(bin_dir);
     const path = std.fs.path.joinZ(gpa, &.{ bin_dir, "../models/silero_vad.onnx" }) catch return null;
@@ -287,7 +299,7 @@ fn loadVad(gpa: std.mem.Allocator, cfg: *const config.Config) ?*vad_backend.Vad 
 /// per-utterance state and two conversations through one would interleave into
 /// nonsense. Concurrency is already linear and the model itself is shared, so
 /// two tracks cost two pipelines' state, not two models.
-const TrackAsr = struct {
+pub const TrackAsr = struct {
     voice: webvtt.Voice,
     pipeline: *Pipeline,
     cues: webvtt.CueBuilder,
@@ -340,7 +352,7 @@ const TrackAsr = struct {
 
     const chunk_bytes: usize = 17_920;
 
-    fn init(
+    pub fn init(
         gpa: std.mem.Allocator,
         voice: webvtt.Voice,
         factory: PipelineFactory,
@@ -361,7 +373,7 @@ const TrackAsr = struct {
         };
     }
 
-    fn deinit(self: *TrackAsr, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *TrackAsr, gpa: std.mem.Allocator) void {
         if (self.vad) |v| v.deinit();
         self.cues.deinit();
         self.buffer.deinit(gpa);
@@ -370,7 +382,7 @@ const TrackAsr = struct {
     }
 
     /// Feed arriving PCM, and write any cue it completed.
-    fn feed(self: *TrackAsr, gpa: std.mem.Allocator, pcm: []const u8, out: *webvtt.Transcript) !void {
+    pub fn feed(self: *TrackAsr, gpa: std.mem.Allocator, pcm: []const u8, out: *webvtt.Transcript) !void {
         self.bytes_arrived += pcm.len;
         try self.buffer.appendSlice(gpa, pcm);
 
@@ -458,7 +470,7 @@ const TrackAsr = struct {
     }
 
     /// Push the tail through and close any open cue.
-    fn finish(self: *TrackAsr, gpa: std.mem.Allocator, out: *webvtt.Transcript) !void {
+    pub fn finish(self: *TrackAsr, gpa: std.mem.Allocator, out: *webvtt.Transcript) !void {
         if (self.buffer.items.len > 0) {
             const tail = try gpa.dupe(u8, self.buffer.items);
             defer gpa.free(tail);
@@ -541,10 +553,16 @@ const Session = struct {
         var path_buf: [64]u8 = undefined;
         const rel = try meeting.sessionPath(&path_buf, std.time.timestamp());
 
-        var file = try SessionFile.create(cfg.meeting.dir, rel, gpa, cfg.meeting.audio_format);
+        var file = try SessionFile.create(cfg.meeting.dir, rel, gpa, cfg.meeting.audio_format, 2);
         errdefer file.finish(gpa);
 
-        var transcript = try Transcript.create(gpa, file.dir, cfg.meeting.detail, SessionFile.audioName(cfg.meeting.audio_format));
+        var transcript = try Transcript.create(
+            gpa,
+            file.dir,
+            cfg.meeting.detail,
+            SessionFile.audioName(cfg.meeting.audio_format),
+            "near end (microphone) = left, far end (call) = right",
+        );
         errdefer transcript.deinit();
 
         // Before anything else is set up, because what is being recorded is
@@ -1026,7 +1044,7 @@ fn writeSourceMetadata(
 /// on disk. Rendering the lot costs nothing at these sizes -- an hour of
 /// transcript is tens of kilobytes, against hundreds of megabytes of audio
 /// beside it -- and it is the only version that is always correct.
-const Transcript = struct {
+pub const Transcript = struct {
     doc: webvtt.Transcript,
     dir: std.fs.Dir,
 
@@ -1039,11 +1057,20 @@ const Transcript = struct {
     /// needing this repository to explain it.
     channels_note: []const u8,
 
-    fn create(
+    /// What kind of transcript this is, as the file's first note.
+    kind_note: []const u8 = "capsper meeting transcript",
+
+    /// `layout` says what the channels of `audio_name` are, in the words a
+    /// person reading the file in two years needs -- "near end (microphone) =
+    /// left, far end (call) = right" for a call, "one microphone, the room"
+    /// for a room. Given rather than derived, because only the caller knows
+    /// what it recorded.
+    pub fn create(
         gpa: std.mem.Allocator,
         dir: std.fs.Dir,
         detail: config.Detail,
         audio_name: []const u8,
+        layout: []const u8,
     ) !Transcript {
         return .{
             .doc = webvtt.Transcript.init(gpa, switch (detail) {
@@ -1051,11 +1078,7 @@ const Transcript = struct {
                 .debug => .debug,
             }),
             .dir = dir,
-            .channels_note = try std.fmt.allocPrint(
-                gpa,
-                "{s}: near end (microphone) = left, far end (call) = right",
-                .{audio_name},
-            ),
+            .channels_note = try std.fmt.allocPrint(gpa, "{s}: {s}", .{ audio_name, layout }),
         };
     }
 
@@ -1065,7 +1088,7 @@ const Transcript = struct {
     /// first: transcribing a chunk usually extends the cue being built rather
     /// than finishing one, and a render and a write per chunk would be
     /// hundreds of times the work for the same bytes.
-    fn saveIfChanged(self: *Transcript) void {
+    pub fn saveIfChanged(self: *Transcript) void {
         if (self.doc.cues.items.len == self.written_cues) return;
         self.save();
     }
@@ -1084,7 +1107,7 @@ const Transcript = struct {
     /// collected as if it were a recording.
     fn save(self: *Transcript) void {
         const tmp = ".audio.vtt.tmp";
-        const header_notes = [_][]const u8{ "capsper meeting transcript", self.channels_note };
+        const header_notes = [_][]const u8{ self.kind_note, self.channels_note };
 
         const bytes = self.doc.render(&header_notes) catch |err| {
             log.err("could not render the transcript: {}", .{err});
@@ -1110,7 +1133,7 @@ const Transcript = struct {
         self.written_cues = self.doc.cues.items.len;
     }
 
-    fn finish(self: *Transcript) void {
+    pub fn finish(self: *Transcript) void {
         defer self.doc.gpa.free(self.channels_note);
         // Unconditional rather than saveIfChanged: closing flushes the cue
         // each track still had open, and those are exactly the ones a running
@@ -1119,7 +1142,7 @@ const Transcript = struct {
         self.doc.deinit();
     }
 
-    fn deinit(self: *Transcript) void {
+    pub fn deinit(self: *Transcript) void {
         self.doc.gpa.free(self.channels_note);
         self.doc.deinit();
     }

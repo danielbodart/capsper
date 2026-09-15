@@ -118,6 +118,10 @@ pub var meeting_near: Input = .{};
 /// Whether the trigger is held right now, or capture is otherwise open.
 pub var live: std.atomic.Value(bool) = .init(false);
 
+/// Whether the room is being recorded — the latched mode the trigger key
+/// toggles, as opposed to `live`, which is the key being held.
+pub var room_recording: std.atomic.Value(bool) = .init(false);
+
 /// How many remote dictation clients are connected to the TCP server.
 pub var tcp_clients: std.atomic.Value(u32) = .init(0);
 

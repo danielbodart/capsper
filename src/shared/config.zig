@@ -114,6 +114,38 @@ pub const Trigger = struct {
     low_latency: bool = false,
 };
 
+/// Recording the room you are sitting in, rather than a call.
+///
+/// The case is an in-person meeting: two people around one laptop, no far end
+/// and nothing playing into the sink, so none of the three gates that decide
+/// when a *call* is happening can see it. The key decides instead --
+/// ctrl+trigger latches it on, the trigger alone turns it off, and the
+/// CapsLock light says which it is.
+///
+/// Everything about the result is borrowed from `meeting` on purpose: the same
+/// directory, the same audio format, the same detail, the same voice activity
+/// gate. What lands in `~/.local/share/capsper/sessions` is a transcript of a
+/// conversation either way, and a second set of settings saying where to put
+/// it would only be a second set to keep in step.
+pub const Room = struct {
+    /// The microphone, overriding `audio.target` for this mode alone. Null
+    /// takes `audio.target`, and if that is null too it follows whatever the
+    /// desktop's input is set to.
+    ///
+    /// Its own setting for the same reason `meeting.near` has one: the mic
+    /// that suits a room of people is rarely the one that suits dictation.
+    source: ?[:0]const u8 = null,
+
+    /// How long a latched session may run before it closes itself, in minutes.
+    /// Zero switches the limit off.
+    ///
+    /// The light is the real guard, and it is a good one right up until the
+    /// lid closes on it. This is what stops a toggle you forgot from recording
+    /// until the disk fills; a meeting that genuinely runs longer resumes with
+    /// another press, in a second file.
+    max_minutes: u32 = 240,
+};
+
 pub const Tcp = struct {
     /// The port to listen on. Null means no server; zero takes an
     /// OS-assigned one.
@@ -312,6 +344,9 @@ pub const Config = struct {
     /// Recording and transcribing calls, as opposed to dictating into a
     /// window.
     meeting: Meeting = .{},
+    /// Recording and transcribing the room, for the meetings that are not on
+    /// a call at all.
+    room: Room = .{},
 
     /// The source the meeting's near track listens to: its own setting if it
     /// has one, otherwise the one every mode shares. Resolved in one place so
@@ -320,6 +355,12 @@ pub const Config = struct {
     /// echo from a signal that never had it.
     pub fn meetingNear(self: *const Config) ?[:0]const u8 {
         return self.meeting.near orelse self.audio.target;
+    }
+
+    /// The microphone room capture listens to, resolved the same way and for
+    /// the same reason as `meetingNear`.
+    pub fn roomSource(self: *const Config) ?[:0]const u8 {
+        return self.room.source orelse self.audio.target;
     }
 
     /// Expand a leading `~/` in every field that names a path. Done once,

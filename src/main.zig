@@ -23,6 +23,7 @@ const sink_mod = @import("platform/sink.zig");
 const VirtualSink = sink_mod.VirtualSink;
 const SinkWatch = sink_mod.SinkWatch;
 const meeting_runner = @import("shared/meeting_runner.zig");
+const room_runner = @import("shared/room_runner.zig");
 const status = @import("shared/status.zig");
 const http_server = @import("shared/http_server.zig");
 
@@ -399,6 +400,7 @@ pub fn main() !void {
                 .trigger_passthrough = cfg.trigger.passthrough,
                 .type_delay_us = cfg.trigger.type_delay_us,
                 .live_fn = &server_mod.setLive,
+                .room_fn = &room_runner.setWanted,
             }) catch |err| {
                 std.debug.print("Failed to init input handler: {}\n", .{err});
                 if (builtin.os.tag == .linux) {
@@ -466,6 +468,20 @@ pub fn main() !void {
     // in the graph from startup, sessions open whenever something plays into
     // it, and nothing has to be started or restarted in time with a meeting.
     // Days of silence between two calls is the ordinary case, not a lapse.
+    // Room capture rides on the trigger key and on nothing else: no sink to
+    // watch, no port to open, no setting to turn on. If there is a key to
+    // latch it with, the thread that answers the latch is up, and until
+    // somebody presses ctrl+trigger it costs one atomic read every 200ms.
+    var room_thread: ?std.Thread = null;
+    if (trigger_key != null and !cli.dry_run) {
+        room_thread = std.Thread.spawn(.{}, runRoom, .{
+            allocator, &cfg, audio_channel, pipeline_factory,
+        }) catch |err| blk: {
+            std.debug.print("Could not start room capture: {}\n", .{err});
+            break :blk null;
+        };
+    }
+
     var meeting_thread: ?std.Thread = null;
     if (want_meeting and !cli.dry_run) {
         meeting_thread = std.Thread.spawn(.{}, runMeeting, .{
@@ -488,6 +504,7 @@ pub fn main() !void {
     try server.run();
 
     if (meeting_thread) |t| t.join();
+    if (room_thread) |t| t.join();
 
     // With the console the only thing asked for, `server.run()` has nothing
     // to serve and returns at once, and there is no thread to join -- the
@@ -496,6 +513,17 @@ pub fn main() !void {
     if (run_http and !want_local and !want_tcp and !want_meeting) {
         while (true) std.Thread.sleep(std.time.ns_per_hour);
     }
+}
+
+/// `room_runner.run` with its error swallowed, for the same reason as
+/// `runMeeting` below.
+fn runRoom(
+    allocator: std.mem.Allocator,
+    cfg: *const config.Config,
+    audio_channel: u32,
+    factory: PipelineFactory,
+) void {
+    room_runner.run(allocator, cfg, audio_channel, factory) catch {};
 }
 
 /// `meeting_runner.run` with its error swallowed, because a thread entry point

@@ -112,6 +112,16 @@ pub const Process = struct {
 };
 
 pub const Document = struct {
+    /// Which kind of capture wrote this. Empty for a call, which is what every
+    /// document was when the format was written, so an older `audio.json`
+    /// answers the question correctly by saying nothing.
+    ///
+    /// Read by the console: a call has two voices hard-panned into a stereo
+    /// file and a channel control that means something, a room has one
+    /// microphone and neither. That cannot be inferred from the cues -- a call
+    /// where the far end sat silent has no far cues either -- so it is
+    /// recorded rather than guessed.
+    mode: []const u8 = "",
     streams: []const Source = &.{},
     devices: []const Device = &.{},
     /// Child first, each naming its parent, so the tree can be rebuilt
@@ -406,6 +416,11 @@ pub fn render(gpa: Allocator, doc: Document) ![]u8 {
     var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .indent_2 } };
 
     try json.beginObject();
+
+    if (doc.mode.len > 0) {
+        try json.objectField("mode");
+        try json.write(doc.mode);
+    }
 
     try json.objectField("streams");
     try json.beginArray();
