@@ -275,12 +275,49 @@ pub const TriggerAction = enum {
     none,
     start_recording, // trigger pressed — begin capture
     stop_recording, // trigger released — stop capture immediately
+    start_room, // trigger toggled on — capture the room until told otherwise
+    stop_room, // trigger toggled off
 };
 
-/// Pure state machine for trigger key press/release.
+/// Pure state machine for the trigger key, which does two jobs.
+///
+/// Held, it dictates: press to speak, release to stop, and the text goes into
+/// whatever window has focus. Pressed with control down, it latches instead --
+/// the room is recorded to a transcript, nothing is typed anywhere, and the
+/// key is free until it is pressed again. The two are exclusive on purpose:
+/// while the room is being recorded the trigger's only job is to stop it.
+///
+/// That last rule is the one worth arguing with later. It costs dictating a
+/// note during an in-person meeting, because the press that would start the
+/// note ends the recording instead. It buys a key that always stops what the
+/// light says is running, without a modifier to remember at the moment you
+/// most want to just stop it.
+///
 /// No debounce — release fires immediately for instant PTT cutoff.
 pub const TriggerState = struct {
     held: bool = false,
+
+    /// Whether the current hold is dictating. A press that latched the room
+    /// on or off never started dictation, so its release must not stop any.
+    dictating: bool = false,
+
+    /// Whether a control key is down, which is what turns the next press into
+    /// a toggle. Fed by `modifier` from the same event stream.
+    ctrl: bool = false,
+
+    /// Whether the room is being recorded. Latched: it outlives the press.
+    room: bool = false,
+
+    /// Note a key that is not the trigger. Only control matters, and only
+    /// because holding it changes what the next trigger press means.
+    pub fn modifier(self: *TriggerState, code: u16, value: i32) void {
+        // Repeats (2) say nothing new about whether the key is down.
+        if (value == 2) return;
+        switch (code) {
+            ev.KEY_LEFTCTRL, ev.KEY_RIGHTCTRL => self.ctrl = value == 1,
+            else => {},
+        }
+    }
 
     /// Process a key event (value: 1=press, 0=release, 2=repeat).
     pub fn keyEvent(self: *TriggerState, value: i32) TriggerAction {
@@ -291,20 +328,34 @@ pub const TriggerState = struct {
         };
     }
 
+    /// Give up any hold, for the safety net that notices the key is not
+    /// physically down after all. The latch deliberately survives: it is not a
+    /// held key, and a missed release says nothing about whether the room
+    /// should still be recording.
+    pub fn forceRelease(self: *TriggerState) void {
+        self.held = false;
+        self.dictating = false;
+    }
+
     fn keyPress(self: *TriggerState) TriggerAction {
-        if (!self.held) {
-            self.held = true;
-            return .start_recording;
+        if (self.held) return .none;
+        self.held = true;
+
+        if (self.ctrl or self.room) {
+            self.room = !self.room;
+            return if (self.room) .start_room else .stop_room;
         }
-        return .none;
+
+        self.dictating = true;
+        return .start_recording;
     }
 
     fn keyRelease(self: *TriggerState) TriggerAction {
-        if (self.held) {
-            self.held = false;
-            return .stop_recording;
-        }
-        return .none;
+        if (!self.held) return .none;
+        self.held = false;
+        if (!self.dictating) return .none;
+        self.dictating = false;
+        return .stop_recording;
     }
 };
 
@@ -374,6 +425,11 @@ pub fn isKeyboardBitmask(keymask: []const u8) bool {
 
 const MAX_DEVICES = 32;
 
+/// How long the room light stays on, and then off, while recording. Chosen by
+/// watching it: a second was too slow to read as "running", and anything much
+/// under half a second reads as a fault rather than a state.
+const blink_interval_ns: u64 = 500 * std.time.ns_per_ms;
+
 const GrabbedDevice = struct {
     fd: posix.fd_t,
     grabbed: bool,
@@ -406,6 +462,14 @@ pub const InputHandler = struct {
     trigger_passthrough: bool,
     type_delay_us: u64,
     live_fn: *const fn (bool) void,
+    /// Told when the room latch turns over. Null where nothing is listening,
+    /// which is every build that has no room capture to start.
+    room_fn: ?*const fn (bool) void = null,
+
+    /// Whether the room light should be showing. Written by `eventLoop` on a
+    /// toggle, read by `deviceLoop`, which owns the blink and every write to
+    /// a device that carries it.
+    room_on: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
     device_thread: ?std.Thread = null,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -423,6 +487,7 @@ pub const InputHandler = struct {
         trigger_passthrough: bool = false,
         type_delay_us: u64 = 12_000, // 12ms between keystrokes
         live_fn: *const fn (bool) void,
+        room_fn: ?*const fn (bool) void = null,
     };
 
     pub fn init(config: Config) !InputHandler {
@@ -431,6 +496,7 @@ pub const InputHandler = struct {
             .trigger_passthrough = config.trigger_passthrough,
             .type_delay_us = config.type_delay_us,
             .live_fn = config.live_fn,
+            .room_fn = config.room_fn,
         };
 
         // Create uinput virtual keyboard
@@ -541,7 +607,7 @@ pub const InputHandler = struct {
             // EVIOCGKEY safety net: verify trigger key is still physically held.
             // Catches lost evdev release events (the PTT-stuck bug).
             if (self.trigger.held and !self.isTriggerPhysicallyHeld()) {
-                self.trigger.held = false;
+                self.trigger.forceRelease();
                 self.live_fn(false);
                 log.warn("trigger key not physically held — forcing release", .{});
             }
@@ -587,14 +653,42 @@ pub const InputHandler = struct {
         log.info("device thread started", .{});
         defer log.info("device thread exiting", .{});
 
+        // The blink's phase, owned here and nowhere else. `eventLoop` sets the
+        // flag and never touches a light, so there is no state to share beyond
+        // one atomic bool.
+        var lit = false;
+        var flip_at_ns: u64 = 0;
+        defer if (lit) self.setLed(false);
+
         while (!self.shutdown.load(.monotonic)) {
             self.closeRetired();
 
             // The timeout is the reaping heartbeat, not a wait on anything:
             // a retired device is closed within 200ms of `eventLoop` marking
             // it, and nothing cares which side of that it happens on.
+            var timeout_ms: i32 = 200;
+
+            if (self.room_on.load(.monotonic)) {
+                const now: u64 = @intCast(std.time.nanoTimestamp());
+                if (now >= flip_at_ns) {
+                    lit = !lit;
+                    self.setLed(lit);
+                    flip_at_ns = now + blink_interval_ns;
+                }
+                // Wake for whichever comes first, the next flip or the next
+                // reap, so the blink keeps its period instead of rounding up
+                // to the heartbeat.
+                const until_ms: u64 = (flip_at_ns -| now) / std.time.ns_per_ms;
+                timeout_ms = @intCast(@min(200, until_ms + 1));
+            } else if (lit) {
+                lit = false;
+                self.setLed(false);
+                // So the next session starts lit rather than half a blink in.
+                flip_at_ns = 0;
+            }
+
             var fds = [_]posix.pollfd{.{ .fd = self.inotify_fd, .events = posix.POLL.IN, .revents = 0 }};
-            const ready = posix.poll(&fds, 200) catch |err| {
+            const ready = posix.poll(&fds, timeout_ms) catch |err| {
                 if (err == error.Interrupted) continue;
                 log.err("inotify poll failed: {}", .{err});
                 return;
@@ -602,6 +696,33 @@ pub const InputHandler = struct {
             if (ready == 0) continue;
 
             self.grabHotplugged();
+        }
+    }
+
+    /// Put every grabbed keyboard's CapsLock light in the same state.
+    ///
+    /// Allowed on any thread, and done on `deviceLoop`: it is a write to fds
+    /// already open, with no ioctl, no open and no close behind it. Measured
+    /// on a Razer Blade with capsper holding the device -- the light comes on,
+    /// stays on, and the desktop does not take it back, because capsper
+    /// swallows CapsLock and so the desktop's own caps state never moves. Turn
+    /// `trigger.passthrough` on and that stops being true.
+    ///
+    /// Keyboards without the light silently do nothing, which is the whole
+    /// error handling this needs: the indicator is a convenience, and a
+    /// failure to light it must never be felt anywhere else.
+    fn setLed(self: *InputHandler, on: bool) void {
+        self.devices_mutex.lock();
+        defer self.devices_mutex.unlock();
+
+        for (&self.devices) |*slot| {
+            const dev = if (slot.*) |*d| d else continue;
+            if (dev.dead) continue;
+            const events = [_]InputEvent{
+                .{ .tv_sec = 0, .tv_usec = 0, .type = EV_LED, .code = ev.LED_CAPSL, .value = if (on) 1 else 0 },
+                InputEvent.syn(),
+            };
+            _ = posix.write(dev.fd, std.mem.sliceAsBytes(&events)) catch {};
         }
     }
 
@@ -632,6 +753,16 @@ pub const InputHandler = struct {
                     self.live_fn(false);
                     log.info("trigger released — stopping", .{});
                 },
+                .start_room => {
+                    self.room_on.store(true, .monotonic);
+                    if (self.room_fn) |f| f(true);
+                    log.info("trigger toggled — recording the room", .{});
+                },
+                .stop_room => {
+                    self.room_on.store(false, .monotonic);
+                    if (self.room_fn) |f| f(false);
+                    log.info("trigger toggled — the room is no longer being recorded", .{});
+                },
                 .none => {},
             }
 
@@ -640,6 +771,10 @@ pub const InputHandler = struct {
             }
             return;
         }
+
+        // Which of the two things the next trigger press means depends on
+        // this, so it is read on the way past rather than asked for later.
+        self.trigger.modifier(event.code, event.value);
 
         // Forward all other keys
         self.forwardEvent(event);
@@ -842,7 +977,7 @@ pub const InputHandler = struct {
 
         // If the trigger was held on that device, nothing will report its release.
         if (self.trigger.held and !self.isTriggerPhysicallyHeld()) {
-            self.trigger.held = false;
+            self.trigger.forceRelease();
             self.live_fn(false);
             log.warn("trigger device removed — forcing release", .{});
         }
@@ -1175,6 +1310,94 @@ test "TriggerState: double release is idempotent" {
     _ = ts.keyEvent(1); // press
     try std.testing.expectEqual(TriggerAction.stop_recording, ts.keyEvent(0));
     try std.testing.expectEqual(TriggerAction.none, ts.keyEvent(0)); // already released
+}
+
+test "TriggerState: ctrl+trigger latches the room instead of dictating" {
+    var t = TriggerState{};
+    t.modifier(ev.KEY_LEFTCTRL, 1);
+    try std.testing.expectEqual(TriggerAction.start_room, t.keyEvent(1));
+    // The release must not stop a dictation that never started.
+    try std.testing.expectEqual(TriggerAction.none, t.keyEvent(0));
+    try std.testing.expect(t.room);
+}
+
+test "TriggerState: the latch outlives the modifier" {
+    var t = TriggerState{};
+    t.modifier(ev.KEY_LEFTCTRL, 1);
+    _ = t.keyEvent(1);
+    _ = t.keyEvent(0);
+    t.modifier(ev.KEY_LEFTCTRL, 0);
+    try std.testing.expect(t.room);
+}
+
+test "TriggerState: a plain press stops the room rather than dictating" {
+    var t = TriggerState{};
+    t.modifier(ev.KEY_RIGHTCTRL, 1);
+    _ = t.keyEvent(1);
+    _ = t.keyEvent(0);
+    t.modifier(ev.KEY_RIGHTCTRL, 0);
+
+    try std.testing.expectEqual(TriggerAction.stop_room, t.keyEvent(1));
+    try std.testing.expectEqual(TriggerAction.none, t.keyEvent(0));
+    try std.testing.expect(!t.room);
+}
+
+test "TriggerState: ctrl+trigger stops the room too" {
+    var t = TriggerState{};
+    t.modifier(ev.KEY_LEFTCTRL, 1);
+    _ = t.keyEvent(1);
+    _ = t.keyEvent(0);
+    try std.testing.expectEqual(TriggerAction.stop_room, t.keyEvent(1));
+    try std.testing.expect(!t.room);
+}
+
+test "TriggerState: dictation works again once the room is stopped" {
+    var t = TriggerState{};
+    t.modifier(ev.KEY_LEFTCTRL, 1);
+    _ = t.keyEvent(1);
+    _ = t.keyEvent(0);
+    t.modifier(ev.KEY_LEFTCTRL, 0);
+    _ = t.keyEvent(1); // stops the room
+    _ = t.keyEvent(0);
+
+    try std.testing.expectEqual(TriggerAction.start_recording, t.keyEvent(1));
+    try std.testing.expectEqual(TriggerAction.stop_recording, t.keyEvent(0));
+}
+
+test "TriggerState: a key repeat does not drop the modifier" {
+    var t = TriggerState{};
+    t.modifier(ev.KEY_LEFTCTRL, 1);
+    t.modifier(ev.KEY_LEFTCTRL, 2);
+    try std.testing.expect(t.ctrl);
+    try std.testing.expectEqual(TriggerAction.start_room, t.keyEvent(1));
+}
+
+test "TriggerState: keys that are not control leave the meaning alone" {
+    var t = TriggerState{};
+    t.modifier(ev.KEY_LEFTSHIFT, 1);
+    t.modifier(ev.KEY_A, 1);
+    try std.testing.expectEqual(TriggerAction.start_recording, t.keyEvent(1));
+}
+
+test "TriggerState: forceRelease gives up the hold but keeps the latch" {
+    var t = TriggerState{};
+    t.modifier(ev.KEY_LEFTCTRL, 1);
+    _ = t.keyEvent(1);
+    _ = t.keyEvent(0);
+    t.modifier(ev.KEY_LEFTCTRL, 0);
+
+    // A dictation hold that the safety net decides is not really held.
+    _ = t.keyEvent(1);
+    t.forceRelease();
+    try std.testing.expect(!t.held);
+    try std.testing.expect(!t.room);
+
+    // And one taken while the room is recording.
+    t.modifier(ev.KEY_LEFTCTRL, 1);
+    _ = t.keyEvent(1);
+    _ = t.keyEvent(0);
+    t.forceRelease();
+    try std.testing.expect(t.room);
 }
 
 test "TriggerState: full press-release-press cycle" {

@@ -50,6 +50,11 @@ pub const InputHandler = struct {
         trigger_passthrough: bool = false,
         type_delay_us: u64 = 12_000,
         live_fn: *const fn (bool) void,
+        /// Accepted so the two platforms take the same config, and ignored:
+        /// the toggle's indicator is the CapsLock light, and macOS keeps that
+        /// behind exclusive HID access. Wiring the latch here without the
+        /// light would leave the room recording with nothing at all saying so.
+        room_fn: ?*const fn (bool) void = null,
     };
 
     pub fn init(config: Config) !InputHandler {
