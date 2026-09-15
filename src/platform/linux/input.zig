@@ -1500,8 +1500,15 @@ test "a forwarded keystroke never lands inside an injected transcript" {
 }
 
 test "the virtual keyboard does not repeat keys of its own accord" {
-    // Needs /dev/uinput; where there is none there is nothing to assert.
-    const fd = createUinput() catch return error.SkipZigTest;
+    // Needs /dev/uinput; where there is none there is nothing to assert. Ask
+    // quietly first: createUinput logs at error level when it cannot open the
+    // node, and the test runner fails a test that logs an error, so skipping
+    // on its return value is too late.
+    const probe = posix.openZ("/dev/uinput", .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0) catch
+        return error.SkipZigTest;
+    posix.close(probe);
+
+    const fd = try createUinput();
     defer {
         doIoctl(fd, UI_DEV_DESTROY, 0) catch {};
         posix.close(fd);
