@@ -26,17 +26,14 @@ extern fn capsper_input_restore_capslock() c_int;
 
 // Global state for C callbacks (C can't capture Zig closures)
 var g_live_fn: ?*const fn (bool) void = null;
-var g_typing_cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 fn onPress() callconv(.c) void {
     log.info("PTT press", .{});
-    g_typing_cancel.store(false, .monotonic);
     if (g_live_fn) |f| f(true);
 }
 
 fn onRelease() callconv(.c) void {
     log.info("PTT release", .{});
-    g_typing_cancel.store(true, .monotonic);
     if (g_live_fn) |f| f(false);
 }
 
@@ -140,14 +137,12 @@ pub const InputHandler = struct {
     }
 
     /// Inject text as Unicode keyboard events via CGEventPost.
-    /// Checks typing_cancel between characters — stops on PTT release.
     pub fn typeText(self: *InputHandler, text: []const u8) void {
         _ = self;
         if (text.len == 0) return;
 
         // Inject the full text at once via CGEventKeyboardSetUnicodeString
         // The C helper handles UTF-8 → UTF-16 conversion and batching (20 chars/event)
-        if (g_typing_cancel.load(.monotonic)) return;
         capsper_input_type_text(text.ptr, @intCast(text.len));
     }
 
