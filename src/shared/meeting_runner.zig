@@ -297,6 +297,16 @@ const TrackAsr = struct {
     /// -- everything still works, it just costs more.
     vad: ?*vad_backend.Vad,
 
+    /// Whether the gate has ever opened on this track.
+    ///
+    /// Only a statement about speech where there *is* a gate. With `vad` null
+    /// every chunk is wanted, so this goes true on the first chunk that is not
+    /// digital zero -- and a session is then never discarded for silence,
+    /// which is the only honest answer when nothing was listening for speech.
+    /// A missing `silero_vad.onnx` must cost encoder passes and nothing else;
+    /// it must never cost a recording.
+    vad_fired: bool = false,
+
     /// The level of the last chunk the gate accepted as speech, for whatever
     /// wants to level this track. Null when the last chunk was not speech.
     ///
@@ -395,6 +405,14 @@ const TrackAsr = struct {
         // and to nothing else. See `speech_rms`.
         self.speech_rms = if (wanted) rms else null;
 
+        const silent = std.mem.allEqual(u8, pcm, 0);
+
+        // What the discard rule reads at close. Digital zero is excluded
+        // deliberately: with no gate loaded every chunk is "wanted", and
+        // counting zeros would mark a track live on audio that is provably
+        // nothing at all.
+        if (wanted and !silent) self.vad_fired = true;
+
         // Digital zero is never speech, so it is not worth an encoder pass.
         // Skipping it is the same rule `ChunkedReader` applies to every other
         // transport, so the encoder sees what the regression corpus has always
@@ -415,7 +433,7 @@ const TrackAsr = struct {
         // The position still advances below, which is the part that matters:
         // audio skipped before the encoder must still move the recording's
         // clock, or every cue after it drifts early.
-        if (wanted and !std.mem.allEqual(u8, pcm, 0)) {
+        if (wanted and !silent) {
             const samples = try utils.pcmToFloat(gpa, pcm);
             defer gpa.free(samples);
 
@@ -800,6 +818,9 @@ const Session = struct {
 
         self.near_asr.finish(gpa, &self.transcript.doc) catch {};
         self.far_asr.finish(gpa, &self.transcript.doc) catch {};
+        // Read before the tracks are torn down, and after `finish`, which
+        // pushes the tail through the gate and can be what opens it.
+        const heard_speech = self.near_asr.vad_fired or self.far_asr.vad_fired;
         self.near_asr.deinit(gpa);
         self.far_asr.deinit(gpa);
 
@@ -812,17 +833,30 @@ const Session = struct {
         status.meeting.closed();
 
         if (self.far_all_zero) {
-            self.discard(seconds);
+            self.discard(seconds, "nothing ever arrived from the far end");
+            return;
+        }
+        // Nobody spoke on either side. A meeting app can hold the sink over a
+        // room that is empty, or over one where the only sound is someone
+        // else's conversation two desks away -- audio both times, a meeting
+        // neither time. The gate is the thing that already knows the
+        // difference, so it is the thing that is asked.
+        if (!heard_speech) {
+            self.discard(seconds, "no speech on either track");
             return;
         }
         std.debug.print("[meeting] session closed ({d:.1}s of audio)\n", .{seconds});
     }
 
-    /// Remove a session whose far track was digital zero from beginning to
-    /// end. Nothing was ever on the other side, so what is on disk is one
-    /// side of a conversation that did not happen -- in the case this was
-    /// written for, five hours of dictation that had nothing to do with any
-    /// meeting.
+    /// Remove a session that recorded no meeting, for one of the two reasons
+    /// that can be known only once it is over: nothing ever arrived from the
+    /// far end, or nothing either side said was speech. The first case was
+    /// five hours of dictation that had nothing to do with any meeting; the
+    /// second is a call left open over an empty room.
+    ///
+    /// `why` is said out loud rather than inferred from the file, because the
+    /// two rules fail in different directions and an operator looking at a
+    /// missing recording needs to know which one to distrust.
     ///
     /// Safe to remove whole rather than file by file: `SessionFile.create`
     /// refuses to reuse an existing directory, so nothing under `rel_path` was
@@ -833,7 +867,7 @@ const Session = struct {
     /// Said out loud on both the console and the journal. Deleting quietly is
     /// the one thing here that could destroy a real recording if the rule is
     /// ever wrong, and an operator who cannot see it happen cannot tell us.
-    fn discard(self: *Session, seconds: f64) void {
+    fn discard(self: *Session, seconds: f64, why: []const u8) void {
         const rel = self.rel_path[0..self.rel_len];
 
         var root = std.fs.cwd().openDir(self.sessions_root, .{}) catch |err| {
@@ -847,10 +881,10 @@ const Session = struct {
             return;
         };
 
-        log.info("discarded {s}: the far track was silent from start to finish", .{rel});
+        log.info("discarded {s}: {s}", .{ rel, why });
         std.debug.print(
-            "[meeting] session discarded ({d:.1}s, nothing ever arrived from the far end): {s}\n",
-            .{ seconds, rel },
+            "[meeting] session discarded ({d:.1}s, {s}): {s}\n",
+            .{ seconds, why, rel },
         );
     }
 };
