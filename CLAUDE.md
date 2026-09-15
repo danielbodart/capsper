@@ -62,7 +62,33 @@ There is no build option to select it and no second variant to choose between at
 
 Push-to-talk voice dictation for Linux and macOS. Self-contained binary per platform. Supports multiple concurrent transcriptions — `--port` starts a TCP server accepting multiple clients simultaneously, each getting an independent pipeline while sharing the single loaded model. `--audio-target` enables local audio capture (always-live without `--trigger`, PTT-gated with `--trigger`). Both can run simultaneously. On Linux: grabs keyboards via evdev, intercepts CapsLock, captures audio via PipeWire, transcribes with Nemotron RNNT (via onnxruntime), injects text via uinput. On macOS: CGEventTap input, CoreAudio capture, CoreML inference (93% ANE), CGEventPost injection.
 
-> **History:** Capsper originally used whisper.cpp for ASR with Silero/TEN-VAD for voice activity detection. It now uses NVIDIA's Nemotron Speech 600M model (FastConformer RNNT) which is incremental and doesn't need a separate VAD — PTT (push-to-talk) is the sole gate. The name "Capsper" is a nod to Casper the friendly ghost — ghostwriting via CapsLock.
+> **History:** Capsper originally used whisper.cpp for ASR with Silero/TEN-VAD for voice activity detection. It now uses NVIDIA's Nemotron Speech 600M model (FastConformer RNNT), which is incremental — dictation needs no VAD, because PTT is the gate. Silero came back for meeting capture, where there is no key to hold; see below. The name "Capsper" is a nod to Casper the friendly ghost — ghostwriting via CapsLock.
+
+### Voice Activity Gate
+
+Silero VAD (`src/shared/vad.zig` + `src/backend/*/vad.zig`), used by **meeting capture only** — dictation and the TCP server are ungated. One gate per track (near and far), each with its own recurrent state. Linux only: the CoreML build has no ONNX Runtime, so `backend/coreml/vad.zig` is a stub that always says yes.
+
+It gates the **encoder pass, never the recording** — the audio file must line up with the cue timestamps — and its answer is also what tells the near-track level controller which chunks were speech. Audio skipped before the encoder still advances the recording position, or every cue after a pause drifts early.
+
+32 ms windows, hysteresis in `vad.zig`: opens on the first window over `onset` (0.3) and encodes that window, closes only after 1000 ms (`min_silence_ms`) continuously under `offset` (0.1). Answers per 560 ms chunk, not per window, since the encoder is fed whole chunks. Errs towards encoding: a failed window counts as speech. Settings are `meeting.vad.{enabled,onset,offset,min_silence_ms}`; a missing `models/silero_vad.onnx` disables the gate silently, which costs encoder passes and nothing else.
+
+**Not** what decides when a session starts or stops — see below. The VAD is a cost optimisation; keep it that way.
+
+### Meeting Session Lifecycle
+
+Three gates, and they answer different questions. Confusing them is what caused the five-hour bug.
+
+| gate | question | where |
+|---|---|---|
+| 1 | is an app holding the sink? | `ArmGate`, fed by `SinkWatch` |
+| **1b** | **is anything actually arriving?** | `FarSilence`/`FarSignal` in `meeting.zig` |
+| 2 | is this chunk worth encoding? | the VAD above |
+
+Gate 1 opens immediately and closes 30 s after the stream count hits zero. That is *not* a call ending: measured in Gather, walking away tears the stream down and rebuilds it on gaps of 2–35 s, and every rebuild resets the debounce, so session length was set by the app's reconnect interval. No value of `idle_close_seconds` fixes it.
+
+Gate 1b is the one with a bound. The far track carrying **exact digital zero** for `far_silence_close_seconds` (600) closes the session; `FarListener` then holds the monitor open with a pre-roll ring, and only far-track signal starts a **new** session — gate 1 is deliberately not allowed to re-open, or the same nothing gets recorded forever in 10-minute files. A session whose far track was zero for its whole life is **deleted**.
+
+Measured, and the reason zero is the signal rather than a level: talking is −16 to −22 dBFS, present-but-quiet is −54 to −74 (a real noise floor), absent is every sample exactly `0`. The third is categorically different, not merely quieter. Read it on arriving far chunks, **never** on the mixed file — `TrackMixer` pads with zeros, so a stalled capture would look identical to a departed far end.
 
 ### Source Layout
 
@@ -80,6 +106,7 @@ src/
     nemo_mel_state.zig               Incremental mel state
     tokenizer.zig                    SentencePiece detokenization
     context_graph.zig                Aho-Corasick drop-term trie
+    vad.zig                          Voice activity hysteresis (pure)
     prop_tests.zig                   Property-based tests
 
   backend/
@@ -89,10 +116,12 @@ src/
       pipeline.zig                   Nemotron RNNT streaming pipeline
       ort_c.zig                      ORT C API bindings
       init.zig                       ORT model loading, session setup
+      vad.zig                        Silero VAD session
     coreml/                        — CoreML (macOS)
       pipeline.zig                   CoreML streaming pipeline
       helpers.m                      Obj-C bridge (model load, predict, cache)
       init.zig                       CoreML model loading
+      vad.zig                        No gate (stub)
 
   platform/
     input.zig                      — Comptime switch → platform input

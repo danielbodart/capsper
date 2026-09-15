@@ -38,6 +38,9 @@ const log = std.log.scoped(.meeting);
 /// the cost this whole design set out to avoid.
 const poll_interval_ms: i32 = 200;
 
+/// One second of the format every capture here produces: 16 kHz, 16-bit, mono.
+const bytes_per_second: usize = 32_000;
+
 /// One session's audio file, written as it is captured rather than held in
 /// memory: an hour of stereo is 230 MB, and a session that is lost because
 /// capsper was killed is a session that never happened.
@@ -60,10 +63,18 @@ const SessionFile = struct {
         // Fail rather than invent a name. Two sessions cannot start in the
         // same second given the idle window, so a collision means something
         // is wrong that a suffix would only hide.
-        root_dir.makePath(rel_path) catch |err| switch (err) {
+        //
+        // Asked rather than caught, because `makePath` reports a directory
+        // that already exists as success -- catching `PathAlreadyExists` here
+        // never fired. That was survivable when the worst case was two
+        // sessions sharing a directory; it stopped being survivable when a
+        // session that heard nothing began deleting its own directory, since
+        // the one it deleted might be the other's.
+        const made = root_dir.makePathStatus(rel_path) catch |err| switch (err) {
             error.PathAlreadyExists => return error.SessionAlreadyExists,
             else => return err,
         };
+        if (made == .existed) return error.SessionAlreadyExists;
         var dir = try root_dir.openDir(rel_path, .{});
         errdefer dir.close();
 
@@ -149,7 +160,11 @@ pub fn run(
 
     var gate = meeting.ArmGate.init(cfg.meeting.idle_close_seconds);
     var session: ?Session = null;
+    // Up only between sessions, while gate 1 still says an application holds
+    // the sink but gate 1b has decided nobody is on the other end.
+    var listener: ?FarListener = null;
     defer if (session) |*s| s.close(gpa);
+    defer if (listener) |*l| l.deinit(gpa);
 
     std.debug.print("Meeting sink '{s}' is up; select it as your output.\n", .{cfg.meeting.sink_name});
 
@@ -175,17 +190,74 @@ pub fn run(
                 };
             },
             .closed => {
+                // The application finally let go of the sink. That ends the
+                // episode outright, including anything gate 1b concluded
+                // during it -- a fresh connection gets a fresh session.
                 if (session) |*s| s.close(gpa);
                 session = null;
+                if (listener) |*l| l.deinit(gpa);
+                listener = null;
             },
         }
 
         if (session) |*s| {
-            s.pump(gpa) catch |err| {
+            const far_gone = s.pump(gpa) catch |err| blk: {
                 log.err("capture failed, closing the session: {}", .{err});
                 s.close(gpa);
                 session = null;
+                break :blk false;
             };
+
+            // Gate 1b. Note what is deliberately *not* done here: `gate` is
+            // left alone. It still believes a session is open, which is what
+            // stops it opening another one on the very next poll -- the
+            // application is still holding the sink, and if gate 1 could
+            // re-arm on that we would record the same nothing again, forever,
+            // in ten-minute files. Only the far track carrying something
+            // starts the next session, and the listener below is what waits
+            // for it.
+            if (far_gone) {
+                if (session) |*live| live.close(gpa);
+                session = null;
+
+                log.info(
+                    "nothing from the far end for {d}s; closing, and listening for it to come back",
+                    .{cfg.meeting.far_silence_close_seconds},
+                );
+
+                listener = FarListener.open(cfg) catch |err| blk: {
+                    // Fails closed: nothing further is recorded until the
+                    // application lets go of the sink and takes it again.
+                    // Safe, but silent enough to be worth saying out loud.
+                    log.err("cannot listen for the call resuming: {}", .{err});
+                    break :blk null;
+                };
+            }
+        } else if (listener) |*l| {
+            const resumed = l.poll(gpa) catch |err| blk: {
+                log.warn("far listener failed: {}", .{err});
+                break :blk null;
+            };
+
+            if (resumed) |preroll| {
+                if (Session.open(gpa, cfg, audio_channel, factory, &watch)) |opened| {
+                    var started = opened;
+                    started.feedPreroll(gpa, preroll) catch |err| {
+                        log.warn("could not carry the pre-roll into the session: {}", .{err});
+                    };
+                    // Only after `feedPreroll`, which reads the listener's buffer.
+                    l.deinit(gpa);
+                    listener = null;
+                    session = started;
+                } else |err| {
+                    // Keep listening rather than tearing the listener down. It
+                    // is the only thing that can start a session while the
+                    // application still holds the sink, so dropping it here
+                    // would mean nothing is recorded again until the call
+                    // disconnects entirely.
+                    log.err("could not start a session, still listening: {}", .{err});
+                }
+            }
         } else {
             std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
         }
@@ -407,6 +479,37 @@ const Session = struct {
     /// theirs would be two loops chasing the same signal.
     near_gain: ?AutoGain,
 
+    /// Gate 1b: how long the far track has carried nothing at all. Fed on
+    /// every poll, so it measures elapsed time rather than arriving bytes.
+    far_silence: meeting.FarSilence,
+
+    /// Whether anything reached the far track since the last poll. Set as the
+    /// bytes arrive, read and cleared once per poll.
+    ///
+    /// Taken from the capture rather than from the file, and that distinction
+    /// is load-bearing: `TrackMixer` pads a lagging track with zeros, so a
+    /// stalled far capture and a departed far end are identical in the
+    /// recording. Read there, a PipeWire hiccup would close live meetings.
+    far_signal: bool = false,
+
+    /// Whether the far track has been digital zero for this session's entire
+    /// life. If it still is at the end, nothing was ever on the other side and
+    /// the session is deleted rather than kept.
+    ///
+    /// Deliberately not "did the far end ever speak". Someone sitting there
+    /// saying nothing still sends their microphone's noise floor, which is
+    /// signal; a session recorded while presenting to a silent audience is a
+    /// real meeting and must survive. Only the complete absence of a stream
+    /// says nobody was there.
+    far_all_zero: bool = true,
+
+    /// This session's directory, relative to the sessions root, kept from open
+    /// rather than recomputed at close -- a path derived from the clock twice
+    /// is a path that can differ twice, and the second use is a delete.
+    rel_path: [64]u8 = undefined,
+    rel_len: usize = 0,
+    sessions_root: []const u8,
+
     pending: std.ArrayListUnmanaged(u8) = .{},
     read_buf: [8192]u8 = undefined,
 
@@ -526,7 +629,7 @@ const Session = struct {
 
         status.meeting.opened(rel, @intCast(std.time.nanoTimestamp()));
         std.debug.print("[meeting] session opened: {s}\n", .{rel});
-        return .{
+        var out: Session = .{
             .near = near,
             .far = far,
             .aec = aec,
@@ -546,18 +649,29 @@ const Session = struct {
                 AutoGain{ .current_gain = cfg.audio.gain }
             else
                 null,
+            .far_silence = meeting.FarSilence.init(cfg.meeting.far_silence_close_seconds),
+            .sessions_root = cfg.meeting.dir,
         };
+        @memcpy(out.rel_path[0..rel.len], rel);
+        out.rel_len = rel.len;
+        return out;
     }
 
     /// Read whatever both captures have ready, transcribe it, and write the
     /// stereo frames that result. Blocks for at most one poll interval, so the
     /// caller's loop keeps ticking even while a track is silent.
-    fn pump(self: *Session, gpa: std.mem.Allocator) !void {
+    ///
+    /// True when the far track has carried nothing for long enough that the
+    /// session is over -- gate 1b. The caller closes; deciding is all that
+    /// happens here.
+    fn pump(self: *Session, gpa: std.mem.Allocator) !bool {
         var fds = [_]posix.pollfd{
             .{ .fd = self.near.pipe_read_fd, .events = posix.POLL.IN, .revents = 0 },
             .{ .fd = self.far.pipe_read_fd, .events = posix.POLL.IN, .revents = 0 },
         };
-        _ = posix.poll(&fds, poll_interval_ms) catch return;
+        // A failed poll still has to reach the gate below: an error here means
+        // no audio, and no audio is exactly what gate 1b is counting.
+        _ = posix.poll(&fds, poll_interval_ms) catch {};
 
         try self.readInto(gpa, fds[0], .near);
         try self.readInto(gpa, fds[1], .far);
@@ -565,6 +679,10 @@ const Session = struct {
         self.pending.clearRetainingCapacity();
         try self.mixer.drain(gpa, &self.pending);
         try self.file.append(self.pending.items);
+
+        const signal = self.far_signal;
+        self.far_signal = false;
+        return self.far_silence.update(signal, @intCast(std.time.nanoTimestamp()));
     }
 
     fn readInto(self: *Session, gpa: std.mem.Allocator, fd: posix.pollfd, track: meeting.Track) !void {
@@ -572,6 +690,15 @@ const Session = struct {
         const n = posix.read(fd.fd, &self.read_buf) catch return;
         if (n == 0) return;
         const pcm = self.read_buf[0..n];
+
+        // Gate 1b, read here rather than anywhere downstream: this is the last
+        // point at which the bytes are what the far end actually sent. One
+        // non-zero byte is signal -- no threshold, no model, no opinion about
+        // what kind of sound it was.
+        if (track == .far and !std.mem.allEqual(u8, pcm, 0)) {
+            self.far_signal = true;
+            self.far_all_zero = false;
+        }
 
         // Recording first, and never gated: the audio file has to line up with
         // the cue timestamps, which is the whole reason it is kept.
@@ -594,6 +721,27 @@ const Session = struct {
         // Put whatever that completed on disk, so the session being recorded
         // reads back as it happens rather than only once it has closed.
         self.transcript.saveIfChanged();
+    }
+
+    /// Feed the far track audio that arrived before this session existed --
+    /// the pre-roll the listener held while waiting for the call to resume.
+    ///
+    /// Treated exactly as if it had just been read: recorded, transcribed, and
+    /// counted as signal. The near track has no counterpart for that stretch,
+    /// because nothing was capturing a microphone while no session was open,
+    /// so `TrackMixer` pads it to match. That padding is honest -- it says the
+    /// near end was not being recorded then, which is true.
+    fn feedPreroll(self: *Session, gpa: std.mem.Allocator, pcm: []const u8) !void {
+        if (pcm.len == 0) return;
+
+        if (!std.mem.allEqual(u8, pcm, 0)) {
+            self.far_signal = true;
+            self.far_all_zero = false;
+        }
+        try self.mixer.push(gpa, .far, pcm);
+        self.far_asr.feed(gpa, pcm, &self.transcript.doc) catch |err| {
+            log.warn("transcription failed on the far pre-roll: {}", .{err});
+        };
     }
 
     /// Track the level of the near end and adjust the microphone to suit.
@@ -662,7 +810,129 @@ const Session = struct {
         const seconds = self.file.durationSeconds();
         self.file.finish(gpa);
         status.meeting.closed();
+
+        if (self.far_all_zero) {
+            self.discard(seconds);
+            return;
+        }
         std.debug.print("[meeting] session closed ({d:.1}s of audio)\n", .{seconds});
+    }
+
+    /// Remove a session whose far track was digital zero from beginning to
+    /// end. Nothing was ever on the other side, so what is on disk is one
+    /// side of a conversation that did not happen -- in the case this was
+    /// written for, five hours of dictation that had nothing to do with any
+    /// meeting.
+    ///
+    /// Safe to remove whole rather than file by file: `SessionFile.create`
+    /// refuses to reuse an existing directory, so nothing under `rel_path` was
+    /// written by anything but this session, and `sessionPath` builds the path
+    /// from formatted integers alone -- it can hold no `..` and no separator
+    /// that was not put there deliberately.
+    ///
+    /// Said out loud on both the console and the journal. Deleting quietly is
+    /// the one thing here that could destroy a real recording if the rule is
+    /// ever wrong, and an operator who cannot see it happen cannot tell us.
+    fn discard(self: *Session, seconds: f64) void {
+        const rel = self.rel_path[0..self.rel_len];
+
+        var root = std.fs.cwd().openDir(self.sessions_root, .{}) catch |err| {
+            log.err("could not open '{s}' to discard {s}: {}", .{ self.sessions_root, rel, err });
+            return;
+        };
+        defer root.close();
+
+        root.deleteTree(rel) catch |err| {
+            log.err("could not discard {s}: {}", .{ rel, err });
+            return;
+        };
+
+        log.info("discarded {s}: the far track was silent from start to finish", .{rel});
+        std.debug.print(
+            "[meeting] session discarded ({d:.1}s, nothing ever arrived from the far end): {s}\n",
+            .{ seconds, rel },
+        );
+    }
+};
+
+/// What watches the far track between sessions.
+///
+/// When gate 1b closes a session, gate 1 is still reporting a stream -- the
+/// application never let go of the sink, which is the entire reason gate 1b
+/// had to exist. So gate 1 cannot be what notices the call resuming, and
+/// something has to keep listening or a meeting that restarts is simply lost.
+///
+/// Deliberately the cheapest thing that could work: one capture on the
+/// monitor, one `allEqual` per read, and a few seconds of audio kept so the
+/// session that starts begins before the sound that started it. No pipeline,
+/// no model, no transcript, no files. That cheapness is why gate 1b compares
+/// bytes instead of running a VAD -- the idle path is the one that runs for
+/// hours, and this one costs nothing to leave running.
+const FarListener = struct {
+    far: AudioCapture,
+    signal: meeting.FarSignal,
+
+    /// The most recent `limit` bytes of far audio, in order. Trimmed from the
+    /// front as it fills, so what it holds is always the tail.
+    preroll: std.ArrayListUnmanaged(u8) = .{},
+    limit: usize,
+
+    read_buf: [8192]u8 = undefined,
+
+    fn open(cfg: *const config.Config) !FarListener {
+        var far = try AudioCapture.init(.{
+            .target = cfg.meeting.sink_name,
+            .channel = AudioCapture.mono_channel,
+            .capture_sink = true,
+        });
+        errdefer far.deinit();
+        far.setActive(true);
+
+        return .{
+            .far = far,
+            .signal = .{ .needed = cfg.meeting.far_signal_chunks },
+            .limit = @as(usize, cfg.meeting.far_preroll_seconds) * bytes_per_second,
+        };
+    }
+
+    fn deinit(self: *FarListener, gpa: std.mem.Allocator) void {
+        self.far.setActive(false);
+        self.far.deinit();
+        self.preroll.deinit(gpa);
+    }
+
+    /// Poll once. Returns the audio to start the next session with, once the
+    /// far track has carried signal for long enough.
+    fn poll(self: *FarListener, gpa: std.mem.Allocator) !?[]const u8 {
+        var fds = [_]posix.pollfd{
+            .{ .fd = self.far.pipe_read_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        _ = posix.poll(&fds, poll_interval_ms) catch {};
+
+        var signal = false;
+        if (fds[0].revents & posix.POLL.IN != 0) {
+            if (posix.read(fds[0].fd, &self.read_buf)) |n| {
+                if (n > 0) {
+                    const pcm = self.read_buf[0..n];
+                    signal = !std.mem.allEqual(u8, pcm, 0);
+                    try self.keep(gpa, pcm);
+                }
+            } else |_| {}
+        }
+
+        if (!self.signal.update(signal)) return null;
+        return self.preroll.items;
+    }
+
+    /// Hold the tail of the far track, dropping whatever no longer fits.
+    ///
+    /// `trimBuffer` rather than a trim written here, for the sample alignment:
+    /// a read can end on an odd byte, and dropping an odd number of bytes
+    /// swaps the halves of every s16 sample after it.
+    fn keep(self: *FarListener, gpa: std.mem.Allocator, pcm: []const u8) !void {
+        if (self.limit == 0) return;
+        try self.preroll.appendSlice(gpa, pcm);
+        utils.trimBuffer(&self.preroll, self.limit);
     }
 };
 

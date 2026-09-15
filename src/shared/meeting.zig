@@ -80,6 +80,105 @@ pub const ArmGate = struct {
     }
 };
 
+// ─── Gate 1b: is anyone actually there? ──────────────────────────────────────
+//
+// Gate 1 above asks whether an application is holding the sink. That turned
+// out not to be the same question as whether a call is happening, and the
+// difference cost five hours of recording.
+//
+// Measured, in Gather, with a real second person: walking away from someone
+// does not reliably drop the stream. What it does instead is tear it down and
+// rebuild it -- gaps of 2s, 15s, 35s, none of them reliably longer than
+// `idle_close_seconds`. Every rebuild reaches `ArmGate.update` as activity and
+// throws the countdown away, so the session's length is set by the app's
+// reconnect interval rather than by anything capsper decides. There is no
+// value of `idle_close_seconds` that fixes it: raising it makes the stall
+// longer, and lowering it cuts real meetings apart on the very same gaps.
+//
+// So the signal moves from the graph to the audio, and stays as dumb as the
+// graph was. Measured on the same call:
+//
+//   someone talking        -16 to -22 dBFS
+//   someone there, quiet   -54 to -74 dBFS -- their microphone's noise floor
+//   nobody there           every sample exactly zero, for 135s unbroken
+//
+// The third is categorically different from the other two, not merely quieter:
+// the app stops sending a stream rather than sending a silent one. Digital
+// zero on the far track and a far side that has hung up are the same event as
+// far as anything downstream can tell, so they are treated as the same event.
+//
+// Deliberately not a VAD. This layer answers "is there signal", and nothing
+// above the level of a byte comparison: no threshold to tune per application,
+// no model to load, and an idle path that costs one `allEqual` per poll. A
+// judgement about whether the signal is *speech* belongs in a layer above this
+// one, where the VAD already lives.
+
+/// How long the far track may carry nothing at all before the session is over.
+///
+/// Pure: the caller says what arrived and when, so a five-hour case is a
+/// microsecond of test rather than five hours of waiting.
+pub const FarSilence = struct {
+    /// Zero disables the gate entirely, leaving gate 1 alone in charge -- the
+    /// behaviour from before this existed.
+    close_ns: u64,
+
+    /// When the far track last fell silent. Null means it is currently
+    /// carrying something, or has not been silent since the last reset.
+    silent_since_ns: ?u64 = null,
+
+    pub fn init(close_seconds: u32) FarSilence {
+        return .{ .close_ns = @as(u64, close_seconds) * std.time.ns_per_s };
+    }
+
+    /// Feed one poll: whether anything at all reached the far track since the
+    /// last call, and a monotonic timestamp. True when the session is over.
+    ///
+    /// Call it on every poll rather than only when audio arrives. No audio at
+    /// all counts as silence -- a stalled capture puts nothing in the file
+    /// either, so there is nothing to tell the two apart by and nothing gained
+    /// by keeping the session open for one.
+    pub fn update(self: *FarSilence, signal: bool, now_ns: u64) bool {
+        if (self.close_ns == 0) return false;
+
+        if (signal) {
+            self.silent_since_ns = null;
+            return false;
+        }
+
+        const since = self.silent_since_ns orelse {
+            self.silent_since_ns = now_ns;
+            return false;
+        };
+
+        // Saturating, as in `ArmGate`: a clock that goes backwards delays the
+        // close rather than causing one.
+        return now_ns -| since >= self.close_ns;
+    }
+};
+
+/// How much signal the far track must carry before a session starts again,
+/// after one closed for silence.
+///
+/// One chunk by default, which is to say any audio at all. The count exists
+/// because it is free to have and awkward to add later, not because anything
+/// is being filtered: a click is signal, and this layer does not get an
+/// opinion about which signals deserve a recording.
+pub const FarSignal = struct {
+    needed: u32 = 1,
+    seen: u32 = 0,
+
+    /// Feed one poll's worth. True once the run of consecutive polls carrying
+    /// signal is long enough to start a session.
+    pub fn update(self: *FarSignal, signal: bool) bool {
+        if (!signal) {
+            self.seen = 0;
+            return false;
+        }
+        self.seen +|= 1;
+        return self.seen >= @max(self.needed, 1);
+    }
+};
+
 // ─── Interleaving the two tracks ─────────────────────────────────────────────
 
 pub const Track = enum {
@@ -529,4 +628,123 @@ test "sessionPath carries no colons, so the layout survives a Windows port" {
     var buf: [64]u8 = undefined;
     const path = try sessionPath(&buf, 1_789_137_000);
     try testing.expect(std.mem.indexOfScalar(u8, path, ':') == null);
+}
+
+// ─── Gate 1b ─────────────────────────────────────────────────────────────────
+
+const minute = 60 * second;
+
+test "far silence closes only after the whole window" {
+    var far = FarSilence.init(600);
+    try testing.expect(!far.update(false, 0));
+    try testing.expect(!far.update(false, 599 * second));
+    try testing.expect(far.update(false, 600 * second));
+}
+
+test "the window runs from the first poll that saw silence, not the last" {
+    var far = FarSilence.init(600);
+    // Silence noticed at 10s; the window ends 600s after that, not 600s after
+    // whenever the caller next happens to ask.
+    try testing.expect(!far.update(false, 10 * second));
+    try testing.expect(!far.update(false, 609 * second));
+    try testing.expect(far.update(false, 610 * second));
+}
+
+test "any signal at all resets the window" {
+    var far = FarSilence.init(600);
+    _ = far.update(false, 0);
+    // One chunk carrying something, 9 minutes in. Not speech, not a threshold
+    // -- one non-zero byte is enough, which is the whole point.
+    try testing.expect(!far.update(true, 540 * second));
+    // Silence noticed again at 1100s, so the window now ends at 1700s -- the
+    // earlier 540s of it are gone, not banked.
+    try testing.expect(!far.update(false, 1100 * second));
+    try testing.expect(!far.update(false, 1699 * second));
+    try testing.expect(far.update(false, 1700 * second));
+}
+
+test "a far end that is present but quiet keeps the session open indefinitely" {
+    // Someone sitting there saying nothing still sends their microphone's
+    // noise floor, measured at -54 to -74 dBFS. That is signal, so the session
+    // stays open however long they stay quiet -- this gate closes on absence,
+    // not on silence-in-the-room.
+    var far = FarSilence.init(600);
+    var now: u64 = 0;
+    for (0..600) |_| {
+        now += 5 * second;
+        try testing.expect(!far.update(true, now));
+    }
+}
+
+test "the five hour case: gate 1 never settles, gate 1b closes anyway" {
+    // The real incident. Gather tore its stream down and rebuilt it every few
+    // seconds, so `ArmGate` was re-armed before its debounce could ever
+    // expire, and the session ran for five hours recording unrelated
+    // dictation. The far track was digital zero throughout.
+    var arm = ArmGate.init(30);
+    var far = FarSilence.init(600);
+
+    var now: u64 = 0;
+    try testing.expectEqual(Transition.opened, arm.update(1, now));
+
+    var closed_at: ?u64 = null;
+    // Five hours of the stream flapping on a 14s cycle, far track silent.
+    while (now < 5 * 60 * minute) {
+        now += 14 * second;
+        // Gate 1 sees the rebuild and resets its countdown, every time.
+        try testing.expectEqual(Transition.none, arm.update(0, now));
+        now += 1 * second;
+        try testing.expectEqual(Transition.none, arm.update(1, now));
+
+        if (far.update(false, now) and closed_at == null) closed_at = now;
+    }
+
+    // Gate 1 is still holding the session open after five hours, exactly as it
+    // did in the incident.
+    try testing.expect(arm.open);
+    // Gate 1b closed it inside the first eleven minutes.
+    try testing.expect(closed_at != null);
+    try testing.expect(closed_at.? <= 11 * minute);
+}
+
+test "a window of zero disables the gate, leaving gate 1 alone in charge" {
+    var far = FarSilence.init(0);
+    var now: u64 = 0;
+    for (0..1000) |_| {
+        now += minute;
+        try testing.expect(!far.update(false, now));
+    }
+}
+
+test "far silence: a clock that goes backwards delays the close rather than causing one" {
+    var far = FarSilence.init(600);
+    _ = far.update(false, 900 * second);
+    try testing.expect(!far.update(false, 100 * second));
+}
+
+test "one chunk of signal starts a session again" {
+    var sig = FarSignal{ .needed = 1 };
+    try testing.expect(!sig.update(false));
+    try testing.expect(sig.update(true));
+}
+
+test "a longer run can be asked for, and must be consecutive" {
+    var sig = FarSignal{ .needed = 3 };
+    try testing.expect(!sig.update(true));
+    try testing.expect(!sig.update(true));
+    try testing.expect(sig.update(true));
+
+    var broken = FarSignal{ .needed = 3 };
+    try testing.expect(!broken.update(true));
+    try testing.expect(!broken.update(true));
+    try testing.expect(!broken.update(false));
+    try testing.expect(!broken.update(true));
+    try testing.expect(!broken.update(true));
+    try testing.expect(broken.update(true));
+}
+
+test "a run of zero is treated as a run of one, not as always ready" {
+    var sig = FarSignal{ .needed = 0 };
+    try testing.expect(!sig.update(false));
+    try testing.expect(sig.update(true));
 }

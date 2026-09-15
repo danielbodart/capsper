@@ -249,6 +249,31 @@ pub const Meeting = struct {
     /// How long a sink can sit idle before the session is closed. Long enough
     /// to survive a screen-share renegotiation or a brief mute.
     idle_close_seconds: u32 = 30,
+    /// How long the far track may carry nothing at all -- every sample exactly
+    /// zero -- before the session closes, however long the application goes on
+    /// holding the sink.
+    ///
+    /// The setting above asks only whether something is connected, which a
+    /// conferencing app can keep true for hours after everyone has gone. This
+    /// asks whether anything is actually arriving. A far end that is merely
+    /// quiet still sends its microphone's noise floor and never trips this;
+    /// only one that is gone does. Zero switches it off.
+    far_silence_close_seconds: u32 = 600,
+    /// How many consecutive chunks the far track must carry something before a
+    /// new session starts, after one closed for silence.
+    ///
+    /// One, meaning any audio at all. Nothing is being filtered here -- a
+    /// click is signal, and deciding which sounds deserve a recording is a
+    /// judgement for a layer above this one. Raise it only if stray samples
+    /// ever start sessions that should not exist.
+    far_signal_chunks: u32 = 1,
+    /// How much far audio to keep while waiting for a call to resume, so the
+    /// session that starts begins before the sound that started it.
+    ///
+    /// Bringing a session up takes long enough -- two pipelines, and an echo
+    /// canceller that budgets three seconds -- that the words which triggered
+    /// it would otherwise be the ones missing from the file.
+    far_preroll_seconds: u32 = 5,
     /// How much each transcript says. `.minimal` here, because these are read
     /// as a record of the conversation rather than to debug the decoder.
     detail: Detail = .minimal,
