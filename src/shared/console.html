@@ -43,6 +43,32 @@
   .session .day, .session .len { color: var(--muted); font-size: .85rem; }
   .session .len { margin-left: auto; font-variant-numeric: tabular-nums; }
 
+  /* ── A day of them ──
+     The heading is the click target, so it gets the whole row and a cursor
+     that says so. `list-style` removes Safari's and Firefox's own marker; the
+     arrow below is ours, so it points the same way in every browser. */
+  .dayGroup > summary {
+    display: flex; align-items: baseline; gap: .5rem;
+    padding: .55rem .25rem;
+    border-bottom: 1px solid var(--line);
+    cursor: pointer; user-select: none;
+    list-style: none;
+  }
+  .dayGroup > summary::-webkit-details-marker { display: none; }
+  .dayGroup > summary::before {
+    content: "▸";
+    display: inline-block; width: 1em;
+    color: var(--muted); font-size: .8em;
+    transition: transform .12s ease;
+  }
+  .dayGroup[open] > summary::before { transform: rotate(90deg); }
+  .dayGroup > summary:hover { background: var(--panel); }
+  .dayName { font-weight: 600; }
+  .dayCount { margin-left: auto; color: var(--muted); font-size: .85rem; }
+  /* Indented under their heading, so a closed day and an open one are telling
+     the same story at two levels of detail. */
+  .dayGroup > .session { padding-left: 1.75rem; }
+
   /* ── Player ── */
   .bar {
     position: sticky; top: 0; z-index: 2;
@@ -189,6 +215,8 @@
       back: "← All transcripts",
       playing: "Near end on the left, far end on the right.",
       empty: "No meetings recorded yet.",
+      // What a day's heading counts. Singular; the renderer adds the s.
+      noun: "meeting",
       // Two voices on one timeline, so the channel control means something.
       stereo: true,
       // A meeting knows where it came from; an utterance typed into a window
@@ -208,6 +236,7 @@
       back: "← All recordings",
       playing: "One microphone, as capsper heard it.",
       empty: "No recordings kept yet.",
+      noun: "recording",
       stereo: false,
       hasSource: false,
       list: async () => {
@@ -263,7 +292,41 @@
       return;
     }
 
+    // A day at a time, and every day but today folded shut. What you came for
+    // is nearly always from today; a year of meetings should not be a year of
+    // scrolling to reach it. `details` rather than a disclosure of our own, so
+    // the arrow, the keyboard, and find-in-page behave the way the browser
+    // already knows how to make them behave.
+    //
+    // The list arrives newest first and a day is contiguous within it, so the
+    // grouping is a walk that starts a new group when the day changes -- no
+    // bucketing, and the order the server chose is the order that survives.
+    const today = new Date().toDateString();
+    let group = null;
+    let groupDay = null;
+
     for (const item of items) {
+      // `toDateString` rather than the localised label, because that label is
+      // what the heading shows and two different days could render the same
+      // in a locale that omits the year.
+      const day = item.date ? item.date.toDateString() : item.day;
+      if (day !== groupDay) {
+        groupDay = day;
+        group = document.createElement("details");
+        group.className = "dayGroup";
+        group.open = day === today;
+
+        const head = document.createElement("summary");
+        const name = document.createElement("span");
+        name.className = "dayName";
+        name.textContent = day === today ? `Today · ${item.day}` : item.day;
+        const tally = document.createElement("span");
+        tally.className = "dayCount";
+        head.append(name, tally);
+        group.append(head);
+        host.append(group);
+      }
+
       const row = document.createElement("a");
       row.className = "session";
       row.href = kind.path + "/" + item.id;
@@ -279,15 +342,24 @@
       const at = document.createElement("span");
       at.className = "when";
       at.textContent = kind === KINDS.recordings ? item.id : (item.time || item.id);
+      // The day is the heading above it now, so the row says only the time.
       const on = document.createElement("span");
       on.className = "day";
-      on.textContent = kind === KINDS.recordings ? `${item.day} ${item.time}` : item.day;
+      on.textContent = kind === KINDS.recordings ? item.time : "";
       const len = document.createElement("span");
       len.className = "len";
       len.textContent = item.seconds ? clock(item.seconds) : "";
 
       row.append(at, on, len);
-      host.appendChild(row);
+      group.append(row);
+    }
+
+    // Counted after the walk rather than during it: a day's tally is only
+    // known once the day is over, and a closed group is exactly where the
+    // count has to do the work the rows would otherwise be doing.
+    for (const g of host.querySelectorAll(".dayGroup")) {
+      const n = g.querySelectorAll(".session").length;
+      g.querySelector(".dayCount").textContent = `${n} ${kind.noun}${n === 1 ? "" : "s"}`;
     }
   }
 
