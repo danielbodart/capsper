@@ -119,6 +119,7 @@ pub fn build(b: *std.Build) void {
         "src/shared/source.zig",
         "src/shared/vad.zig",
         "src/shared/recorder.zig",
+        "src/shared/keep_awake.zig",
     }) |src| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{

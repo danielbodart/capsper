@@ -16,6 +16,7 @@
 // saying "and also, exit after printing the version".
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 /// Audio file container, selectable per output path.
@@ -144,6 +145,27 @@ pub const Room = struct {
     /// until the disk fills; a meeting that genuinely runs longer resumes with
     /// another press, in a second file.
     max_minutes: u32 = 240,
+
+    /// A shell command that keeps the machine from sleeping while the room
+    /// is recorded, run when the session opens and ended when it closes.
+    /// Null, or empty, lets the machine sleep as it would anyway.
+    ///
+    /// Idle suspend is the case: a room recording is started once and then
+    /// nobody touches the keyboard, which is exactly what a desktop takes as
+    /// leave to sleep. Room capture alone, and not meetings, because only
+    /// this one was asked for by a keystroke -- something that started
+    /// itself has no business keeping the machine up.
+    ///
+    /// Closing the lid still sleeps, because the default asks for `sleep`
+    /// and not `handle-lid-switch`: shutting the laptop is a way of saying
+    /// stop. The command's standard input closes with the session, and with
+    /// capsper if it dies, so one that reads to the end -- as `cat` does --
+    /// cannot keep the machine awake after the recording has gone.
+    keep_awake: ?[:0]const u8 = switch (builtin.os.tag) {
+        .linux => "exec systemd-inhibit --what=sleep --who=capsper --why='Recording the room' --no-ask-password cat",
+        .macos => "exec caffeinate -i cat",
+        else => null,
+    },
 };
 
 pub const Tcp = struct {

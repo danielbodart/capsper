@@ -21,6 +21,7 @@ const std = @import("std");
 const posix = std.posix;
 
 const config = @import("config.zig");
+const keep_awake = @import("keep_awake.zig");
 const meeting = @import("meeting.zig");
 const meeting_runner = @import("meeting_runner.zig");
 const server_mod = @import("server.zig");
@@ -138,6 +139,11 @@ const Session = struct {
     rel_len: usize = 0,
     sessions_root: []const u8,
 
+    /// The command keeping the machine awake, when there is one. Null too
+    /// when it could not be started: a recording is worth more than the
+    /// guarantee that it will not be cut short by a sleep.
+    awake: ?keep_awake.Hold = null,
+
     read_buf: [8192]u8 = undefined,
 
     fn open(
@@ -209,6 +215,15 @@ const Session = struct {
         @memcpy(out.rel_path[0..rel.len], rel);
         out.rel_len = rel.len;
 
+        // Last, once nothing after it can fail, so no error path has a
+        // running command to clean up.
+        if (cfg.room.keep_awake) |command| if (command.len > 0) {
+            out.awake = keep_awake.Hold.start(gpa, command) catch |err| blk: {
+                log.warn("could not start the keep-awake command, the machine may sleep: {}", .{err});
+                break :blk null;
+            };
+        };
+
         log.info("recording the room: {s}", .{rel});
         std.debug.print("[room] session opened: {s}\n", .{rel});
         return out;
@@ -216,6 +231,8 @@ const Session = struct {
 
     /// One pass. True when the session has run out of time and should close.
     fn pump(self: *Session, gpa: std.mem.Allocator) !bool {
+        if (self.awake) |*a| a.check();
+
         var fds = [_]posix.pollfd{
             .{ .fd = self.mic.pipe_read_fd, .events = posix.POLL.IN, .revents = 0 },
         };
@@ -279,6 +296,11 @@ const Session = struct {
     }
 
     fn close(self: *Session, gpa: std.mem.Allocator) void {
+        // Held until the last of the file is written: finishing the
+        // transcript runs the tail through the model, and a machine that
+        // sleeps in the middle of that closes the session hours later.
+        defer if (self.awake) |*a| a.stop();
+
         self.mic.setActive(false);
         self.mic.deinit();
         if (self.level) |*l| l.deinit();
