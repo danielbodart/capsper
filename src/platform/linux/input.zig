@@ -432,6 +432,17 @@ const blink_interval_ns: u64 = 500 * std.time.ns_per_ms;
 
 const GrabbedDevice = struct {
     fd: posix.fd_t,
+    /// A second, ungrabbed open of the same node, for asking the kernel which
+    /// keys are down — and for nothing else.
+    ///
+    /// Never ask that of `fd`. EVIOCGKEY throws away every key event still
+    /// queued on the fd it is called on, on the reasoning that the state it
+    /// returns supersedes them. On the fd we read from, those events are
+    /// keystrokes nobody has forwarded yet: let go of control while the trigger
+    /// is down, and the release is discarded, and the desktop holds control
+    /// until it is pressed again. A grab delivers nothing to this fd, so its
+    /// queue is always empty and the flush has nothing to lose.
+    state_fd: posix.fd_t,
     grabbed: bool,
     name: [64]u8,
     name_len: usize,
@@ -582,59 +593,70 @@ pub const InputHandler = struct {
         }
 
         while (!self.shutdown.load(.monotonic)) {
-            // Poll every device we hold and have not retired.
-            var fds: [MAX_DEVICES]posix.pollfd = undefined;
-            var fd_map: [MAX_DEVICES]usize = undefined; // maps poll index → device index
-            var nfds: usize = 0;
-            {
-                self.devices_mutex.lock();
-                defer self.devices_mutex.unlock();
-                for (self.devices, 0..) |maybe_dev, i| {
-                    const dev = maybe_dev orelse continue;
-                    if (dev.dead) continue;
-                    fds[nfds] = .{ .fd = dev.fd, .events = posix.POLL.IN | posix.POLL.ERR, .revents = 0 };
-                    fd_map[nfds] = i;
-                    nfds += 1;
-                }
-            }
-
-            const ready = posix.poll(fds[0..nfds], 200) catch |err| {
-                if (err == error.Interrupted) continue;
+            self.pollOnce(200) catch |err| {
                 log.err("poll failed: {}", .{err});
                 break;
             };
+        }
+    }
 
-            // EVIOCGKEY safety net: verify trigger key is still physically held.
-            // Catches lost evdev release events (the PTT-stuck bug).
-            if (self.trigger.held and !self.isTriggerPhysicallyHeld()) {
-                self.trigger.forceRelease();
-                self.live_fn(false);
-                log.warn("trigger key not physically held — forcing release", .{});
+    /// One pass of `eventLoop`: wait up to `timeout_ms` for any device we hold,
+    /// and forward whatever it has.
+    fn pollOnce(self: *InputHandler, timeout_ms: i32) !void {
+        // Poll every device we hold and have not retired.
+        var fds: [MAX_DEVICES]posix.pollfd = undefined;
+        var fd_map: [MAX_DEVICES]usize = undefined; // maps poll index → device index
+        var nfds: usize = 0;
+        {
+            self.devices_mutex.lock();
+            defer self.devices_mutex.unlock();
+            for (self.devices, 0..) |maybe_dev, i| {
+                const dev = maybe_dev orelse continue;
+                if (dev.dead) continue;
+                fds[nfds] = .{ .fd = dev.fd, .events = posix.POLL.IN | posix.POLL.ERR, .revents = 0 };
+                fd_map[nfds] = i;
+                nfds += 1;
+            }
+        }
+
+        const ready = posix.poll(fds[0..nfds], timeout_ms) catch |err| {
+            if (err == error.Interrupted) return;
+            return err;
+        };
+
+        if (ready > 0) self.readReady(fds[0..nfds], fd_map[0..nfds]);
+
+        // EVIOCGKEY safety net: verify trigger key is still physically held.
+        // Catches lost evdev release events (the PTT-stuck bug). Asked after
+        // the reads, so a release that did arrive is handled as one, and this
+        // only speaks up for a release that never came.
+        if (self.trigger.held and !self.isTriggerPhysicallyHeld()) {
+            self.trigger.forceRelease();
+            self.live_fn(false);
+            log.warn("trigger key not physically held — forcing release", .{});
+        }
+    }
+
+    fn readReady(self: *InputHandler, fds: []const posix.pollfd, fd_map: []const usize) void {
+        for (fds, fd_map) |pfd, dev_idx| {
+            if (pfd.revents == 0) continue;
+
+            if (pfd.revents & posix.POLL.ERR != 0) {
+                self.retireDevice(dev_idx);
+                continue;
             }
 
-            if (ready == 0) continue;
-
-            for (0..nfds) |fi| {
-                if (fds[fi].revents == 0) continue;
-                const dev_idx = fd_map[fi];
-
-                if (fds[fi].revents & posix.POLL.ERR != 0) {
+            // Read events
+            while (true) {
+                var event: InputEvent = undefined;
+                const n = posix.read(pfd.fd, std.mem.asBytes(&event)) catch |err| {
+                    if (err == error.WouldBlock) break;
                     self.retireDevice(dev_idx);
-                    continue;
-                }
+                    break;
+                };
+                if (n != @sizeOf(InputEvent)) break;
 
-                // Read events
-                while (true) {
-                    var event: InputEvent = undefined;
-                    const n = posix.read(fds[fi].fd, std.mem.asBytes(&event)) catch |err| {
-                        if (err == error.WouldBlock) break;
-                        self.retireDevice(dev_idx);
-                        break;
-                    };
-                    if (n != @sizeOf(InputEvent)) break;
-
-                    self.processEvent(event);
-                }
+                self.processEvent(event);
             }
         }
     }
@@ -850,6 +872,13 @@ pub const InputHandler = struct {
             name_len += 1;
         }
 
+        // A client of its own, so the grab below leaves it with no events
+        // queued for EVIOCGKEY to throw away. See `GrabbedDevice.state_fd`.
+        const state_fd = posix.openZ(path.ptr, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0) catch {
+            return error.OpenFailed;
+        };
+        errdefer posix.close(state_fd);
+
         // Grab whatever the keys are doing. Declining a keyboard because
         // someone is leaning on it loses that keyboard for good, which is a
         // far worse outcome than the latched key `releaseHeldKeys` repairs.
@@ -861,7 +890,7 @@ pub const InputHandler = struct {
             _ = posix.read(fd, std.mem.asBytes(&drain_buf)) catch break;
         }
 
-        self.releaseHeldKeys(fd, name[0..name_len]);
+        self.releaseHeldKeys(state_fd, name[0..name_len]);
 
         var path_store: [64]u8 = std.mem.zeroes([64]u8);
         @memcpy(path_store[0..path.len], path);
@@ -875,6 +904,7 @@ pub const InputHandler = struct {
                 if (slot.* != null) continue;
                 slot.* = .{
                     .fd = fd,
+                    .state_fd = state_fd,
                     .grabbed = true,
                     .name = name,
                     .name_len = name_len,
@@ -906,10 +936,10 @@ pub const InputHandler = struct {
     /// from ours instead — with the trigger key's release swallowed outright
     /// when passthrough is off. Left alone that is a modifier stuck down until
     /// the user works out to tap it again, so send the releases ourselves.
-    fn releaseHeldKeys(self: *InputHandler, fd: posix.fd_t, name: []const u8) void {
+    fn releaseHeldKeys(self: *InputHandler, state_fd: posix.fd_t, name: []const u8) void {
         const state_size = (KEY_MAX + 7) / 8 + 1;
         var state: [state_size]u8 = std.mem.zeroes([state_size]u8);
-        doIoctl(fd, EVIOCGKEY(state_size), @intFromPtr(&state)) catch return;
+        doIoctl(state_fd, EVIOCGKEY(state_size), @intFromPtr(&state)) catch return;
 
         // These go to the same virtual keyboard a transcript is typed on, so
         // they take the same lock: half a released modifier in the middle of an
@@ -1003,6 +1033,7 @@ pub const InputHandler = struct {
         for (doomed[0..count]) |dev| {
             if (dev.grabbed) doIoctl(dev.fd, EVIOCGRAB, 0) catch {};
             posix.close(dev.fd);
+            posix.close(dev.state_fd);
             log.info("device removed: {s}", .{dev.name[0..dev.name_len]});
         }
     }
@@ -1018,7 +1049,7 @@ pub const InputHandler = struct {
             const dev = maybe_dev orelse continue;
             if (dev.dead) continue;
             var state: [state_size]u8 = std.mem.zeroes([state_size]u8);
-            doIoctl(dev.fd, EVIOCGKEY(state_size), @intFromPtr(&state)) catch continue;
+            doIoctl(dev.state_fd, EVIOCGKEY(state_size), @intFromPtr(&state)) catch continue;
             if (hasKeyBit(&state, self.trigger_key)) return true;
         }
         return false;
@@ -1539,6 +1570,7 @@ test "isKeyboardBitmask: short mask fails gracefully" {
 fn testDevice(path: []const u8) GrabbedDevice {
     var dev = GrabbedDevice{
         .fd = -1,
+        .state_fd = -1,
         .grabbed = true,
         .name = std.mem.zeroes([64]u8),
         .name_len = 0,
@@ -1752,6 +1784,136 @@ test "the virtual keyboard does not repeat keys of its own accord" {
     try std.testing.expectEqual(@as(u64, 0), mask & (@as(u64, 1) << @intCast(EV_REP)));
 }
 
+/// A real evdev node the test presses keys on, made through uinput with only
+/// the keys it is given — too few for anything, a running capsper included, to
+/// take it for a keyboard and grab it before the test does.
+const SourceDevice = struct {
+    uinput: posix.fd_t,
+    path_buf: [32]u8 = undefined,
+    path_len: usize = 0,
+
+    fn create(keys: []const u16) !SourceDevice {
+        const fd = try posix.openZ("/dev/uinput", .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        errdefer posix.close(fd);
+
+        try doIoctl(fd, UI_SET_EVBIT, EV_SYN);
+        try doIoctl(fd, UI_SET_EVBIT, EV_KEY);
+        for (keys) |k| try doIoctl(fd, UI_SET_KEYBIT, k);
+
+        var setup: UinputSetup = std.mem.zeroes(UinputSetup);
+        const name = "capsper test source";
+        @memcpy(setup.name[0..name.len], name);
+        setup.id.bustype = BUS_VIRTUAL;
+        try doIoctl(fd, UI_DEV_SETUP, @intFromPtr(&setup));
+        try doIoctl(fd, UI_DEV_CREATE, 0);
+        errdefer doIoctl(fd, UI_DEV_DESTROY, 0) catch {};
+
+        var sys: [64]u8 = std.mem.zeroes([64]u8);
+        try doIoctl(fd, UI_GET_SYSNAME(64), @intFromPtr(&sys));
+        var class_buf: [96]u8 = undefined;
+        const class = try std.fmt.bufPrint(&class_buf, "/sys/class/input/{s}", .{std.mem.sliceTo(&sys, 0)});
+        var dir = try std.fs.openDirAbsolute(class, .{ .iterate = true });
+        defer dir.close();
+
+        var self = SourceDevice{ .uinput = fd };
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "event")) continue;
+            const p = try std.fmt.bufPrintZ(&self.path_buf, "/dev/input/{s}", .{entry.name});
+            self.path_len = p.len;
+            return self;
+        }
+        return error.NoEventNode;
+    }
+
+    fn path(self: *const SourceDevice) [:0]const u8 {
+        return self.path_buf[0..self.path_len :0];
+    }
+
+    /// Open the node once udev has made it ours, which is a moment after it
+    /// appears.
+    fn open(self: *const SourceDevice) !posix.fd_t {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            return posix.openZ(self.path(), .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0) catch |err| {
+                if (tries >= 300) return err;
+                switch (err) {
+                    error.AccessDenied, error.FileNotFound => {
+                        std.Thread.sleep(10 * std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return err,
+                }
+            };
+        }
+    }
+
+    fn key(self: *const SourceDevice, code: u16, value: i32) !void {
+        const events = [_]InputEvent{ InputEvent.key(code, value), InputEvent.syn() };
+        _ = try posix.write(self.uinput, std.mem.sliceAsBytes(&events));
+    }
+
+    fn destroy(self: *const SourceDevice) void {
+        doIoctl(self.uinput, UI_DEV_DESTROY, 0) catch {};
+        posix.close(self.uinput);
+    }
+};
+
+test "asking whether the trigger is held loses no keystroke waiting to be read" {
+    const probe = posix.openZ("/dev/uinput", .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0) catch
+        return error.SkipZigTest;
+    posix.close(probe);
+
+    const source = try SourceDevice.create(&.{ ev.KEY_LEFTCTRL, ev.KEY_CAPSLOCK });
+    defer source.destroy();
+
+    var read_fd: posix.fd_t = undefined;
+    var handler = try handlerOnPipe(&read_fd, 0);
+    defer {
+        posix.close(handler.uinput_fd);
+        posix.close(read_fd);
+    }
+
+    // Opened as `tryGrabDevice` opens it: the state fd first, then the grab.
+    const state_fd = try source.open();
+    defer posix.close(state_fd);
+    const fd = try source.open();
+    defer posix.close(fd);
+    try doIoctl(fd, EVIOCGRAB, 1);
+    handler.devices[0] = .{
+        .fd = fd,
+        .state_fd = state_fd,
+        .grabbed = true,
+        .name = std.mem.zeroes([64]u8),
+        .name_len = 0,
+        .path = std.mem.zeroes([64]u8),
+        .path_len = 0,
+    };
+
+    // Control and the trigger, which latches the room and holds the trigger.
+    try source.key(ev.KEY_LEFTCTRL, 1);
+    try source.key(ev.KEY_CAPSLOCK, 1);
+    try handler.pollOnce(1000);
+    try std.testing.expect(handler.trigger.held);
+
+    // Control let go first, with the trigger still down: the release is in
+    // the queue when the safety net asks the kernel whether the trigger is
+    // held, and it must still be there to read afterwards.
+    try source.key(ev.KEY_LEFTCTRL, 0);
+    try handler.pollOnce(1000);
+
+    try source.key(ev.KEY_CAPSLOCK, 0);
+    try handler.pollOnce(1000);
+
+    var buf: [32]InputEvent = undefined;
+    const events = try drainEvents(read_fd, &buf);
+    var ctrl_released = false;
+    for (events) |e| {
+        if (e.type == EV_KEY and e.code == ev.KEY_LEFTCTRL and e.value == 0) ctrl_released = true;
+    }
+    try std.testing.expect(ctrl_released);
+}
+
 test "a dead device is handed to the device thread, not closed on the event loop" {
     var read_fd: posix.fd_t = undefined;
     var handler = try handlerOnPipe(&read_fd, 0);
@@ -1765,6 +1927,7 @@ test "a dead device is handed to the device thread, not closed on the event loop
     defer posix.close(device[1]);
     handler.devices[0] = .{
         .fd = device[0],
+        .state_fd = try posix.dup(device[0]),
         .grabbed = false, // no EVIOCGRAB to undo on a pipe
         .name = std.mem.zeroes([64]u8),
         .name_len = 0,
