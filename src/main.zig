@@ -400,7 +400,7 @@ pub fn main() !void {
                 .trigger_passthrough = cfg.trigger.passthrough,
                 .type_delay_us = cfg.trigger.type_delay_us,
                 .live_fn = &server_mod.setLive,
-                .room_fn = &room_runner.setWanted,
+                .room = &room_runner.wanted,
             }) catch |err| {
                 std.debug.print("Failed to init input handler: {}\n", .{err});
                 if (builtin.os.tag == .linux) {

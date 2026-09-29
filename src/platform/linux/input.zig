@@ -465,6 +465,9 @@ fn findDeviceByPath(devices: []const ?GrabbedDevice, path: []const u8) ?usize {
 
 // ──── InputHandler ────
 
+/// The latch for a handler that was given none to share.
+var no_room: std.atomic.Value(bool) = .init(false);
+
 pub const InputHandler = struct {
     devices: [MAX_DEVICES]?GrabbedDevice = .{null} ** MAX_DEVICES,
     uinput_fd: posix.fd_t = -1,
@@ -473,14 +476,12 @@ pub const InputHandler = struct {
     trigger_passthrough: bool,
     type_delay_us: u64,
     live_fn: *const fn (bool) void,
-    /// Told when the room latch turns over. Null where nothing is listening,
-    /// which is every build that has no room capture to start.
-    room_fn: ?*const fn (bool) void = null,
-
-    /// Whether the room light should be showing. Written by `eventLoop` on a
-    /// toggle, read by `deviceLoop`, which owns the blink and every write to
-    /// a device that carries it.
-    room_on: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Whether the room is latched on: turned over by `eventLoop` on a
+    /// toggle, read by `deviceLoop` for the light, and owned by the room loop,
+    /// which drops it when a session ends without the key -- the lid shut, the
+    /// time ran out, the capture failed. One flag rather than a copy on each
+    /// side, so the light and the next press always agree with the recording.
+    room: *std.atomic.Value(bool) = &no_room,
     thread: ?std.Thread = null,
     device_thread: ?std.Thread = null,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -498,7 +499,9 @@ pub const InputHandler = struct {
         trigger_passthrough: bool = false,
         type_delay_us: u64 = 12_000, // 12ms between keystrokes
         live_fn: *const fn (bool) void,
-        room_fn: ?*const fn (bool) void = null,
+        /// The room latch, shared with whatever records the room. Null where
+        /// nothing does; the key still latches, and nobody is told.
+        room: ?*std.atomic.Value(bool) = null,
     };
 
     pub fn init(config: Config) !InputHandler {
@@ -507,7 +510,7 @@ pub const InputHandler = struct {
             .trigger_passthrough = config.trigger_passthrough,
             .type_delay_us = config.type_delay_us,
             .live_fn = config.live_fn,
-            .room_fn = config.room_fn,
+            .room = config.room orelse &no_room,
         };
 
         // Create uinput virtual keyboard
@@ -690,7 +693,7 @@ pub const InputHandler = struct {
             // it, and nothing cares which side of that it happens on.
             var timeout_ms: i32 = 200;
 
-            if (self.room_on.load(.monotonic)) {
+            if (self.room.load(.monotonic)) {
                 const now: u64 = @intCast(std.time.nanoTimestamp());
                 if (now >= flip_at_ns) {
                     lit = !lit;
@@ -765,6 +768,9 @@ pub const InputHandler = struct {
 
         // Trigger key handling
         if (event.code == self.trigger_key) {
+            // The room loop may have ended the session since the last press,
+            // and what the key means next depends on what is recording now.
+            self.trigger.room = self.room.load(.monotonic);
             const action = self.trigger.keyEvent(event.value);
             switch (action) {
                 .start_recording => {
@@ -776,13 +782,11 @@ pub const InputHandler = struct {
                     log.info("trigger released — stopping", .{});
                 },
                 .start_room => {
-                    self.room_on.store(true, .monotonic);
-                    if (self.room_fn) |f| f(true);
+                    self.room.store(true, .monotonic);
                     log.info("trigger toggled — recording the room", .{});
                 },
                 .stop_room => {
-                    self.room_on.store(false, .monotonic);
-                    if (self.room_fn) |f| f(false);
+                    self.room.store(false, .monotonic);
                     log.info("trigger toggled — the room is no longer being recorded", .{});
                 },
                 .none => {},
@@ -1947,4 +1951,33 @@ test "a dead device is handed to the device thread, not closed on the event loop
     handler.closeRetired();
     try std.testing.expect(handler.devices[0] == null);
     try std.testing.expectError(error.NotOpenForReading, posix.read(device[0], &probe));
+}
+
+var test_room: std.atomic.Value(bool) = .init(false);
+
+test "a latch the room dropped on its own is not still on at the key" {
+    var read_fd: posix.fd_t = undefined;
+    var handler = try handlerOnPipe(&read_fd, 0);
+    defer {
+        posix.close(handler.uinput_fd);
+        posix.close(read_fd);
+    }
+    handler.room = &test_room;
+    test_room.store(false, .monotonic);
+
+    handler.processEvent(InputEvent.key(ev.KEY_LEFTCTRL, 1));
+    handler.processEvent(InputEvent.key(ev.KEY_CAPSLOCK, 1));
+    handler.processEvent(InputEvent.key(ev.KEY_CAPSLOCK, 0));
+    handler.processEvent(InputEvent.key(ev.KEY_LEFTCTRL, 0));
+    try std.testing.expect(test_room.load(.monotonic));
+
+    // The room closes itself -- the lid shut, or the time ran out.
+    test_room.store(false, .monotonic);
+
+    // The next ctrl+trigger is a new recording, not the end of the old one.
+    handler.processEvent(InputEvent.key(ev.KEY_LEFTCTRL, 1));
+    handler.processEvent(InputEvent.key(ev.KEY_CAPSLOCK, 1));
+    handler.processEvent(InputEvent.key(ev.KEY_CAPSLOCK, 0));
+    handler.processEvent(InputEvent.key(ev.KEY_LEFTCTRL, 0));
+    try std.testing.expect(test_room.load(.monotonic));
 }

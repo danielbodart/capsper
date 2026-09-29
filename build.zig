@@ -161,6 +161,15 @@ pub fn build(b: *std.Build) void {
         });
         input_tests.linkLibC();
         test_step.dependOn(&b.addRunArtifact(input_tests).step);
+
+        const lid_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/platform/linux/lid.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(lid_tests).step);
     }
 
     // --- Property tests (minish-based, runs as executable) ---

@@ -54,7 +54,7 @@ pub const InputHandler = struct {
         /// the toggle's indicator is the CapsLock light, and macOS keeps that
         /// behind exclusive HID access. Wiring the latch here without the
         /// light would leave the room recording with nothing at all saying so.
-        room_fn: ?*const fn (bool) void = null,
+        room: ?*std.atomic.Value(bool) = null,
     };
 
     pub fn init(config: Config) !InputHandler {

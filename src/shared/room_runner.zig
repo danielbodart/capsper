@@ -31,22 +31,27 @@ const utils = @import("utils.zig");
 const webvtt = @import("webvtt.zig");
 const AudioCapture = @import("../platform/audio.zig").AudioCapture;
 const AutoGain = @import("auto_gain.zig").AutoGain;
+const Lid = @import("../platform/lid.zig").Lid;
 const MicLevel = @import("../platform/mic_level.zig").MicLevel;
 const PipelineFactory = server_mod.PipelineFactory;
 
 const log = std.log.scoped(.room);
 
-/// Set by the input thread when the latch turns over, read here.
+/// The latch. Turned over by the input thread when the key is pressed, and
+/// handed to it by `main` -- storing to it is the whole of what the keystroke
+/// path does about room capture.
 ///
 /// An atomic and nothing more, because the write happens on the thread that
 /// carries every keystroke: it may not allocate, may not open anything, and
 /// may certainly not wait for a microphone to come up. All of that belongs to
 /// this loop, which has nobody's typing waiting on it.
-var wanted: std.atomic.Value(bool) = .init(false);
+///
+/// Dropped here, too, when a session ends without the key. The input side
+/// reads the same flag for the light and for what its next press means, so
+/// the two can never disagree about whether the room is being recorded.
+pub var wanted: std.atomic.Value(bool) = .init(false);
 
-/// The callback handed to the input layer. Deliberately the whole of what the
-/// keystroke path does about room capture.
-pub fn setWanted(on: bool) void {
+fn setWanted(on: bool) void {
     wanted.store(on, .monotonic);
 }
 
@@ -94,20 +99,24 @@ pub fn run(
         }
 
         if (session) |*s| {
-            const over_time = s.pump(gpa) catch |err| blk: {
+            const stop = s.pump(gpa) catch |err| blk: {
                 log.err("capture failed, closing the session: {}", .{err});
-                break :blk true;
+                break :blk .failed;
             };
 
-            // Either the limit ran out or the capture died. Both end the
-            // session, and both drop the latch, because the light has to stop
-            // saying "recording" the moment the recording stops.
-            if (over_time) {
+            // The limit ran out, the lid shut, or the capture died. All end
+            // the session, and all drop the latch, because the light has to
+            // stop saying "recording" the moment the recording stops.
+            if (stop) |why| {
+                switch (why) {
+                    .over_time => log.info("the room session reached room.max_minutes, closing it", .{}),
+                    .lid_shut => log.info("the lid was shut, closing the room session", .{}),
+                    .failed => {},
+                }
                 s.close(gpa);
                 session = null;
                 setWanted(false);
                 status.room_recording.store(false, .monotonic);
-                log.info("the room session has closed itself", .{});
             }
         } else {
             std.Thread.sleep(idle_poll_ms * std.time.ns_per_ms);
@@ -138,6 +147,10 @@ const Session = struct {
     rel_path: [64]u8 = undefined,
     rel_len: usize = 0,
     sessions_root: []const u8,
+
+    /// The lid switch, read for the moment it shuts. Null when
+    /// `room.stop_on_lid` is off or there is no lid to read.
+    lid: ?Lid = null,
 
     /// The command keeping the machine awake, when there is one. Null too
     /// when it could not be started: a recording is worth more than the
@@ -216,7 +229,9 @@ const Session = struct {
         out.rel_len = rel.len;
 
         // Last, once nothing after it can fail, so no error path has a
-        // running command to clean up.
+        // running command or an open device to clean up.
+        if (cfg.room.stop_on_lid) out.lid = Lid.open();
+
         if (cfg.room.keep_awake) |command| if (command.len > 0) {
             out.awake = keep_awake.Hold.start(gpa, command) catch |err| blk: {
                 log.warn("could not start the keep-awake command, the machine may sleep: {}", .{err});
@@ -229,17 +244,35 @@ const Session = struct {
         return out;
     }
 
-    /// One pass. True when the session has run out of time and should close.
-    fn pump(self: *Session, gpa: std.mem.Allocator) !bool {
+    const Stop = enum { over_time, lid_shut, failed };
+
+    /// One pass. Why the session should close, or null to carry on.
+    fn pump(self: *Session, gpa: std.mem.Allocator) !?Stop {
         if (self.awake) |*a| a.check();
 
         var fds = [_]posix.pollfd{
             .{ .fd = self.mic.pipe_read_fd, .events = posix.POLL.IN, .revents = 0 },
+            // A negative fd is skipped by poll, which is all "no lid" needs.
+            .{ .fd = if (self.lid) |l| l.fd else -1, .events = posix.POLL.IN, .revents = 0 },
         };
         _ = posix.poll(&fds, @intCast(idle_poll_ms)) catch |err| {
-            if (err == error.Interrupted) return false;
+            if (err == error.Interrupted) return null;
             return err;
         };
+
+        // Before the audio, which is left in the pipe: a pass's worth at most,
+        // and what it holds is the sound of the lid coming down.
+        if (self.lid) |*lid| {
+            if (fds[1].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
+                // Never expected of a lid, and a dead fd left in the poll
+                // would wake it on every pass. The recording outlives it.
+                log.warn("the lid switch went away, so closing the lid will no longer stop the recording", .{});
+                lid.close();
+                self.lid = null;
+            } else if (fds[1].revents & posix.POLL.IN != 0 and lid.shut()) {
+                return .lid_shut;
+            }
+        }
 
         if (fds[0].revents & posix.POLL.IN != 0) {
             const n = posix.read(self.mic.pipe_read_fd, &self.read_buf) catch |err| {
@@ -262,10 +295,10 @@ const Session = struct {
         return self.expired();
     }
 
-    fn expired(self: *const Session) bool {
-        const deadline = self.deadline_ns orelse return false;
+    fn expired(self: *const Session) ?Stop {
+        const deadline = self.deadline_ns orelse return null;
         const now: u64 = @intCast(std.time.nanoTimestamp());
-        return now >= deadline;
+        return if (now >= deadline) .over_time else null;
     }
 
     /// Feed the level controller, and only ever with speech. See the note on
@@ -304,6 +337,7 @@ const Session = struct {
         self.mic.setActive(false);
         self.mic.deinit();
         if (self.level) |*l| l.deinit();
+        if (self.lid) |*l| l.close();
 
         self.asr.finish(gpa, &self.transcript.doc) catch {};
         // Read after `finish`, which pushes the tail through the gate and can

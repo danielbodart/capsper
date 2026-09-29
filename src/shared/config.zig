@@ -146,6 +146,16 @@ pub const Room = struct {
     /// another press, in a second file.
     max_minutes: u32 = 240,
 
+    /// Whether shutting the laptop's lid ends the session, as a press of the
+    /// key would. Linux only, where the room latch is.
+    ///
+    /// Shutting the laptop is a way of saying stop, and without this nothing
+    /// hears it: the machine sleeps, wakes, and carries on recording, and
+    /// with an external display attached it does not sleep at all. Only the
+    /// lid shutting counts, not its being shut, so a laptop docked and closed
+    /// can still record the room.
+    stop_on_lid: bool = true,
+
     /// A shell command that keeps the machine from sleeping while the room
     /// is recorded, run when the session opens and ended when it closes.
     /// Null, or empty, lets the machine sleep as it would anyway.
@@ -158,9 +168,10 @@ pub const Room = struct {
     ///
     /// Closing the lid still sleeps, because the default asks for `sleep`
     /// and not `handle-lid-switch`: shutting the laptop is a way of saying
-    /// stop. The command's standard input closes with the session, and with
-    /// capsper if it dies, so one that reads to the end -- as `cat` does --
-    /// cannot keep the machine awake after the recording has gone.
+    /// stop, and `stop_on_lid` is what ends the session. The command's
+    /// standard input closes with the session, and with capsper if it
+    /// dies, so one that reads to the end -- as `cat` does -- cannot keep
+    /// the machine awake after the recording has gone.
     keep_awake: ?[:0]const u8 = switch (builtin.os.tag) {
         .linux => "exec systemd-inhibit --what=sleep --who=capsper --why='Recording the room' --no-ask-password cat",
         .macos => "exec caffeinate -i cat",
