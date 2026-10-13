@@ -115,6 +115,16 @@ export async function build() {
     await ensureCheckout();
     await ensureDeps();
     const ver = await version();
+    // Symlink installed models so the binary finds them at ../models/ relative
+    // to bin/. Before zig build, which installs the VAD model into models/: run
+    // after, it finds a real directory there and the link is never made.
+    const modelsLink = `${PLATFORM_DIR}/models`;
+    const modelsTarget = join(process.env.HOME!, ".local/share/capsper/models");
+    if (!existsSync(modelsLink) && existsSync(modelsTarget)) {
+        await $`mkdir -p ${PLATFORM_DIR}`;
+        await $`ln -s ${modelsTarget} ${modelsLink}`;
+    }
+
     console.log(`Building v${ver} (${IS_MACOS ? "coreml" : "ort"})...`);
     // -Dcpu on Linux only: the dist build targets x86_64_v3, while macOS is
     // Apple Silicon, where Zig's native default is already right.
@@ -122,13 +132,6 @@ export async function build() {
         await $`zig build --prefix ${PLATFORM_DIR} -Dversion=${ver} -Doptimize=ReleaseSafe`;
     } else {
         await $`zig build --prefix ${PLATFORM_DIR} -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
-    }
-
-    // Symlink installed models so the binary finds them at ../models/ relative to bin/
-    const modelsLink = `${PLATFORM_DIR}/models`;
-    const modelsTarget = join(process.env.HOME!, ".local/share/capsper/models");
-    if (!existsSync(modelsLink) && existsSync(modelsTarget)) {
-        await $`ln -s ${modelsTarget} ${modelsLink}`;
     }
 }
 
