@@ -214,6 +214,17 @@ pub fn writeHtml(w: anytype, text: []const u8) !void {
 // Tests
 // ============================================================
 
+/// A fraction of the volume slider's travel as a gain on the signal.
+///
+/// Desktop sliders are cubic, so 40% of the way along is 6.4% of the
+/// amplitude, and a setting that reads like the slider has to be cubed before
+/// it reaches anything that multiplies samples. Clamped to [0, 1]: this only
+/// ever turns something down.
+pub fn sliderToGain(fraction: f32) f32 {
+    const f = std.math.clamp(fraction, 0, 1);
+    return f * f * f;
+}
+
 test "textPreview: short text unchanged" {
     try std.testing.expectEqualStrings("hello", textPreview("hello"));
 }
@@ -560,4 +571,15 @@ test "writeWav: header fields correct" {
     try std.testing.expectEqualStrings("WAVE", w[8..12]);
     try std.testing.expectEqual(@as(u32, 16000), std.mem.readInt(u32, w[24..28], .little));
     try std.testing.expectEqual(@as(u32, 32000), std.mem.readInt(u32, w[28..32], .little));
+}
+
+test "sliderToGain: cubes the slider fraction" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.064), sliderToGain(0.4), 1e-6);
+    try std.testing.expectEqual(@as(f32, 1), sliderToGain(1));
+    try std.testing.expectEqual(@as(f32, 0), sliderToGain(0));
+}
+
+test "sliderToGain: never turns anything up" {
+    try std.testing.expectEqual(@as(f32, 1), sliderToGain(3));
+    try std.testing.expectEqual(@as(f32, 0), sliderToGain(-1));
 }

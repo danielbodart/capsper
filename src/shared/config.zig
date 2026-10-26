@@ -113,6 +113,11 @@ pub const Trigger = struct {
     /// the first word. The desktop's microphone indicator then stays lit
     /// whether or not anyone is speaking.
     low_latency: bool = false,
+    /// Turn the speakers down while the trigger is held, to this fraction of
+    /// where the volume slider was: 0.4 sounds like dragging it to 40% of the
+    /// way it was, 0 mutes. Null leaves them alone. The slider moves while
+    /// the key is down and comes back when it is released.
+    duck_output: ?f32 = null,
 };
 
 /// Recording the room you are sitting in, rather than a call.
@@ -559,6 +564,7 @@ pub const flags = [_]Flag{
     .{ .name = "--trigger-passthrough", .path = "trigger.passthrough" },
     .{ .name = "--type-delay", .path = "trigger.type_delay_us", .arg = "MICROSECONDS" },
     .{ .name = "--low-latency", .path = "trigger.low_latency" },
+    .{ .name = "--duck-output", .path = "trigger.duck_output", .arg = "FRACTION" },
 
     .{ .name = "--port", .aliases = &.{"-p"}, .path = "tcp.port", .arg = "PORT" },
 
@@ -839,6 +845,7 @@ test "defaults match the documented schema" {
     try testing.expectEqual(OnDeviceLost.wait, cfg.audio.on_device_lost);
     try testing.expect(cfg.trigger.key == null);
     try testing.expectEqual(@as(u64, 12_000), cfg.trigger.type_delay_us);
+    try testing.expect(cfg.trigger.duck_output == null);
     try testing.expect(cfg.tcp.port == null);
     try testing.expectEqual(AudioFormat.wav, cfg.debug_recording.audio_format);
     try testing.expectEqual(AudioFormat.opus, cfg.meeting.audio_format);
@@ -958,6 +965,7 @@ test "flags set every setting they name" {
         "--drop-terms",      "drop.txt",
         "--model",           "/opt/m",
         "--low-latency",
+        "--duck-output",     "0.4",
         "--trigger-passthrough",
         "--verbose",
     }));
@@ -977,6 +985,7 @@ test "flags set every setting they name" {
     try testing.expectEqualStrings("drop.txt", cfg.drop_terms.?);
     try testing.expectEqualStrings("/opt/m", cfg.model.?);
     try testing.expect(cfg.trigger.low_latency);
+    try testing.expectEqual(@as(f32, 0.4), cfg.trigger.duck_output.?);
     try testing.expect(cfg.trigger.passthrough);
     try testing.expect(cfg.verbose);
 }

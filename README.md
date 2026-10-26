@@ -235,6 +235,7 @@ only what you want to change.
         .passthrough = false,    // --trigger-passthrough
         .type_delay_us = 12_000, // --type-delay
         .low_latency = false,    // --low-latency
+        .duck_output = null,     // --duck-output; 0.4 turns the speakers down while held
     },
 
     .tcp = .{

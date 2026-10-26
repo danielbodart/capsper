@@ -190,3 +190,12 @@ pub extern fn pw_mic_level_destroy(m: *pw_mic_level) void;
 pub extern fn pw_mic_level_set(m: *pw_mic_level, volume: f32) c_int;
 pub extern fn pw_mic_level_take_changed(m: *pw_mic_level) c_int;
 pub extern fn pw_mic_level_node_name(m: *pw_mic_level) [*:0]const u8;
+
+// The default output, lowered while the trigger is held. Follows the default
+// as it changes, and sets the level on the card's route where there is one so
+// the desktop's slider agrees with what is heard. `factor` is linear.
+pub const pw_out_duck = opaque {};
+pub extern fn pw_out_duck_create() ?*pw_out_duck;
+pub extern fn pw_out_duck_destroy(d: *pw_out_duck) void;
+pub extern fn pw_out_duck_hold(d: *pw_out_duck, factor: f32) c_int;
+pub extern fn pw_out_duck_release(d: *pw_out_duck) void;

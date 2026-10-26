@@ -5,6 +5,8 @@
 #include <pipewire/extensions/metadata.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/props.h>
+#include <spa/param/route.h>
+#include <spa/pod/parser.h>
 #include <spa/pod/builder.h>
 #include <spa/utils/result.h>
 #include <string.h>
@@ -2371,4 +2373,457 @@ const char *
 pw_mic_level_node_name(struct pw_mic_level *m)
 {
     return m ? m->node_name : "";
+}
+
+/* ─── Turning the speakers down while the trigger is held ──────────────────────
+
+   The default output, followed the way the microphone's level follows the
+   default input, and lowered for as long as someone is dictating.
+
+   The volume is set where the desktop sets it, not on the node. A sink that is
+   a card's output has its level on the card's route -- the hardware mixer --
+   and the node's own volume is the session manager's copy of that. Writing the
+   node directly is quieter, but nothing else knows about it: the slider still
+   reads the old level, and putting the old value back on the node did not
+   bring the mixer with it, so it stayed quiet until something rewrote the
+   route. Measured on the blade's onboard card, which is why this goes the long
+   way round. A sink with no card behind it -- a loopback, a filter chain --
+   has nowhere else for its volume to live, and there the node is the place.
+
+   Done this way the slider moves while the key is held and comes back after.
+   If anything goes wrong in between, what it leaves behind is a volume the
+   desktop can see and the user can drag back up, rather than one nothing
+   reports.
+
+   The route is written with `save` off, so a level that only lasts for a held
+   key is never what the session manager remembers for that output. */
+
+struct pw_out_duck {
+    struct pw_thread_loop *thread_loop;
+    struct pw_context     *context;
+    struct pw_core        *core;
+    struct pw_registry    *registry;
+    struct spa_hook        registry_listener;
+
+    struct pw_proxy *metadata;
+    struct spa_hook  metadata_listener;
+
+    char node_name[256];
+
+    /* Every output in the graph, by name. The registry announces each node
+       once, and it announces them before the metadata has replayed which one
+       is the default -- so by the time the name is known, its node has already
+       gone past and nothing will mention it again. */
+    struct { uint32_t id; char name[256]; } sinks[64];
+    uint32_t n_sinks;
+
+    /* The default sink, once it has been seen in the registry. */
+    uint32_t         node_id;
+    struct pw_proxy *node;
+    struct spa_hook  node_listener;
+
+    /* The card behind it, and which of the card's outputs it is. Unset for a
+       sink with no card, which is levelled on the node instead. */
+    int32_t          device_id;
+    int32_t          route_device;
+    struct pw_proxy *device;
+    struct spa_hook  device_listener;
+    int32_t          route_index;
+
+    /* The level as last reported, or as last set: a write is taken as
+       having happened rather than waiting for the echo, so a quick second
+       press does not mistake the lowered level for the one to come back to. */
+    uint32_t channels;
+    float    volumes[SPA_AUDIO_MAX_CHANNELS];
+
+    /* Set while the key is held and the output is lowered. */
+    int      ducked;
+    uint32_t saved_channels;
+    float    saved[SPA_AUDIO_MAX_CHANNELS];
+};
+
+static int
+read_channel_volumes(const struct spa_pod *props, float *out, uint32_t *n)
+{
+    if (!props || !spa_pod_is_object(props)) return -1;
+    const struct spa_pod_prop *p = spa_pod_find_prop(props, NULL, SPA_PROP_channelVolumes);
+    if (!p) return -1;
+    uint32_t k = spa_pod_copy_array(&p->value, SPA_TYPE_Float, out, SPA_AUDIO_MAX_CHANNELS);
+    if (k == 0) return -1;
+    *n = k;
+    return 0;
+}
+
+/* Write a level to the output. Caller holds the thread loop. */
+static int
+out_duck_apply(struct pw_out_duck *d, const float *vols, uint32_t n)
+{
+    uint8_t buf[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    struct spa_pod *pod;
+
+    if (d->device && d->route_index >= 0) {
+        struct spa_pod_frame f;
+        spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_ParamRoute, SPA_PARAM_Route);
+        spa_pod_builder_add(&b,
+            SPA_PARAM_ROUTE_index, SPA_POD_Int(d->route_index),
+            SPA_PARAM_ROUTE_device, SPA_POD_Int(d->route_device),
+            0);
+        spa_pod_builder_prop(&b, SPA_PARAM_ROUTE_props, 0);
+        spa_pod_builder_add_object(&b,
+            SPA_TYPE_OBJECT_Props, SPA_PARAM_Route,
+            SPA_PROP_channelVolumes,
+            SPA_POD_Array(sizeof(float), SPA_TYPE_Float, n, vols));
+        spa_pod_builder_add(&b, SPA_PARAM_ROUTE_save, SPA_POD_Bool(false), 0);
+        pod = spa_pod_builder_pop(&b, &f);
+        if (!pod) return -1;
+        pw_device_set_param((struct pw_device *)d->device, SPA_PARAM_Route, 0, pod);
+    } else if (d->node && d->device_id < 0) {
+        pod = spa_pod_builder_add_object(&b,
+            SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+            SPA_PROP_channelVolumes,
+            SPA_POD_Array(sizeof(float), SPA_TYPE_Float, n, vols));
+        if (!pod) return -1;
+        pw_node_set_param((struct pw_node *)d->node, SPA_PARAM_Props, 0, pod);
+    } else {
+        /* A card's output whose route has not been reported yet. */
+        return -1;
+    }
+
+    memcpy(d->volumes, vols, n * sizeof(float));
+    d->channels = n;
+    return 0;
+}
+
+/* Put back the level from before the key went down. Caller holds the loop. */
+static void
+out_duck_restore(struct pw_out_duck *d)
+{
+    if (!d->ducked) return;
+    d->ducked = 0;
+    out_duck_apply(d, d->saved, d->saved_channels);
+}
+
+static void
+on_duck_device_param(void *data, int seq, uint32_t id, uint32_t index,
+                     uint32_t next, const struct spa_pod *param)
+{
+    struct pw_out_duck *d = data;
+    (void)seq; (void)index; (void)next;
+    if (id != SPA_PARAM_Route || !param) return;
+
+    int32_t route_index, route_device;
+    uint32_t direction;
+    struct spa_pod *props = NULL;
+    if (spa_pod_parse_object(param, SPA_TYPE_OBJECT_ParamRoute, NULL,
+            SPA_PARAM_ROUTE_index, SPA_POD_Int(&route_index),
+            SPA_PARAM_ROUTE_direction, SPA_POD_Id(&direction),
+            SPA_PARAM_ROUTE_device, SPA_POD_Int(&route_device),
+            SPA_PARAM_ROUTE_props, SPA_POD_OPT_Pod(&props)) < 0)
+        return;
+    if (direction != SPA_DIRECTION_OUTPUT || route_device != d->route_device) return;
+
+    d->route_index = route_index;
+    /* While lowered, the report is the lowered level; what to come back to
+       is already saved. */
+    if (!d->ducked) read_channel_volumes(props, d->volumes, &d->channels);
+}
+
+static const struct pw_device_events duck_device_events = {
+    PW_VERSION_DEVICE_EVENTS,
+    .param = on_duck_device_param,
+};
+
+static void
+on_duck_node_info(void *data, const struct pw_node_info *info)
+{
+    struct pw_out_duck *d = data;
+    if (!info || !info->props || d->device) return;
+
+    const char *dev = spa_dict_lookup(info->props, PW_KEY_DEVICE_ID);
+    const char *route = spa_dict_lookup(info->props, "card.profile.device");
+    if (!dev || !route) return;
+
+    d->device_id = atoi(dev);
+    d->route_device = atoi(route);
+    struct pw_proxy *proxy = pw_registry_bind(d->registry, (uint32_t)d->device_id,
+                                              PW_TYPE_INTERFACE_Device,
+                                              PW_VERSION_DEVICE, 0);
+    if (!proxy) return;
+    d->device = proxy;
+    pw_device_add_listener((struct pw_device *)proxy, &d->device_listener,
+                           &duck_device_events, d);
+    uint32_t ids[] = { SPA_PARAM_Route };
+    pw_device_subscribe_params((struct pw_device *)proxy, ids, 1);
+}
+
+static void
+on_duck_node_param(void *data, int seq, uint32_t id, uint32_t index,
+                   uint32_t next, const struct spa_pod *param)
+{
+    struct pw_out_duck *d = data;
+    (void)seq; (void)index; (void)next;
+    /* A card's sink is read from its route; the node is its copy. */
+    if (id != SPA_PARAM_Props || d->device_id >= 0 || d->ducked) return;
+    read_channel_volumes(param, d->volumes, &d->channels);
+}
+
+static const struct pw_node_events duck_node_events = {
+    PW_VERSION_NODE_EVENTS,
+    .info = on_duck_node_info,
+    .param = on_duck_node_param,
+};
+
+static void
+out_duck_release_node(struct pw_out_duck *d)
+{
+    if (d->device) {
+        spa_hook_remove(&d->device_listener);
+        pw_proxy_destroy(d->device);
+        d->device = NULL;
+    }
+    if (d->node) {
+        spa_hook_remove(&d->node_listener);
+        pw_proxy_destroy(d->node);
+        d->node = NULL;
+    }
+    d->node_id = 0;
+    d->device_id = -1;
+    d->route_device = -1;
+    d->route_index = -1;
+    d->channels = 0;
+}
+
+static void
+out_duck_bind_node(struct pw_out_duck *d, uint32_t id)
+{
+    struct pw_proxy *proxy = pw_registry_bind(d->registry, id,
+                                              PW_TYPE_INTERFACE_Node,
+                                              PW_VERSION_NODE, 0);
+    if (!proxy) return;
+    d->node = proxy;
+    d->node_id = id;
+    pw_node_add_listener((struct pw_node *)proxy, &d->node_listener,
+                         &duck_node_events, d);
+    uint32_t ids[] = { SPA_PARAM_Props };
+    pw_node_subscribe_params((struct pw_node *)proxy, ids, 1);
+}
+
+static int
+on_duck_metadata_property(void *data, uint32_t subject, const char *key,
+                          const char *type, const char *value)
+{
+    struct pw_out_duck *d = data;
+    (void)subject;
+    (void)type;
+
+    if (!key || strcmp(key, "default.audio.sink") != 0) return 0;
+
+    char name[sizeof(d->node_name)];
+    if (parse_default_name(value, name, sizeof(name)) != 0) return 0;
+    if (strcmp(name, d->node_name) == 0) return 0;
+
+    /* The output that was turned down is the one to turn back up, so it gets
+       its level back before it is let go -- not whichever is the default by
+       the time the key comes up. */
+    out_duck_restore(d);
+    snprintf(d->node_name, sizeof(d->node_name), "%s", name);
+    out_duck_release_node(d);
+    for (uint32_t i = 0; i < d->n_sinks; i++) {
+        if (strcmp(d->sinks[i].name, name) == 0) {
+            out_duck_bind_node(d, d->sinks[i].id);
+            break;
+        }
+    }
+    return 0;
+}
+
+static const struct pw_metadata_events duck_metadata_events = {
+    PW_VERSION_METADATA_EVENTS,
+    .property = on_duck_metadata_property,
+};
+
+static void
+on_duck_registry_global(void *data, uint32_t id, uint32_t permissions,
+                        const char *type, uint32_t version,
+                        const struct spa_dict *props)
+{
+    struct pw_out_duck *d = data;
+    (void)permissions;
+    (void)version;
+
+    if (!props || !type) return;
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Metadata) == 0 && !d->metadata) {
+        const char *name = spa_dict_lookup(props, PW_KEY_METADATA_NAME);
+        if (name && strcmp(name, "default") == 0) {
+            struct pw_proxy *proxy = pw_registry_bind(d->registry, id, type,
+                                                      PW_VERSION_METADATA, 0);
+            if (proxy) {
+                d->metadata = proxy;
+                pw_metadata_add_listener((struct pw_metadata *)proxy,
+                                         &d->metadata_listener,
+                                         &duck_metadata_events, d);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0) return;
+
+    const char *class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (!class || !name || strcmp(class, "Audio/Sink") != 0) return;
+
+    if (d->n_sinks < SPA_N_ELEMENTS(d->sinks)) {
+        d->sinks[d->n_sinks].id = id;
+        snprintf(d->sinks[d->n_sinks].name, sizeof(d->sinks[0].name), "%s", name);
+        d->n_sinks++;
+    }
+
+    if (!d->node && d->node_name[0] && strcmp(name, d->node_name) == 0)
+        out_duck_bind_node(d, id);
+}
+
+static void
+on_duck_registry_global_remove(void *data, uint32_t id)
+{
+    struct pw_out_duck *d = data;
+    for (uint32_t i = 0; i < d->n_sinks; i++) {
+        if (d->sinks[i].id == id) {
+            d->sinks[i] = d->sinks[--d->n_sinks];
+            break;
+        }
+    }
+    /* Unplugged mid-hold: there is nothing left to give the level back to. */
+    if (d->node && d->node_id == id) {
+        d->ducked = 0;
+        out_duck_release_node(d);
+    }
+}
+
+struct pw_out_duck *
+pw_out_duck_create(void)
+{
+    pw_init(NULL, NULL);
+
+    struct pw_out_duck *d = calloc(1, sizeof(*d));
+    if (!d) return NULL;
+    d->device_id = -1;
+    d->route_device = -1;
+    d->route_index = -1;
+
+    d->thread_loop = pw_thread_loop_new("capsper-duck", NULL);
+    if (!d->thread_loop) { free(d); return NULL; }
+
+    d->context = pw_context_new(pw_thread_loop_get_loop(d->thread_loop), NULL, 0);
+    if (!d->context) {
+        pw_thread_loop_destroy(d->thread_loop);
+        free(d); return NULL;
+    }
+
+    pw_thread_loop_lock(d->thread_loop);
+
+    if (pw_thread_loop_start(d->thread_loop) < 0) goto fail_context;
+
+    d->core = pw_context_connect(d->context, NULL, 0);
+    if (!d->core) goto fail_started;
+
+    d->registry = pw_core_get_registry(d->core, PW_VERSION_REGISTRY, 0);
+    if (!d->registry) {
+        pw_core_disconnect(d->core);
+        goto fail_started;
+    }
+
+    static const struct pw_registry_events reg_events = {
+        PW_VERSION_REGISTRY_EVENTS,
+        .global = on_duck_registry_global,
+        .global_remove = on_duck_registry_global_remove,
+    };
+    spa_zero(d->registry_listener);
+    pw_registry_add_listener(d->registry, &d->registry_listener, &reg_events, d);
+
+    pw_thread_loop_unlock(d->thread_loop);
+    return d;
+
+fail_started:
+    pw_thread_loop_unlock(d->thread_loop);
+    pw_thread_loop_stop(d->thread_loop);
+    pw_context_destroy(d->context);
+    pw_thread_loop_destroy(d->thread_loop);
+    free(d);
+    return NULL;
+
+fail_context:
+    pw_thread_loop_unlock(d->thread_loop);
+    pw_context_destroy(d->context);
+    pw_thread_loop_destroy(d->thread_loop);
+    free(d);
+    return NULL;
+}
+
+void
+pw_out_duck_destroy(struct pw_out_duck *d)
+{
+    if (!d) return;
+
+    pw_thread_loop_lock(d->thread_loop);
+    out_duck_restore(d);
+    out_duck_release_node(d);
+    if (d->metadata) {
+        spa_hook_remove(&d->metadata_listener);
+        pw_proxy_destroy(d->metadata);
+    }
+    spa_hook_remove(&d->registry_listener);
+    pw_proxy_destroy((struct pw_proxy *)d->registry);
+    pw_core_disconnect(d->core);
+    pw_thread_loop_unlock(d->thread_loop);
+
+    pw_thread_loop_stop(d->thread_loop);
+    pw_context_destroy(d->context);
+    pw_thread_loop_destroy(d->thread_loop);
+    free(d);
+}
+
+/* Lower the default output to `factor` of its level, linear, until
+   `pw_out_duck_release`. A second call while lowered does nothing.
+
+   Returns -1 when there is no level to lower yet -- the output has not been
+   seen, or its route not reported -- which leaves the speakers as they are. */
+int
+pw_out_duck_hold(struct pw_out_duck *d, float factor)
+{
+    if (!d) return -1;
+
+    pw_thread_loop_lock(d->thread_loop);
+    int rc = 0;
+    if (!d->ducked) {
+        rc = -1;
+        if (d->channels > 0) {
+            uint32_t n = d->channels;
+            float saved[SPA_AUDIO_MAX_CHANNELS], lowered[SPA_AUDIO_MAX_CHANNELS];
+            memcpy(saved, d->volumes, n * sizeof(float));
+            for (uint32_t i = 0; i < n; i++) lowered[i] = saved[i] * factor;
+            if (out_duck_apply(d, lowered, n) == 0) {
+                memcpy(d->saved, saved, n * sizeof(float));
+                d->saved_channels = n;
+                d->ducked = 1;
+                rc = 0;
+            }
+        }
+    }
+    pw_thread_loop_unlock(d->thread_loop);
+    return rc;
+}
+
+/* Give the output back the level it had when the key went down. Whatever was
+   done to the volume in between is undone with it: the hold is short, and
+   coming back to where it started is the promise. */
+void
+pw_out_duck_release(struct pw_out_duck *d)
+{
+    if (!d) return;
+    pw_thread_loop_lock(d->thread_loop);
+    out_duck_restore(d);
+    pw_thread_loop_unlock(d->thread_loop);
 }

@@ -12,6 +12,7 @@ const Server = server_mod.Server;
 const PipelineFactory = server_mod.PipelineFactory;
 const TypeCallback = server_mod.TypeCallback;
 const AudioCapture = @import("platform/audio.zig").AudioCapture;
+const OutputDuck = @import("platform/output_duck.zig").OutputDuck;
 const input_mod = @import("platform/input.zig");
 const InputHandler = input_mod.InputHandler;
 const utils = @import("shared/utils.zig");
@@ -26,6 +27,23 @@ const meeting_runner = @import("shared/meeting_runner.zig");
 const room_runner = @import("shared/room_runner.zig");
 const status = @import("shared/status.zig");
 const http_server = @import("shared/http_server.zig");
+
+/// The speakers, turned down while the trigger is held. Module-level because
+/// the input handler takes a bare function and this is what it reaches.
+var duck: ?OutputDuck = null;
+var duck_gain: f32 = 1;
+
+/// The trigger's callback when `trigger.duck_output` is set. Only the trigger
+/// comes through here -- an always-live capsper calls `setLive` itself and
+/// would otherwise hold the speakers down for as long as it ran -- and the room
+/// latch never does, because latching is not holding.
+fn liveWithDuck(live: bool) void {
+    if (live and !duck.?.hold(duck_gain)) {
+        std.debug.print("No output to turn down yet; the speakers stay as they are\n", .{});
+    }
+    server_mod.setLive(live);
+    if (!live) duck.?.release();
+}
 
 pub fn main() !void {
     // First, so an uptime counts from the process rather than from whenever
@@ -394,12 +412,22 @@ pub fn main() !void {
 
     if (!cli.dry_run) {
         if (trigger_key) |tkey| {
+            // Before the handler, which is handed a different callback when
+            // there is an output to turn down. Not fatal: dictation with the
+            // speakers at full volume still dictates.
+            if (cfg.trigger.duck_output) |fraction| {
+                duck_gain = utils.sliderToGain(fraction);
+                duck = OutputDuck.init() catch |err| blk: {
+                    std.debug.print("Turning the speakers down while dictating is unavailable: {}\n", .{err});
+                    break :blk null;
+                };
+            }
             std.debug.print("Initializing input handler (trigger=keycode {d})\n", .{tkey});
             input_handler = InputHandler.init(.{
                 .trigger_key = tkey,
                 .trigger_passthrough = cfg.trigger.passthrough,
                 .type_delay_us = cfg.trigger.type_delay_us,
-                .live_fn = &server_mod.setLive,
+                .live_fn = if (duck != null) &liveWithDuck else &server_mod.setLive,
                 .room = &room_runner.wanted,
             }) catch |err| {
                 std.debug.print("Failed to init input handler: {}\n", .{err});
@@ -424,6 +452,7 @@ pub fn main() !void {
     }
     defer {
         if (input_handler != null) input_handler.?.deinit();
+        if (duck) |*d| d.deinit();
     }
 
     if (cli.dry_run) {
