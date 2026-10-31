@@ -2396,7 +2396,14 @@ pw_mic_level_node_name(struct pw_mic_level *m)
    reports.
 
    The route is written with `save` off, so a level that only lasts for a held
-   key is never what the session manager remembers for that output. */
+   key is never what the session manager remembers for that output.
+
+   The level is read back by asking again each time the object says its
+   params changed. Subscribing to the param looks like the same thing and is
+   not: PipeWire answers a subscription once, with the level at the time, and
+   never again -- so the level to come back to stayed whatever it was when
+   capsper started, and turning the volume down afterwards was undone by the
+   next release. */
 
 struct pw_out_duck {
     struct pw_thread_loop *thread_loop;
@@ -2404,6 +2411,8 @@ struct pw_out_duck {
     struct pw_core        *core;
     struct pw_registry    *registry;
     struct spa_hook        registry_listener;
+
+    struct spa_hook  core_listener;
 
     struct pw_proxy *metadata;
     struct spa_hook  metadata_listener;
@@ -2435,6 +2444,12 @@ struct pw_out_duck {
        press does not mistake the lowered level for the one to come back to. */
     uint32_t channels;
     float    volumes[SPA_AUDIO_MAX_CHANNELS];
+
+    /* A sync sent after the last write, and not yet answered. Reports that
+       arrive before it describe the output from before that write -- a quick
+       tap's lowered level, read back just after the release put the real one
+       back -- so they are not the level to come back to. */
+    int settle_seq;
 
     /* Set while the key is held and the output is lowered. */
     int      ducked;
@@ -2492,7 +2507,24 @@ out_duck_apply(struct pw_out_duck *d, const float *vols, uint32_t n)
 
     memcpy(d->volumes, vols, n * sizeof(float));
     d->channels = n;
+    d->settle_seq = pw_core_sync(d->core, PW_ID_CORE, 0);
     return 0;
+}
+
+static void
+on_duck_core_done(void *data, uint32_t id, int seq)
+{
+    struct pw_out_duck *d = data;
+    if (id == PW_ID_CORE && seq == d->settle_seq) d->settle_seq = -1;
+}
+
+/* Whether a report of the level is the one to come back to: not while it is
+   lowered, when what to come back to is already saved, and not while a write
+   is still on its way. */
+static int
+out_duck_reading(const struct pw_out_duck *d)
+{
+    return !d->ducked && d->settle_seq < 0;
 }
 
 /* Put back the level from before the key went down. Caller holds the loop. */
@@ -2524,13 +2556,20 @@ on_duck_device_param(void *data, int seq, uint32_t id, uint32_t index,
     if (direction != SPA_DIRECTION_OUTPUT || route_device != d->route_device) return;
 
     d->route_index = route_index;
-    /* While lowered, the report is the lowered level; what to come back to
-       is already saved. */
-    if (!d->ducked) read_channel_volumes(props, d->volumes, &d->channels);
+    if (out_duck_reading(d)) read_channel_volumes(props, d->volumes, &d->channels);
+}
+
+static void
+on_duck_device_info(void *data, const struct pw_device_info *info)
+{
+    struct pw_out_duck *d = data;
+    if (!info || !(info->change_mask & PW_DEVICE_CHANGE_MASK_PARAMS)) return;
+    pw_device_enum_params((struct pw_device *)d->device, 0, SPA_PARAM_Route, 0, UINT32_MAX, NULL);
 }
 
 static const struct pw_device_events duck_device_events = {
     PW_VERSION_DEVICE_EVENTS,
+    .info = on_duck_device_info,
     .param = on_duck_device_param,
 };
 
@@ -2538,7 +2577,13 @@ static void
 on_duck_node_info(void *data, const struct pw_node_info *info)
 {
     struct pw_out_duck *d = data;
-    if (!info || !info->props || d->device) return;
+    if (!info) return;
+
+    /* A sink with no card is read from the node itself. */
+    if (d->device_id < 0 && (info->change_mask & PW_NODE_CHANGE_MASK_PARAMS))
+        pw_node_enum_params((struct pw_node *)d->node, 0, SPA_PARAM_Props, 0, UINT32_MAX, NULL);
+
+    if (!info->props || d->device) return;
 
     const char *dev = spa_dict_lookup(info->props, PW_KEY_DEVICE_ID);
     const char *route = spa_dict_lookup(info->props, "card.profile.device");
@@ -2553,8 +2598,6 @@ on_duck_node_info(void *data, const struct pw_node_info *info)
     d->device = proxy;
     pw_device_add_listener((struct pw_device *)proxy, &d->device_listener,
                            &duck_device_events, d);
-    uint32_t ids[] = { SPA_PARAM_Route };
-    pw_device_subscribe_params((struct pw_device *)proxy, ids, 1);
 }
 
 static void
@@ -2564,7 +2607,7 @@ on_duck_node_param(void *data, int seq, uint32_t id, uint32_t index,
     struct pw_out_duck *d = data;
     (void)seq; (void)index; (void)next;
     /* A card's sink is read from its route; the node is its copy. */
-    if (id != SPA_PARAM_Props || d->device_id >= 0 || d->ducked) return;
+    if (id != SPA_PARAM_Props || d->device_id >= 0 || !out_duck_reading(d)) return;
     read_channel_volumes(param, d->volumes, &d->channels);
 }
 
@@ -2605,8 +2648,6 @@ out_duck_bind_node(struct pw_out_duck *d, uint32_t id)
     d->node_id = id;
     pw_node_add_listener((struct pw_node *)proxy, &d->node_listener,
                          &duck_node_events, d);
-    uint32_t ids[] = { SPA_PARAM_Props };
-    pw_node_subscribe_params((struct pw_node *)proxy, ids, 1);
 }
 
 static int
@@ -2712,6 +2753,7 @@ pw_out_duck_create(void)
     d->device_id = -1;
     d->route_device = -1;
     d->route_index = -1;
+    d->settle_seq = -1;
 
     d->thread_loop = pw_thread_loop_new("capsper-duck", NULL);
     if (!d->thread_loop) { free(d); return NULL; }
@@ -2742,6 +2784,13 @@ pw_out_duck_create(void)
     };
     spa_zero(d->registry_listener);
     pw_registry_add_listener(d->registry, &d->registry_listener, &reg_events, d);
+
+    static const struct pw_core_events core_events = {
+        PW_VERSION_CORE_EVENTS,
+        .done = on_duck_core_done,
+    };
+    spa_zero(d->core_listener);
+    pw_core_add_listener(d->core, &d->core_listener, &core_events, d);
 
     pw_thread_loop_unlock(d->thread_loop);
     return d;
@@ -2776,6 +2825,7 @@ pw_out_duck_destroy(struct pw_out_duck *d)
     }
     spa_hook_remove(&d->registry_listener);
     pw_proxy_destroy((struct pw_proxy *)d->registry);
+    spa_hook_remove(&d->core_listener);
     pw_core_disconnect(d->core);
     pw_thread_loop_unlock(d->thread_loop);
 
