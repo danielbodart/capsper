@@ -168,6 +168,8 @@ export async function dev() {
 }
 
 export async function test() {
+    await ensureCheckout();
+    await ensureDeps();
     await $`zig build test`;
 }
 
@@ -276,71 +278,23 @@ async function distMacOS() {
     console.log(`Tarball: ${TARBALL} (v${ver})`);
 }
 
+/** macOS: the Mach-O binary signed with a Fulcio certificate, and the tarball
+ *  made again around it. Needs CI's OIDC token. The tarballs themselves are
+ *  signed with cosign by CI's release job, once, for both platforms. */
 export async function sign() {
     ensureBinary();
-    if (!existsSync(TARBALL)) {
-        console.error(`Tarball not found: ${TARBALL} — run dist first`);
-        process.exit(1);
+    if (!IS_MACOS) {
+        console.log("sign: nothing to do on Linux (CI's release job signs the tarball)");
+        return;
     }
-
-    const hasOidc = !!process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-
-    // macOS: sign the Mach-O binary with Fulcio cert
-    if (IS_MACOS) {
-        console.log("Signing macOS binary with Fulcio...");
-        await $`fulcio-codesign --identifier io.github.danielbodart.capsper --subject io.github.danielbodart.capsper --entitlements dist/macos/entitlements.plist ${PLATFORM_DIR}/bin/capsper`;
-        // Re-create tarball with signed binary
-        await distMacOS();
-    }
-
-    // Both platforms: sign the tarball with cosign for provenance
-    if (hasOidc) {
-        console.log(`Signing ${TARBALL} with cosign...`);
-        await $`cosign sign-blob ${TARBALL} --bundle ${TARBALL}.sigstore.json --yes`;
-    } else {
-        console.log("Skipping cosign blob signing (no OIDC token — not in CI)");
-    }
+    console.log("Signing macOS binary with Fulcio...");
+    await $`fulcio-codesign --identifier io.github.danielbodart.capsper --subject io.github.danielbodart.capsper --entitlements dist/macos/entitlements.plist ${PLATFORM_DIR}/bin/capsper`;
+    // Re-create tarball with signed binary
+    await distMacOS();
 }
 
 export async function lint() {
     await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh`;
-}
-
-export async function ci() {
-    await ensureCheckout();
-    await ensureDeps();
-    const ver = await version();
-    console.log("Running lint...");
-    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh`;
-    console.log("Running tests...");
-    await $`zig build test`;
-    await build();
-    await dist();
-    await sign();
-    if (process.env.GH_TOKEN) {
-        const noCreateRelease = process.env.NO_CREATE_RELEASE === "true";
-        const assets = [TARBALL, `${TARBALL}.sha256`];
-        if (existsSync(`${TARBALL}.sigstore.json`)) {
-            assets.push(`${TARBALL}.sigstore.json`);
-        }
-        if (noCreateRelease) {
-            console.log(`Uploading assets to release v${ver}...`);
-            for (let attempt = 1; attempt <= 10; attempt++) {
-                const { exitCode } = await $`gh release upload v${ver} ${assets} --clobber`.nothrow();
-                if (exitCode === 0) break;
-                if (attempt === 10) {
-                    console.error(`Failed to upload after ${attempt} attempts`);
-                    process.exit(1);
-                }
-                console.log(`Release not ready yet (attempt ${attempt}/10), waiting 30s...`);
-                await Bun.sleep(30_000);
-            }
-        } else {
-            const commitMsg = (await $`git log -1 --format=%B`.quiet()).text().trim();
-            console.log(`Creating release v${ver}...`);
-            await $`gh release create v${ver} ${assets} --title v${ver} --notes ${commitMsg}`;
-        }
-    }
 }
 
 // ─── Command dispatch ──────────────────────────────────────────────────────
@@ -368,7 +322,7 @@ export async function nix() {
     await $`nix build --no-link .#capsper`;
 }
 const commands: Record<string, Function> = {
-    dev, build, clean, setup, test, lint, dist, sign, ci, nix, version: printVersion,
+    dev, build, clean, setup, test, lint, dist, sign, nix, version: printVersion,
     "short-test": shortTest,
     "medium-test": mediumTest,
     "long-test": longTest,

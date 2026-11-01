@@ -2,21 +2,28 @@ name: CI
 on:
   push:
     branches: [trunk]
+  # release: publish once the checks pass whatever changed. The weekly update
+  # sets it when it moved something the tarballs are made of, its push having
+  # started nothing.
+  workflow_dispatch:
+    inputs:
+      release:
+        type: boolean
+        default: false
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 jobs:
-  linux:
+  # The fast one: shellcheck and the unit and property tests, with mise's Zig.
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
           # libopus is a submodule, compiled into the binary.
           submodules: recursive
       # The LFS objects themselves, keyed on the pointer files -- which are
       # content-addressed, so the key changes exactly when the libraries do.
-      # `./run ci` pulls them if this misses, which costs one 24MB download.
+      # `./run` pulls them if this misses, which costs one 24MB download.
       #
       # No restore-keys: a near-miss would hand this key the *previous*
       # object store, and saving it back would carry every superseded library
@@ -27,30 +34,53 @@ jobs:
         with:
           path: .git/lfs
           key: lfs-${{ hashFiles('dist/linux/lib/*.so') }}
-      # zig, bun, shellcheck and cosign, at the versions .mise.toml pins.
-      # Installs and caches them; the tools it installs land on PATH for the
-      # steps below.
+      # zig, bun, shellcheck and cosign, at the versions mise.toml pins.
       - uses: jdx/mise-action@v5
       # Zig's global cache: the compiled standard library and the build's own
       # dependencies, which is most of a cold build.
       - uses: actions/cache@v6
         with:
           path: ~/.cache/zig
-          key: zig-linux-${{ hashFiles('build.zig.zon', '.mise.toml') }}
+          key: zig-linux-${{ hashFiles('build.zig.zon', 'mise.toml') }}
           restore-keys: zig-linux-
-      - name: CI
-        run: ./run ci
-        env:
-          CI: "true"
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
+      - run: mise run check
+
+  # The Linux tarball, built by mise as it is released, and installed into a
+  # scratch home to verify its user units against the binary in it.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # run.ts versions the release by commit count.
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/cache@v6
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('dist/linux/lib/*.so') }}
+      - uses: jdx/mise-action@v5
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/zig
+          key: zig-linux-${{ hashFiles('build.zig.zon', 'mise.toml') }}
+          restore-keys: zig-linux-
+      - run: mise run dist
+      - run: mise run dist-check
       - uses: actions/upload-artifact@v7
         with:
           name: capsper-linux-x86_64
-          path: dist/linux/
+          path: |
+            capsper-linux-x86_64.tar.gz
+            capsper-linux-x86_64.tar.gz.sha256
 
+  # The macOS tarball, its tests run there too. On trunk the binary is signed
+  # with a Fulcio certificate (the OIDC token) before it is packed.
   macos:
     runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -61,25 +91,27 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: ~/.cache/zig
-          key: zig-macos-${{ hashFiles('build.zig.zon', '.mise.toml') }}
+          key: zig-macos-${{ hashFiles('build.zig.zon', 'mise.toml') }}
           restore-keys: zig-macos-
-      - name: CI
-        run: ./run ci
-        env:
-          CI: "true"
-          NO_CREATE_RELEASE: "true"
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
+      - run: mise run check
+      - run: mise run dist
+      - name: Sign the binary
+        if: github.ref == 'refs/heads/trunk'
+        run: ./run sign
       - uses: actions/upload-artifact@v7
         with:
           name: capsper-macos-arm64
-          path: dist/macos/
+          path: |
+            capsper-macos-arm64.tar.gz
+            capsper-macos-arm64.tar.gz.sha256
 
   # NixOS support. There is no NixOS runner image, but a Nix derivation builds
   # identically on any host, so Nix on ubuntu is a real verification of the
   # package. The NixOS module needs an actual NixOS system, which the flake's
   # check boots in a VM — KVM is available on Linux runners and the installer
-  # enables it.
+  # enables it. On trunk, capsper's own package goes to the danielbodart
+  # cache, and nothing else: never the VM test's closure (the free tier is
+  # 5 GB).
   nix:
     runs-on: ubuntu-latest
     steps:
@@ -92,5 +124,63 @@ jobs:
           # this repository has no account for: it fails after a 15s timeout
           # and warns. KVM is configured either way, and the VM test needs it.
           determinate: false
+      - uses: cachix/cachix-action@v17
+        with:
+          name: danielbodart
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
       - name: Nix
         run: ./run nix
+      - name: Push capsper's package to Cachix
+        if: github.ref == 'refs/heads/trunk'
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          if [ -z "$CACHIX_AUTH_TOKEN" ]; then echo "No CACHIX_AUTH_TOKEN: nothing is pushed."; exit 0; fi
+          nix build --no-link --print-out-paths .#capsper | cachix push danielbodart
+
+  # A release, when a push to trunk that passed every channel's checks above
+  # changed what the tarballs are made of: anything in mise.toml's
+  # RELEASE_PATHS since the last release tag (`mise run release-due`). The
+  # workflows, docs, flake.nix, flake.lock and nix/ alone release nothing. A
+  # dispatch with `release` publishes whatever changed. The tarballs are the
+  # ones the linux and macos jobs built and checked, each signed here with
+  # cosign (keyless, a sigstore bundle beside it).
+  release:
+    needs: [check, linux, macos, nix]
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/trunk'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: jdx/mise-action@v5
+      - name: Is a release due?
+        id: due
+        env:
+          FORCE: ${{ inputs.release }}
+        run: |
+          if [ "$FORCE" = true ]; then due=true; else due=$(mise run release-due 2>/dev/null | tail -n1); fi
+          echo "Release due: $due"
+          echo "due=$due" >> "$GITHUB_OUTPUT"
+      - if: steps.due.outputs.due == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - name: Sign and release
+        if: steps.due.outputs.due == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(./run version)
+          assets=()
+          for t in capsper-linux-x86_64.tar.gz capsper-macos-arm64.tar.gz; do
+            sha256sum -c "$t.sha256"
+            cosign sign-blob "$t" --bundle "$t.sigstore.json" --yes
+            assets+=("$t" "$t.sha256" "$t.sigstore.json")
+          done
+          gh release create "v$V" --title "v$V" --notes "$(git log -1 --format=%B)" --target "$GITHUB_SHA" "${assets[@]}"

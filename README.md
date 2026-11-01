@@ -501,6 +501,15 @@ The `--trigger` flag selects which key activates push-to-talk. CapsLock is the d
 
 Function keys F13–F20 are the safest choice for a non-default trigger — they exist on both platforms and are rarely used by applications.
 
+## Channels
+
+Capsper ships two channels:
+
+- **Release tarballs**, `capsper-linux-x86_64.tar.gz` and `capsper-macos-arm64.tar.gz`: built by [mise](https://mise.jdx.dev) with the Zig `mise.toml` pins (`mise run dist`), each with a `.sha256` and a cosign `.sigstore.json` bundle beside it (the macOS binary is also signed with a Fulcio certificate). Install as above: `install.sh` writes the systemd user unit on Linux. A release is made when a push to `trunk` that passes every check changed what the tarballs are made of (`RELEASE_PATHS` in `mise.toml`), as `v0.<commits>.<build>`.
+- **Nix package and NixOS/home-manager modules**: built by nixpkgs (nixos-26.05, its `zig_0_15`) as `0-unstable-<date>`, pushed to the `danielbodart` Cachix. Take the flake as an input, as above.
+
+Every Sunday at 21:23 UTC the weekly update moves the flake's inputs and mise's tools to their latest patch, checks both channels with them, and commits them to `trunk`.
+
 ## Development
 
 Want to hack on Capsper? You'll need the [requirements](#requirements) for your platform, plus [mise](https://mise.jdx.dev), which supplies the toolchain.
@@ -511,7 +520,7 @@ cd capsper
 ./run.ts
 ```
 
-mise installs Zig, Bun, shellcheck and cosign at the versions `.mise.toml` pins — the same versions CI uses — into its own data directory. `run.ts` finds the pinned Bun through mise whether or not your shell has mise activated.
+mise installs Zig, Bun, shellcheck and cosign at the versions `mise.toml` pins — the same versions CI uses — into its own data directory. `run.ts` finds the pinned Bun through mise whether or not your shell has mise activated.
 
 From there `./run.ts` handles the rest:
 - Initialises the libopus submodule and fetches the Git LFS objects (the ONNX Runtime libraries on Linux)
@@ -529,6 +538,11 @@ Every step is incremental — re-running `./run.ts` is fast if everything is alr
 All commands go through the Bun-based task runner (`run.ts`):
 
 ```bash
+# What CI runs: shellcheck + unit/property tests, the tarball, the tarball installed and its units verified
+mise run check
+mise run dist
+mise run dist-check
+
 # Build (default command)
 ./run.ts build
 
