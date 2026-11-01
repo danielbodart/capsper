@@ -2,8 +2,6 @@ name: CI
 on:
   push:
     branches: [trunk]
-  # The weekly flake.lock bump starts this on the commit it pushes.
-  workflow_dispatch:
 permissions:
   contents: write
   id-token: write

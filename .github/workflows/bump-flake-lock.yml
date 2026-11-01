@@ -6,8 +6,9 @@
 #
 # The new lock is committed only if `./run nix` -- what CI's nix job runs,
 # the flake check with its NixOS VM test and the package -- passes with it.
-# A push with GITHUB_TOKEN starts no workflow, so this starts CI on the bumped
-# commit itself, and that releases it as any push to trunk does.
+# Nothing is released for it: a release would be the same code under a new
+# version, since what it ships is not built from the flake. The lock goes
+# out with the next release a real change makes.
 name: Bump the flake's inputs
 on:
   schedule:
@@ -15,7 +16,6 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
-  actions: write
 concurrency:
   group: flake-lock
 jobs:
@@ -43,10 +43,9 @@ jobs:
       - name: Check the flake with the new lock
         if: steps.update.outputs.moved
         run: ./run nix
-      - name: Commit and push the lock, and run CI on it
+      - name: Commit and push the lock
         if: steps.update.outputs.moved
         env:
-          GH_TOKEN: ${{ github.token }}
           MOVED: ${{ steps.update.outputs.moved }}
         run: |
           git config user.name "github-actions[bot]"
@@ -54,4 +53,3 @@ jobs:
           git commit -qm "Bump the flake's inputs: $MOVED" flake.lock
           git pull -q --rebase origin trunk
           git push -q origin HEAD:trunk
-          gh workflow run ci.yml --ref trunk
