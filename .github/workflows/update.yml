@@ -1,0 +1,165 @@
+# Every dependency moves once a week, in the window all of danielbodart's
+# repositories share: Sunday 21:23 UTC, two hours before nix-config takes its
+# own inputs on the same nixos-26.05, so what the flake builds here is the
+# derivation nix-config builds, already in the danielbodart cache when it
+# asks. What moves: every flake input, each tool in mise.toml to the latest
+# patch of its minor (a minor moves by hand, with zig_0_NN in
+# nix/package.nix), and fulcio-codesign, danielbodart's own, to its latest
+# release. build.zig.zon's dependencies and vendor/libopus, a submodule on
+# upstream's tags, move by hand.
+#
+# Nothing is committed unless the new files pass what CI runs, every channel:
+# on Linux `mise run check`, the tarball built and installed with its units
+# verified, and `./run nix`, the flake check with its NixOS VM test; on macOS
+# the check and the tarball. The files go from job to job as an artifact.
+# Then they are committed straight to trunk, named by what moved, capsper's
+# package is pushed to Cachix, and if anything in mise.toml's RELEASE_PATHS
+# moved (a new Zig, say), CI is dispatched with `release` (a push made with
+# GITHUB_TOKEN starts no workflow). A week that moved only flake.lock
+# releases nothing: the tarballs are not built from the flake, so it would
+# be the same code under a new version.
+name: Weekly update
+on:
+  schedule:
+    - cron: "23 21 * * 0"
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+# Shared with anything else that commits to trunk.
+concurrency:
+  group: update
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    outputs:
+      moved: ${{ steps.update.outputs.moved }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+      - name: Move everything
+        id: update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          moved=()
+
+          nix flake update 2>&1 | tee update.log
+          mapfile -t inputs < <(grep -oE "Updated input '[^']+'" update.log | cut -d"'" -f2)
+          moved+=("${inputs[@]}")
+
+          # Each tool to the latest patch of the minor mise.toml pins.
+          while read -r tool pinned; do
+            latest=$(mise latest "$tool@${pinned%.*}")
+            if [ -n "$latest" ] && [ "$latest" != "$pinned" ] && [ "$(grep -c "\"$pinned\"" mise.toml)" = 1 ]; then
+              sed -i "s/\"$pinned\"/\"$latest\"/" mise.toml
+              moved+=("$tool $pinned -> $latest")
+            fi
+          done < <(mise ls --current --local --json | jq -r 'to_entries[] | "\(.key) \(.value[0].requested_version)"')
+
+          # fulcio-codesign, danielbodart's own (macOS only, so not listed
+          # above), to its latest release.
+          pinned=$(sed -n '/^\[tools."github:danielbodart\/fulcio-codesign"\]/,/^version/s/^version = "\(.*\)"$/\1/p' mise.toml)
+          latest=$(gh release view -R danielbodart/fulcio-codesign --json tagName -q .tagName)
+          latest=${latest#v}
+          if [ -n "$latest" ] && [ "$latest" != "$pinned" ]; then
+            sed -i "/^\[tools.\"github:danielbodart\/fulcio-codesign\"\]/,/^version/s/^version = \".*\"$/version = \"$latest\"/" mise.toml
+            moved+=("fulcio-codesign $pinned -> $latest")
+          fi
+
+          if [ ${#moved[@]} -eq 0 ]; then echo "Nothing moved."; exit 0; fi
+          list=$(printf '%s, ' "${moved[@]}")
+          echo "moved=${list%, }" >> "$GITHUB_OUTPUT"
+      - if: steps.update.outputs.moved
+        uses: actions/upload-artifact@v7
+        with:
+          name: moved
+          path: |
+            flake.lock
+            mise.toml
+
+  linux:
+    needs: [update]
+    if: needs.update.outputs.moved
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/download-artifact@v8
+        with:
+          name: moved
+      - uses: jdx/mise-action@v5
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+      # Read only: the action would push every path the check built, the VM
+      # test's NixOS closure among them, and the free tier is 5 GB.
+      - uses: cachix/cachix-action@v17
+        with:
+          name: danielbodart
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
+      - run: mise run check
+      - run: mise run dist
+      - run: mise run dist-check
+      - run: ./run nix
+
+  macos:
+    needs: [update]
+    if: needs.update.outputs.moved
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/download-artifact@v8
+        with:
+          name: moved
+      - uses: jdx/mise-action@v5
+      - run: mise run check
+      - run: mise run dist
+
+  commit:
+    needs: [update, linux, macos]
+    if: needs.update.outputs.moved
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: moved
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+      - uses: cachix/cachix-action@v17
+        with:
+          name: danielbodart
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
+      - name: Commit and push
+        env:
+          MOVED: ${{ needs.update.outputs.moved }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qm "Weekly update: $MOVED" flake.lock mise.toml
+          git pull -q --rebase origin trunk
+          git push -q origin HEAD:trunk
+      - name: Push capsper's package to Cachix
+        run: nix build --no-link --print-out-paths .#capsper | cachix push danielbodart
+      - name: Release, if a release path moved
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          read -ra paths <<<"$(sed -n 's/^RELEASE_PATHS = "\(.*\)"$/\1/p' mise.toml)"
+          if [ -n "$(git diff --name-only HEAD~1 HEAD -- "${paths[@]}")" ]; then
+            gh workflow run ci.yml --ref trunk -f release=true
+          else
+            echo "Nothing the tarballs are made of moved: no release."
+          fi
