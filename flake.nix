@@ -21,19 +21,12 @@
       # that changes on every rebuild would need re-approving each time.
       system = "x86_64-linux";
 
-      # The same shape `./run.ts version` stamps into the release binaries --
-      # 0.<commits>.<build> -- so `capsper --version` means the same thing
-      # however it was built. `revCount` is the number run.ts gets from
-      # `git rev-list --count`, and `lastModifiedDate` is the same
-      # YYYYMMDDHHMMSS stamp it falls back to off CI, taken from the commit
-      # rather than the clock so the build stays reproducible.
-      #
-      # Only a git ref carries revCount: `github:owner/repo` fetches a tarball
-      # through the API and arrives without one, as does a bare path. Those
-      # land on 0.0.<date> -- still ordered, still exact about the source.
-      # Reference the flake as `git+https://github.com/danielbodart/capsper`
-      # to get the commit count.
-      version = "0.${toString (self.revCount or 0)}.${self.lastModifiedDate}";
+      # nixpkgs' version for a build from a commit, 0-unstable-YYYY-MM-DD,
+      # from the commit's date: it never claims to be a release (those are
+      # the tarballs', 0.<commits>.<build>, which `./run.ts version` stamps),
+      # and a `github:` ref has the date as a `git+https:` one does.
+      date = self.lastModifiedDate;
+      version = "0-unstable-${builtins.substring 0 4 date}-${builtins.substring 4 2 date}-${builtins.substring 6 2 date}";
 
       pkgs = nixpkgs.legacyPackages.${system};
     in
@@ -49,7 +42,7 @@
       # when something non-interactive did not.
       #
       # Deliberately not the toolchain: zig, bun and shellcheck still come
-      # from mise, pinned in .mise.toml, so a local build uses the identical
+      # from mise, pinned in mise.toml, so a local build uses the identical
       # versions CI does rather than whatever nixpkgs happens to carry. This
       # supplies only the system half -- the same packages `ensureDeps` in
       # run.ts installs with apt, plus the two binaries `dist` shells out to,
