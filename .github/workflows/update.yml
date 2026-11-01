@@ -4,9 +4,11 @@
 # derivation nix-config builds, already in the danielbodart cache when it
 # asks. What moves: every flake input, each tool in mise.toml to the latest
 # patch of its minor (a minor moves by hand, with zig_0_NN in
-# nix/package.nix), and fulcio-codesign, danielbodart's own, to its latest
-# release. build.zig.zon's dependencies and vendor/libopus, a submodule on
-# upstream's tags, move by hand.
+# nix/package.nix), fulcio-codesign, danielbodart's own, to its latest
+# release, build.zig.zon's dependencies to their upstream's latest release
+# tag that builds with that Zig (scripts/zig-deps.sh), and the
+# vendor/libopus submodule to upstream's latest release tag, with build.zig's
+# list of its sources written again from it (scripts/submodules.sh).
 #
 # Nothing is committed unless the new files pass what CI runs, every channel:
 # on Linux `mise run check`, the tarball built and installed with its units
@@ -14,7 +16,8 @@
 # the check and the tarball. The files go from job to job as an artifact.
 # Then they are committed straight to trunk, named by what moved, capsper's
 # package is pushed to Cachix, and if anything in mise.toml's RELEASE_PATHS
-# moved (a new Zig, say), CI is dispatched with `release` (a push made with
+# changed since the last release tag (`mise run release-due`: a new Zig or
+# libopus, say), CI is dispatched with `release` (a push made with
 # GITHUB_TOKEN starts no workflow). A week that moved only flake.lock
 # releases nothing: the tarballs are not built from the flake, so it would
 # be the same code under a new version.
@@ -29,13 +32,20 @@ permissions:
 # Shared with anything else that commits to trunk.
 concurrency:
   group: update
+# bash -eo pipefail for every run step.
+defaults:
+  run:
+    shell: bash
 jobs:
   update:
     runs-on: ubuntu-latest
     outputs:
       moved: ${{ steps.update.outputs.moved }}
+      submodules: ${{ steps.update.outputs.submodules }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - uses: jdx/mise-action@v5
       - uses: DeterminateSystems/nix-installer-action@main
         with:
@@ -69,6 +79,21 @@ jobs:
             sed -i "/^\[tools.\"github:danielbodart\/fulcio-codesign\"\]/,/^version/s/^version = \".*\"$/version = \"$latest\"/" mise.toml
             moved+=("fulcio-codesign $pinned -> $latest")
           fi
+          mise install
+
+          # build.zig.zon's dependencies, each to its latest tag that builds
+          # with that Zig.
+          zigdeps=$(mise exec -- scripts/zig-deps.sh)
+          if [ -n "$zigdeps" ]; then mapfile -t deps <<<"$zigdeps"; moved+=("${deps[@]}"); fi
+
+          # The submodules to upstream's latest release tag, handed on as
+          # path=tag, since an artifact cannot carry a gitlink.
+          subs=$(scripts/submodules.sh)
+          if [ -n "$subs" ]; then
+            mapfile -t lines <<<"$subs"
+            moved+=("${lines[@]}")
+            echo "submodules=$(awk '{ printf "%s=%s ", $1, $NF }' <<<"$subs")" >> "$GITHUB_OUTPUT"
+          fi
 
           if [ ${#moved[@]} -eq 0 ]; then echo "Nothing moved."; exit 0; fi
           list=$(printf '%s, ' "${moved[@]}")
@@ -80,6 +105,8 @@ jobs:
           path: |
             flake.lock
             mise.toml
+            build.zig.zon
+            build.zig
 
   linux:
     needs: [update]
@@ -93,6 +120,16 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: moved
+      - name: The submodules where the update moved them
+        env:
+          SUBMODULES: ${{ needs.update.outputs.submodules }}
+        run: |
+          for kv in $SUBMODULES; do
+            git -C "${kv%%=*}" fetch -q --tags origin
+            git -C "${kv%%=*}" checkout -q "${kv#*=}"
+            # Staged, or ./run's `git submodule update` puts it back.
+            git add "${kv%%=*}"
+          done
       - uses: jdx/mise-action@v5
       - uses: DeterminateSystems/nix-installer-action@main
         with:
@@ -121,6 +158,16 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: moved
+      - name: The submodules where the update moved them
+        env:
+          SUBMODULES: ${{ needs.update.outputs.submodules }}
+        run: |
+          for kv in $SUBMODULES; do
+            git -C "${kv%%=*}" fetch -q --tags origin
+            git -C "${kv%%=*}" checkout -q "${kv#*=}"
+            # Staged, or ./run's `git submodule update` puts it back.
+            git add "${kv%%=*}"
+          done
       - uses: jdx/mise-action@v5
       - run: mise run check
       - run: mise run dist
@@ -130,10 +177,25 @@ jobs:
     if: needs.update.outputs.moved
     runs-on: ubuntu-latest
     steps:
+      # The tags and the history, for release-due.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
       - uses: actions/download-artifact@v8
         with:
           name: moved
+      - name: The submodules where the update moved them
+        env:
+          SUBMODULES: ${{ needs.update.outputs.submodules }}
+        run: |
+          for kv in $SUBMODULES; do
+            git -C "${kv%%=*}" fetch -q --tags origin
+            git -C "${kv%%=*}" checkout -q "${kv#*=}"
+            # Staged, or ./run's `git submodule update` puts it back.
+            git add "${kv%%=*}"
+          done
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           determinate: false
@@ -148,18 +210,14 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -qm "Weekly update: $MOVED" flake.lock mise.toml
+          git commit -qm "Weekly update: $MOVED" flake.lock mise.toml build.zig.zon build.zig vendor/libopus
           git pull -q --rebase origin trunk
           git push -q origin HEAD:trunk
       - name: Push capsper's package to Cachix
         run: nix build --no-link --print-out-paths .#capsper | cachix push danielbodart
+      - uses: jdx/mise-action@v5
       - name: Release, if a release path moved
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          read -ra paths <<<"$(sed -n 's/^RELEASE_PATHS = "\(.*\)"$/\1/p' mise.toml)"
-          if [ -n "$(git diff --name-only HEAD~1 HEAD -- "${paths[@]}")" ]; then
-            gh workflow run ci.yml --ref trunk -f release=true
-          else
-            echo "Nothing the tarballs are made of moved: no release."
-          fi
+          if mise run release-due; then gh workflow run ci.yml --ref trunk -f release=true; fi

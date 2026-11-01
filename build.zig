@@ -316,9 +316,9 @@ fn addPlatformDeps(b: *std.Build, exe: *Exe, is_macos: bool, ort_lib: ?[]const u
 /// the defines below are what `configure` would have produced.
 ///
 /// The file list is upstream's own, from the `*_sources.mk` files in the
-/// submodule. Regenerate after a version bump with:
-///
-///     sed -n '/= *\\/,/^$/p' vendor/libopus/*_sources.mk | grep -oP '^\K[A-Za-z0-9_/]+\.c'
+/// submodule: scripts/submodules.sh, which the weekly update runs to move the
+/// submodule to upstream's latest release tag, writes it and the version
+/// string below again from the new tag's.
 ///
 /// Only the encoder's dependencies are here: the DNN extensions (deep PLC,
 /// DRED, OSCE) are off by default upstream and nothing capsper does needs them.
@@ -356,7 +356,6 @@ const opus_sources = [_][]const u8{
     "celt/celt_decoder.c",
     "celt/celt_encoder.c",
     "celt/celt_lpc.c",
-    "celt/celt_tx_tables.c",
     "celt/cwrs.c",
     "celt/entcode.c",
     "celt/entdec.c",
@@ -365,7 +364,6 @@ const opus_sources = [_][]const u8{
     "celt/laplace.c",
     "celt/mathops.c",
     "celt/mdct.c",
-    "celt/mdct_pfa.c",
     "celt/modes.c",
     "celt/pitch.c",
     "celt/quant_bands.c",

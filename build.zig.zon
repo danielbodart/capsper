@@ -6,7 +6,8 @@
             // Pin to the immutable v0.1.0 tag — NOT main.tar.gz, which is a
             // moving branch: upstream advancing main (0.1.0 → 0.3.0) broke the
             // hash and failed CI on every push. Tag tarball is byte-identical
-            // to the pinned hash.
+            // to the pinned hash. The weekly update moves it to the latest tag
+            // that builds with mise.toml's Zig (scripts/zig-deps.sh).
             .url = "https://github.com/CogitatorTech/minish/archive/refs/tags/v0.1.0.tar.gz",
             // Only the property tests use minish, so keep it out of the way of
             // a plain `zig build` -- that makes the binary buildable with no
