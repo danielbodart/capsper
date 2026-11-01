@@ -22,9 +22,9 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Only for bun, which runs run.ts. The flake supplies everything else.
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           determinate: false

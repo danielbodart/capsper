@@ -9,7 +9,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # libopus is a submodule, compiled into the binary.
@@ -23,17 +23,17 @@ jobs:
       # forward for as long as the chain is unbroken. That is how the cache
       # stayed at 184MB after the 368MB CUDA provider was deleted -- it was
       # still in there, being copied from key to key.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .git/lfs
           key: lfs-${{ hashFiles('dist/linux/lib/*.so') }}
       # zig, bun, shellcheck and cosign, at the versions .mise.toml pins.
       # Installs and caches them; the tools it installs land on PATH for the
       # steps below.
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
       # Zig's global cache: the compiled standard library and the build's own
       # dependencies, which is most of a cold build.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/zig
           key: zig-linux-${{ hashFiles('build.zig.zon', '.mise.toml') }}
@@ -44,7 +44,7 @@ jobs:
           CI: "true"
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: capsper-linux-x86_64
           path: dist/linux/
@@ -52,13 +52,13 @@ jobs:
   macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # libopus is a submodule, compiled into the binary.
           submodules: recursive
-      - uses: jdx/mise-action@v4
-      - uses: actions/cache@v4
+      - uses: jdx/mise-action@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/zig
           key: zig-macos-${{ hashFiles('build.zig.zon', '.mise.toml') }}
@@ -70,7 +70,7 @@ jobs:
           NO_CREATE_RELEASE: "true"
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: capsper-macos-arm64
           path: dist/macos/
@@ -83,9 +83,9 @@ jobs:
   nix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Only for bun, which runs run.ts. The flake supplies everything else.
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           # Upstream Nix rather than Determinate Nix, whose FlakeHub login
