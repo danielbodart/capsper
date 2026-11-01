@@ -9,15 +9,17 @@
 # functions and calls the ones that lay files down, with systemctl a no-op.
 set -euo pipefail
 
-CDPATH='' cd "$(dirname "$0")/.."
+CDPATH='' cd "$(dirname "$0")/../dist"
 tarball=capsper-linux-x86_64.tar.gz
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-(sha256sum -c "$tarball.sha256")
+sha256sum -c "$tarball.sha256"
+sha256sum -c --ignore-missing SHA256SUMS
 src=$work/src
 mkdir -p "$src" "$work/home"
 tar -C "$src" -xzf "$tarball"
+[ -f "$src/README.md" ]
 
 export HOME=$work/home XDG_DATA_HOME=$work/home/.local/share XDG_CONFIG_HOME=$work/home/.config
 systemctl() { :; }

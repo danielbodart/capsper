@@ -1,10 +1,7 @@
-dist/linux/bin/
-dist/macos/bin/
-dist/models/*
-dist/macos/models
-dist/linux/models
+# Everything `mise run build` and `mise run dist` make; the sources they are
+# made from are in packaging/ and vendor/.
+/dist/
 zig-out/
-dist/*/VERSION
 .zig-cache/
 .direnv/
 .idea/
@@ -14,6 +11,3 @@ CLAUDE.local.md
 test/results/
 test/macos-audio-helpers
 .playwright-mcp
-dist/.DS_Store
-capsper-linux-x86_64*.tar.gz*
-capsper-macos-arm64*.tar.gz*

@@ -5,7 +5,7 @@
 # window. So the unit lives here rather than in the NixOS module, which
 # handles only the system permissions it needs (services.capsper).
 #
-# Compared with the unit dist/linux/install.sh generates, this one drops the
+# Compared with the unit packaging/linux/install.sh generates, this one drops the
 # auto-update machinery -- ExecStartPre=capsper-apply-update.sh, the
 # OnFailure=capsper-rollback.service handler, and the daily update timer.
 # Under Nix that is all both redundant and inert: the store is read-only, and

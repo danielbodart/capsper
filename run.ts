@@ -7,11 +7,21 @@ import { manualEchoTest } from "./scripts/echo-manual-test";
 process.env.FORCE_COLOR = "1";
 
 const IS_MACOS = process.platform === "darwin";
-const PLATFORM_DIR = IS_MACOS ? "dist/macos" : "dist/linux";
+// dist/ holds only what build and dist make: this platform's runnable tree
+// (bin/, models/, lib/ on Linux, and the scripts), the tarball, its .sha256
+// and SHA256SUMS. What they are made from is checked in elsewhere: the
+// scripts in packaging/, onnxruntime in vendor/onnxruntime.
+const PLATFORM = IS_MACOS ? "macos" : "linux";
+const PLATFORM_DIR = `dist/${PLATFORM}`;
+const PACKAGING_DIR = `packaging/${PLATFORM}`;
 const BINARY = `./${PLATFORM_DIR}/bin/capsper`;
 const SCRIPT_DIR = import.meta.dir;
 const TARBALL = IS_MACOS ? "capsper-macos-arm64.tar.gz" : "capsper-linux-x86_64.tar.gz";
-const LIB_DIR = "dist/linux/lib"; // Linux only — macOS uses system CoreML frameworks
+const LIB_DIR = "vendor/onnxruntime/lib"; // Linux only — macOS uses system CoreML frameworks
+// Each platform's installer and update scripts, and the one both share.
+const SCRIPTS = IS_MACOS
+    ? ["install.sh", "capsper-update.sh"]
+    : ["install.sh", "capsper-update.sh", "capsper-apply-update.sh", "capsper-rollback.sh"];
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -76,7 +86,7 @@ async function ensureCheckout() {
     // A no-op once initialised, so it costs a stat rather than a fetch.
     await $`git -C ${SCRIPT_DIR} submodule update --init --recursive --quiet`;
 
-    // dist/linux/lib/libonnxruntime.so is a Git LFS object, and a clone
+    // vendor/onnxruntime/lib/libonnxruntime.so is a Git LFS object, and a clone
     // without the LFS filters leaves a ~130-byte text pointer in its place.
     // Linking against that fails with an error that mentions neither LFS nor
     // the file, so check the size rather than wait to be confused by it.
@@ -133,6 +143,18 @@ export async function build() {
     } else {
         await $`zig build --prefix ${PLATFORM_DIR} -Dversion=${ver} -Doptimize=ReleaseSafe -Dcpu=x86_64_v3`;
     }
+
+    // The rest of the tree install.sh runs from, as the tarball lays it out:
+    // the scripts beside bin/, and on Linux the onnxruntime the binary's
+    // $ORIGIN/../lib RPATH finds, linked rather than copied.
+    for (const script of SCRIPTS) {
+        await $`cp ${PACKAGING_DIR}/${script} ${PLATFORM_DIR}/`;
+    }
+    await $`cp packaging/shared/install-common.sh ${PLATFORM_DIR}/`;
+    if (!IS_MACOS) {
+        await $`rm -rf ${PLATFORM_DIR}/lib`;
+        await $`ln -s ../../${LIB_DIR} ${PLATFORM_DIR}/lib`;
+    }
 }
 
 export async function clean() {
@@ -156,7 +178,7 @@ export async function setup() {
 export async function dev() {
     await build();
     console.log("Running lint...");
-    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh`;
+    await lint();
     console.log("Running unit + property tests...");
     await $`zig build test`;
     console.log("Running integration smoke tests...");
@@ -212,7 +234,7 @@ async function distLinux() {
     const lines = stdout.toString().trim().split("\n");
     const bad = lines.filter(l => !l.includes("ELF") && !l.includes("symbolic link"));
     if (bad.length > 0) {
-        console.error("ERROR: dist/linux/lib/ contains non-ELF files:");
+        console.error(`ERROR: ${LIB_DIR}/ contains non-ELF files:`);
         bad.forEach(l => console.error(`  ${l}`));
         process.exit(1);
     }
@@ -249,15 +271,48 @@ async function distLinux() {
     // to discover it is missing.
     await $`mkdir -p ${staging}/models`;
     await $`cp models/silero_vad.onnx ${staging}/models/`;
-    for (const script of ["install.sh", "capsper-update.sh", "capsper-apply-update.sh", "capsper-rollback.sh"]) {
-        await $`cp ${PLATFORM_DIR}/${script} ${staging}/`;
+    await stageScripts(staging);
+    await pack(staging, ver);
+}
+
+/** The scripts, VERSION, README and LICENSE into a tarball's staging tree. */
+async function stageScripts(staging: string) {
+    for (const script of SCRIPTS) {
+        await $`cp ${PACKAGING_DIR}/${script} ${staging}/`;
     }
-    await $`cp dist/shared/install-common.sh ${staging}/`;
+    await $`cp packaging/shared/install-common.sh ${staging}/`;
     await $`cp ${PLATFORM_DIR}/VERSION ${staging}/`;
-    await $`tar -czf ${TARBALL} -C ${staging} .`;
-    await $`sha256sum ${TARBALL} > ${TARBALL}.sha256`;
+    await $`cp README.md ${staging}/`;
+    // capsper has no licence file yet; the tarball carries one once it does.
+    if (existsSync("LICENSE")) await $`cp LICENSE ${staging}/`;
+}
+
+/** The staging tree as dist/<tarball>, its .sha256 (read by the installed
+ *  capsper-update.sh, so it stays) and dist/SHA256SUMS. */
+async function pack(staging: string, ver: string) {
+    await $`tar -czf dist/${TARBALL} -C ${staging} .`;
     await $`rm -rf ${staging}`;
-    console.log(`Tarball: ${TARBALL} (v${ver})`);
+    await sha256(TARBALL, `${TARBALL}.sha256`);
+    await sums();
+    console.log(`Tarball: dist/${TARBALL} (v${ver})`);
+}
+
+/** sha256sum's line for each file in dist/, by its bare name, into dist/<out>. */
+async function sha256(files: string | string[], out: string) {
+    const names = Array.isArray(files) ? files : [files];
+    const tool = IS_MACOS ? ["shasum", "-a", "256"] : ["sha256sum"];
+    await $`${tool} ${names} > ${out}`.cwd("dist");
+}
+
+/** dist/SHA256SUMS: every tarball in dist/, which is both platforms' once
+ *  CI's release job has gathered them there. */
+export async function sums() {
+    const tarballs = [...new Bun.Glob("*.tar.gz").scanSync("dist")].sort();
+    if (tarballs.length === 0) {
+        console.error("sums: no tarball in dist/");
+        process.exit(1);
+    }
+    await sha256(tarballs, "SHA256SUMS");
 }
 
 async function distMacOS() {
@@ -268,14 +323,8 @@ async function distMacOS() {
     await $`rm -rf ${staging}`;
     await $`mkdir -p ${staging}`;
     await $`cp -r ${PLATFORM_DIR}/bin ${staging}/`;
-    await $`cp ${PLATFORM_DIR}/install.sh ${staging}/`;
-    await $`cp ${PLATFORM_DIR}/capsper-update.sh ${staging}/`;
-    await $`cp dist/shared/install-common.sh ${staging}/`;
-    await $`cp ${PLATFORM_DIR}/VERSION ${staging}/`;
-    await $`tar -czf ${TARBALL} -C ${staging} .`;
-    await $`shasum -a 256 ${TARBALL} > ${TARBALL}.sha256`;
-    await $`rm -rf ${staging}`;
-    console.log(`Tarball: ${TARBALL} (v${ver})`);
+    await stageScripts(staging);
+    await pack(staging, ver);
 }
 
 /** macOS: the Mach-O binary signed with a Fulcio certificate, and the tarball
@@ -288,13 +337,13 @@ export async function sign() {
         return;
     }
     console.log("Signing macOS binary with Fulcio...");
-    await $`fulcio-codesign --identifier io.github.danielbodart.capsper --subject io.github.danielbodart.capsper --entitlements dist/macos/entitlements.plist ${PLATFORM_DIR}/bin/capsper`;
+    await $`fulcio-codesign --identifier io.github.danielbodart.capsper --subject io.github.danielbodart.capsper --entitlements packaging/macos/entitlements.plist ${PLATFORM_DIR}/bin/capsper`;
     // Re-create tarball with signed binary
     await distMacOS();
 }
 
 export async function lint() {
-    await $`shellcheck dist/linux/*.sh dist/macos/*.sh dist/shared/*.sh scripts/*.sh`;
+    await $`shellcheck packaging/linux/*.sh packaging/macos/*.sh packaging/shared/*.sh scripts/*.sh`;
 }
 
 // ─── Command dispatch ──────────────────────────────────────────────────────
@@ -322,7 +371,7 @@ export async function nix() {
     await $`nix build --no-link .#capsper`;
 }
 const commands: Record<string, Function> = {
-    dev, build, clean, setup, test, lint, dist, sign, nix, version: printVersion,
+    dev, build, clean, setup, test, lint, dist, sums, sign, nix, version: printVersion,
     "short-test": shortTest,
     "medium-test": mediumTest,
     "long-test": longTest,

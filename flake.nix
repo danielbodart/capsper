@@ -60,8 +60,8 @@
         buildInputs = [ pkgs.pipewire ];
 
         # The binary `./run build` produces links the onnxruntime in
-        # dist/linux/lib, which it finds through an $ORIGIN-relative RPATH that
-        # build.zig sets -- but that library is a C++ one built elsewhere, and
+        # vendor/onnxruntime/lib, which it finds through dist/linux/lib and
+        # an $ORIGIN-relative RPATH that build.zig sets -- but that library is a C++ one built elsewhere, and
         # nothing gives it a path to a libstdc++. The packaged build needs no
         # equivalent: it links nixpkgs' onnxruntime, so Zig's RPATH covers it.
         LD_LIBRARY_PATH = "${pkgs.lib.getLib pkgs.stdenv.cc.cc}/lib";

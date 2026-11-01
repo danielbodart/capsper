@@ -49,7 +49,8 @@ require_cmd() {
 }
 
 is_dev_mode() {
-    # In the repo: SCRIPT_DIR is dist/linux/ or dist/macos/, so .git is at ../../.git
+    # In the repo: SCRIPT_DIR is dist/linux/ or dist/macos/ (where build copies
+    # the scripts beside bin/), so .git is at ../../.git
     # In a tarball: no .git directory exists at all
     [ -d "$SCRIPT_DIR/../.git" ] || [ -d "$SCRIPT_DIR/../../.git" ]
 }

@@ -236,6 +236,6 @@ absolute store paths, and `-Dprop-tests=false` drops the only external Zig
 dependency so the build needs no network in the sandbox. All three default to
 the previous behaviour, so the tarball build is unchanged.
 
-**Git LFS.** `dist/linux/lib/*.so` are LFS objects and arrive as pointer files
+**Git LFS.** `vendor/onnxruntime/lib/*.so` are LFS objects and arrive as pointer files
 when the flake is fetched from GitHub. The source filter excludes that
 directory entirely; nothing in the Nix build reads it.

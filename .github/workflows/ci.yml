@@ -12,6 +12,10 @@ on:
         default: false
 permissions:
   contents: read
+# bash -eo pipefail for every run step.
+defaults:
+  run:
+    shell: bash
 jobs:
   # The fast one: shellcheck and the unit and property tests, with mise's Zig.
   check:
@@ -33,7 +37,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: .git/lfs
-          key: lfs-${{ hashFiles('dist/linux/lib/*.so') }}
+          key: lfs-${{ hashFiles('vendor/onnxruntime/lib/*.so') }}
       # zig, bun, shellcheck and cosign, at the versions mise.toml pins.
       - uses: jdx/mise-action@v5
       # Zig's global cache: the compiled standard library and the build's own
@@ -58,7 +62,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: .git/lfs
-          key: lfs-${{ hashFiles('dist/linux/lib/*.so') }}
+          key: lfs-${{ hashFiles('vendor/onnxruntime/lib/*.so') }}
       - uses: jdx/mise-action@v5
       - uses: actions/cache@v6
         with:
@@ -71,8 +75,8 @@ jobs:
         with:
           name: capsper-linux-x86_64
           path: |
-            capsper-linux-x86_64.tar.gz
-            capsper-linux-x86_64.tar.gz.sha256
+            dist/capsper-linux-x86_64.tar.gz
+            dist/capsper-linux-x86_64.tar.gz.sha256
 
   # The macOS tarball, its tests run there too. On trunk the binary is signed
   # with a Fulcio certificate (the OIDC token) before it is packed.
@@ -102,8 +106,8 @@ jobs:
         with:
           name: capsper-macos-arm64
           path: |
-            capsper-macos-arm64.tar.gz
-            capsper-macos-arm64.tar.gz.sha256
+            dist/capsper-macos-arm64.tar.gz
+            dist/capsper-macos-arm64.tar.gz.sha256
 
   # NixOS support. There is no NixOS runner image, but a Nix derivation builds
   # identically on any host, so Nix on ubuntu is a real verification of the
@@ -144,8 +148,10 @@ jobs:
   # RELEASE_PATHS since the last release tag (`mise run release-due`). The
   # workflows, docs, flake.nix, flake.lock and nix/ alone release nothing. A
   # dispatch with `release` publishes whatever changed. The tarballs are the
-  # ones the linux and macos jobs built and checked, each signed here with
-  # cosign (keyless, a sigstore bundle beside it).
+  # ones the linux and macos jobs built and checked, gathered into dist/,
+  # where `mise run sums` writes SHA256SUMS over both, each signed here with
+  # cosign (keyless, a sigstore bundle beside it). The notes are the commits
+  # since the last release.
   release:
     needs: [check, linux, macos, nix]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/trunk'
@@ -164,12 +170,13 @@ jobs:
         env:
           FORCE: ${{ inputs.release }}
         run: |
-          if [ "$FORCE" = true ]; then due=true; else due=$(mise run release-due 2>/dev/null | tail -n1); fi
+          if [ "$FORCE" = true ] || mise run release-due; then due=true; else due=false; fi
           echo "Release due: $due"
           echo "due=$due" >> "$GITHUB_OUTPUT"
       - if: steps.due.outputs.due == 'true'
         uses: actions/download-artifact@v8
         with:
+          path: dist
           merge-multiple: true
       - name: Sign and release
         if: steps.due.outputs.due == 'true'
@@ -177,10 +184,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           V=$(./run version)
-          assets=()
+          mise run sums
+          assets=(dist/SHA256SUMS)
           for t in capsper-linux-x86_64.tar.gz capsper-macos-arm64.tar.gz; do
-            sha256sum -c "$t.sha256"
-            cosign sign-blob "$t" --bundle "$t.sigstore.json" --yes
-            assets+=("$t" "$t.sha256" "$t.sigstore.json")
+            (cd dist && sha256sum -c "$t.sha256")
+            cosign sign-blob "dist/$t" --bundle "dist/$t.sigstore.json" --yes
+            assets+=("dist/$t" "dist/$t.sha256" "dist/$t.sigstore.json")
           done
-          gh release create "v$V" --title "v$V" --notes "$(git log -1 --format=%B)" --target "$GITHUB_SHA" "${assets[@]}"
+          # Trunk-based, no pull requests, so GitHub's PR-based notes would be
+          # empty: the commits since the last release instead, or the head
+          # commit when there is none.
+          PREV="$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+          if [ -n "$PREV" ] && git rev-parse -q --verify "refs/tags/$PREV" >/dev/null; then
+            git log "$PREV..HEAD" --pretty='- %s (%h)' > notes.md
+          else
+            { echo 'First automated release.'; echo; git log -1 --pretty='- %s (%h)'; } > notes.md
+          fi
+          gh release create "v$V" --title "v$V" --notes-file notes.md --target "$GITHUB_SHA" "${assets[@]}"

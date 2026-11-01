@@ -16,10 +16,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null && pwd)"
 # In a tarball, install-common.sh is alongside install.sh.
 # In the repo, it's in the sibling shared/ directory.
 if [ -f "$SCRIPT_DIR/install-common.sh" ]; then
-    # shellcheck source=dist/shared/install-common.sh
+    # shellcheck source=packaging/shared/install-common.sh
     source "$SCRIPT_DIR/install-common.sh"
 else
-    # shellcheck source=dist/shared/install-common.sh
+    # shellcheck source=packaging/shared/install-common.sh
     source "$SCRIPT_DIR/../shared/install-common.sh"
 fi
 

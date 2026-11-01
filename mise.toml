@@ -18,11 +18,13 @@ version = "0.8.9"
 os = ["macos"]
 
 # What the release tarballs are made of. A change to any of these since the
-# last release tag is released (see release-due); the workflows, docs,
-# flake.nix, flake.lock and nix/ are not. vendor/libopus is a submodule,
-# compiled into the binary.
+# last release tag is released (see release-due); the workflows, docs (the
+# README the tarballs carry goes out with the next release), flake.nix,
+# flake.lock and nix/ are not. vendor/ is onnxruntime, linked, and the
+# libopus submodule, compiled into the binary; packaging/ the scripts the
+# tarballs carry.
 [env]
-RELEASE_PATHS = "build.zig build.zig.zon src dist models vendor .gitmodules run.ts mise.toml"
+RELEASE_PATHS = "build.zig build.zig.zon src packaging models vendor .gitmodules run.ts mise.toml"
 
 [tasks.check]
 description = "shellcheck and the unit and property tests"
@@ -37,21 +39,27 @@ description = "The unit and property tests"
 run = "./run test"
 
 [tasks.build]
-description = "capsper for this platform, into dist/linux or dist/macos"
+description = "capsper for this platform, into dist/linux or dist/macos, with the scripts install.sh runs beside"
 run = "./run build"
 
 [tasks.dist]
-description = "This platform's release tarball and its .sha256"
+description = "This platform's release tarball in dist/, its .sha256 and dist/SHA256SUMS"
 run = "./run build && ./run dist"
+
+[tasks.sums]
+description = "dist/SHA256SUMS for every tarball in dist/ (CI's release job, once both platforms' are there)"
+run = "./run sums"
 
 [tasks.dist-check]
 description = "The Linux tarball, as dist made it, installed into a scratch home, and its user units verified"
 run = "scripts/dist-check.sh"
 
+# `if mise run release-due; then ...`: CI's release job and the weekly
+# update ask it, and nothing else knows RELEASE_PATHS.
 [tasks.release-due]
-description = "Print true if anything in RELEASE_PATHS changed since the last release tag, else false"
+description = "Print true and succeed if anything in RELEASE_PATHS changed since the last release tag, else print false and fail"
 run = '''
 set -f
 last=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null) || { echo true; exit 0; }
-if [ -n "$(git diff --name-only "$last" HEAD -- $RELEASE_PATHS)" ]; then echo true; else echo false; fi
+if [ -n "$(git diff --name-only "$last" HEAD -- $RELEASE_PATHS)" ]; then echo true; else echo false; exit 1; fi
 '''

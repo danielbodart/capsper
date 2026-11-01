@@ -7,7 +7,7 @@
 # only the part a user cannot grant themselves: the uinput kernel module, the
 # device permissions, and group membership.
 #
-# This replaces what dist/linux/install.sh does imperatively with `usermod -aG`
+# This replaces what packaging/linux/install.sh does imperatively with `usermod -aG`
 # and by writing /etc/udev/rules.d/99-uinput.rules.
 { self }:
 { config, lib, ... }:

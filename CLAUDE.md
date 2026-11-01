@@ -146,26 +146,31 @@ src/
 - **`run.ts`** — Bun task runner, run directly (`./run.ts`); its shebang resolves the pinned Bun through mise. Commands: `dev` (default), `build`, `clean`, `setup`, `test`, `slow-test`, `dist`, `sign`, `nix`; mise.toml names the tasks CI calls (`mise run check`, `build`, `dist`, `dist-check`).
 - **`install.sh`** — Self-contained bash installer. Ships in dist tarball. On macOS: downloads CoreML models from HuggingFace. On Linux: downloads the int8 ONNX model.
 
-### Build System & `dist/` Layout
+### Build System, `packaging/` and `dist/`
 
-Platform-specific files are separated into `dist/linux/` and `dist/macos/`, mirroring the `src/platform/` pattern. Shared scripts live in `dist/shared/`. Pre-built onnxruntime shared libraries are committed in `dist/linux/lib/` via Git LFS. macOS uses system CoreML framework.
+The checked-in sources of what ships are in `packaging/` (the scripts) and `vendor/onnxruntime/` (pre-built ORT, Git LFS, Linux only; macOS uses the system CoreML framework). `dist/` is only output: `./run build` makes `dist/<platform>/`, the tree install.sh runs from, and `./run dist` the tarball, its `.sha256` and `SHA256SUMS` beside it.
 
 ```
-dist/
+packaging/
 ├── linux/
-│   ├── bin/                     (build output: capsper)
-│   ├── lib/                     (pre-built ORT .so files via LFS)
-│   ├── include/onnxruntime/     (ORT C API headers — build-time only)
 │   ├── install.sh               (Linux installer)
 │   ├── capsper-update.sh        (two-phase: stage only, applied on restart)
 │   ├── capsper-apply-update.sh  (ExecStartPre: applies staged update)
 │   └── capsper-rollback.sh      (OnFailure: auto-rollback)
 ├── macos/
-│   ├── bin/                     (build output: capsper)
 │   ├── install.sh               (macOS installer — no auto-update)
-│   └── capsper-update.sh        (manual: download + immediate swap)
+│   ├── capsper-update.sh        (manual: download + immediate swap)
+│   └── entitlements.plist
 └── shared/
     └── install-common.sh        (shared helpers, model download, install_files)
+vendor/onnxruntime/
+├── lib/                         (pre-built ORT .so files via LFS)
+└── include/onnxruntime/         (ORT C API headers — build-time only)
+dist/                            (output only, ignored)
+├── linux/                       (bin/, models/, lib -> vendor/onnxruntime/lib, the scripts)
+├── macos/                       (bin/, models/, the scripts)
+├── capsper-linux-x86_64.tar.gz  (+ .sha256)
+└── SHA256SUMS
 ```
 
 ### Nix / NixOS
@@ -173,10 +178,10 @@ dist/
 `nix/` plus the root `flake.nix` package capsper for NixOS. It is **built from source** — nothing is patchelf'd, because Zig links the executable and sets its own interpreter and RPATH. Things to know:
 
 - The flake tracks the repository, not releases. There are no binary hashes to bump, and no pinned artefacts at all.
-- It links nixpkgs' `onnxruntime` (1.24.4, cached), rather than the 1.23.2 in `dist/linux/lib`. The two are verified equivalent — the long regression group produces identical coverage and WER on both.
+- It links nixpkgs' `onnxruntime` (1.24.4, cached), rather than the 1.23.2 in `vendor/onnxruntime/lib`. The two are verified equivalent — the long regression group produces identical coverage and WER on both.
 - `./run.ts nix` runs `nix flake check` (including a NixOS VM test of the module) and builds the package. Wired into CI as its own job; it is a no-op where `nix` is absent, including macOS.
 - The Nix build relies on three `build.zig` options — `-Dort-include`/`-Dort-lib` (external onnxruntime), `-Drpath` (RPATH entries for absolute store paths), and `-Dprop-tests=false` (drops the only external Zig dependency, so the sandboxed build needs no network). All default to the previous behaviour, so the tarball build is unchanged.
-- `dist/linux/lib/*.so` are Git LFS objects and arrive as pointer files when the flake is fetched from GitHub. The source filter excludes that directory; nothing in the Nix build reads it.
+- `vendor/onnxruntime/lib/*.so` are Git LFS objects and arrive as pointer files when the flake is fetched from GitHub. The source filter excludes that directory; nothing in the Nix build reads it.
 
 See `docs/nixos.md`.
 

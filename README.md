@@ -503,12 +503,11 @@ Function keys F13–F20 are the safest choice for a non-default trigger — they
 
 ## Channels
 
-Capsper ships two channels:
+- **Tarball + systemd**: `capsper-linux-x86_64.tar.gz` and `capsper-macos-arm64.tar.gz` on each release, with `SHA256SUMS`, and a `.sha256` and a cosign `.sigstore.json` bundle beside each (the macOS binary is also signed with a Fulcio certificate); built by [mise](https://mise.jdx.dev) with the Zig `mise.toml` pins (`mise run dist`). Unpack and run `./install.sh`, as under Install: on Linux it writes the systemd user units (`capsper.service` with rollback on failure, and the update timer).
+- **Nix**: a flake input, `github:danielbodart/capsper` (with `inputs.nixpkgs.follows = "nixpkgs"`), its `packages.default` (`0-unstable-<date>`), `nixosModules.default` and `homeModules.default`; built by nixpkgs (nixos-26.05, its `zig_0_15`), pushed to the `danielbodart` Cachix.
+- Not shipped: Docker — capsper is a desktop dictation tool, which needs the user's keyboard, audio and session.
 
-- **Release tarballs**, `capsper-linux-x86_64.tar.gz` and `capsper-macos-arm64.tar.gz`: built by [mise](https://mise.jdx.dev) with the Zig `mise.toml` pins (`mise run dist`), each with a `.sha256` and a cosign `.sigstore.json` bundle beside it (the macOS binary is also signed with a Fulcio certificate). Install as above: `install.sh` writes the systemd user unit on Linux. A release is made when a push to `trunk` that passes every check changed what the tarballs are made of (`RELEASE_PATHS` in `mise.toml`), as `v0.<commits>.<build>`.
-- **Nix package and NixOS/home-manager modules**: built by nixpkgs (nixos-26.05, its `zig_0_15`) as `0-unstable-<date>`, pushed to the `danielbodart` Cachix. Take the flake as an input, as above.
-
-Every Sunday at 21:23 UTC the weekly update moves the flake's inputs and mise's tools to their latest patch, checks both channels with them, and commits them to `trunk`.
+Updated weekly (Sunday 21:23 UTC): the flake's inputs, mise's tools to the latest patch of their minor (fulcio-codesign to its latest release), build.zig.zon's minish to its latest tag that builds with that Zig, and the vendored libopus to upstream's latest release tag. A release, `v0.<commits>.<build>`, is cut when the code, the scripts in `packaging/`, `vendor/` (onnxruntime and libopus), the models or `mise.toml` changed since the last one (`RELEASE_PATHS` in `mise.toml`).
 
 ## Development
 

@@ -24,7 +24,7 @@ let
   ortInclude = "${lib.getDev onnxruntime}/include/onnxruntime";
   ortLib = "${lib.getLib onnxruntime}/lib";
 
-  # Only what the build actually reads. Notably excludes dist/linux, whose
+  # Only what the build actually reads. Notably excludes vendor/onnxruntime, whose
   # libraries are Git LFS objects that arrive as pointer files when the flake
   # is fetched from GitHub rather than checked out -- this build links
   # nixpkgs' onnxruntime and reads neither those nor the headers beside them.

@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", version_str);
     options.addOption(Backend, "backend", backend);
 
-    // Where to find onnxruntime. Defaults to the copies vendored under dist/,
+    // Where to find onnxruntime. Defaults to the copies in vendor/onnxruntime,
     // which is what the tarball build uses. A package manager that supplies its
     // own onnxruntime (Nix) points these at it instead -- the vendored copies
     // are Git LFS objects and are not present in a source tarball anyway.
@@ -248,7 +248,7 @@ fn addLibPath(b: *std.Build, exe: *Exe, is_macos: bool, ort_lib: ?[]const u8) vo
         exe.root_module.addLibraryPath(.{ .cwd_relative = dir });
         exe.root_module.addRPathSpecial(dir);
     } else {
-        exe.root_module.addLibraryPath(b.path("dist/linux/lib"));
+        exe.root_module.addLibraryPath(b.path("vendor/onnxruntime/lib"));
         exe.root_module.addRPathSpecial("$ORIGIN/../lib");
     }
 }
@@ -267,7 +267,7 @@ fn addBackendDeps(b: *std.Build, exe: *Exe, backend: Backend, ort_include: ?[]co
             if (ort_include) |dir| {
                 exe.root_module.addIncludePath(.{ .cwd_relative = dir });
             } else {
-                exe.root_module.addIncludePath(b.path("dist/linux/include/onnxruntime"));
+                exe.root_module.addIncludePath(b.path("vendor/onnxruntime/include/onnxruntime"));
             }
             // Not via pkg-config: onnxruntime's .pc file is named
             // `libonnxruntime`, so a pkg-config lookup for `onnxruntime`
