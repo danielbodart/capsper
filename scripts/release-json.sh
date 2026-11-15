@@ -47,15 +47,17 @@ for pair in "${pairs[@]}"; do
     platform=${pair%%:*}
     system=${pair#*:}
     name="capsper-$platform.tar.gz"
-    mapfile -t hex < <(awk -v n="$name" '$2 == n || $2 == "*" n { print $1 }' "$sums")
-    if [ ${#hex[@]} -ne 1 ] || ! [[ ${hex[0]} =~ ^[0-9a-f]{64}$ ]]; then
-        echo "release-json: want one sha256 for $name in $sums, found ${#hex[@]}" >&2
+    # No mapfile: the check runs this on macOS too, whose bash is 3.2.
+    hex=$(awk -v n="$name" '$2 == n || $2 == "*" n { print $1 }' "$sums")
+    found=$(printf '%s' "$hex" | grep -c . || true)
+    if [ "$found" -ne 1 ] || ! [[ $hex =~ ^[0-9a-f]{64}$ ]]; then
+        echo "release-json: want one sha256 for $name in $sums, found $found" >&2
         exit 1
     fi
     n=$((n + 1))
     sep=,
     [ $n -lt ${#pairs[@]} ] || sep=
     printf '    "%s": {\n      "url": "https://github.com/danielbodart/capsper/releases/download/v%s/%s",\n      "hash": "%s"\n    }%s\n' \
-        "$system" "$version" "$name" "$(sri "${hex[0]}")" "$sep"
+        "$system" "$version" "$name" "$(sri "$hex")" "$sep"
 done
 printf '  }\n}\n'
