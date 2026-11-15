@@ -353,9 +353,13 @@ async function printVersion() {
 }
 
 
-/** Verify the Nix flake: the package builds from source, and the NixOS module
- *  actually grants the permissions it claims (checked in a real NixOS VM).
- *  Skipped where nix is unavailable, which includes the macOS CI runner. */
+/** Verify the Nix flake: the package, which is the release tarball patched
+ *  for NixOS, runs, and the NixOS module actually grants the permissions it
+ *  claims (checked in a real NixOS VM). The package exists only where
+ *  nix/release.json does: on a release tag, or after
+ *  scripts/nix-local-release.sh has made a tarball built here the release,
+ *  as CI's nix job does. Skipped where nix is unavailable, which includes
+ *  the macOS CI runner. */
 export async function nix() {
     if (IS_MACOS) {
         console.log("nix: skipped (macOS — the flake packages Linux only)");
@@ -366,9 +370,13 @@ export async function nix() {
         return;
     }
     // Evaluates every output and builds the checks, including the NixOS VM
-    // test. Cheap: capsper is a zig build and onnxruntime comes from the cache.
+    // test.
     await $`nix flake check --print-build-logs`;
-    await $`nix build --no-link .#capsper`;
+    if (existsSync("nix/release.json")) {
+        await $`nix build --no-link --print-build-logs .#capsper`;
+    } else {
+        console.log("nix: no nix/release.json, so no package to build (scripts/nix-local-release.sh makes one)");
+    }
 }
 const commands: Record<string, Function> = {
     dev, build, clean, setup, test, lint, dist, sums, sign, nix, version: printVersion,

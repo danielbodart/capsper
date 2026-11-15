@@ -52,8 +52,10 @@ curl -fSL https://github.com/danielbodart/capsper/releases/latest/download/capsp
 NixOS has its own flake, since the tarball installer's assumptions (a writable install prefix, `usermod`, hand-written udev rules, self-updating binaries) do not hold there:
 
 ```nix
-inputs.capsper.url = "github:danielbodart/capsper";
+inputs.capsper.url = "github:danielbodart/capsper/v<V>";   # a release tag
 ```
+
+Its package is the release's own Linux tarball, patched for NixOS, so pin a release tag: trunk has the modules but no package.
 
 See [docs/nixos.md](docs/nixos.md) for the NixOS and home-manager modules, and for how to fetch the models.
 
@@ -504,10 +506,10 @@ Function keys F13–F20 are the safest choice for a non-default trigger — they
 ## Channels
 
 - **Tarball + systemd**: `capsper-linux-x86_64.tar.gz` and `capsper-macos-arm64.tar.gz` on each release, with `SHA256SUMS`, and a `.sha256` and a cosign `.sigstore.json` bundle beside each (the macOS binary is also signed with a Fulcio certificate); built by [mise](https://mise.jdx.dev) with the Zig `mise.toml` pins (`mise run dist`). Unpack and run `./install.sh`, as under Install: on Linux it writes the systemd user units (`capsper.service` with rollback on failure, and the update timer).
-- **Nix**: a flake input, `github:danielbodart/capsper` (with `inputs.nixpkgs.follows = "nixpkgs"`), its `packages.default` (`0-unstable-<date>`), `nixosModules.default` and `homeModules.default`; built by nixpkgs (nixos-26.05, its `zig_0_15`), pushed to the `danielbodart` Cachix.
+- **Nix**: a flake input pinned to a release tag, `github:danielbodart/capsper/v<V>` (with `inputs.nixpkgs.follows = "nixpkgs"`), its `packages.default`, `nixosModules.default` and `homeModules.default`. The package is that release's Linux tarball, fetched by the hash in the tag's `nix/release.json` and patched for NixOS (`autoPatchelfHook`), not a build from source; each release's tag is a commit of its own, a child of the released trunk commit, adding only that file.
 - Not shipped: Docker — capsper is a desktop dictation tool, which needs the user's keyboard, audio and session.
 
-Updated weekly (Sunday 21:23 UTC): the flake's inputs, mise's tools to the latest patch of their minor (fulcio-codesign to its latest release), build.zig.zon's minish to its latest tag that builds with that Zig, and the vendored libopus to upstream's latest release tag. A release, `v0.<commits>.<build>`, is cut when the code, the scripts in `packaging/`, `vendor/` (onnxruntime and libopus), the models or `mise.toml` changed since the last one (`RELEASE_PATHS` in `mise.toml`).
+Updated weekly (Sunday 21:23 UTC): the flake's inputs, mise's tools to the latest patch of their minor (fulcio-codesign to its latest release), build.zig.zon's minish to its latest tag that builds with that Zig, and the vendored libopus to upstream's latest release tag. A release, `v0.<commits>.<build>`, is cut when the code, the scripts in `packaging/`, `vendor/` (onnxruntime and libopus), the models, `mise.toml`, `flake.nix` or `nix/` changed since the last one (`RELEASE_PATHS` in `mise.toml`).
 
 ## Development
 

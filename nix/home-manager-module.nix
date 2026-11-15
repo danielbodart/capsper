@@ -62,7 +62,11 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.capsper;
+      # The release's package, which a flake pinned to a release tag has and
+      # trunk does not (flake.nix).
+      default =
+        self.packages.${pkgs.stdenv.hostPlatform.system}.capsper
+          or (throw "services.capsper.package: capsper's flake has a package only at a release tag; pin github:danielbodart/capsper/v<V>");
       defaultText = lib.literalExpression "capsper.packages.\${system}.capsper";
       description = "The capsper package to run.";
     };

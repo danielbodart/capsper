@@ -1,10 +1,8 @@
 # Every dependency moves once a week, in the window all of danielbodart's
 # repositories share: Sunday 21:23 UTC, two hours before nix-config takes its
-# own inputs on the same nixos-26.05, so what the flake builds here is the
-# derivation nix-config builds, already in the danielbodart cache when it
-# asks. What moves: every flake input, each tool in mise.toml to the latest
-# patch of its minor (a minor moves by hand, with zig_0_NN in
-# nix/package.nix), fulcio-codesign, danielbodart's own, to its latest
+# own inputs on the same nixos-26.05. What moves: every flake input, each
+# tool in mise.toml to the latest patch of its minor (a minor moves by
+# hand), fulcio-codesign, danielbodart's own, to its latest
 # release, build.zig.zon's dependencies to their upstream's latest release
 # tag that builds with that Zig (scripts/zig-deps.sh), and the
 # vendor/libopus submodule to upstream's latest release tag, with build.zig's
@@ -12,15 +10,15 @@
 #
 # Nothing is committed unless the new files pass what CI runs, every channel:
 # on Linux `mise run check`, the tarball built and installed with its units
-# verified, and `./run nix`, the flake check with its NixOS VM test; on macOS
-# the check and the tarball. The files go from job to job as an artifact.
-# Then they are committed straight to trunk, named by what moved, capsper's
-# package is pushed to Cachix, and if anything in mise.toml's RELEASE_PATHS
-# changed since the last release tag (`mise run release-due`: a new Zig or
-# libopus, say), CI is dispatched with `release` (a push made with
-# GITHUB_TOKEN starts no workflow). A week that moved only flake.lock
-# releases nothing: the tarballs are not built from the flake, so it would
-# be the same code under a new version.
+# verified, and `./run nix` on that tarball made the flake's release
+# (scripts/nix-local-release.sh), the flake check with its NixOS VM test; on
+# macOS the check and the tarball. The files go from job to job as an
+# artifact. Then they are committed straight to trunk, named by what moved,
+# and if anything in mise.toml's RELEASE_PATHS changed since the last release
+# (`mise run release-due`: a new Zig or libopus, say), CI is dispatched with
+# `release` (a push made with GITHUB_TOKEN starts no workflow). A week that
+# moved only flake.lock releases nothing: the package is the release tarball,
+# which is not built from the flake, and a consumer follows its own nixpkgs.
 name: Weekly update
 on:
   schedule:
@@ -134,17 +132,13 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           determinate: false
-      # Read only: the action would push every path the check built, the VM
-      # test's NixOS closure among them, and the free tier is 5 GB.
-      - uses: cachix/cachix-action@v17
-        with:
-          name: danielbodart
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          skipPush: true
       - run: mise run check
       - run: mise run dist
       - run: mise run dist-check
-      - run: ./run nix
+      - name: The tarball as the flake's release, and the flake checked
+        run: |
+          scripts/nix-local-release.sh "$(./run version)" dist
+          ./run nix
 
   macos:
     needs: [update]
@@ -196,14 +190,6 @@ jobs:
             # Staged, or ./run's `git submodule update` puts it back.
             git add "${kv%%=*}"
           done
-      - uses: DeterminateSystems/nix-installer-action@main
-        with:
-          determinate: false
-      - uses: cachix/cachix-action@v17
-        with:
-          name: danielbodart
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          skipPush: true
       - name: Commit and push
         env:
           MOVED: ${{ needs.update.outputs.moved }}
@@ -213,8 +199,6 @@ jobs:
           git commit -qm "Weekly update: $MOVED" flake.lock mise.toml build.zig.zon build.zig vendor/libopus
           git pull -q --rebase origin trunk
           git push -q origin HEAD:trunk
-      - name: Push capsper's package to Cachix
-        run: nix build --no-link --print-out-paths .#capsper | cachix push danielbodart
       - uses: jdx/mise-action@v5
       - name: Release, if a release path moved
         env:

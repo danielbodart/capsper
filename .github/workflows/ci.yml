@@ -113,13 +113,22 @@ jobs:
   # identically on any host, so Nix on ubuntu is a real verification of the
   # package. The NixOS module needs an actual NixOS system, which the flake's
   # check boots in a VM — KVM is available on Linux runners and the installer
-  # enables it. On trunk, capsper's own package goes to the danielbodart
-  # cache, and nothing else: never the VM test's closure (the free tier is
-  # 5 GB).
+  # enables it.
+  #
+  # The flake's package is the release tarball (flake.nix), so this job takes
+  # the one the linux job built and makes it the flake's release
+  # (scripts/nix-local-release.sh): the checks then run the very binary this
+  # run releases, through the same release.json, fetchurl and patching a
+  # pinned tag gives. Nothing goes to Cachix: there is nothing of capsper's
+  # to build that the release does not already carry.
   nix:
+    needs: linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # run.ts versions the release by commit count, as the linux job did.
+          fetch-depth: 0
       # Only for bun, which runs run.ts. The flake supplies everything else.
       - uses: jdx/mise-action@v5
       - uses: DeterminateSystems/nix-installer-action@main
@@ -128,30 +137,45 @@ jobs:
           # this repository has no account for: it fails after a 15s timeout
           # and warns. KVM is configured either way, and the VM test needs it.
           determinate: false
-      - uses: cachix/cachix-action@v17
+      - name: The flake as trunk has it, evaluated
+        run: nix flake check --no-build
+      - uses: actions/download-artifact@v8
         with:
-          name: danielbodart
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          skipPush: true
+          name: capsper-linux-x86_64
+          path: dist
+      - name: This run's tarball as the flake's release
+        run: |
+          cp dist/capsper-linux-x86_64.tar.gz.sha256 dist/SHA256SUMS
+          scripts/nix-local-release.sh "$(./run version)" dist
       - name: Nix
         run: ./run nix
-      - name: Push capsper's package to Cachix
-        if: github.ref == 'refs/heads/trunk'
-        env:
-          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        run: |
-          if [ -z "$CACHIX_AUTH_TOKEN" ]; then echo "No CACHIX_AUTH_TOKEN: nothing is pushed."; exit 0; fi
-          nix build --no-link --print-out-paths .#capsper | cachix push danielbodart
 
   # A release, when a push to trunk that passed every channel's checks above
-  # changed what the tarballs are made of: anything in mise.toml's
-  # RELEASE_PATHS since the last release tag (`mise run release-due`). The
-  # workflows, docs, flake.nix, flake.lock and nix/ alone release nothing. A
-  # dispatch with `release` publishes whatever changed. The tarballs are the
-  # ones the linux and macos jobs built and checked, gathered into dist/,
-  # where `mise run sums` writes SHA256SUMS over both, each signed here with
-  # cosign (keyless, a sigstore bundle beside it). The notes are the commits
-  # since the last release.
+  # changed what a release is made of: anything in mise.toml's RELEASE_PATHS
+  # since the last release (`mise run release-due`). The workflows, docs,
+  # scripts and flake.lock alone release nothing. A dispatch with `release`
+  # publishes whatever changed. The tarballs are the ones the linux and macos
+  # jobs built and checked, gathered into dist/, where `mise run sums` writes
+  # SHA256SUMS over both, each signed here with cosign (keyless, a sigstore
+  # bundle beside it). The notes are the commits since the last release.
+  #
+  # THE TAG'S OWN COMMIT. flake.nix's package is the release's Linux
+  # tarball, fetched, and a flake fetched as github:danielbodart/capsper/v<V>
+  # sees its commit but not its tag, so the version and the tarball's URL
+  # and hash must be in the tagged tree: nix/release.json
+  # (scripts/release-json.sh). It is committed, by github-actions[bot], as a
+  # one-commit child of the released trunk commit, and only the tag v<V> is
+  # pushed, pointing at that child; trunk never gets the commit. Agents and
+  # the weekly update commit to trunk, and a bot commit on origin/trunk would
+  # make every local trunk diverge on every release; a tag on no branch does
+  # not, needs no skip-CI marker in its message, since a tag push starts no
+  # run here, and cannot race anyone's push to trunk. (Never write that
+  # marker, the words skip and ci in square brackets, in a commit message,
+  # even to say it is not needed: GitHub starts no workflow at all for a push
+  # whose head commit's message contains it anywhere, and a green trunk
+  # commit then goes untested and unreleased until the next push.) So the
+  # last release is the tag's parent, not an ancestor tag
+  # (scripts/last-release.sh, which release-due and the notes ask).
   release:
     needs: [check, linux, macos, nix]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/trunk'
@@ -159,45 +183,102 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      # To start CI on trunk's head, where this commit cannot be tagged.
+      actions: write
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
       - uses: jdx/mise-action@v5
+      # GitHub refuses GITHUB_TOKEN, which can never hold the workflows
+      # permission, a new ref whose .github/workflows differ from trunk's
+      # head ("HTTP 403: Resource not accessible by integration"): a tag of
+      # this commit's child, once trunk has moved on to a commit that changed
+      # a workflow, would be one. Then the release is trunk head's to make,
+      # its commits including this one's: its own run makes it, or, where it
+      # has none, one started here.
       - name: Is a release due?
         id: due
         env:
           FORCE: ${{ inputs.release }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$FORCE" = true ] || mise run release-due; then due=true; else due=false; fi
-          echo "Release due: $due"
-          echo "due=$due" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != true ] && ! mise run release-due; then
+            echo "Nothing a release is made of changed since the last release: no release."
+            echo "due=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch -q origin trunk
+          head=$(git rev-parse FETCH_HEAD)
+          if [ "$head" != "$GITHUB_SHA" ] && ! git diff --quiet "$GITHUB_SHA" "$head" -- .github/workflows; then
+            echo "::warning::trunk is at ${head:0:7}, which changed a workflow since ${GITHUB_SHA:0:7}: GITHUB_TOKEN cannot tag ${GITHUB_SHA:0:7}, so the release is ${head:0:7}'s"
+            if [ "$(gh run list --workflow ci.yml --commit "$head" --json databaseId --jq length)" = 0 ]; then
+              gh workflow run ci.yml --ref trunk -f release="${FORCE:-false}"
+            fi
+            echo "due=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "due=true" >> "$GITHUB_OUTPUT"
       - if: steps.due.outputs.due == 'true'
         uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - name: Sign and release
+      - name: Sign
+        id: sign
         if: steps.due.outputs.due == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           V=$(./run version)
           mise run sums
-          assets=(dist/SHA256SUMS)
           for t in capsper-linux-x86_64.tar.gz capsper-macos-arm64.tar.gz; do
             (cd dist && sha256sum -c "$t.sha256")
             cosign sign-blob "dist/$t" --bundle "dist/$t.sigstore.json" --yes
+          done
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      # Trunk-based, no pull requests, so GitHub's PR-based notes would be
+      # empty: the commits since the last release instead, or the head commit
+      # when there is none. Written before this release's tag exists.
+      - name: Release notes
+        if: steps.due.outputs.due == 'true'
+        env:
+          V: ${{ steps.sign.outputs.version }}
+        run: |
+          if read -r _ prev < <(scripts/last-release.sh); then
+            git log "$prev..$GITHUB_SHA" --pretty='- %s (%h)' > notes.md
+          else
+            { echo 'First automated release.'; echo; git log -1 --pretty='- %s (%h)' "$GITHUB_SHA"; } > notes.md
+          fi
+          { echo; echo "With Nix: the flake github:danielbodart/capsper/v$V (docs/nixos.md)."; } >> notes.md
+      # The tag, on its own commit (see the top of this job): nix/release.json
+      # for the tarballs signed above, committed on a detached HEAD whose
+      # parent is the commit this run tested, and only the tag pushed.
+      - name: Tag v<V> on a child commit holding nix/release.json
+        if: steps.due.outputs.due == 'true'
+        env:
+          V: ${{ steps.sign.outputs.version }}
+        run: |
+          git checkout -q --detach "$GITHUB_SHA"
+          mkdir -p nix
+          scripts/release-json.sh "$V" dist/SHA256SUMS > nix/release.json
+          cat nix/release.json
+          git add nix/release.json
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Release v$V" \
+              -m "nix/release.json, for flake.nix: the release's version and its Linux tarball's URL and hash. This commit is on no branch; only the tag v$V names it."
+          git tag "v$V"
+          git push -q origin "refs/tags/v$V"
+      # The release, on the tag just pushed (--verify-tag: never one GitHub
+      # would make itself, on trunk).
+      - name: Release
+        if: steps.due.outputs.due == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.sign.outputs.version }}
+        run: |
+          assets=(dist/SHA256SUMS)
+          for t in capsper-linux-x86_64.tar.gz capsper-macos-arm64.tar.gz; do
             assets+=("dist/$t" "dist/$t.sha256" "dist/$t.sigstore.json")
           done
-          # Trunk-based, no pull requests, so GitHub's PR-based notes would be
-          # empty: the commits since the last release instead, or the head
-          # commit when there is none.
-          PREV="$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
-          if [ -n "$PREV" ] && git rev-parse -q --verify "refs/tags/$PREV" >/dev/null; then
-            git log "$PREV..HEAD" --pretty='- %s (%h)' > notes.md
-          else
-            { echo 'First automated release.'; echo; git log -1 --pretty='- %s (%h)'; } > notes.md
-          fi
-          gh release create "v$V" --title "v$V" --notes-file notes.md --target "$GITHUB_SHA" "${assets[@]}"
+          gh release create "v$V" --verify-tag --title "v$V" --notes-file notes.md "${assets[@]}"

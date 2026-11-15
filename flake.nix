@@ -6,10 +6,10 @@
     # and it is recommended that you do. capsper's largest runtime dependency
     # is PipeWire, whose closure is ~700MB once the SPA plugins are counted,
     # and any machine that can run capsper already has it -- but that cost is
-    # only shared if both resolve to the same store path. Following is safe
-    # here precisely because these are source builds: the code is compiled
-    # against whatever nixpkgs it is handed, rather than being a prebuilt
-    # binary linked to one particular glibc.
+    # only shared if both resolve to the same store path. Following is safe:
+    # the release binary is patched against whatever nixpkgs it is handed
+    # (nix/package.nix), and asks of its glibc and PipeWire no more than any
+    # distribution's.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   };
 
@@ -21,18 +21,31 @@
       # that changes on every rebuild would need re-approving each time.
       system = "x86_64-linux";
 
-      # nixpkgs' version for a build from a commit, 0-unstable-YYYY-MM-DD,
-      # from the commit's date: it never claims to be a release (those are
-      # the tarballs', 0.<commits>.<build>, which `./run.ts version` stamps),
-      # and a `github:` ref has the date as a `git+https:` one does.
-      date = self.lastModifiedDate;
-      version = "0-unstable-${builtins.substring 0 4 date}-${builtins.substring 4 2 date}-${builtins.substring 6 2 date}";
+      # THE PACKAGE IS THE RELEASE TARBALL, not a build from source (Dan,
+      # 2026-11-15): the tarball is built once, by mise's Zig in CI's linux
+      # job, tested and released, and building capsper again here only made
+      # a second binary that was not the one released. So a release's tag is
+      # a commit of its own, a child of the released trunk commit, that adds
+      # nix/release.json: the version, and the tarball's URL and hash
+      # (scripts/release-json.sh writes it; ci.yml's release job commits and
+      # tags it). A flake fetched as github:danielbodart/capsper/v<V> cannot
+      # see its tag, only its commit, which is why the version is in the file.
+      #
+      # On trunk there is no such file and no package: pin a release tag.
+      # Absent rather than an error, so `nix flake check` and the dev shell
+      # still work on trunk.
+      releaseFile = ./nix/release.json;
+      release = if builtins.pathExists releaseFile then nixpkgs.lib.importJSON releaseFile else null;
+      asset = if release == null then null else release.assets.${system} or null;
 
       pkgs = nixpkgs.legacyPackages.${system};
     in
     {
-      packages.${system} = {
-        capsper = pkgs.callPackage ./nix/package.nix { inherit version; };
+      packages.${system} = nixpkgs.lib.optionalAttrs (asset != null) {
+        capsper = pkgs.callPackage ./nix/package.nix {
+          inherit (release) version;
+          inherit (asset) url hash;
+        };
         default = self.packages.${system}.capsper;
       };
 
@@ -62,8 +75,8 @@
         # The binary `./run build` produces links the onnxruntime in
         # vendor/onnxruntime/lib, which it finds through dist/linux/lib and
         # an $ORIGIN-relative RPATH that build.zig sets -- but that library is a C++ one built elsewhere, and
-        # nothing gives it a path to a libstdc++. The packaged build needs no
-        # equivalent: it links nixpkgs' onnxruntime, so Zig's RPATH covers it.
+        # nothing gives it a path to a libstdc++. The package needs no
+        # equivalent: autoPatchelfHook gives it one (nix/package.nix).
         LD_LIBRARY_PATH = "${pkgs.lib.getLib pkgs.stdenv.cc.cc}/lib";
       };
 
@@ -123,8 +136,13 @@
           pkgs.runCommand "capsper-zon-renderer" { } ''
             diff -u ${pkgs.writeText "expected.zon" expected} \
                     ${pkgs.writeText "rendered.zon" rendered}
-            ${pkgs.lib.getExe self.packages.${system}.capsper} \
-              --config ${pkgs.writeText "rendered.zon" rendered} --write-config > /dev/null
+            ${pkgs.lib.optionalString (self.packages.${system} ? capsper) ''
+              # Only where there is a package to run: on a release tag,
+              # and in CI's nix job, which makes the tarball its own run
+              # built the release (scripts/nix-local-release.sh).
+              ${pkgs.lib.getExe self.packages.${system}.capsper} \
+                --config ${pkgs.writeText "rendered.zon" rendered} --write-config > /dev/null
+            ''}
             touch $out
           '';
 

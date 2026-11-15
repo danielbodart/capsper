@@ -1,95 +1,69 @@
-# capsper, built from source against nixpkgs' own onnxruntime: no prebuilt
-# binaries, no patchelf, and no CPU-baseline restriction (the dist build
-# targets x86_64_v3; this one does not).
+# capsper as the release ships it: the Linux tarball CI's linux job built
+# with mise's Zig, fetched by the hash nix/release.json names, and patched to
+# run on NixOS. Not a build from source (Dan, 2026-11-15): the tarball is
+# built once, tested and released, and building it again here only made a
+# second binary that was not the one released.
 #
-# Nothing here is patched. The executable is linked by Zig, which sets its own
-# interpreter and RPATH (-Dort-lib, -Drpath).
+# The tarball is made for an FHS distribution, so two things change, and
+# only those: the ELF interpreter (/lib64/ld-linux-x86-64.so.2 there) and
+# the RUNPATHs, which autoPatchelfHook points at the store. The binary
+# needs libpipewire-0.3 and the onnxruntime the tarball carries in lib/,
+# which capsper finds through $ORIGIN/../lib; that onnxruntime is a C++
+# library built elsewhere, and needs libstdc++ and libgcc_s, from
+# stdenv.cc.cc.lib. glibc is stdenv's. Opus is compiled in. Nothing is
+# stripped (dontStrip), so the code is the release's byte for byte.
+#
+# PipeWire's SPA plugins are not linked: libpipewire loads them at run time
+# from the paths its own build names, so the package's pipewire brings them.
+#
+# Like the tarball, it targets x86_64_v3 (run.ts builds with
+# -Dcpu=x86_64_v3).
 {
   lib,
   stdenv,
+  fetchurl,
+  autoPatchelfHook,
   runtimeShell,
-  zig_0_15,
-  pkg-config,
   pipewire,
-  libopus,
-  onnxruntime,
   version,
+  url,
+  hash,
 }:
 
-let
-  # The headers must match the library being linked: capsper asks for
-  # ORT_API_VERSION at run time, and a library older than the headers declare
-  # hands back null rather than an API table. Taking both from the same
-  # package is what keeps that true.
-  ortInclude = "${lib.getDev onnxruntime}/include/onnxruntime";
-  ortLib = "${lib.getLib onnxruntime}/lib";
-
-  # Only what the build actually reads. Notably excludes vendor/onnxruntime, whose
-  # libraries are Git LFS objects that arrive as pointer files when the flake
-  # is fetched from GitHub rather than checked out -- this build links
-  # nixpkgs' onnxruntime and reads neither those nor the headers beside them.
-  source = lib.fileset.toSource {
-    root = ../.;
-    fileset = lib.fileset.unions [
-      ../build.zig
-      ../build.zig.zon
-      ../src
-      ../build/gen_config_docs.zig # build step: harvests the settings' descriptions
-      ../test/jfk.wav # installed beside the binary as the warmup clip
-      ../models # the voice activity model, installed into the models directory
-    ];
-  };
-in
 stdenv.mkDerivation {
   pname = "capsper";
   inherit version;
 
-  src = source;
+  src = fetchurl { inherit url hash; };
 
-  nativeBuildInputs = [
-    zig_0_15
-    pkg-config
-  ];
+  # The tarball's root is ".", holding bin/, lib/, models/ and the scripts.
+  sourceRoot = ".";
+
+  nativeBuildInputs = [ autoPatchelfHook ];
 
   buildInputs = [
     pipewire
-    libopus
-    onnxruntime
+    stdenv.cc.cc.lib
   ];
 
   dontConfigure = true;
-
-  buildPhase = ''
-    runHook preBuild
-
-    # Zig writes to a global cache; point it somewhere writable in the sandbox.
-    export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-
-    # No -Dcpu: unlike the dist build, this is not pinned to x86_64_v3.
-    zig build install \
-      --prefix "$out" \
-      -Doptimize=ReleaseSafe \
-      -Dversion=${version} \
-      -Dprop-tests=false \
-      -Dsystem-opus=true \
-      -Dort-include=${ortInclude} \
-      -Dort-lib=${ortLib} \
-      -Drpath=${ortLib} \
-      -Drpath=${lib.getLib pipewire}/lib
-
-    runHook postBuild
-  '';
+  dontBuild = true;
+  dontStrip = true;
 
   installPhase = ''
     runHook preInstall
 
-    # zig build already installed into $out/bin. Move the real binary aside so
-    # $out/bin/capsper can be the wrapper -- jfk.wav has to follow it, because
-    # capsper resolves the warmup clip relative to its own executable.
-    mkdir -p $out/libexec
-    mv $out/bin/capsper $out/libexec/capsper
-    mv $out/bin/jfk.wav $out/libexec/jfk.wav
+    # The layout capsper resolves against its own executable: jfk.wav (the
+    # warm-up clip) beside it, the voice activity model at ../models, and
+    # onnxruntime at ../lib. $out/bin/capsper is the wrapper, so the binary
+    # lives in libexec.
+    install -Dm0755 bin/capsper $out/libexec/capsper
+    install -Dm0644 bin/jfk.wav $out/libexec/jfk.wav
+    install -Dm0644 models/silero_vad.onnx $out/models/silero_vad.onnx
+    mkdir -p $out/lib
+    cp -P lib/libonnxruntime.so* $out/lib/
 
+    mkdir -p $out/bin
     substitute ${./capsper-wrapper.sh} $out/bin/capsper \
       --subst-var-by shell ${runtimeShell} \
       --subst-var-by exe $out/libexec/capsper
@@ -103,5 +77,6 @@ stdenv.mkDerivation {
     homepage = "https://github.com/danielbodart/capsper";
     platforms = [ "x86_64-linux" ];
     mainProgram = "capsper";
+    sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
   };
 }

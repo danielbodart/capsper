@@ -4,20 +4,29 @@ capsper ships a flake for NixOS. It is an alternative to `install.sh`, not a
 replacement — the tarball installer remains the path for Ubuntu, Arch, Fedora
 and macOS, and is unaffected by anything here.
 
-Both packages are **built from source**. Nothing is patchelf'd: the executable
-is linked by Zig, which sets its own ELF interpreter and RPATH.
+The package is **the release's own Linux tarball**, not a build from source:
+the binary CI built with mise's Zig, tested and released, fetched by its hash
+and patched for NixOS by `autoPatchelfHook`, which changes only its ELF
+interpreter and RPATHs (`nix/package.nix`). It carries the onnxruntime the
+tarball does, and Opus compiled in; PipeWire, libstdc++ and glibc come from
+your nixpkgs.
 
 ## What the flake provides
 
 | Output | What it is |
 |---|---|
-| `packages.x86_64-linux.capsper` | The binary, built against nixpkgs' onnxruntime. Free, fully cached. The `default`. |
+| `packages.x86_64-linux.capsper` | The release binary, patched for NixOS. The `default`. Only at a release tag. |
 | `nixosModules.default` | `services.capsper` — uinput, udev, group membership. |
 | `homeModules.default` | `services.capsper` — the user service itself. |
 | `checks.x86_64-linux.nixos-module` | Boots NixOS in a VM and asserts the module's permissions. |
 
-Unlike the release tarball, these are not built for `x86_64_v3`, so they run on
-any x86_64 machine.
+Like the tarball, the binary is built for `x86_64_v3` (Haswell or later).
+
+There is a package only at a **release tag**: a release's tag is a commit of
+its own, a child of the released trunk commit, that adds `nix/release.json`
+(the version, and the tarball's URL and hash), because a flake fetched as
+`github:danielbodart/capsper/v<V>` sees its commit but not its tag. Trunk has
+no such file, so it has the modules and checks but no package: pin a tag.
 
 ## Why there is no GPU build
 
@@ -52,7 +61,7 @@ In your flake inputs:
 
 ```nix
 capsper = {
-  url = "github:danielbodart/capsper";
+  url = "github:danielbodart/capsper/v<V>";   # a release tag, from the Releases page
   inputs.nixpkgs.follows = "nixpkgs";
 };
 ```
@@ -61,9 +70,9 @@ capsper = {
 PipeWire, whose closure is ~700MB once you count the SPA plugins (libcamera,
 gstreamer, ffmpeg). Any machine that can run capsper already has PipeWire, so
 following your nixpkgs means that cost is shared rather than duplicated — and
-it can only be shared if both resolve to the same store path. Because these are
-source builds rather than prebuilt binaries, following is safe: the code is
-compiled against whatever nixpkgs you hand it.
+it can only be shared if both resolve to the same store path. Following is
+safe: the release binary is patched against your nixpkgs, and asks of its glibc
+and PipeWire no more than any distribution's.
 
 In your NixOS configuration:
 
@@ -181,61 +190,39 @@ There is no auto-update, and none of `capsper-update.sh`,
 `capsper-apply-update.sh`, `capsper-rollback.sh` or the daily timer are
 installed. Under Nix they would be both redundant and inert — the store is
 read-only, and atomic switch plus rollback is what `nixos-rebuild` already
-does. Because the packages build from source, the flake tracks the repository
-rather than a release, so there are no hashes to bump:
+does. Updating is moving the input to a newer release tag:
 
 ```bash
+# in your flake.nix: capsper.url = "github:danielbodart/capsper/v<newer>";
 nix flake update capsper
 sudo nixos-rebuild switch --flake .
 # and if it misbehaves:
 sudo nixos-rebuild switch --rollback
 ```
 
-Nothing here is pinned to a released artefact: the package is built from the
-source the flake points at, against nixpkgs' own onnxruntime.
-
-### Which version you end up running
-
-`capsper --version` reports `0.<commits>.<build>`, the same shape the release
-binaries carry, so a Nix build and a tarball build can be compared directly.
-Nix takes the commit count from the flake input and uses the commit date as
-the build stamp, where a release uses the CI run number:
-
-```
-0.392.20260914141256   # nix, at commit 392, committed 14 Sep 14:12:56
-0.392.481              # the release built from that same commit by CI
-```
-
-The commit count only reaches the build if the input is a **git** ref.
-`github:danielbodart/capsper` fetches a tarball through GitHub's API, which
-carries the revision but not the count, and lands on `0.0.<date>`. If you want
-the number, ask for git:
-
-```nix
-capsper = {
-  url = "git+https://github.com/danielbodart/capsper";
-  inputs.nixpkgs.follows = "nixpkgs";
-};
-```
-
-That clones the history rather than fetching a tarball — a little slower to
-fetch and to update, which is the whole of the trade.
+`capsper --version` reports the release's own `0.<commits>.<build>`, the same
+as the tarball's, since it is the same binary.
 
 ## Which onnxruntime
 
-The package links nixpkgs' own `onnxruntime`, which is in `cache.nixos.org` and
-needs no build. That is 1.24.4, while the release tarball ships 1.23.2 --
-verified equivalent: the full long regression group produces identical coverage
-and WER on both.
+The release tarball's own: `vendor/onnxruntime/lib`, 1.23.2, the library the
+binary was built and regression-tested against, patched to find nixpkgs'
+libstdc++ and libgcc_s. (Until the package became the release tarball it was
+built from source against nixpkgs' onnxruntime, 1.24.4, which the long
+regression group showed to give identical coverage and WER.)
 
 ## Notes
 
-**The build.zig options this relies on.** `-Dort-include` / `-Dort-lib` point
-at an external onnxruntime, `-Drpath` adds RPATH entries for libraries at
-absolute store paths, and `-Dprop-tests=false` drops the only external Zig
-dependency so the build needs no network in the sandbox. All three default to
-the previous behaviour, so the tarball build is unchanged.
+**How CI checks the package before a release.** CI's nix job takes the
+tarball its own linux job built and makes it the flake's release
+(`scripts/nix-local-release.sh`: it writes `nix/release.json` for it, stages
+it, and adds the tarball to the store at the path `fetchurl` would fetch it
+to), so `nix flake check` runs the very binary that run releases, through the
+same package a pinned tag gives. To do the same locally after `mise run dist`:
+`scripts/nix-local-release.sh "$(./run version)" dist && ./run nix`, then
+`git rm --cached -f nix/release.json`; it must never be committed to trunk.
 
-**Git LFS.** `vendor/onnxruntime/lib/*.so` are LFS objects and arrive as pointer files
-when the flake is fetched from GitHub. The source filter excludes that
-directory entirely; nothing in the Nix build reads it.
+**build.zig's external-library options** (`-Dort-include`, `-Dort-lib`,
+`-Drpath`, `-Dsystem-opus`, `-Dprop-tests=false`) were for the source build
+the flake used to make. Nothing in this repository uses them now; they remain
+for anyone packaging capsper from source against their own libraries.

@@ -175,13 +175,13 @@ dist/                            (output only, ignored)
 
 ### Nix / NixOS
 
-`nix/` plus the root `flake.nix` package capsper for NixOS. It is **built from source** — nothing is patchelf'd, because Zig links the executable and sets its own interpreter and RPATH. Things to know:
+`nix/` plus the root `flake.nix` package capsper for NixOS. The package is **the release's own Linux tarball**, not a build from source (Dan, 2026-11-15): fetched by hash and patched with `autoPatchelfHook` (interpreter and RPATHs only). Things to know:
 
-- The flake tracks the repository, not releases. There are no binary hashes to bump, and no pinned artefacts at all.
-- It links nixpkgs' `onnxruntime` (1.24.4, cached), rather than the 1.23.2 in `vendor/onnxruntime/lib`. The two are verified equivalent — the long regression group produces identical coverage and WER on both.
-- `./run.ts nix` runs `nix flake check` (including a NixOS VM test of the module) and builds the package. Wired into CI as its own job; it is a no-op where `nix` is absent, including macOS.
-- The Nix build relies on three `build.zig` options — `-Dort-include`/`-Dort-lib` (external onnxruntime), `-Drpath` (RPATH entries for absolute store paths), and `-Dprop-tests=false` (drops the only external Zig dependency, so the sandboxed build needs no network). All default to the previous behaviour, so the tarball build is unchanged.
-- `vendor/onnxruntime/lib/*.so` are Git LFS objects and arrive as pointer files when the flake is fetched from GitHub. The source filter excludes that directory; nothing in the Nix build reads it.
+- A release's tag is a commit of its own, a child of the released trunk commit, adding only `nix/release.json` (version, tarball URL and SRI hash; `scripts/release-json.sh`). CI's release job commits it as github-actions[bot] and pushes only the tag. **Never commit `nix/release.json` to trunk**; on trunk the flake has no package, so pin a tag.
+- The last release is the tag's parent (`scripts/last-release.sh`), not `git describe`; `mise run release-due` and the notes use it.
+- CI's nix job makes the linux job's tarball the flake's release (`scripts/nix-local-release.sh`, which `git add`s release.json and `nix-store --add-fixed`s the tarball), then `./run nix` runs `nix flake check` (the zon-renderer check runs the binary; a NixOS VM test checks the module) and builds the package. Nothing is pushed to Cachix.
+- **Never put the skip-CI marker (the words skip and ci in square brackets) in a commit message, even in a sentence**: GitHub then starts no run for the push.
+- build.zig's `-Dort-include`/`-Dort-lib`/`-Drpath`/`-Dsystem-opus`/`-Dprop-tests=false` were for the old source build and are unused here now.
 
 See `docs/nixos.md`.
 
