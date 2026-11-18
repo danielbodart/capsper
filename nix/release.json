@@ -1,0 +1,9 @@
+{
+  "version": "0.425.303",
+  "assets": {
+    "x86_64-linux": {
+      "url": "https://github.com/danielbodart/capsper/releases/download/v0.425.303/capsper-linux-x86_64.tar.gz",
+      "hash": "sha256-DE+eoAV1J2YoasbHy8GHCyfxS/Yr6LcRvMCvCTzpwJw="
+    }
+  }
+}
