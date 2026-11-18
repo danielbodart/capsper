@@ -2455,7 +2455,43 @@ struct pw_out_duck {
     int      ducked;
     uint32_t saved_channels;
     float    saved[SPA_AUDIO_MAX_CHANNELS];
+
+    /* When the last write was sent, to tell a sync that is merely on its way
+       from one that will never come back. */
+    struct timespec settle_at;
+
+    /* Rebuilds the connection. A connection the server has dropped does not
+       say so on a write -- the write goes nowhere and reports success -- so
+       without this a single dropped connection left every later press
+       believing it had turned the speakers down, for the life of the process,
+       and nothing in the log. Armed from the core's error event, and from a
+       press that finds the last write never answered. */
+    struct spa_source *reconnect_timer;
+
+    /* A level that was lowered when the connection went, to put back on the
+       same output once the new connection has found it again. The write that
+       lowered it was not saved, but it is still on the card until something
+       rewrites it, and the connection that would have done so is gone. */
+    int      restore_pending;
+    char     restore_name[256];
+    uint32_t restore_channels;
+    float    restore[SPA_AUDIO_MAX_CHANNELS];
 };
+
+/* How long a write's sync may go unanswered before the connection is taken
+   to be dead. The server answers in well under a millisecond; this is long
+   enough that a busy graph never trips it. */
+#define OUT_DUCK_SETTLE_TIMEOUT_NS (2ull * SPA_NSEC_PER_SEC)
+
+static void out_duck_schedule_reconnect(struct pw_out_duck *d, int seconds);
+
+static uint64_t
+out_duck_elapsed_ns(const struct timespec *since)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)(SPA_TIMESPEC_TO_NSEC(&now) - SPA_TIMESPEC_TO_NSEC(since));
+}
 
 static int
 read_channel_volumes(const struct spa_pod *props, float *out, uint32_t *n)
@@ -2508,6 +2544,7 @@ out_duck_apply(struct pw_out_duck *d, const float *vols, uint32_t n)
     memcpy(d->volumes, vols, n * sizeof(float));
     d->channels = n;
     d->settle_seq = pw_core_sync(d->core, PW_ID_CORE, 0);
+    clock_gettime(CLOCK_MONOTONIC, &d->settle_at);
     return 0;
 }
 
@@ -2516,6 +2553,31 @@ on_duck_core_done(void *data, uint32_t id, int seq)
 {
     struct pw_out_duck *d = data;
     if (id == PW_ID_CORE && seq == d->settle_seq) d->settle_seq = -1;
+}
+
+static void
+on_duck_core_error(void *data, uint32_t id, int seq, int res, const char *message)
+{
+    struct pw_out_duck *d = data;
+    (void)seq;
+    fprintf(stderr, "[duck] PipeWire error on object %u: %s (%s)\n",
+            id, message ? message : "", spa_strerror(res));
+    /* An error on the core is the connection itself: nothing sent on it
+       arrives any more. */
+    if (id == PW_ID_CORE) {
+        fprintf(stderr, "[duck] Lost the connection to PipeWire; reconnecting\n");
+        out_duck_schedule_reconnect(d, 0);
+    }
+}
+
+/* A lowered level left behind by a dropped connection, put back once its
+   output is found again. True when it was. Caller holds the loop. */
+static int
+out_duck_restore_pending(struct pw_out_duck *d)
+{
+    if (!d->restore_pending || strcmp(d->node_name, d->restore_name) != 0) return 0;
+    d->restore_pending = 0;
+    return out_duck_apply(d, d->restore, d->restore_channels) == 0;
 }
 
 /* Whether a report of the level is the one to come back to: not while it is
@@ -2556,6 +2618,7 @@ on_duck_device_param(void *data, int seq, uint32_t id, uint32_t index,
     if (direction != SPA_DIRECTION_OUTPUT || route_device != d->route_device) return;
 
     d->route_index = route_index;
+    if (out_duck_restore_pending(d)) return;
     if (out_duck_reading(d)) read_channel_volumes(props, d->volumes, &d->channels);
 }
 
@@ -2607,7 +2670,8 @@ on_duck_node_param(void *data, int seq, uint32_t id, uint32_t index,
     struct pw_out_duck *d = data;
     (void)seq; (void)index; (void)next;
     /* A card's sink is read from its route; the node is its copy. */
-    if (id != SPA_PARAM_Props || d->device_id >= 0 || !out_duck_reading(d)) return;
+    if (id != SPA_PARAM_Props || d->device_id >= 0) return;
+    if (out_duck_restore_pending(d) || !out_duck_reading(d)) return;
     read_channel_volumes(param, d->volumes, &d->channels);
 }
 
@@ -2668,6 +2732,9 @@ on_duck_metadata_property(void *data, uint32_t subject, const char *key,
        its level back before it is let go -- not whichever is the default by
        the time the key comes up. */
     out_duck_restore(d);
+    /* A level left down by a dropped connection is only put back on the
+       output it was taken from, and only while that is still the default. */
+    if (d->restore_pending && strcmp(name, d->restore_name) != 0) d->restore_pending = 0;
     snprintf(d->node_name, sizeof(d->node_name), "%s", name);
     out_duck_release_node(d);
     for (uint32_t i = 0; i < d->n_sinks; i++) {
@@ -2743,6 +2810,100 @@ on_duck_registry_global_remove(void *data, uint32_t id)
     }
 }
 
+/* Open a connection and start following the default output. Caller holds the
+   loop. On failure nothing is left half-built. */
+static int
+out_duck_connect(struct pw_out_duck *d)
+{
+    d->core = pw_context_connect(d->context, NULL, 0);
+    if (!d->core) return -1;
+
+    d->registry = pw_core_get_registry(d->core, PW_VERSION_REGISTRY, 0);
+    if (!d->registry) {
+        pw_core_disconnect(d->core);
+        d->core = NULL;
+        return -1;
+    }
+
+    static const struct pw_core_events core_events = {
+        PW_VERSION_CORE_EVENTS,
+        .done = on_duck_core_done,
+        .error = on_duck_core_error,
+    };
+    spa_zero(d->core_listener);
+    pw_core_add_listener(d->core, &d->core_listener, &core_events, d);
+
+    static const struct pw_registry_events reg_events = {
+        PW_VERSION_REGISTRY_EVENTS,
+        .global = on_duck_registry_global,
+        .global_remove = on_duck_registry_global_remove,
+    };
+    spa_zero(d->registry_listener);
+    pw_registry_add_listener(d->registry, &d->registry_listener, &reg_events, d);
+    return 0;
+}
+
+/* Let go of the connection and everything learnt through it, which the next
+   one will announce again. Caller holds the loop. */
+static void
+out_duck_disconnect(struct pw_out_duck *d)
+{
+    if (!d->core) return;
+
+    /* Lowered when the connection went: what to come back to is kept for
+       the new one, since nothing can be written on this one. */
+    if (d->ducked) {
+        d->restore_pending = 1;
+        snprintf(d->restore_name, sizeof(d->restore_name), "%s", d->node_name);
+        memcpy(d->restore, d->saved, d->saved_channels * sizeof(float));
+        d->restore_channels = d->saved_channels;
+        d->ducked = 0;
+    }
+
+    out_duck_release_node(d);
+    if (d->metadata) {
+        spa_hook_remove(&d->metadata_listener);
+        pw_proxy_destroy(d->metadata);
+        d->metadata = NULL;
+    }
+    spa_hook_remove(&d->registry_listener);
+    pw_proxy_destroy((struct pw_proxy *)d->registry);
+    d->registry = NULL;
+    spa_hook_remove(&d->core_listener);
+    pw_core_disconnect(d->core);
+    d->core = NULL;
+
+    d->n_sinks = 0;
+    d->node_name[0] = '\0';
+    d->settle_seq = -1;
+}
+
+static void
+on_duck_reconnect(void *data, uint64_t expirations)
+{
+    struct pw_out_duck *d = data;
+    (void)expirations;
+    out_duck_disconnect(d);
+    if (out_duck_connect(d) == 0) {
+        fprintf(stderr, "[duck] Reconnected to PipeWire\n");
+    } else {
+        fprintf(stderr, "[duck] Could not reconnect to PipeWire; trying again in 2s\n");
+        out_duck_schedule_reconnect(d, 2);
+    }
+}
+
+/* Rebuild the connection from the loop's own thread, after `seconds`. Not
+   done in place: the core's error arrives inside the core's own callback,
+   where it cannot be torn down. Caller holds the loop. */
+static void
+out_duck_schedule_reconnect(struct pw_out_duck *d, int seconds)
+{
+    /* A zero timespec disarms a timer, so "now" is one nanosecond. */
+    struct timespec value = { .tv_sec = seconds, .tv_nsec = seconds ? 0 : 1 };
+    pw_loop_update_timer(pw_thread_loop_get_loop(d->thread_loop),
+                         d->reconnect_timer, &value, NULL, false);
+}
+
 struct pw_out_duck *
 pw_out_duck_create(void)
 {
@@ -2764,33 +2925,14 @@ pw_out_duck_create(void)
         free(d); return NULL;
     }
 
+    d->reconnect_timer = pw_loop_add_timer(pw_thread_loop_get_loop(d->thread_loop),
+                                           on_duck_reconnect, d);
+    if (!d->reconnect_timer) goto fail_context;
+
     pw_thread_loop_lock(d->thread_loop);
 
-    if (pw_thread_loop_start(d->thread_loop) < 0) goto fail_context;
-
-    d->core = pw_context_connect(d->context, NULL, 0);
-    if (!d->core) goto fail_started;
-
-    d->registry = pw_core_get_registry(d->core, PW_VERSION_REGISTRY, 0);
-    if (!d->registry) {
-        pw_core_disconnect(d->core);
-        goto fail_started;
-    }
-
-    static const struct pw_registry_events reg_events = {
-        PW_VERSION_REGISTRY_EVENTS,
-        .global = on_duck_registry_global,
-        .global_remove = on_duck_registry_global_remove,
-    };
-    spa_zero(d->registry_listener);
-    pw_registry_add_listener(d->registry, &d->registry_listener, &reg_events, d);
-
-    static const struct pw_core_events core_events = {
-        PW_VERSION_CORE_EVENTS,
-        .done = on_duck_core_done,
-    };
-    spa_zero(d->core_listener);
-    pw_core_add_listener(d->core, &d->core_listener, &core_events, d);
+    if (pw_thread_loop_start(d->thread_loop) < 0) goto fail_locked;
+    if (out_duck_connect(d) < 0) goto fail_started;
 
     pw_thread_loop_unlock(d->thread_loop);
     return d;
@@ -2798,13 +2940,15 @@ pw_out_duck_create(void)
 fail_started:
     pw_thread_loop_unlock(d->thread_loop);
     pw_thread_loop_stop(d->thread_loop);
-    pw_context_destroy(d->context);
-    pw_thread_loop_destroy(d->thread_loop);
-    free(d);
-    return NULL;
+    goto fail_timer;
+
+fail_locked:
+    pw_thread_loop_unlock(d->thread_loop);
+
+fail_timer:
+    pw_loop_destroy_source(pw_thread_loop_get_loop(d->thread_loop), d->reconnect_timer);
 
 fail_context:
-    pw_thread_loop_unlock(d->thread_loop);
     pw_context_destroy(d->context);
     pw_thread_loop_destroy(d->thread_loop);
     free(d);
@@ -2818,18 +2962,11 @@ pw_out_duck_destroy(struct pw_out_duck *d)
 
     pw_thread_loop_lock(d->thread_loop);
     out_duck_restore(d);
-    out_duck_release_node(d);
-    if (d->metadata) {
-        spa_hook_remove(&d->metadata_listener);
-        pw_proxy_destroy(d->metadata);
-    }
-    spa_hook_remove(&d->registry_listener);
-    pw_proxy_destroy((struct pw_proxy *)d->registry);
-    spa_hook_remove(&d->core_listener);
-    pw_core_disconnect(d->core);
+    out_duck_disconnect(d);
     pw_thread_loop_unlock(d->thread_loop);
 
     pw_thread_loop_stop(d->thread_loop);
+    pw_loop_destroy_source(pw_thread_loop_get_loop(d->thread_loop), d->reconnect_timer);
     pw_context_destroy(d->context);
     pw_thread_loop_destroy(d->thread_loop);
     free(d);
@@ -2839,17 +2976,30 @@ pw_out_duck_destroy(struct pw_out_duck *d)
    `pw_out_duck_release`. A second call while lowered does nothing.
 
    Returns -1 when there is no level to lower yet -- the output has not been
-   seen, or its route not reported -- which leaves the speakers as they are. */
+   seen, or its route not reported, or the connection is being rebuilt --
+   which leaves the speakers as they are. */
 int
 pw_out_duck_hold(struct pw_out_duck *d, float factor)
 {
     if (!d) return -1;
 
     pw_thread_loop_lock(d->thread_loop);
+
+    /* The last write's sync never came back: the server is not reading this
+       connection, whether or not it said so. */
+    if (d->core && d->settle_seq >= 0 &&
+        out_duck_elapsed_ns(&d->settle_at) > OUT_DUCK_SETTLE_TIMEOUT_NS) {
+        fprintf(stderr, "[duck] PipeWire stopped answering; reconnecting\n");
+        d->settle_seq = -1;
+        out_duck_schedule_reconnect(d, 0);
+        pw_thread_loop_unlock(d->thread_loop);
+        return -1;
+    }
+
     int rc = 0;
     if (!d->ducked) {
         rc = -1;
-        if (d->channels > 0) {
+        if (d->core && d->channels > 0) {
             uint32_t n = d->channels;
             float saved[SPA_AUDIO_MAX_CHANNELS], lowered[SPA_AUDIO_MAX_CHANNELS];
             memcpy(saved, d->volumes, n * sizeof(float));
